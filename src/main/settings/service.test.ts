@@ -21,7 +21,9 @@ vi.mock('electron', () => ({
     }
   },
   app: { getPath: () => '/home', getAppPath: () => '/home/no-such-app-root', isPackaged: false },
-  net: { fetch: vi.fn() }
+  // The provider-validation probe fetches over net.fetch (proxy-aware in production). Delegate to the
+  // global fetch each test stubs, so the existing vi.stubGlobal('fetch', …) probe expectations hold.
+  net: { fetch: vi.fn((...args: Parameters<typeof fetch>) => globalThis.fetch(...args)) }
 }))
 
 const { SettingsService } = await import('./service')
@@ -31,6 +33,9 @@ const { SkillRegistry } = await import('../skills/registry')
 const { managedClaudeDir } = await import('./managed-claude')
 const { managedOpencodeDir } = await import('./managed-opencode')
 const { netFetch } = await import('../skills/net-fetch')
+const { net: mockedNet } = (await import('electron')) as unknown as {
+  net: { fetch: ReturnType<typeof vi.fn> }
+}
 
 let storageRoot: string
 let repository: InstanceType<typeof SettingsRepository>
@@ -269,7 +274,8 @@ describe('SettingsService: providers', () => {
 
     await expect(service.loginIsolatedCodex()).resolves.toMatchObject({
       ok: true,
-      category: 'ok'
+      category: 'ok',
+      applied: true
     })
     expect((await repository.getSettings()).providers[0].lastValidatedAt).toBeDefined()
 
@@ -322,7 +328,9 @@ describe('SettingsService: providers', () => {
     await service.upsertProvider({ type: 'codex-shared' })
     resolveLogin({ mode: 'isolated', supported: true, authenticated: true })
 
-    await expect(pending).resolves.toMatchObject({ ok: true })
+    // ok reflects the sign-in itself, but applied:false marks it as discarded so a success-gated
+    // caller (onboarding) does not advance on a profile the store never recorded it against.
+    await expect(pending).resolves.toMatchObject({ ok: true, applied: false })
     const stored = (await repository.getSettings()).providers[0]
     expect(stored.type).toBe('codex-shared')
     expect(stored.lastValidatedAt).toBeUndefined()
@@ -394,6 +402,65 @@ describe('SettingsService: providers', () => {
 
     expect(codexAuth.cancelLogin).toHaveBeenCalledOnce()
     expect(codexAuth.logoutIsolated).toHaveBeenCalledOnce()
+    const stored = (await repository.getSettings()).providers[0]
+    expect(stored.lastValidatedAt).toBeUndefined()
+    expect(stored.lastValidationFailure).toBeUndefined()
+  })
+
+  it('preserves the verified markers when isolated sign-out times out', async () => {
+    // The P1 fix: a timed-out sign-out never called logout(), so the credential may still be in the
+    // isolated home. Clearing lastValidatedAt would falsely mark the provider as signed out while
+    // the credential is usable — instead preserve the verified state and return the failure so the
+    // user knows to retry.
+    const codexAuth = {
+      getStatus: vi.fn(),
+      loginIsolated: vi.fn().mockResolvedValue({
+        mode: 'isolated',
+        supported: true,
+        authenticated: true
+      }),
+      cancelLogin: vi.fn(),
+      logoutIsolated: vi.fn().mockResolvedValue({
+        mode: 'isolated',
+        supported: true,
+        authenticated: false,
+        message: 'Codex sign-out timed out.'
+      })
+    }
+    const service = createService(undefined, { codexAuth })
+    await service.upsertProvider({ type: 'codex-isolated' })
+    await service.loginIsolatedCodex()
+
+    const result = await service.logoutIsolatedCodex()
+
+    expect(result).toEqual({ ok: false, category: 'timeout', message: 'Codex sign-out timed out.' })
+    const stored = (await repository.getSettings()).providers[0]
+    expect(stored.lastValidatedAt).toBeGreaterThan(0)
+    expect(stored.lastValidationFailure).toBeUndefined()
+  })
+
+  it('returns success when isolated sign-out completes cleanly', async () => {
+    const codexAuth = {
+      getStatus: vi.fn(),
+      loginIsolated: vi.fn().mockResolvedValue({
+        mode: 'isolated',
+        supported: true,
+        authenticated: true
+      }),
+      cancelLogin: vi.fn(),
+      logoutIsolated: vi.fn().mockResolvedValue({
+        mode: 'isolated',
+        supported: true,
+        authenticated: false
+      })
+    }
+    const service = createService(undefined, { codexAuth })
+    await service.upsertProvider({ type: 'codex-isolated' })
+    await service.loginIsolatedCodex()
+
+    const result = await service.logoutIsolatedCodex()
+
+    expect(result).toEqual({ ok: true, category: 'ok' })
     const stored = (await repository.getSettings()).providers[0]
     expect(stored.lastValidatedAt).toBeUndefined()
     expect(stored.lastValidationFailure).toBeUndefined()
@@ -533,6 +600,29 @@ describe('SettingsService: validation', () => {
     expect((await repository.getSettings()).providers[0].lastValidatedAt).toBeGreaterThan(0)
   })
 
+  it('probes over the proxy-aware net.fetch, not Node global fetch directly', async () => {
+    const service = createService()
+    // A direct undici fetch ignores the system proxy, so an official vendor reachable only through a
+    // proxy fails as a false network error. The probe must go through net.fetch (Chromium stack).
+    mockedNet.fetch.mockClear()
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ status: 200 }))
+
+    const created = (
+      await service.upsertProvider({
+        type: 'custom',
+        name: 'G',
+        baseUrl: 'https://g/v1',
+        model: 'm',
+        key: 'k'
+      })
+    ).providers[0]
+
+    await service.validateProvider({ providerId: created.id })
+
+    expect(mockedNet.fetch).toHaveBeenCalledTimes(1)
+    expect(mockedNet.fetch.mock.calls[0][0]).toContain('https://g')
+  })
+
   it('records the failure (not lastValidatedAt) for a saved provider on failure', async () => {
     const service = createService()
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ status: 401 }))
@@ -556,6 +646,90 @@ describe('SettingsService: validation', () => {
     expect(stored.lastValidatedAt).toBeUndefined()
     expect(stored.lastValidationFailure).toMatchObject({ category: 'auth' })
     expect(stored.lastValidationFailure?.at).toBeGreaterThan(0)
+  })
+
+  it('reports incompatible (no network probe) when the provider cannot drive the active framework', async () => {
+    const service = createService()
+    const fetchMock = vi.fn().mockResolvedValue({ status: 200 })
+    vi.stubGlobal('fetch', fetchMock)
+
+    // Default framework is Claude Code (Anthropic /v1/messages only); an OpenAI-only gateway can't drive
+    // it, so testing must fail with the pairing reason rather than firing a misleading /v1/messages probe.
+    const created = (
+      await service.upsertProvider({
+        type: 'custom',
+        name: 'G',
+        baseUrl: 'https://g',
+        model: 'm',
+        key: 'k',
+        apiEndpoints: ['openai']
+      })
+    ).providers[0]
+
+    const result = await service.validateProvider({ providerId: created.id })
+
+    expect(result).toMatchObject({ ok: false, category: 'incompatible', applied: true })
+    expect(result.message).toContain('/v1/chat/completions')
+    expect(fetchMock).not.toHaveBeenCalled()
+
+    const stored = (await repository.getSettings()).providers.find((p) => p.id === created.id)
+    expect(stored?.lastValidatedAt).toBeUndefined()
+    expect(stored?.lastValidationFailure).toMatchObject({ category: 'incompatible' })
+  })
+
+  it('probes normally once the active framework can drive the provider', async () => {
+    const service = createService()
+    const fetchMock = vi.fn().mockResolvedValue({ status: 200 })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const created = (
+      await service.upsertProvider({
+        type: 'custom',
+        name: 'G',
+        baseUrl: 'https://g',
+        model: 'm',
+        key: 'k',
+        apiEndpoints: ['openai']
+      })
+    ).providers[0]
+
+    // OpenCode accepts /v1/chat/completions, so the same provider now validates over the network.
+    await service.setAgentFramework('opencode')
+    const result = await service.validateProvider({ providerId: created.id })
+
+    expect(result).toMatchObject({ ok: true, category: 'ok' })
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(fetchMock.mock.calls[0][0]).toContain('/v1/chat/completions')
+  })
+
+  it('probes the route the active framework drives for a multi-route provider', async () => {
+    const service = createService()
+    const fetchMock = vi.fn().mockResolvedValue({ status: 200 })
+    vi.stubGlobal('fetch', fetchMock)
+
+    // A provider that speaks both routes. preferredEndpoint would pick OpenAI globally, but Claude Code
+    // runs /v1/messages — so the probe must hit that, or a passing test wouldn't prove the real route.
+    const created = (
+      await service.upsertProvider({
+        type: 'custom',
+        name: 'G',
+        baseUrl: 'https://g',
+        model: 'm',
+        key: 'k',
+        apiEndpoints: ['anthropic', 'openai']
+      })
+    ).providers[0]
+
+    // Default framework is Claude Code (Anthropic only).
+    await service.validateProvider({ providerId: created.id })
+
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(fetchMock.mock.calls[0][0]).toContain('/v1/messages')
+
+    // The same provider under OpenCode should instead be probed on the OpenAI route it will run.
+    await service.setAgentFramework('opencode')
+    await service.validateProvider({ providerId: created.id })
+    expect(fetchMock.mock.calls[1][0]).toContain('/v1/chat/completions')
   })
 
   it('clears a recorded failure once a later validation succeeds', async () => {
@@ -606,6 +780,44 @@ describe('SettingsService: validation', () => {
     const stored = (await repository.getSettings()).providers[0]
     expect(stored.lastValidatedAt).toBeUndefined()
     expect(stored.lastValidationFailure).toMatchObject({ category: 'auth' })
+  })
+
+  it('marks a superseded validation as not applied and leaves the newer stamp intact', async () => {
+    const service = createService()
+    const created = (
+      await service.upsertProvider({
+        type: 'custom',
+        name: 'G',
+        baseUrl: 'https://g/v1',
+        model: 'm',
+        key: 'k'
+      })
+    ).providers[0]
+
+    // A slow probe lets a second, faster validation start and bump the generation before the first
+    // resolves. The first is stale: it must report applied:false and never write over the newer run.
+    let releaseSlow!: () => void
+    const fetchMock = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            releaseSlow = () => resolve({ status: 401 } as Response)
+          })
+      )
+      .mockResolvedValue({ status: 200 } as Response)
+    vi.stubGlobal('fetch', fetchMock)
+
+    const slow = service.validateProvider({ providerId: created.id })
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce())
+    const fast = await service.validateProvider({ providerId: created.id })
+    expect(fast).toMatchObject({ ok: true, applied: true })
+
+    releaseSlow()
+    await expect(slow).resolves.toMatchObject({ ok: false, applied: false })
+
+    // The newer success stands: the superseded failure must not have cleared it.
+    expect((await repository.getSettings()).providers[0].lastValidatedAt).toBeGreaterThan(0)
   })
 
   it.each([
@@ -1023,8 +1235,16 @@ describe('SettingsService: preflight & spawn config', () => {
     expect(backend.authentication).toBeUndefined()
     expect(backend.providerConfiguration).toBeUndefined()
     expect(backend.env.CODEX_API_KEY).toBeUndefined()
-    expect(backend.env.CODEX_CONFIG).toBeUndefined()
-    expect(backend.env.MODEL_PROVIDER).toBeUndefined()
+    if (type === 'codex-isolated') {
+      // Seed the selected model into CODEX_CONFIG so codex-acp uses it from session start and the
+      // first prompt doesn't wait for the late session/set_config_option model switch (issue #277).
+      // The ChatGPT subscription is codex-acp's default provider, so no model_provider override.
+      expect(JSON.parse(backend.env.CODEX_CONFIG ?? '{}')).toEqual({ model: 'gpt-5.6-terra' })
+      expect(backend.env.MODEL_PROVIDER).toBeUndefined()
+    } else {
+      expect(backend.env.CODEX_CONFIG).toBeUndefined()
+      expect(backend.env.MODEL_PROVIDER).toBeUndefined()
+    }
     expect(backend.env.NO_BROWSER).toBeUndefined()
     expect(backend.env.CODEX_PATH).toBe('/data/codex-managed/native/codex')
     expect(backend.env.CODEX_HOME).toBe(
@@ -1206,6 +1426,52 @@ describe('SettingsService: preflight & spawn config', () => {
       'utf8'
     )
     expect(pubmedSkill).toContain('host.mcp')
+  })
+
+  it('drives a native-Responses official vendor directly, without starting the bridge', async () => {
+    // MiniMax advertises anthropic + openai + responses. Codex must drive native Responses on the
+    // vendor's own OpenAI /v1 base with the vendor key — NOT spin up the Chat Completions bridge and
+    // post to its local URL (which would authenticate with the vendor key instead of the bridge token).
+    const adapterPath = join(storageRoot, 'bin', 'codex-acp')
+    await mkdir(dirname(adapterPath), { recursive: true })
+    await writeFile(adapterPath, '', 'utf8')
+    const service = createService(undefined, {
+      codexDetected: { path: adapterPath, version: 'codex-acp 1.1.4' }
+    })
+    await repository.setCodexInfo({ resolvedPath: adapterPath, version: '1.1.4' })
+    await repository.setAgentFramework('codex')
+    const provider = (
+      await service.upsertProvider({
+        type: 'official',
+        name: 'MiniMax',
+        vendorId: 'minimax',
+        region: 'global',
+        key: 'mm-secret'
+      })
+    ).providers[0]
+    const storedProvider = (await repository.getSettings()).providers[0]
+    await repository.upsertProvider({ ...storedProvider, lastValidatedAt: Date.now() })
+    await service.setActiveProvider(provider.id)
+
+    vi.stubEnv('OPEN_SCIENCE_AGENT_FRAMEWORK', 'codex')
+    const backend = await service.resolveActiveAgentBackend()
+
+    // No bridge: no local provider-configuration, no bridge session model.
+    expect(backend.providerConfiguration).toBeUndefined()
+    expect(backend.sessionModel).toBe('MiniMax-M3')
+    // Codex posts native Responses to the vendor's own /v1 base with the vendor key.
+    const codexConfig = JSON.parse(backend.env.CODEX_CONFIG ?? '{}')
+    expect(codexConfig.model_providers['open-science']).toMatchObject({
+      base_url: 'https://api.minimax.io/v1',
+      wire_api: 'responses',
+      requires_openai_auth: true
+    })
+    expect(backend.authentication).toEqual({
+      methodId: 'api-key',
+      _meta: { 'api-key': { apiKey: 'mm-secret' } }
+    })
+    expect(backend.env.CODEX_CONFIG).not.toContain('127.0.0.1')
+    expect(backend.env.CODEX_CONFIG).not.toContain('mm-secret')
   })
 
   it('builds spawn env from the active provider with the decrypted key', async () => {
@@ -1458,6 +1724,9 @@ describe('SettingsService: official vendors', () => {
     const fetchMock = vi.fn().mockResolvedValue({ status: 200 })
     vi.stubGlobal('fetch', fetchMock)
 
+    // OpenCode drives DeepSeek's OpenAI route, so the probe hits /v1/chat/completions — but as a plain
+    // non-streaming ping (the bridge streaming function-tool probe is Codex-only).
+    await service.setAgentFramework('opencode')
     const result = await service.validateProvider({
       draft: { type: 'official', vendorId: 'deepseek', key: 'sk-ds' }
     })
@@ -2428,5 +2697,205 @@ describe('SettingsService: uninstall managed runtime', () => {
     const { snapshot } = await service.uninstallOpencode()
 
     expect(snapshot.agentFrameworkId).toBe('codex')
+  })
+})
+
+describe('SettingsService: reasoning effort', () => {
+  it("projects 'default' when no reasoning effort is stored", async () => {
+    const service = createService()
+
+    expect((await service.getSettingsView()).reasoningEffort).toBe('default')
+  })
+
+  it('projects the stored level into the settings view', async () => {
+    const service = createService()
+
+    await repository.setReasoningEffort('low')
+
+    expect((await service.getSettingsView()).reasoningEffort).toBe('low')
+  })
+
+  it('persists the level and returns the refreshed snapshot', async () => {
+    const service = createService()
+
+    const snapshot = await service.setReasoningEffort('max')
+
+    expect(snapshot.reasoningEffort).toBe('max')
+    expect((await repository.getSettings()).reasoningEffort).toBe('max')
+  })
+
+  it('surfaces the stored level as sessionEffort on the resolved OpenCode backend', async () => {
+    // resolveActiveAgentBackend honors this forced-framework env above stored settings; set it
+    // explicitly (a prior test may leave it stubbed) so this resolves OpenCode.
+    vi.stubEnv('OPEN_SCIENCE_AGENT_FRAMEWORK', 'opencode')
+    await repository.setAgentFramework('opencode')
+    const service = createService(undefined, {
+      opencodeDetected: { path: '/usr/local/bin/opencode', version: '1.19.0' }
+    })
+    const provider = (
+      await service.upsertProvider({ type: 'official', name: 'Kimi', vendorId: 'kimi', key: 'k' })
+    ).providers[0]
+    await service.setActiveProvider(provider.id)
+    await repository.setReasoningEffort('high')
+
+    const backend = await service.resolveActiveAgentBackend()
+
+    expect(backend.sessionEffort).toBe('high')
+    // The level also reaches the framework's own config channel (opencode model options).
+    const content = JSON.parse(backend.env?.OPENCODE_CONFIG_CONTENT ?? '{}')
+    expect(content.provider['openai-compatible'].models['kimi-k3']).toEqual(
+      expect.objectContaining({ options: { reasoningEffort: 'high' } })
+    )
+  })
+
+  it('surfaces sessionEffort on the Claude backend too (the early-return path)', async () => {
+    vi.stubEnv('OPEN_SCIENCE_AGENT_FRAMEWORK', 'claude-code')
+    const service = createService()
+    await repository.setClaudeInfo({ resolvedPath: execPath, version: '2.1.0' })
+    const provider = (
+      await service.upsertProvider({
+        type: 'custom',
+        name: 'G',
+        baseUrl: 'https://g/v1',
+        model: 'm',
+        key: 'k'
+      })
+    ).providers[0]
+    await service.setActiveProvider(provider.id)
+    await repository.setReasoningEffort('low')
+
+    const backend = await service.resolveActiveAgentBackend()
+
+    expect(backend.framework.id).toBe('claude-code')
+    expect(backend.sessionEffort).toBe('low')
+  })
+
+  it("leaves sessionEffort undefined when the level is 'default' or unset", async () => {
+    vi.stubEnv('OPEN_SCIENCE_AGENT_FRAMEWORK', 'claude-code')
+    const service = createService()
+    await repository.setClaudeInfo({ resolvedPath: execPath, version: '2.1.0' })
+    const provider = (
+      await service.upsertProvider({
+        type: 'custom',
+        name: 'G',
+        baseUrl: 'https://g/v1',
+        model: 'm',
+        key: 'k'
+      })
+    ).providers[0]
+    await service.setActiveProvider(provider.id)
+
+    // Unset: nothing stored yet.
+    expect((await service.resolveActiveAgentBackend()).sessionEffort).toBeUndefined()
+
+    // 'default' means "don't override": the agent keeps its own default effort.
+    await repository.setReasoningEffort('default')
+    expect((await service.resolveActiveAgentBackend()).sessionEffort).toBeUndefined()
+  })
+
+  it('updates the live bridge forwarding policy when the level changes', async () => {
+    const localFetch = globalThis.fetch
+    let upstreamRequest: Record<string, unknown> | undefined
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        upstreamRequest = JSON.parse(String(init?.body)) as Record<string, unknown>
+        return new Response(
+          [
+            'data: ' +
+              JSON.stringify({
+                id: 'chat-effort-policy',
+                model: 'deepseek-v4-flash',
+                choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+              }),
+            '',
+            'data: [DONE]',
+            ''
+          ].join('\n'),
+          { headers: { 'content-type': 'text/event-stream' } }
+        )
+      })
+    )
+    const adapterPath = join(storageRoot, 'bin', 'codex-acp')
+    await mkdir(dirname(adapterPath), { recursive: true })
+    await writeFile(adapterPath, '', 'utf8')
+    const service = createService(undefined, {
+      codexDetected: { path: adapterPath, version: 'codex-acp 1.1.4' }
+    })
+    await repository.setCodexInfo({
+      resolvedPath: adapterPath,
+      version: '1.1.4',
+      nativePath: '/data/codex-managed/native/codex',
+      nativeVersion: '0.144.6'
+    })
+    await repository.setAgentFramework('codex')
+    const provider = (
+      await service.upsertProvider({
+        type: 'custom',
+        name: 'DeepSeek',
+        apiEndpoints: ['openai'],
+        baseUrl: 'https://api.deepseek.com',
+        model: 'deepseek-v4-flash',
+        key: 'test-key'
+      })
+    ).providers[0]
+    await service.setActiveProvider(provider.id)
+    vi.stubEnv('OPEN_SCIENCE_AGENT_FRAMEWORK', 'codex')
+    const backend = await service.resolveActiveAgentBackend()
+    const post = (): Promise<string> =>
+      localFetch(`${backend.providerConfiguration?.baseUrl}/responses`, {
+        method: 'POST',
+        headers: {
+          authorization: backend.providerConfiguration?.headers.authorization ?? '',
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: 'gpt-5.5',
+          input: 'hi',
+          reasoning: { effort: 'high' },
+          stream: true
+        })
+      }).then((response) => response.text())
+
+    // No explicit choice yet: Codex's own default effort is stripped, as pre-feature.
+    await post()
+    expect(upstreamRequest).not.toHaveProperty('reasoning_effort')
+
+    // An explicit level forwards — Codex applies it live over ACP, no reconnect touches the bridge.
+    await service.setReasoningEffort('high')
+    await post()
+    expect(upstreamRequest).toMatchObject({ reasoning_effort: 'high' })
+
+    // Back to 'default': stripping is restored so Codex's own effort can't leak upstream.
+    await service.setReasoningEffort('default')
+    await post()
+    expect(upstreamRequest).not.toHaveProperty('reasoning_effort')
+  })
+})
+
+describe('SettingsService: notifications preference', () => {
+  it('projects enabled when no preference is stored', async () => {
+    const service = createService()
+
+    expect((await service.getSettingsView()).notificationsEnabled).toBe(true)
+    expect(await service.getNotificationsEnabled()).toBe(true)
+  })
+
+  it('projects the stored preference into the settings view', async () => {
+    const service = createService()
+
+    await repository.setNotificationsEnabled(false)
+
+    expect((await service.getSettingsView()).notificationsEnabled).toBe(false)
+    expect(await service.getNotificationsEnabled()).toBe(false)
+  })
+
+  it('persists the preference and returns the refreshed snapshot', async () => {
+    const service = createService()
+
+    const snapshot = await service.setNotificationsEnabled(false)
+
+    expect(snapshot.notificationsEnabled).toBe(false)
+    expect((await repository.getSettings()).notificationsEnabled).toBe(false)
   })
 })

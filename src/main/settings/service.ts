@@ -48,6 +48,7 @@ import type {
   ImportSkillZipBatchRequest,
   ImportSkillZipBatchResult,
   PreviewSkillZipRequest,
+  ReasoningEffort,
   SkillBundlePreviewResult,
   ScanRepoRequest,
   ScanRepoResult,
@@ -60,8 +61,11 @@ import {
   CODEX_ISOLATED_PROVIDER_ID,
   CODEX_SHARED_PROVIDER_ID,
   codexSubscriptionProviderIdentity,
+  DEFAULT_NOTIFICATIONS_ENABLED,
+  DEFAULT_REASONING_EFFORT,
   isCodexSubscriptionProvider,
-  isProviderUsableByFramework
+  isProviderUsableByFramework,
+  providerEndpoints
 } from '../../shared/settings'
 import type { PackageMirror } from '../../shared/mirror'
 import type { NotebookLanguage } from '../../shared/notebook'
@@ -147,7 +151,7 @@ import { renderConnectorInstructions, renderSkillDoc } from '../connectors/skill
 import { syncConnectorSkillDocs } from '../connectors/provision'
 import { SkillRegistry, type BundledSkill } from '../skills/registry'
 import { UserSkillRepository } from '../skills/user-skill-repository'
-import { netFetch } from '../skills/net-fetch'
+import { netFetch, netFetchStandard } from '../skills/net-fetch'
 import { decodeBoundedBase64, SKILL_IMPORT_LIMITS } from '../skills/import-limits'
 import { readSkillFile } from '../skills/skill-files'
 import { NOTEBOOK_MCP_SERVER_NAME, NOTEBOOK_RPC_TOOLS } from '../notebook/mcp-server'
@@ -422,6 +426,8 @@ class SettingsService {
       ),
       onboardingCompletedAt: settings.onboardingCompletedAt,
       packageMirror: settings.packageMirror,
+      reasoningEffort: settings.reasoningEffort ?? DEFAULT_REASONING_EFFORT,
+      notificationsEnabled: settings.notificationsEnabled ?? DEFAULT_NOTIFICATIONS_ENABLED,
       agentFrameworkId: settings.agentFrameworkId ?? DEFAULT_AGENT_FRAMEWORK_ID,
       agentFrameworks: listAgentFrameworks().map((framework) => ({
         id: framework.id,
@@ -558,6 +564,34 @@ class SettingsService {
   // Selects the agent backend to drive; the caller reconnects so the choice applies to the next spawn.
   async setAgentFramework(id: AgentFrameworkId): Promise<SettingsSnapshot> {
     await this.repository.setAgentFramework(id)
+
+    return this.getSettingsView()
+  }
+
+  // Sets the reasoning-effort preference. Where the framework supports it the caller applies the
+  // level live over ACP (otherwise it reconnects); the persisted value drives the next spawn.
+  async setReasoningEffort(effort: ReasoningEffort): Promise<SettingsSnapshot> {
+    await this.repository.setReasoningEffort(effort)
+
+    // A live bridge never sees resolveActiveAgentBackend again until the next provider switch, so its
+    // forwarding policy must be updated in place: an explicit level forwards, 'default' restores
+    // stripping so Codex's own default effort never leaks upstream.
+    this.responsesBridge?.setForwardReasoningEffort(effort !== DEFAULT_REASONING_EFFORT)
+
+    return this.getSettingsView()
+  }
+
+  // Whether desktop notifications for finished/failed agent tasks are on, read fresh so the
+  // notification path sees a toggle change immediately (no restart, no cached copy to go stale).
+  async getNotificationsEnabled(): Promise<boolean> {
+    return (
+      (await this.repository.getSettings()).notificationsEnabled ?? DEFAULT_NOTIFICATIONS_ENABLED
+    )
+  }
+
+  // Sets the desktop-notification preference and returns the refreshed snapshot for the renderer.
+  async setNotificationsEnabled(enabled: boolean): Promise<SettingsSnapshot> {
+    await this.repository.setNotificationsEnabled(enabled)
 
     return this.getSettingsView()
   }
@@ -1484,8 +1518,10 @@ class SettingsService {
     )
     // The provider can be edited while the browser flow is open. Unless the stored record is still
     // the isolated subscription the login was started for, the outcome is stale and discarded —
-    // recording it could stamp a switched-to-shared (and unauthenticated) profile as verified.
-    if (provider?.type !== 'codex-isolated') return result
+    // recording it could stamp a switched-to-shared (and unauthenticated) profile as verified. Flag
+    // it as not-applied so a caller gating navigation on success (onboarding) does not advance on a
+    // result the stored provider never received.
+    if (provider?.type !== 'codex-isolated') return { ...result, applied: false }
 
     await this.repository.upsertProvider(
       result.ok
@@ -1506,16 +1542,23 @@ class SettingsService {
           }
     )
 
-    return result
+    return { ...result, applied: true }
   }
 
-  async logoutIsolatedCodex(): Promise<SettingsSnapshot> {
-    await this.codexAuth.logoutIsolated()
+  async logoutIsolatedCodex(): Promise<ValidateProviderResult> {
+    const status = await this.codexAuth.logoutIsolated()
+
+    // A sign-out is confirmed only when the adapter acknowledged it cleanly, which is the only path
+    // that sets no message. A timeout or capability failure leaves the status ambiguous — the
+    // credential may still be in the isolated home — so we preserve the verified markers and surface
+    // the failure rather than falsely reporting the account as signed out.
+    const succeeded = status.authenticated === false && status.message === undefined
+
     const settings = await this.repository.getSettings()
     const provider = settings.providers.find(
       (candidate) => candidate.id === codexSubscriptionProviderIdentity().id
     )
-    if (provider) {
+    if (provider && succeeded) {
       await this.repository.upsertProvider({
         ...provider,
         lastValidatedAt: undefined,
@@ -1523,7 +1566,15 @@ class SettingsService {
       })
     }
 
-    return this.getSettingsView()
+    if (!succeeded) {
+      return {
+        ok: false,
+        category: status.message?.toLowerCase().includes('timed out') ? 'timeout' : 'unknown',
+        message: status.message ?? 'Codex sign-out did not complete.'
+      }
+    }
+
+    return { ok: true, category: 'ok' }
   }
 
   // Activates a provider and the model to run within it. An omitted/unknown model falls back to the
@@ -1554,35 +1605,62 @@ class SettingsService {
       this.providerValidationGenerations.set(resolved.storedId, validationGeneration)
     }
 
-    const result = isCodexSubscriptionProvider(resolved.provider.type)
-      ? this.codexAuthValidationResult(
-          // Validation is a read-only status check in both modes: signing in is a separate explicit
-          // action (loginIsolatedCodex), so testing or saving a provider never pops a browser the
-          // user didn't ask for.
-          await this.codexAuth.getStatus(
-            resolved.provider.type === 'codex-shared' ? 'shared' : 'isolated'
-          ),
-          'Not signed in. Use Sign in to connect your ChatGPT account.'
-        )
-      : await validateProvider(resolved.provider, {
-          runClaudeProbe:
-            resolved.provider.type === 'claude-default'
-              ? () => this.runClaudeProbe(resolved.provider, settings)
-              : undefined
-        })
+    // Test against the framework the agent will actually spawn with. An OpenAI-only gateway tested
+    // while Claude Code is active would otherwise fail a raw /v1/messages probe and be reported as an
+    // auth error, even though the key is valid — the pairing, not the credential, is the problem. Decide
+    // this before any network call so the card names the real reason (which route the framework needs).
+    // codex-subscription keeps its own login-status branch below; its usability is enforced elsewhere.
+    const framework = getAgentFramework(settings.agentFrameworkId ?? DEFAULT_AGENT_FRAMEWORK_ID)
+    const incompatibility = isCodexSubscriptionProvider(resolved.provider.type)
+      ? undefined
+      : this.frameworkIncompatibilityResult(resolved.provider, framework)
+
+    const result =
+      incompatibility ??
+      (isCodexSubscriptionProvider(resolved.provider.type)
+        ? this.codexAuthValidationResult(
+            // Validation is a read-only status check in both modes: signing in is a separate explicit
+            // action (loginIsolatedCodex), so testing or saving a provider never pops a browser the
+            // user didn't ask for.
+            await this.codexAuth.getStatus(
+              resolved.provider.type === 'codex-shared' ? 'shared' : 'isolated'
+            ),
+            'Not signed in. Use Sign in to connect your ChatGPT account.'
+          )
+        : await validateProvider(resolved.provider, {
+            // Probe over Electron's network stack, which honors the system/VPN proxy. Node's global
+            // fetch (undici) takes a direct path and ignores that proxy, so an official vendor reachable
+            // only through a proxy (e.g. api.openai.com) would fail the probe as a false `network` error
+            // even with a valid key. The local Responses-bridge loopback stays on the direct fetch.
+            fetchImpl: netFetchStandard,
+            runClaudeProbe:
+              resolved.provider.type === 'claude-default'
+                ? () => this.runClaudeProbe(resolved.provider, settings)
+                : undefined,
+            // For a multi-route provider, probe the route this framework actually drives so a passing
+            // test proves that route (e.g. Claude Code hits /v1/messages, not /v1/chat/completions).
+            // Codex is excluded: it bridges the provider's OpenAI route under its `responses` protocol,
+            // so its HTTP route is decided by the bridge, not by supportedApiTypes — keep it as-is.
+            frameworkEndpoints: framework.id === 'codex' ? undefined : framework.supportedApiTypes
+          }))
 
     if (resolved.storedId) {
+      // Each early return here means the tested target no longer matches what is stored (a newer test
+      // superseded this one, the provider was deleted, or it was edited mid-flight). The outcome is
+      // real but was not recorded, so `applied: false` tells a success-gated caller not to advance.
       if (this.providerValidationGenerations.get(resolved.storedId) !== validationGeneration) {
-        return result
+        return { ...result, applied: false }
       }
       const latestSettings = await this.repository.getSettings()
       const stored = latestSettings.providers.find((provider) => provider.id === resolved.storedId)
-      if (!stored) return result
+      if (!stored) return { ...result, applied: false }
       const latestResolved = this.resolveProvider(
         stored,
         latestSettings.activeProviderId === stored.id ? latestSettings.activeModel : undefined
       )
-      if (!this.sameValidationTarget(resolved.provider, latestResolved)) return result
+      if (!this.sameValidationTarget(resolved.provider, latestResolved)) {
+        return { ...result, applied: false }
+      }
 
       // Success stamps the validated time and clears any prior failure. A failure keeps the provider
       // but records why, so the list can flag it and the model pickers exclude it until it passes.
@@ -1604,6 +1682,8 @@ class SettingsService {
               }
             }
       )
+
+      return { ...result, applied: true }
     }
 
     return result
@@ -1967,6 +2047,19 @@ class SettingsService {
     return available
   }
 
+  // Returns the bookmark folders for a provider. Used by the remote file browser Go-to dropdown.
+  async getComputeBookmarks(providerId: string): Promise<string[]> {
+    const settings = await this.repository.getSettings()
+    const store = settings.computeBookmarks ?? {}
+    const folders = store[providerId]
+    return Array.isArray(folders) ? folders.filter((f): f is string => typeof f === 'string') : []
+  }
+
+  // Sets the bookmark folders for a provider. Replaces the full array for that provider.
+  async setComputeBookmarks(providerId: string, folders: string[]): Promise<void> {
+    await this.repository.setComputeBookmarks(providerId, folders)
+  }
+
   // Builds the spawn env for the active provider, read fresh so switching takes effect on reconnect.
   async resolveActiveSpawnConfig(): Promise<AgentSpawnConfig> {
     const settings = await this.repository.getSettings()
@@ -2039,6 +2132,18 @@ class SettingsService {
         ? forced
         : (settings.agentFrameworkId ?? DEFAULT_AGENT_FRAMEWORK_ID)
     const framework = getAgentFramework(frameworkId)
+    // 'default' means "don't override": nothing is sent over ACP or framework config, so the agent
+    // keeps its own default effort. A concrete level is delivered through two channels deliberately
+    // (defense-in-depth, mirroring how sessionModel reaches opencode): the framework's own config
+    // (Codex model_reasoning_effort, opencode model options) covers agents that ignore the protocol,
+    // while sessionEffort drives the ACP thought_level configOption — Claude Code's only channel —
+    // and, being applied per session after spawn, wins over the baked config when both fire. The
+    // channels clamp 'max' independently (Codex config → xhigh, opencode config → high, ACP → the
+    // nearest advertised rung), which is accepted: each stays within its own supported set.
+    const sessionEffort =
+      settings.reasoningEffort && settings.reasoningEffort !== DEFAULT_REASONING_EFFORT
+        ? settings.reasoningEffort
+        : undefined
 
     // Enforce provider↔framework compatibility up front so an incompatible pair fails with a clear
     // message instead of spawning an agent that can't use the credentials — e.g. OpenCode + a Local
@@ -2086,7 +2191,8 @@ class SettingsService {
         framework,
         backendId: `${framework.id}:${activeProvider.id}`,
         executablePath,
-        env: envOverrides
+        env: envOverrides,
+        sessionEffort
       }
     }
 
@@ -2116,16 +2222,23 @@ class SettingsService {
     if (!(framework.id === 'codex' && provider.type === 'codex-shared')) {
       await this.materializeAgentSkills(settings, skillsRoot)
     }
+    // The Chat Completions bridge only exists to let Codex (a Responses-only client) drive an
+    // OpenAI Chat provider. A provider that also speaks native Responses is driven directly, so
+    // starting the bridge for it would be dead weight — and worse, Codex would post to the bridge's
+    // local URL with the provider key instead of the bridge token. Bridge openai-only providers.
     const needsResponsesBridge =
-      framework.id === 'codex' && (provider.apiEndpoints?.includes('openai') ?? false)
+      framework.id === 'codex' &&
+      (provider.apiEndpoints?.includes('openai') ?? false) &&
+      !(provider.apiEndpoints?.includes('responses') ?? false)
     const enabledConnectorIds = this.enabledConnectorIds(settings.connectors)
     const responsesBridge = needsResponsesBridge
-      ? await this.ensureResponsesBridge(provider, enabledConnectorIds)
+      ? await this.ensureResponsesBridge(provider, enabledConnectorIds, sessionEffort !== undefined)
       : await this.disableResponsesBridge()
     const modelConfig = framework.prepareModelConfig(provider, {
       storageRoot: this.storageRoot,
       executablePath,
       responsesBridge,
+      reasoningEffort: sessionEffort,
       // Connector conventions + tools, so opencode uses host.mcp instead of raw HTTP (it has no skill
       // docs like Claude). Enabled bundled connectors only.
       instructions: renderConnectorInstructions(enabledConnectorIds)
@@ -2150,6 +2263,7 @@ class SettingsService {
       ...(framework.id === 'codex' && isCodexSubscriptionProvider(provider.type) && sessionModel
         ? { sessionModelRequired: true }
         : {}),
+      sessionEffort,
       authentication: modelConfig.authentication,
       providerConfiguration: modelConfig.providerConfiguration
     }
@@ -2157,7 +2271,8 @@ class SettingsService {
 
   private async ensureResponsesBridge(
     provider: ResolvedProvider,
-    enabledConnectorIds: string[]
+    enabledConnectorIds: string[],
+    forwardReasoningEffort: boolean
   ): Promise<ResponsesBridgeConnection> {
     // Resolve to the OpenAI base the bridge appends `/chat/completions` to: an official vendor's exact
     // versioned base, or a custom gateway root normalized to `<root>/v1`.
@@ -2168,6 +2283,7 @@ class SettingsService {
       baseUrl: targetBaseUrl,
       key: provider.key,
       model: provider.model,
+      forwardReasoningEffort,
       namespacedTools: [...CODEX_BRIDGE_NOTEBOOK_TOOLS, ...CODEX_BRIDGE_ARTIFACT_TOOLS],
       connectorInstructions: enabledConnectorIds.map((id) => {
         const metadata = CONNECTOR_CATALOG.find((connector) => connector.id === id)
@@ -2388,6 +2504,53 @@ class SettingsService {
       key: draft.key,
       apiEndpoints: draft.apiEndpoints ?? ['anthropic']
     }
+  }
+
+  // A failed-validation result when the provider can't drive the active agent framework, or undefined
+  // when the pair is compatible. Mirrors the spawn-time guard in resolveActiveAgentBackend so the test
+  // reports the same mismatch here, instead of a misleading auth failure, before it blocks a session.
+  private frameworkIncompatibilityResult(
+    provider: ResolvedProvider,
+    framework: ReturnType<typeof getAgentFramework>
+  ): ValidateProviderResult | undefined {
+    if (
+      isProviderUsableByFramework(
+        { apiEndpoints: provider.apiEndpoints, type: provider.type },
+        framework
+      )
+    ) {
+      return undefined
+    }
+
+    return {
+      ok: false,
+      category: 'incompatible',
+      message: this.frameworkIncompatibilityMessage(provider, framework)
+    }
+  }
+
+  // The human reason a provider can't drive a framework: a Claude-only login, else a route mismatch
+  // (which endpoint the framework needs vs. which the provider speaks). Route paths, not vendor names,
+  // so it reads as "which API shape".
+  private frameworkIncompatibilityMessage(
+    provider: ResolvedProvider,
+    framework: { displayName: string; supportedApiTypes: readonly ChatApiEndpoint[] }
+  ): string {
+    if (provider.type === 'claude-default') {
+      return `Uses this machine's Claude sign-in, which only Claude Code can run. Switch to Claude Code or pick another provider.`
+    }
+
+    const routes: Record<ChatApiEndpoint, string> = {
+      anthropic: '/v1/messages',
+      openai: '/v1/chat/completions',
+      responses: '/v1/responses'
+    }
+    const needs = framework.supportedApiTypes.map((endpoint) => routes[endpoint]).join(' or ')
+    const speaks = providerEndpoints(provider)
+      .map((endpoint) => routes[endpoint])
+      .join(' or ')
+
+    return `Not compatible with ${framework.displayName}: it needs ${needs}, but this provider speaks ${speaks}. Change the API format or switch the agent framework.`
   }
 
   // Resolves what validateProvider should probe: a stored provider (by id) or an inline draft.

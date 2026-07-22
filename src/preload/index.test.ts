@@ -28,6 +28,9 @@ vi.mock('electron', () => ({
 
 // The subset of the bridge these tests exercise. Args are unknown — forwarding, not shape, is asserted.
 type PreloadApi = {
+  lifecycle: {
+    getClientId: () => unknown
+  }
   sessions: {
     loadAll: () => unknown
     saveSession: (session: unknown) => unknown
@@ -40,6 +43,7 @@ type PreloadApi = {
     installOpencode: (request: unknown) => unknown
     installCodex: (request: unknown) => unknown
     setAgentFramework: (request: unknown) => unknown
+    setNotificationsEnabled: (request: unknown) => unknown
     uninstallClaude: () => unknown
     uninstallOpencode: () => unknown
     uninstallCodex: () => unknown
@@ -50,6 +54,9 @@ type PreloadApi = {
   acp: {
     resumeSession: (request: unknown) => unknown
     resetSessionContext: (request: unknown) => unknown
+  }
+  notifications: {
+    takePendingOpenSession: () => unknown
   }
   cli: {
     getStatus: () => unknown
@@ -93,6 +100,12 @@ const sampleFramework = { framework: 'opencode' }
 const sampleResumeRequest = { sessionId: 's-1', cwd: '/workspace/project' }
 
 const cases: ForwardingCase[] = [
+  {
+    name: 'lifecycle.getClientId → lifecycle:client-id (no args)',
+    invoke: (a) => a.lifecycle.getClientId(),
+    channel: 'lifecycle:client-id',
+    args: []
+  },
   // sessions block
   {
     name: 'sessions.loadAll → sessions:load-all (no args)',
@@ -148,6 +161,12 @@ const cases: ForwardingCase[] = [
     invoke: (a) => a.settings.setAgentFramework(sampleFramework),
     channel: 'settings:set-agent-framework',
     args: [sampleFramework]
+  },
+  {
+    name: 'settings.setNotificationsEnabled → settings:set-notifications-enabled',
+    invoke: (a) => a.settings.setNotificationsEnabled({ enabled: false }),
+    channel: 'settings:set-notifications-enabled',
+    args: [{ enabled: false }]
   },
   {
     name: 'settings.uninstallClaude → settings:uninstall-claude (no args)',
@@ -216,6 +235,13 @@ const cases: ForwardingCase[] = [
     invoke: (a) => a.acp.resetSessionContext(sampleResumeRequest),
     channel: 'acp:reset-session-context',
     args: [sampleResumeRequest]
+  },
+  // Notification click target: the renderer pulls it once sessions are hydrated.
+  {
+    name: 'notifications.takePendingOpenSession → notifications:take-pending-open-session',
+    invoke: (a) => a.notifications.takePendingOpenSession(),
+    channel: 'notifications:take-pending-open-session',
+    args: []
   }
 ]
 

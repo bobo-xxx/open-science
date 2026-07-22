@@ -176,11 +176,29 @@ describe('classifyDataRoot', () => {
     Object.defineProperty(process, 'platform', { value: 'win32', configurable: true })
 
     try {
-      // Derived target length is 99; the default env reserve is 161, totaling exactly 260.
-      const result = await classifyDataRoot(`/${'b'.repeat(86)}`, currentDataRoot)
+      // Derived target length is 106; the short default env reserve is 154
+      // (runtime\envs\.p + separator + the 138 conservative pack budget), totaling exactly 260.
+      const result = await classifyDataRoot(`/${'b'.repeat(93)}`, currentDataRoot)
 
       expect(result.kind).toBe('invalid')
       expect(result.error).toMatch(/too long|260/i)
+    } finally {
+      Object.defineProperty(process, 'platform', { value: original, configurable: true })
+    }
+  })
+
+  it('uses the short physical default prefix rather than either logical default name', async () => {
+    const original = process.platform
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true })
+
+    try {
+      // Derived target length is 96. The logical default-python reserve would total 262 and reject
+      // this target, while the physical .p reserve totals 250 and fits. The synthetic directory does
+      // not exist, but it must get past the path-budget check.
+      const result = await classifyDataRoot(`/${'b'.repeat(83)}`, currentDataRoot)
+
+      expect(result.kind).toBe('invalid')
+      expect(result.error).not.toMatch(/too long|260/i)
     } finally {
       Object.defineProperty(process, 'platform', { value: original, configurable: true })
     }

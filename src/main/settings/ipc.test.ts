@@ -34,6 +34,8 @@ type FakeSettingsService = Record<
   | 'uninstallOpencode'
   | 'uninstallCodex'
   | 'setAgentFramework'
+  | 'setReasoningEffort'
+  | 'setNotificationsEnabled'
   | 'upsertProvider'
   | 'deleteProvider'
   | 'setActiveProvider'
@@ -79,6 +81,12 @@ const createFakeService = (): FakeSettingsService => ({
   setAgentFramework: vi
     .fn()
     .mockResolvedValue({ claude: {}, providers: [], agentFrameworkId: 'opencode' }),
+  setReasoningEffort: vi
+    .fn()
+    .mockResolvedValue({ claude: {}, providers: [], reasoningEffort: 'high' }),
+  setNotificationsEnabled: vi
+    .fn()
+    .mockResolvedValue({ claude: {}, providers: [], notificationsEnabled: false }),
   upsertProvider: vi.fn().mockResolvedValue({ claude: {}, providers: [] }),
   deleteProvider: vi.fn().mockResolvedValue({ claude: {}, providers: [] }),
   setActiveProvider: vi.fn().mockResolvedValue({ claude: {}, providers: [] }),
@@ -163,7 +171,8 @@ describe('settings IPC handlers', () => {
   it('reconnects the active Codex subscription after isolated logout', async () => {
     handlers.clear()
     const service = createFakeService()
-    service.logoutIsolatedCodex.mockResolvedValue({
+    service.logoutIsolatedCodex.mockResolvedValue({ ok: true, category: 'ok' })
+    service.getSettingsView.mockResolvedValue({
       claude: {},
       providers: [],
       activeProviderId: CODEX_SUBSCRIPTION_PROVIDER_ID
@@ -177,6 +186,28 @@ describe('settings IPC handlers', () => {
     await invoke('settings:logout-isolated-codex')
 
     expect(onActiveProviderChanged).toHaveBeenCalledOnce()
+  })
+
+  it('does not reconnect when isolated logout times out', async () => {
+    // Reconnecting when the sign-out timed out would re-authenticate with the credential that is
+    // still in place — the opposite of what the user intended. Skip the reconnect so the live
+    // agent keeps its existing session until a retry clears the credential.
+    handlers.clear()
+    const service = createFakeService()
+    service.logoutIsolatedCodex.mockResolvedValue({
+      ok: false,
+      category: 'timeout',
+      message: 'Codex sign-out timed out.'
+    })
+    const onActiveProviderChanged = vi.fn()
+    registerSettingsIpcHandlers({
+      service: asService(service),
+      onActiveProviderChanged
+    })
+
+    await invoke('settings:logout-isolated-codex')
+
+    expect(onActiveProviderChanged).not.toHaveBeenCalled()
   })
 
   it('reconnects the active provider only when the isolated login was actually applied', async () => {
@@ -483,6 +514,98 @@ describe('settings IPC handlers', () => {
     // Switching frameworks swaps the backend binary, so the live agent must be dropped like a provider switch.
     expect(onActiveProviderChanged).toHaveBeenCalledOnce()
     expect(result).toBe(snapshot)
+  })
+
+  it('applies the level live without respawning when the framework supports it', async () => {
+    handlers.clear()
+    const service = createFakeService()
+    const snapshot = { claude: {}, providers: [], reasoningEffort: 'high' }
+    service.setReasoningEffort.mockResolvedValue(snapshot)
+    const onActiveProviderChanged = vi.fn()
+    const onReasoningEffortChanged = vi.fn().mockResolvedValue(true)
+    registerSettingsIpcHandlers({
+      service: asService(service),
+      onActiveProviderChanged,
+      onReasoningEffortChanged
+    })
+
+    const result = await invoke('settings:set-reasoning-effort', { effort: 'high' })
+
+    // A live ACP application (Claude Code, Codex) makes the level stick without a respawn.
+    expect(service.setReasoningEffort).toHaveBeenCalledWith('high')
+    expect(onReasoningEffortChanged).toHaveBeenCalledWith('high')
+    expect(onActiveProviderChanged).not.toHaveBeenCalled()
+    expect(result).toBe(snapshot)
+  })
+
+  it('respawns the agent when the framework cannot apply the level live', async () => {
+    handlers.clear()
+    const service = createFakeService()
+    const snapshot = { claude: {}, providers: [], reasoningEffort: 'high' }
+    service.setReasoningEffort.mockResolvedValue(snapshot)
+    const onActiveProviderChanged = vi.fn()
+    const onReasoningEffortChanged = vi.fn().mockResolvedValue(false)
+    registerSettingsIpcHandlers({
+      service: asService(service),
+      onActiveProviderChanged,
+      onReasoningEffortChanged
+    })
+
+    const result = await invoke('settings:set-reasoning-effort', { effort: 'high' })
+
+    // opencode bakes effort into its spawn config, so the provider-switch reconnect delivers it.
+    expect(service.setReasoningEffort).toHaveBeenCalledWith('high')
+    expect(onActiveProviderChanged).toHaveBeenCalledOnce()
+    expect(result).toBe(snapshot)
+  })
+
+  it('rejects an unknown reasoning effort without touching the service or the agent', async () => {
+    handlers.clear()
+    const service = createFakeService()
+    const onActiveProviderChanged = vi.fn()
+    registerSettingsIpcHandlers({ service: asService(service), onActiveProviderChanged })
+
+    // Renderer payloads are untyped at runtime: garbage must fail at the boundary, not persist.
+    await expect(invoke('settings:set-reasoning-effort', { effort: 'ultra' })).rejects.toThrow(
+      'Unknown reasoning effort'
+    )
+    await expect(invoke('settings:set-reasoning-effort', { effort: 3 })).rejects.toThrow(
+      'Unknown reasoning effort'
+    )
+    await expect(invoke('settings:set-reasoning-effort', {})).rejects.toThrow(
+      'Unknown reasoning effort'
+    )
+    expect(service.setReasoningEffort).not.toHaveBeenCalled()
+    expect(onActiveProviderChanged).not.toHaveBeenCalled()
+  })
+
+  it('persists the notifications preference on set-notifications-enabled', async () => {
+    handlers.clear()
+    const service = createFakeService()
+    const snapshot = { claude: {}, providers: [], notificationsEnabled: false }
+    service.setNotificationsEnabled.mockResolvedValue(snapshot)
+    registerSettingsIpcHandlers({ service: asService(service) })
+
+    const result = await invoke('settings:set-notifications-enabled', { enabled: false })
+
+    // The handler unwraps the request to the bare boolean the service expects.
+    expect(service.setNotificationsEnabled).toHaveBeenCalledWith(false)
+    expect(result).toBe(snapshot)
+  })
+
+  it('rejects a non-boolean notifications flag without touching the service', async () => {
+    handlers.clear()
+    const service = createFakeService()
+    registerSettingsIpcHandlers({ service: asService(service) })
+
+    // Renderer payloads are untyped at runtime: garbage must fail at the boundary, not persist.
+    await expect(invoke('settings:set-notifications-enabled', { enabled: 'yes' })).rejects.toThrow(
+      'Invalid notifications-enabled flag'
+    )
+    await expect(invoke('settings:set-notifications-enabled', {})).rejects.toThrow(
+      'Invalid notifications-enabled flag'
+    )
+    expect(service.setNotificationsEnabled).not.toHaveBeenCalled()
   })
 
   it('surfaces a service error thrown by install-opencode', async () => {

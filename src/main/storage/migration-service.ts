@@ -21,6 +21,7 @@ import {
 } from './migration-marker'
 import { waitForDataRootWriters } from './migration-state'
 import { DEFAULT_MAX_ENV_RELATIVE_PATH, PACK_PATH_BUDGET_FILE } from '../notebook/bundle-manifest'
+import { windowsDefaultEnvPrefixReserve } from '../notebook/runtime-paths'
 import { RELOCATABLE_DATA_DIRS } from './data-directories'
 
 export { DATA_ROOT_DIRS } from './data-directories'
@@ -43,10 +44,9 @@ export type ClassifyResult = { kind: DataRootKind; error?: string }
 // every tool a user's Python/R environment might shell out to, so the app guards against it directly.
 const WINDOWS_MAX_USABLE_PATH = 259
 // Headroom reserved for the app's deepest nested paths (artifacts/notebooks/runtime) under the root.
-// Keep the migration guard aligned with the current managed env's conservative pack metadata:
-// runtime\\envs\\default-r plus the longest linked package path. This is deliberately a budget, not a
-// universal package-path constant; newer manifests can tighten the release gate further.
-const WINDOWS_ENV_PREFIX_RESERVE = 'runtime\\envs\\default-r'.length + 1
+// Keep the migration guard aligned with the physical default prefix selected by runtime-paths plus
+// the longest linked package path. Logical names deliberately do not participate in this budget.
+const WINDOWS_ENV_PREFIX_RESERVE = windowsDefaultEnvPrefixReserve()
 
 export const maxManagedEnvRelativePath = (dataRoot: string): number => {
   let maximum = DEFAULT_MAX_ENV_RELATIVE_PATH
