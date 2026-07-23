@@ -3186,6 +3186,50 @@ describe('ACP runtime session management', () => {
     runtime.disposeReviewerSession(session)
   })
 
+  // Claude Code preserves hyphens in MCP server names in real tool traces, so the permission title
+  // can use mcp__<hyphenated-server>__<tool> instead of the sanitized underscore form.
+  it('auto-approves a claude-code reviewer MCP tool identified by its hyphenated title', async () => {
+    const process = new FakeAgentProcess()
+    let permissionResponse: unknown
+    startPermissionProbeAgent(process, {
+      newSessionId: 'reviewer-session-1',
+      toolCallId: 'reviewer-hyphenated-title',
+      toolTitle: 'mcp__open-science-reviewer__read_turn',
+      permissionOptions: [
+        { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
+        { optionId: 'reject-once', name: 'Reject', kind: 'reject_once' }
+      ],
+      onPermissionResponse: (response) => {
+        permissionResponse = response
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: claudeCodeFramework
+    })
+
+    const { session } = await runtime.buildReviewerSession({
+      cwd: '/workspace',
+      mcpServers: [
+        {
+          type: 'http',
+          name: 'open-science-reviewer',
+          url: 'http://127.0.0.1:1/mcp',
+          headers: []
+        }
+      ]
+    })
+    await session.prompt([{ type: 'text', text: 'read the audited turn' }])
+
+    expect(permissionResponse).toEqual({
+      outcome: { outcome: 'selected', optionId: 'allow-once' }
+    })
+    expect(runtime.reviewerRejectedToolCallCount(session.sessionId)).toBe(0)
+    runtime.disposeReviewerSession(session)
+  })
+
   // Security: the toolCallId is agent-controlled, so a reviewer-shaped id must NOT authorize a call
   // whose title/kind are a genuinely disallowed tool. Only the title carries the trusted MCP identity.
   it('rejects a Bash call that carries a reviewer-shaped toolCallId', async () => {
@@ -4124,6 +4168,246 @@ describe('ACP runtime session management', () => {
     expect(process.killed).toBe(true)
   })
 
+  it('createSession waits for a pending provider reconnect before using the new connection', async () => {
+    const oldProcess = new FakeAgentProcess()
+    const newProcess = new FakeAgentProcess()
+    const gate = createDeferred()
+    // Old process: one session, prompt gated so it stays in-flight.
+    startFakeAgent(oldProcess, ['s1'], { onPrompt: () => gate.promise })
+    // New process: serves sessions after the reconnect.
+    startFakeAgent(newProcess, ['s2'])
+
+    let spawnCount = 0
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: async () => {
+        spawnCount += 1
+        return {
+          framework: {
+            ...claudeCodeFramework,
+            spawn: () => asAgentProcess(spawnCount === 1 ? oldProcess : newProcess)
+          },
+          executablePath: '/bin/agent',
+          env: {},
+          args: []
+        }
+      }
+    })
+
+    // Establish the initial connection and start an in-flight prompt.
+    await runtime.createSession({ cwd: '/workspace' })
+    const prompt = runtime.sendPrompt({ sessionId: 's1', text: 'hi' })
+
+    // Request a provider reconnect while the prompt is running — arms the barrier.
+    await runtime.requestProviderReconnect()
+
+    // A concurrent createSession must NOT complete before the barrier resolves.
+    let secondSessionDone = false
+    const secondSession = runtime.createSession({ cwd: '/workspace' }).then((r) => {
+      secondSessionDone = true
+      return r
+    })
+
+    // Yield so any eager resolution would be observable, then assert still blocked.
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(secondSessionDone).toBe(false)
+
+    // Release the gate → prompt finishes → deferred reconnect fires → barrier resolves.
+    gate.resolve()
+    await prompt
+    const result = await secondSession
+
+    // The second session must have landed on the new connection (second spawn).
+    expect(result.sessionId).toBe('s2')
+    expect(spawnCount).toBe(2)
+  })
+
+  it('createSession proceeds immediately when an unexpected connection close resolves the barrier', async () => {
+    const oldProcess = new FakeAgentProcess()
+    const newProcess = new FakeAgentProcess()
+    const gate = createDeferred()
+    startFakeAgent(oldProcess, ['s1'], { onPrompt: () => gate.promise })
+    startFakeAgent(newProcess, ['s2'])
+
+    let spawnCount = 0
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: async () => {
+        spawnCount += 1
+        return {
+          framework: {
+            ...claudeCodeFramework,
+            spawn: () => asAgentProcess(spawnCount === 1 ? oldProcess : newProcess)
+          },
+          executablePath: '/bin/agent',
+          env: {},
+          args: []
+        }
+      }
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    const prompt = runtime.sendPrompt({ sessionId: 's1', text: 'hi' })
+
+    // Arm the barrier with a deferred reconnect while the prompt is running.
+    await runtime.requestProviderReconnect()
+
+    // createSession blocks on the barrier.
+    const secondSession = runtime.createSession({ cwd: '/workspace' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    // Simulate an unexpected connection close — handleConnectionClosed resolves the barrier.
+    oldProcess.stdout.end()
+
+    // createSession must unblock and connect fresh (the close cleared the stale connection).
+    const result = await secondSession
+    expect(result.sessionId).toBe('s2')
+
+    // Clean up the in-flight prompt gate so the test can exit cleanly.
+    gate.resolve()
+    await prompt.catch(() => undefined)
+  })
+
+  it('reconnects on a fresh backend when the deferred disconnect rejects', async () => {
+    const oldProcess = new FakeAgentProcess()
+    const newProcess = new FakeAgentProcess()
+    const gate = createDeferred()
+    startFakeAgent(oldProcess, ['s1'], { onPrompt: () => gate.promise })
+    startFakeAgent(newProcess, ['s2'])
+
+    let spawnCount = 0
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: async () => {
+        spawnCount += 1
+        return {
+          framework: {
+            ...claudeCodeFramework,
+            spawn: () => asAgentProcess(spawnCount === 1 ? oldProcess : newProcess)
+          },
+          executablePath: '/bin/agent',
+          env: {},
+          args: []
+        }
+      }
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    const prompt = runtime.sendPrompt({ sessionId: 's1', text: 'hi' })
+
+    // Arm the barrier with a deferred reconnect while the prompt is running.
+    await runtime.requestProviderReconnect()
+
+    // The deferred disconnect (fired when the turn settles) rejects before it can clear the stale
+    // connection. The barrier must still resolve AND the stale connection must be invalidated, so a
+    // blocked createSession reconnects on a fresh backend instead of reusing the old one.
+    const disconnectSpy = vi
+      .spyOn(runtime, 'disconnect')
+      .mockRejectedValueOnce(new Error('teardown failed'))
+
+    // A createSession issued during the deferred window blocks on the barrier.
+    const secondSession = runtime.createSession({ cwd: '/workspace' })
+
+    // Release the gate → turn settles → maybeApplyPendingProviderReconnect calls the rejecting
+    // disconnect → catch invalidates the connection → finally() resolves the barrier.
+    gate.resolve()
+    await prompt
+
+    // Must complete (no deadlock) AND land on the second spawn — proof the stale connection was not
+    // reused after the teardown failure.
+    const result = await secondSession
+    expect(result.sessionId).toBe('s2')
+    expect(spawnCount).toBe(2)
+    disconnectSpy.mockRestore()
+  })
+
+  it('broadcasts closed and releases the barrier when a failed deferred disconnect has no follow-up', async () => {
+    const process = new FakeAgentProcess()
+    const gate = createDeferred()
+    startFakeAgent(process, ['s1'], { onPrompt: () => gate.promise })
+    const states: string[] = []
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      callbacks: { onStateChanged: (s) => states.push(s.status) }
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    const prompt = runtime.sendPrompt({ sessionId: 's1', text: 'hi' })
+    await runtime.requestProviderReconnect()
+
+    const disconnectSpy = vi
+      .spyOn(runtime, 'disconnect')
+      .mockRejectedValueOnce(new Error('teardown failed'))
+
+    // Turn settles → deferred disconnect rejects → no createSession follows. The catch must still
+    // broadcast 'closed' so the renderer doesn't stay on the stale 'connected' snapshot.
+    states.length = 0
+    gate.resolve()
+    await prompt
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(states).toContain('closed')
+    expect(runtime.getSnapshot().status).toBe('closed')
+    disconnectSpy.mockRestore()
+  })
+
+  it('still releases the barrier when the closed broadcast on a failed disconnect throws', async () => {
+    const oldProcess = new FakeAgentProcess()
+    const newProcess = new FakeAgentProcess()
+    const gate = createDeferred()
+    startFakeAgent(oldProcess, ['s1'], { onPrompt: () => gate.promise })
+    startFakeAgent(newProcess, ['s2'])
+
+    let spawnCount = 0
+    // Throw from onStateChanged only on the post-failure broadcast (the one emitted while status is
+    // 'closed' with no connection), so the barrier must survive an emitState that itself throws.
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      callbacks: {
+        onStateChanged: (s) => {
+          if (s.status === 'closed') throw new Error('renderer broadcast blew up')
+        }
+      },
+      resolveBackend: async () => {
+        spawnCount += 1
+        return {
+          framework: {
+            ...claudeCodeFramework,
+            spawn: () => asAgentProcess(spawnCount === 1 ? oldProcess : newProcess)
+          },
+          executablePath: '/bin/agent',
+          env: {},
+          args: []
+        }
+      }
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    const prompt = runtime.sendPrompt({ sessionId: 's1', text: 'hi' })
+    await runtime.requestProviderReconnect()
+
+    const disconnectSpy = vi
+      .spyOn(runtime, 'disconnect')
+      .mockRejectedValueOnce(new Error('teardown failed'))
+
+    const secondSession = runtime.createSession({ cwd: '/workspace' })
+    gate.resolve()
+    await prompt
+
+    // The guarded emitState swallows its own throw, so the barrier still resolves and the blocked
+    // createSession reconnects on a fresh backend rather than hanging.
+    const result = await secondSession
+    expect(result.sessionId).toBe('s2')
+    expect(spawnCount).toBe(2)
+    disconnectSpy.mockRestore()
+  })
+
   it('reconnects immediately when a provider switch happens with no prompt in flight', async () => {
     const process = new FakeAgentProcess()
     startFakeAgent(process, ['s1'])
@@ -4177,6 +4461,52 @@ describe('ACP runtime session management', () => {
     await prompt
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(process.killed).toBe(true)
+  })
+
+  it('applies a provider reconnect and a skills reload deferred in the same turn with one disconnect', async () => {
+    const oldProcess = new FakeAgentProcess()
+    const newProcess = new FakeAgentProcess()
+    const gate = createDeferred()
+    startFakeAgent(oldProcess, ['s1'], { onPrompt: () => gate.promise })
+    startFakeAgent(newProcess, ['s2'])
+
+    let spawnCount = 0
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: async () => {
+        spawnCount += 1
+        return {
+          framework: {
+            ...claudeCodeFramework,
+            spawn: () => asAgentProcess(spawnCount === 1 ? oldProcess : newProcess)
+          },
+          executablePath: '/bin/agent',
+          env: {},
+          args: []
+        }
+      }
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    const prompt = runtime.sendPrompt({ sessionId: 's1', text: 'hi' })
+
+    // Both a provider switch and a skill toggle arrive during the same in-flight prompt.
+    await runtime.requestProviderReconnect()
+    await runtime.requestSkillsReload()
+    expect(oldProcess.killed).toBe(false)
+
+    // Turn finishes → a SINGLE deferred disconnect satisfies both (spawnCount 1 → 2). A second,
+    // redundant disconnect would spawn a third process on the next createSession.
+    gate.resolve()
+    await prompt
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(oldProcess.killed).toBe(true)
+
+    // The next session lands on the second spawn — proof no extra reconnect churned the process.
+    const next = await runtime.createSession({ cwd: '/workspace' })
+    expect(next.sessionId).toBe('s2')
+    expect(spawnCount).toBe(2)
   })
 
   it('passes the artifact MCP server to new and resumed sessions', async () => {
