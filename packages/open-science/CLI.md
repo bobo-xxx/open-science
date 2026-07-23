@@ -72,7 +72,7 @@ Provide a prompt directly, read it from a UTF-8 file, or pipe it through stdin:
 
 ```bash
 open-science run --project "Systematic review" --prompt "Summarize the evidence" --wait
-open-science run --project "Systematic review" --prompt-file ./task.md --wait --json
+open-science run --project "Systematic review" --workspace /benchmark/task-1 --prompt-file ./task.md --wait --json
 printf '%s\n' "Summarize the evidence" | open-science run --project "Systematic review" --wait --json
 ```
 
@@ -107,6 +107,23 @@ open-science run \
 
 The default approval profile is `ask`. Unattended workflows must explicitly use
 `--approval-profile auto` or `--approval-profile full` when that access is appropriate.
+
+`--workspace <path>` selects an existing absolute directory as the agent's actual working directory
+when creating a new session. The effective path is returned as `workspacePath`. A resumed session
+keeps its original workspace; supplying a different path is rejected.
+
+## Reproducibility configuration
+
+Inspect the active, non-secret runtime configuration before a benchmark run:
+
+```bash
+open-science configuration --json
+```
+
+The snapshot includes the app version and optional `OPEN_SCIENCE_COMMIT` build identifier, selected
+agent framework, provider identity/type, Codex profile mode, model, reasoning effort, and enabled
+skill/connector IDs. It never includes credentials, tokens, endpoint URLs, email addresses, or local
+runtime paths.
 
 ## Machine-readable output
 
@@ -154,5 +171,5 @@ Artifact output paths are resolved relative to the current working directory.
 
 ## Current scope
 
-The initial CLI does not expose file or directory attachments, per-run model selection, or per-run
-agent-backend selection. These require stable public runtime contracts before they can be added.
+The initial CLI does not expose file attachments, per-run model selection, or per-run agent-backend
+selection. These require stable public runtime contracts before they can be added.

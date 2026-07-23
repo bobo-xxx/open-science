@@ -1,4 +1,8 @@
-import { describe, expect, it, vi } from 'vitest'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
+
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { AcpRuntimeEvent } from '../../shared/acp'
 import type { PersistedChatSession } from '../../shared/session-persistence'
@@ -12,6 +16,12 @@ const project = {
   createdAt: 1,
   updatedAt: 1
 }
+
+const roots: string[] = []
+
+afterEach(async () => {
+  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
+})
 
 describe('HeadlessTaskApi', () => {
   it('supports project, session, and artifact queries through the public interface', async () => {
@@ -99,6 +109,140 @@ describe('HeadlessTaskApi', () => {
       })
     ).rejects.toMatchObject({ code: 'invalid_request' })
     expect(invoke).not.toHaveBeenCalled()
+  })
+
+  it('uses an existing absolute workspace for a new session and returns the effective path', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'open-science-task-workspace-'))
+    roots.push(workspace)
+    const invoke = vi.fn(async (channel: string, _clientId: string, args: unknown[]) => {
+      if (channel === 'projects:list') return [project]
+      if (channel === 'sessions:load-all') return { sessions: [], manifest: { version: 1 } }
+      if (channel === 'acp:create-session') {
+        expect(args[0]).toMatchObject({ cwd: resolve(workspace), projectName: project.id })
+        return { sessionId: 'session-workspace', cwd: resolve(workspace) }
+      }
+      if (channel === 'sessions:save-session' || channel === 'acp:send-prompt') return undefined
+      throw new Error(`Unexpected RPC channel: ${channel}`)
+    })
+    const api = new HeadlessTaskApi({ invoke })
+
+    const started = await api.startRun({
+      project: project.id,
+      prompt: 'Run in this workspace.',
+      workspacePath: workspace
+    })
+
+    expect(started.workspacePath).toBe(resolve(workspace))
+    await api.waitForRun(started.id)
+  })
+
+  it('rejects invalid or changed workspaces without creating or resuming a session', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'open-science-task-workspace-'))
+    const otherWorkspace = await mkdtemp(join(tmpdir(), 'open-science-task-workspace-'))
+    roots.push(workspace, otherWorkspace)
+    const existing: PersistedChatSession = {
+      id: 'session-workspace',
+      projectId: project.id,
+      title: 'Workspace session',
+      cwd: workspace,
+      status: 'idle',
+      messages: [],
+      createdAt: 1,
+      updatedAt: 1
+    }
+    const invoke = vi.fn(async (channel: string) => {
+      if (channel === 'projects:list') return [project]
+      if (channel === 'sessions:load-all') return { sessions: [existing], manifest: { version: 1 } }
+      throw new Error(`Unexpected RPC channel: ${channel}`)
+    })
+    const api = new HeadlessTaskApi({ invoke })
+
+    await expect(
+      api.startRun({ project: project.id, prompt: 'No.', workspacePath: 'relative/path' })
+    ).rejects.toMatchObject({ code: 'invalid_request' })
+    await expect(
+      api.startRun({
+        project: project.id,
+        sessionId: existing.id,
+        prompt: 'No.',
+        workspacePath: otherWorkspace
+      })
+    ).rejects.toMatchObject({
+      code: 'invalid_request',
+      message: expect.stringContaining('cannot change its workspace')
+    })
+    expect(invoke).not.toHaveBeenCalledWith(
+      'acp:create-session',
+      expect.anything(),
+      expect.anything()
+    )
+    expect(invoke).not.toHaveBeenCalledWith(
+      'acp:resume-session',
+      expect.anything(),
+      expect.anything()
+    )
+  })
+
+  it('returns a non-secret reproducibility configuration snapshot', async () => {
+    const invoke = vi.fn(async (channel: string) => {
+      if (channel === 'settings:get-settings') {
+        return {
+          agentFrameworkId: 'codex',
+          activeProviderId: 'builtin-codex-subscription',
+          activeModel: 'gpt-5.4',
+          reasoningEffort: 'high',
+          providers: [
+            {
+              id: 'builtin-codex-subscription',
+              type: 'codex-isolated',
+              name: 'Codex subscription',
+              maskedKey: 'secret-hint',
+              baseUrl: 'https://secret.example'
+            }
+          ]
+        }
+      }
+      if (channel === 'settings:list-skills') {
+        return [
+          { id: 'enabled-skill', enabled: true },
+          { id: 'disabled-skill', enabled: false }
+        ]
+      }
+      if (channel === 'settings:list-connectors') {
+        return {
+          connectors: [
+            { id: 'pubmed', enabled: true },
+            { id: 'rna', enabled: false }
+          ],
+          customServers: [{ id: 'custom-1', name: 'lab', transport: 'stdio', enabled: true }],
+          ncbi: { contactEmail: 'private@example.com', hasApiKey: true }
+        }
+      }
+      throw new Error(`Unexpected RPC channel: ${channel}`)
+    })
+    const api = new HeadlessTaskApi(
+      { invoke },
+      { appMetadata: () => ({ version: '0.6.0', commit: 'abc123' }) }
+    )
+
+    const configuration = await api.getConfiguration()
+
+    expect(configuration).toEqual({
+      app: { version: '0.6.0', commit: 'abc123' },
+      agent: {
+        frameworkId: 'codex',
+        providerId: 'builtin-codex-subscription',
+        providerType: 'codex-isolated',
+        providerName: 'Codex subscription',
+        profile: 'isolated',
+        model: 'gpt-5.4',
+        reasoningEffort: 'high'
+      },
+      skillIds: ['enabled-skill'],
+      connectorIds: ['pubmed'],
+      customConnectors: [{ id: 'custom-1', name: 'lab', transport: 'stdio' }]
+    })
+    expect(JSON.stringify(configuration)).not.toMatch(/secret|private@example/)
   })
 
   it('rejects overlapping runs for the same durable session', async () => {

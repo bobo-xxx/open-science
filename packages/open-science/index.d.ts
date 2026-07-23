@@ -14,12 +14,33 @@ export type Run = {
   id: string
   sessionId: string
   projectId: string
+  workspacePath: string
   status: RunStatus
   startedAt: number
   completedAt?: number
   output?: string
   error?: string
   artifacts: Artifact[]
+}
+
+export type Configuration = {
+  app: { version: string; commit?: string }
+  agent: {
+    frameworkId: 'claude-code' | 'opencode' | 'codex'
+    providerId?: string
+    providerType?: 'custom' | 'claude-default' | 'official' | 'codex-shared' | 'codex-isolated'
+    providerName?: string
+    profile?: 'shared' | 'isolated'
+    model?: string
+    reasoningEffort: 'default' | 'low' | 'medium' | 'high' | 'max'
+  }
+  skillIds: string[]
+  connectorIds: string[]
+  customConnectors: Array<{
+    id: string
+    name: string
+    transport: 'stdio' | 'streamable_http' | 'sse'
+  }>
 }
 
 export type Session = {
@@ -63,12 +84,14 @@ export class OpenScienceClient {
   createProject(request: { name: string; description?: string }): Promise<Project>
   listSessions(project?: string): Promise<Session[]>
   getSession(sessionId: string): Promise<Session>
+  getConfiguration(): Promise<Configuration>
   startRun(request: {
     project: string
     prompt: string
     sessionId?: string
     permissionProfile?: PermissionProfile
     skillIds?: string[]
+    workspacePath?: string
   }): Promise<Run>
   getRun(runId: string): Promise<Run>
   waitForRun(

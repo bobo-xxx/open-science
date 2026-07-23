@@ -176,6 +176,28 @@ describe('OpenScienceClient', () => {
     }
   })
 
+  it('reads the public reproducibility configuration', async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValue(
+        response(200, { data: { app: { version: '0.6.0' }, agent: { frameworkId: 'codex' } } })
+      )
+    const client = new OpenScienceClient({
+      baseUrl: 'http://127.0.0.1:44100',
+      token: 'token-1',
+      fetch
+    })
+
+    await expect(client.getConfiguration()).resolves.toMatchObject({
+      app: { version: '0.6.0' },
+      agent: { frameworkId: 'codex' }
+    })
+    expect(fetch).toHaveBeenCalledWith(
+      'http://127.0.0.1:44100/api/v1/configuration',
+      expect.any(Object)
+    )
+  })
+
   it('yields normalized public events and closes the WebSocket iterator', async () => {
     class FakeWebSocket {
       static instance: FakeWebSocket

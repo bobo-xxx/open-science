@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto'
+import { realpath, stat } from 'node:fs/promises'
+import { isAbsolute, resolve } from 'node:path'
 
 import {
   getAcpRuntimeEventImage,
@@ -22,8 +24,10 @@ import type {
   StartTaskRunRequest,
   TaskApiErrorCode,
   TaskRun,
-  TaskSessionSummary
+  TaskSessionSummary,
+  TaskConfiguration
 } from '../../shared/task-api'
+import type { ConnectorsSnapshot, SettingsSnapshot, SkillView } from '../../shared/settings'
 
 const TASK_API_CLIENT_ID = 'headless-task-api'
 const MAX_RETAINED_RUNS = 200
@@ -36,6 +40,7 @@ type TaskApiDependencies = {
   createId: () => string
   now: () => number
   subscribeEvents: (listener: (event: AcpRuntimeEvent) => void) => () => void
+  appMetadata: () => TaskConfiguration['app']
 }
 
 type MutableTaskRun = TaskRun & {
@@ -57,6 +62,7 @@ const cloneRun = (run: MutableTaskRun): TaskRun => ({
   id: run.id,
   sessionId: run.sessionId,
   projectId: run.projectId,
+  workspacePath: run.workspacePath,
   status: run.status,
   startedAt: run.startedAt,
   completedAt: run.completedAt,
@@ -126,7 +132,8 @@ class HeadlessTaskApi {
     this.dependencies = {
       createId: dependencies.createId ?? randomUUID,
       now: dependencies.now ?? Date.now,
-      subscribeEvents: dependencies.subscribeEvents ?? (() => () => undefined)
+      subscribeEvents: dependencies.subscribeEvents ?? (() => () => undefined),
+      appMetadata: dependencies.appMetadata ?? (() => ({ version: 'unknown' }))
     }
     this.unsubscribeEvents = this.dependencies.subscribeEvents((event) => this.captureEvent(event))
   }
@@ -160,6 +167,51 @@ class HeadlessTaskApi {
     return summarizeSession(await this.findSession(sessionId))
   }
 
+  async getConfiguration(): Promise<TaskConfiguration> {
+    const [settings, skills, connectors] = await Promise.all([
+      this.invoke('settings:get-settings') as Promise<SettingsSnapshot>,
+      this.invoke('settings:list-skills') as Promise<SkillView[]>,
+      this.invoke('settings:list-connectors') as Promise<ConnectorsSnapshot>
+    ])
+    const provider = settings.providers.find(
+      (candidate) => candidate.id === settings.activeProviderId
+    )
+    const profile =
+      provider?.type === 'codex-shared'
+        ? 'shared'
+        : provider?.type === 'codex-isolated'
+          ? 'isolated'
+          : undefined
+    return {
+      app: this.dependencies.appMetadata(),
+      agent: {
+        frameworkId: settings.agentFrameworkId,
+        ...(provider
+          ? {
+              providerId: provider.id,
+              providerType: provider.type,
+              providerName: provider.name
+            }
+          : {}),
+        ...(profile ? { profile } : {}),
+        ...(settings.activeModel ? { model: settings.activeModel } : {}),
+        reasoningEffort: settings.reasoningEffort
+      },
+      skillIds: skills
+        .filter((skill) => skill.enabled)
+        .map((skill) => skill.id)
+        .sort(),
+      connectorIds: connectors.connectors
+        .filter((connector) => connector.enabled)
+        .map((connector) => connector.id)
+        .sort(),
+      customConnectors: connectors.customServers
+        .filter((connector) => connector.enabled)
+        .map(({ id, name, transport }) => ({ id, name, transport }))
+        .sort((left, right) => left.id.localeCompare(right.id))
+    }
+  }
+
   async startRun(request: StartTaskRunRequest): Promise<TaskRun> {
     if (!request || typeof request !== 'object') {
       throw new TaskApiError('invalid_request', 'Run request must be an object.')
@@ -183,6 +235,12 @@ class HeadlessTaskApi {
     ) {
       throw new TaskApiError('invalid_request', 'Skill ids must be non-empty strings.')
     }
+    if (
+      request.workspacePath !== undefined &&
+      (typeof request.workspacePath !== 'string' || !request.workspacePath.trim())
+    ) {
+      throw new TaskApiError('invalid_request', 'Workspace path must be a non-empty string.')
+    }
     const prompt = typeof request.prompt === 'string' ? request.prompt.trim() : ''
     if (!prompt) throw new TaskApiError('invalid_request', 'Prompt is required.')
 
@@ -200,13 +258,32 @@ class HeadlessTaskApi {
         `Session ${existing.id} does not belong to project ${project.id}.`
       )
     }
+    const requestedWorkspace = request.workspacePath
+      ? await this.resolveWorkspace(request.workspacePath)
+      : undefined
+    if (existing && requestedWorkspace) {
+      const existingWorkspace = await this.resolveWorkspace(existing.cwd)
+      if (requestedWorkspace !== existingWorkspace) {
+        throw new TaskApiError(
+          'invalid_request',
+          `Session ${existing.id} cannot change its workspace after creation.`
+        )
+      }
+    }
 
     const userMessageId = this.dependencies.createId()
     const runId = this.dependencies.createId()
     if (existing) this.reserveSession(existing.id, runId)
     let prepared: Awaited<ReturnType<HeadlessTaskApi['prepareSession']>>
     try {
-      prepared = await this.prepareSession(project, existing, request, prompt, userMessageId)
+      prepared = await this.prepareSession(
+        project,
+        existing,
+        request,
+        prompt,
+        userMessageId,
+        requestedWorkspace
+      )
       this.reserveSession(prepared.session.id, runId)
     } catch (error) {
       if (existing) this.releaseSession(existing.id, runId)
@@ -217,6 +294,7 @@ class HeadlessTaskApi {
       id: runId,
       sessionId: session.id,
       projectId: project.id,
+      workspacePath: requestedWorkspace ?? session.cwd,
       status: 'running' as const,
       startedAt: this.dependencies.now(),
       artifacts: [],
@@ -235,6 +313,24 @@ class HeadlessTaskApi {
       prepared.resumeFallback
     ).finally(() => this.releaseSession(session.id, runId))
     return cloneRun(run)
+  }
+
+  private async resolveWorkspace(input: string): Promise<string> {
+    const trimmed = input.trim()
+    if (!isAbsolute(trimmed)) {
+      throw new TaskApiError('invalid_request', 'Workspace path must be absolute.')
+    }
+    const normalized = resolve(trimmed)
+    try {
+      const details = await stat(normalized)
+      if (!details.isDirectory()) {
+        throw new TaskApiError('invalid_request', 'Workspace path must be an existing directory.')
+      }
+      return await realpath(normalized)
+    } catch (error) {
+      if (error instanceof TaskApiError) throw error
+      throw new TaskApiError('invalid_request', 'Workspace path must be an existing directory.')
+    }
   }
 
   getRun(runId: string): TaskRun {
@@ -299,7 +395,8 @@ class HeadlessTaskApi {
     existing: PersistedChatSession | undefined,
     request: StartTaskRunRequest,
     prompt: string,
-    userMessageId: string
+    userMessageId: string,
+    requestedWorkspace?: string
   ): Promise<{
     session: PersistedChatSession
     historyPreamble?: string
@@ -338,7 +435,8 @@ class HeadlessTaskApi {
     } else {
       sessionInfo = (await this.invoke('acp:create-session', {
         projectName: project.id,
-        permissionProfile
+        permissionProfile,
+        ...(requestedWorkspace ? { cwd: requestedWorkspace } : {})
       })) as AcpCreateSessionResponse
     }
 

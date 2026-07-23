@@ -58,6 +58,10 @@ export class OpenScienceClient {
     return this.request(`/api/v1/sessions/${encodeURIComponent(sessionId)}`)
   }
 
+  getConfiguration() {
+    return this.request('/api/v1/configuration')
+  }
+
   startRun(request) {
     return this.request('/api/v1/runs', { method: 'POST', body: request })
   }

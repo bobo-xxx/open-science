@@ -1,6 +1,7 @@
 import type { ArtifactFile } from './artifacts'
 import type { PermissionProfileId } from './permission-profiles'
 import type { Project } from './projects'
+import type { AgentFrameworkId, ProviderType, ReasoningEffort } from './settings'
 
 export type TaskRunStatus = 'running' | 'completed' | 'failed'
 
@@ -10,18 +11,43 @@ export type StartTaskRunRequest = {
   sessionId?: string
   permissionProfile?: PermissionProfileId
   skillIds?: string[]
+  workspacePath?: string
 }
 
 export type TaskRun = {
   id: string
   sessionId: string
   projectId: string
+  workspacePath: string
   status: TaskRunStatus
   startedAt: number
   completedAt?: number
   output?: string
   error?: string
   artifacts: ArtifactFile[]
+}
+
+export type TaskConfiguration = {
+  app: {
+    version: string
+    commit?: string
+  }
+  agent: {
+    frameworkId: AgentFrameworkId
+    providerId?: string
+    providerType?: ProviderType
+    providerName?: string
+    profile?: 'shared' | 'isolated'
+    model?: string
+    reasoningEffort: ReasoningEffort
+  }
+  skillIds: string[]
+  connectorIds: string[]
+  customConnectors: Array<{
+    id: string
+    name: string
+    transport: 'stdio' | 'streamable_http' | 'sse'
+  }>
 }
 
 export type TaskSessionSummary = {

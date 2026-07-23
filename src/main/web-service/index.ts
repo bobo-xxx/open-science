@@ -40,6 +40,7 @@ export type WebServiceControllerDeps = {
     appPath: string
     appName: string
     appVersion: string
+    commit?: string
     versions: { electron: string; chrome: string; node: string }
     pid: number
   }
@@ -69,6 +70,7 @@ const createWebServiceController = (
       appPath: app.getAppPath(),
       appName: app.getName(),
       appVersion: app.getVersion(),
+      commit: process.env.OPEN_SCIENCE_COMMIT?.trim() || undefined,
       versions: {
         electron: process.versions.electron,
         chrome: process.versions.chrome,
@@ -77,6 +79,10 @@ const createWebServiceController = (
       pid: process.pid
     }))
   const tasks = new HeadlessTaskApi(rpc, {
+    appMetadata: () => {
+      const info = appInfo()
+      return { version: info.appVersion, ...(info.commit ? { commit: info.commit } : {}) }
+    },
     subscribeEvents: (listener) =>
       addRendererBroadcastSink((channel, payload) => {
         if (channel === 'acp:event') listener(payload as Parameters<typeof listener>[0])

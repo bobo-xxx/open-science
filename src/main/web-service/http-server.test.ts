@@ -160,6 +160,13 @@ describe('startWebHttpServer', () => {
     roots.push(staticRoot)
     await writeFile(join(staticRoot, 'index.html'), '<!doctype html>')
     const tasks = {
+      getConfiguration: vi.fn().mockResolvedValue({
+        app: { version: '0.0.0' },
+        agent: { frameworkId: 'codex', reasoningEffort: 'default' },
+        skillIds: [],
+        connectorIds: [],
+        customConnectors: []
+      }),
       listProjects: vi.fn().mockResolvedValue([{ id: 'project-1', name: 'Research' }]),
       createProject: vi.fn(),
       listSessions: vi.fn(),
@@ -214,6 +221,11 @@ describe('startWebHttpServer', () => {
     expect(projects.status).toBe(200)
     expect(await projects.json()).toEqual({ data: [{ id: 'project-1', name: 'Research' }] })
 
+    const configuration = await fetch(`${base}/api/v1/configuration`, { headers })
+    expect(await configuration.json()).toMatchObject({
+      data: { app: { version: '0.0.0' }, agent: { frameworkId: 'codex' } }
+    })
+
     const started = await fetch(`${base}/api/v1/runs`, {
       method: 'POST',
       headers: { ...headers, 'content-type': 'application/json' },
@@ -256,6 +268,7 @@ describe('startWebHttpServer', () => {
       })
     )
     const tasks = {
+      getConfiguration: vi.fn(),
       listProjects: vi.fn(),
       createProject: vi.fn(),
       listSessions: vi.fn(),
@@ -320,6 +333,7 @@ describe('startWebHttpServer', () => {
       )
     )
     const tasks = {
+      getConfiguration: vi.fn(),
       listProjects: vi.fn(),
       createProject: vi.fn(),
       listSessions: vi.fn(),

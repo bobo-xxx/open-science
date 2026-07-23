@@ -11,6 +11,8 @@ describe('task CLI', () => {
         'systematic-review',
         '--prompt-file',
         'task.md',
+        '--workspace',
+        '/benchmark/task-1',
         '--session',
         'session-1',
         '--approval-profile',
@@ -27,6 +29,7 @@ describe('task CLI', () => {
         wait: true,
         project: 'systematic-review',
         promptFile: 'task.md',
+        workspace: '/benchmark/task-1',
         session: 'session-1',
         approvalProfile: 'auto'
       }
@@ -54,6 +57,25 @@ describe('task CLI', () => {
     expect(() => parseCliArgs(['run', '--timeout-ms', '1000'])).toThrow(
       '--timeout-ms requires run --wait.'
     )
+  })
+
+  it('prints the public configuration snapshot as JSON', async () => {
+    const configuration = {
+      app: { version: '0.6.0', commit: 'abc123' },
+      agent: { frameworkId: 'codex', model: 'gpt-5.4', reasoningEffort: 'high' },
+      skillIds: ['literature-review'],
+      connectorIds: ['pubmed'],
+      customConnectors: []
+    }
+    const client = { getConfiguration: vi.fn().mockResolvedValue(configuration) }
+    const log = vi.fn()
+
+    await runTaskCommand(
+      { command: 'configuration', options: { json: true, jsonl: false } },
+      { connect: vi.fn().mockResolvedValue(client), log }
+    )
+
+    expect(JSON.parse(log.mock.calls[0][0])).toEqual(configuration)
   })
 
   it('reads a prompt file, waits for completion, and emits one JSON result', async () => {

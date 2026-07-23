@@ -51,6 +51,7 @@ type WebServerOptions = {
     | 'createProject'
     | 'listSessions'
     | 'getSession'
+    | 'getConfiguration'
     | 'startRun'
     | 'getRun'
     | 'listArtifacts'
@@ -213,6 +214,10 @@ const handleTaskApiRequest = async (
   tasks: NonNullable<WebServerOptions['tasks']>
 ): Promise<boolean> => {
   try {
+    if (url.pathname === '/api/v1/configuration' && request.method === 'GET') {
+      json(response, 200, { data: await tasks.getConfiguration() })
+      return true
+    }
     if (url.pathname === '/api/v1/projects' && request.method === 'GET') {
       json(response, 200, { data: await tasks.listProjects() })
       return true

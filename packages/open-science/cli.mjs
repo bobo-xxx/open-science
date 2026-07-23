@@ -28,6 +28,7 @@ Commands:
   url         Print the authenticated web URL
   project list
   project create <name> [--description <text>]
+  configuration  Show the non-secret runtime configuration
   run --project <id-or-name> (--prompt <text> | --prompt-file <path>) [--wait]
   run status <run-id>
   session status <session-id>
@@ -40,6 +41,7 @@ Options:
   --config-root <path>   Config directory override
   --project <id-or-name> Project id or exact name
   --session <id>         Resume an existing session
+  --workspace <path>     Existing absolute workspace for a new session
   --prompt <text>        Prompt text (or read stdin when omitted)
   --prompt-file <path>   Read the prompt from a UTF-8 file
   --approval-profile <profile>  ask, auto, or full (default: ask)
@@ -60,6 +62,7 @@ const VALUE_OPTIONS = {
   '--config-root': 'configRoot',
   '--project': 'project',
   '--session': 'session',
+  '--workspace': 'workspace',
   '--prompt': 'prompt',
   '--prompt-file': 'promptFile',
   '--approval-profile': 'approvalProfile',
@@ -68,7 +71,7 @@ const VALUE_OPTIONS = {
   '--output': 'output'
 }
 
-const TASK_COMMANDS = new Set(['project', 'run', 'session', 'artifacts'])
+const TASK_COMMANDS = new Set(['project', 'run', 'session', 'artifacts', 'configuration'])
 const GROUP_COMMANDS = new Set(['project', 'session', 'artifacts'])
 
 export class CliUsageError extends Error {
@@ -507,6 +510,11 @@ export const runTaskCommand = async (parsed, dependencies = {}) => {
   const { command, subcommand, positionals = [], options } = parsed
   const client = await deps.connect({ configRoot: options.configRoot })
 
+  if (command === 'configuration') {
+    outputValue(await client.getConfiguration(), options, deps)
+    return
+  }
+
   if (command === 'project' && subcommand === 'list') {
     outputValue(await client.listProjects(), options, deps)
     return
@@ -568,6 +576,7 @@ export const runTaskCommand = async (parsed, dependencies = {}) => {
         project: options.project,
         prompt,
         ...(options.session ? { sessionId: options.session } : {}),
+        ...(options.workspace ? { workspacePath: resolve(options.workspace) } : {}),
         ...(options.approvalProfile ? { permissionProfile: options.approvalProfile } : {}),
         ...(options.skills?.length ? { skillIds: options.skills } : {})
       })
