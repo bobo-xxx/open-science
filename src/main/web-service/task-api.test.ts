@@ -183,6 +183,39 @@ describe('HeadlessTaskApi', () => {
     )
   })
 
+  it('resumes a session when an equivalent workspace resolves to the same path', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'open-science-task-workspace-'))
+    roots.push(workspace)
+    const existing: PersistedChatSession = {
+      id: 'session-workspace-resume',
+      projectId: project.id,
+      title: 'Workspace session',
+      cwd: resolve(workspace),
+      status: 'idle',
+      messages: [],
+      createdAt: 1,
+      updatedAt: 1
+    }
+    const invoke = vi.fn(async (channel: string) => {
+      if (channel === 'projects:list') return [project]
+      if (channel === 'sessions:load-all') return { sessions: [existing], manifest: { version: 1 } }
+      if (channel === 'acp:get-state') return { sessionIds: [existing.id] }
+      if (channel === 'sessions:save-session' || channel === 'acp:send-prompt') return undefined
+      throw new Error(`Unexpected RPC channel: ${channel}`)
+    })
+    const api = new HeadlessTaskApi({ invoke })
+
+    const started = await api.startRun({
+      project: project.id,
+      sessionId: existing.id,
+      prompt: 'Continue.',
+      workspacePath: join(workspace, '.')
+    })
+
+    expect(started.workspacePath).toBe(resolve(workspace))
+    await api.waitForRun(started.id)
+  })
+
   it('returns a non-secret reproducibility configuration snapshot', async () => {
     const invoke = vi.fn(async (channel: string) => {
       if (channel === 'settings:get-settings') {

@@ -294,7 +294,7 @@ class HeadlessTaskApi {
       id: runId,
       sessionId: session.id,
       projectId: project.id,
-      workspacePath: requestedWorkspace ?? session.cwd,
+      workspacePath: session.cwd,
       status: 'running' as const,
       startedAt: this.dependencies.now(),
       artifacts: [],
@@ -440,11 +440,25 @@ class HeadlessTaskApi {
       })) as AcpCreateSessionResponse
     }
 
+    if (typeof sessionInfo.cwd !== 'string' || !sessionInfo.cwd.trim()) {
+      throw new TaskApiError('invalid_request', 'ACP did not report an effective workspace path.')
+    }
+    if (requestedWorkspace) {
+      const effectiveWorkspace = await this.resolveWorkspace(sessionInfo.cwd)
+      if (effectiveWorkspace !== requestedWorkspace) {
+        throw new TaskApiError(
+          'invalid_request',
+          'ACP did not use the requested workspace path.'
+        )
+      }
+      sessionInfo.cwd = effectiveWorkspace
+    }
+
     const userMessage = createUserMessage(userMessageId, prompt, now)
     const session: PersistedChatSession = existing
       ? {
           ...existing,
-          cwd: sessionInfo.cwd ?? existing.cwd,
+          cwd: sessionInfo.cwd,
           status: 'running',
           permissionProfile,
           agentFrameworkId: sessionInfo.frameworkId ?? existing.agentFrameworkId,
@@ -458,7 +472,7 @@ class HeadlessTaskApi {
           id: sessionInfo.sessionId,
           projectId: project.id,
           title: createTitle(prompt),
-          cwd: sessionInfo.cwd ?? '',
+          cwd: sessionInfo.cwd,
           status: 'running',
           permissionProfile,
           agentFrameworkId: sessionInfo.frameworkId,

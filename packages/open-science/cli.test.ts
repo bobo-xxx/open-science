@@ -1,3 +1,5 @@
+import { resolve } from 'node:path'
+
 import { describe, expect, it, vi } from 'vitest'
 
 import { CliUsageError, parseCliArgs, reportCliError, runTaskCommand } from './cli.mjs'
@@ -79,6 +81,7 @@ describe('task CLI', () => {
   })
 
   it('reads a prompt file, waits for completion, and emits one JSON result', async () => {
+    const workspace = resolve('benchmark-workspace')
     const client = {
       startRun: vi.fn().mockResolvedValue({ id: 'run-1', status: 'running' }),
       waitForRun: vi.fn().mockResolvedValue({
@@ -100,6 +103,7 @@ describe('task CLI', () => {
         options: {
           project: 'project-1',
           promptFile: 'task.md',
+          workspace,
           approvalProfile: 'auto',
           wait: true,
           json: true,
@@ -117,11 +121,33 @@ describe('task CLI', () => {
     expect(client.startRun).toHaveBeenCalledWith({
       project: 'project-1',
       prompt: 'Research this.',
+      workspacePath: workspace,
       permissionProfile: 'auto'
     })
     expect(client.waitForRun).toHaveBeenCalledWith('run-1')
     expect(JSON.parse(log.mock.calls[0][0])).toMatchObject({ status: 'completed', output: 'Done' })
     expect(log).toHaveBeenCalledTimes(1)
+  })
+
+  it('rejects a relative workspace before starting a run', async () => {
+    const startRun = vi.fn()
+
+    await expect(
+      runTaskCommand(
+        {
+          command: 'run',
+          options: {
+            project: 'project-1',
+            prompt: 'Research this.',
+            workspace: 'relative/workspace',
+            json: false,
+            jsonl: false
+          }
+        },
+        { connect: vi.fn().mockResolvedValue({ startRun }), stdinIsTTY: true }
+      )
+    ).rejects.toThrow('--workspace must be an absolute path.')
+    expect(startRun).not.toHaveBeenCalled()
   })
 
   it('dispatches project, session, and artifact commands through the SDK', async () => {

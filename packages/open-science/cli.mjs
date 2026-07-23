@@ -5,7 +5,7 @@
 import { closeSync, openSync } from 'node:fs'
 import { createWriteStream } from 'node:fs'
 import { mkdir, readFile, rm } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { spawn, spawnSync } from 'node:child_process'
@@ -558,6 +558,9 @@ export const runTaskCommand = async (parsed, dependencies = {}) => {
   }
   if (command === 'run') {
     if (!options.project) throw new CliUsageError('--project is required.')
+    if (options.workspace && !isAbsolute(options.workspace)) {
+      throw new CliUsageError('--workspace must be an absolute path.')
+    }
     const prompt = await readPrompt(options, deps)
     if (!prompt) throw new CliUsageError('Prompt is required.')
     const sessionIdRef = { current: options.session, pending: [] }
@@ -576,7 +579,7 @@ export const runTaskCommand = async (parsed, dependencies = {}) => {
         project: options.project,
         prompt,
         ...(options.session ? { sessionId: options.session } : {}),
-        ...(options.workspace ? { workspacePath: resolve(options.workspace) } : {}),
+        ...(options.workspace ? { workspacePath: options.workspace } : {}),
         ...(options.approvalProfile ? { permissionProfile: options.approvalProfile } : {}),
         ...(options.skills?.length ? { skillIds: options.skills } : {})
       })
