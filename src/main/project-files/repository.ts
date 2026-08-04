@@ -2,19 +2,29 @@ import { randomUUID } from 'node:crypto'
 import { realpath, stat } from 'node:fs/promises'
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
-import type { ManagedFile, Prisma, PrismaClient } from '@prisma/client'
+import { Prisma, type FileOriginSession, type ManagedFile, type PrismaClient } from '@prisma/client'
 
 import type {
   ArtifactGroupPage,
+  GetProjectFilesOverviewRequest,
   ListArtifactGroupsRequest,
   ListProjectFilesRequest,
   ProjectFileItem,
   ProjectFilesOverview,
   ProjectFilesPage,
-  ProjectFileSource
+  ProjectFileSource,
+  ProjectFileOriginSession,
+  SearchArtifactsRequest,
+  SearchArtifactsResult
 } from '../../shared/project-files'
+import { createArtifactVersionLocator } from '../../shared/artifact-provenance'
 import type { PersistedChatSession } from '../../shared/session-persistence'
-import { getUploadedAttachmentName, PENDING_UPLOAD_SESSION_ID } from '../../shared/uploads'
+import {
+  createUploadVersionReference,
+  DEFAULT_UPLOAD_PROJECT_NAME,
+  getUploadedAttachmentName,
+  PENDING_UPLOAD_SESSION_ID
+} from '../../shared/uploads'
 
 const ARTIFACTS_DIR = 'artifacts'
 const UPLOADS_DIR = 'uploads'
@@ -26,7 +36,13 @@ const RETRYABLE_COLLISION_REVISION = -1
 
 type ProjectFilesClient = Pick<
   PrismaClient,
-  'managedFile' | 'managedFileSessionSync' | '$transaction'
+  | 'managedFile'
+  | 'managedFileSessionSync'
+  | 'fileOriginSession'
+  | 'artifactLineage'
+  | 'uploadFile'
+  | '$queryRaw'
+  | '$transaction'
 >
 type ProjectFilesClientProvider = () => Promise<ProjectFilesClient>
 type ProjectFilesClientFactory = (configRoot: string) => Promise<ProjectFilesClient>
@@ -34,6 +50,8 @@ type ProjectFilesClientFactory = (configRoot: string) => Promise<ProjectFilesCli
 type IndexedFileInput = {
   source: ProjectFileSource
   sourceFileId: string
+  sourceVersionId?: string
+  checksum?: string
   projectId: string
   sessionId: string
   messageId?: string
@@ -50,20 +68,49 @@ type IndexedFileCandidate = Omit<IndexedFileInput, 'storageKey' | 'sizeBytes' | 
 }
 
 type FileCursor = {
-  version: 1
-  kind: 'uploads' | 'sessionArtifacts'
+  version: 2
+  kind: 'all' | 'uploads' | 'sessionArtifacts'
   projectId: string
   sessionId?: string
+  queryKey: string
   sortAtMs: string
   seq: number
 }
 
 type GroupCursor = {
-  version: 1
+  version: 2
   kind: 'artifactGroups'
   projectId: string
+  queryKey: string
   groupSortAtMs: string
   sessionId: string
+}
+
+type SearchArtifactCursor = {
+  version: 2
+  kind: 'globalArtifacts'
+  primaryProjectId: string
+  queryKey: string
+  sortAtMs: string
+  seq: number
+}
+
+type NormalizedSearch = {
+  filenameContains: string
+  queryKey: string
+}
+
+type SearchArtifactGroupRow = {
+  sessionId: string
+  groupSortAtMs: bigint
+  artifactCount: bigint
+}
+
+type SearchOverviewRow = {
+  totalCount: bigint
+  uploadCount: bigint
+  artifactCount: bigint
+  artifactGroupCount: bigint
 }
 
 type ManagedFileSoftDeleteToken = string
@@ -101,7 +148,8 @@ class ManagedFileIndexRepository {
       if (
         !options.force &&
         currentSync?.filesRevision === revision &&
-        currentSync.deletedAt === null
+        currentSync.deletedAt === null &&
+        (await this.isFileProjectionCurrent(client, session.projectId, session.id))
       ) {
         this.incompleteSessions.delete(sessionKey(session.projectId, session.id))
         return []
@@ -176,6 +224,8 @@ class ManagedFileIndexRepository {
                 where: { seq: existing.seq },
                 data: {
                   sourceFileId: file.sourceFileId,
+                  sourceVersionId: file.sourceVersionId,
+                  checksum: file.checksum,
                   sessionId: file.sessionId,
                   messageId: file.messageId,
                   displayName: file.displayName,
@@ -192,8 +242,12 @@ class ManagedFileIndexRepository {
 
           rowsById.set(idKey, row)
           rowsByPath.set(pathKey, row)
-          retainedSeqs.add(row.seq)
-          retainedSources.set(row.seq, file.source)
+          // Cross-Session references preserve the source owner's row, but they are not members of the
+          // referencing Session's ledger or Artifact group.
+          if (file.sessionId === session.id) {
+            retainedSeqs.add(row.seq)
+            retainedSources.set(row.seq, file.source)
+          }
           acceptedFiles.push(file)
         }
 
@@ -369,9 +423,17 @@ class ManagedFileIndexRepository {
       const indexedSessions = await client.managedFileSessionSync.findMany({
         select: { projectId: true, sessionId: true, deletedAt: true }
       })
+      const retainedOrigins = await client.fileOriginSession.findMany({
+        where: { state: { in: ['deleting', 'deleted'] } },
+        select: { projectId: true, sessionId: true }
+      })
+      const retainedKeys = new Set(
+        retainedOrigins.map((origin) => sessionKey(origin.projectId, origin.sessionId))
+      )
 
       for (const indexed of indexedSessions) {
-        const isActive = activeKeys.has(sessionKey(indexed.projectId, indexed.sessionId))
+        const key = sessionKey(indexed.projectId, indexed.sessionId)
+        const isActive = activeKeys.has(key) || retainedKeys.has(key)
 
         if (isActive && indexed.deletedAt !== null) {
           // A complete scan proves that JSON survived an interrupted deletion. Restore all metadata for
@@ -398,6 +460,9 @@ class ManagedFileIndexRepository {
           await this.softDeleteSession(indexed.projectId, indexed.sessionId)
         }
       }
+      for (const origin of retainedOrigins) {
+        await this.rebuildRetainedOriginProjection(client, origin.projectId, origin.sessionId)
+      }
       // A first sync can fail before a ledger row exists. Once a complete scan proves that JSON is
       // gone, its transient failure marker must not keep the project permanently incomplete.
       for (const key of this.incompleteSessions.keys()) {
@@ -410,6 +475,137 @@ class ManagedFileIndexRepository {
     }
   }
 
+  // Reconstructs Files metadata from SQLite authority when a deleted Session JSON can no longer be
+  // used for repair. Missing content bytes do not erase the row: opening it can still show the
+  // captured Provenance and an explicit content-unavailable state.
+  private async rebuildRetainedOriginProjection(
+    client: ProjectFilesClient,
+    projectId: string,
+    sessionId: string
+  ): Promise<void> {
+    const [lineages, uploads] = await Promise.all([
+      client.artifactLineage.findMany({
+        where: { projectId, sessionId },
+        include: {
+          versions: {
+            where: { state: 'finalized' },
+            orderBy: [{ versionNumber: 'desc' }, { id: 'desc' }],
+            take: 1
+          }
+        }
+      }),
+      client.uploadFile.findMany({
+        where: { projectId, sessionId },
+        include: {
+          versions: {
+            where: { state: 'ready' },
+            orderBy: [{ versionNumber: 'desc' }, { id: 'desc' }],
+            take: 1
+          }
+        }
+      })
+    ])
+    const artifactFiles: IndexedFileInput[] = lineages.flatMap((lineage) => {
+      const version = lineage.versions[0]
+      return version
+        ? [
+            {
+              source: 'artifact' as const,
+              sourceFileId: lineage.id,
+              sourceVersionId: version.id,
+              checksum: version.checksum,
+              projectId,
+              sessionId,
+              messageId: version.messageId ?? undefined,
+              displayName: lineage.filename,
+              storageKey: version.contentStorageKey,
+              mimeType: version.contentType ?? undefined,
+              sizeBytes: version.sizeBytes,
+              mtimeMs: BigInt(version.createdAt.getTime()),
+              sortAtMs: BigInt(version.createdAt.getTime())
+            }
+          ]
+        : []
+    })
+    const uploadFiles: IndexedFileInput[] = uploads.flatMap((upload) => {
+      const version = upload.versions[0]
+      const createdAt = version?.createdAt ?? version?.registeredAt
+      return version && createdAt
+        ? [
+            {
+              source: 'upload' as const,
+              sourceFileId: upload.id,
+              sourceVersionId: version.id,
+              checksum: version.checksum,
+              projectId,
+              sessionId,
+              displayName: version.filename,
+              storageKey: version.contentStorageKey,
+              mimeType: version.contentType ?? undefined,
+              sizeBytes: version.sizeBytes,
+              mtimeMs: BigInt(createdAt.getTime()),
+              sortAtMs: BigInt(createdAt.getTime())
+            }
+          ]
+        : []
+    })
+    const files = [...artifactFiles, ...uploadFiles]
+    // Legacy retained origins may predate ArtifactVersion/UploadVersion authority while their
+    // existing ManagedFile projection is still valid. Do not erase that projection during upgrade.
+    if (files.length === 0) return
+    const groupSortAtMs = files.reduce(
+      (latest, file) => (file.sortAtMs > latest ? file.sortAtMs : latest),
+      BigInt(0)
+    )
+
+    await client.$transaction(async (tx) => {
+      for (const file of files) {
+        await tx.managedFile.upsert({
+          where: {
+            projectId_source_sourceFileId: {
+              projectId,
+              source: file.source,
+              sourceFileId: file.sourceFileId
+            }
+          },
+          create: file,
+          update: {
+            sourceVersionId: file.sourceVersionId,
+            checksum: file.checksum,
+            sessionId,
+            messageId: file.messageId,
+            displayName: file.displayName,
+            storageKey: file.storageKey,
+            mimeType: file.mimeType,
+            sizeBytes: file.sizeBytes,
+            mtimeMs: file.mtimeMs,
+            sortAtMs: file.sortAtMs,
+            deletedAt: null,
+            deleteOperationId: null
+          }
+        })
+      }
+      await tx.managedFileSessionSync.upsert({
+        where: { projectId_sessionId: { projectId, sessionId } },
+        create: {
+          projectId,
+          sessionId,
+          filesRevision: 0,
+          groupSortAtMs,
+          artifactCount: artifactFiles.length,
+          uploadCount: uploadFiles.length
+        },
+        update: {
+          groupSortAtMs,
+          artifactCount: artifactFiles.length,
+          uploadCount: uploadFiles.length,
+          deletedAt: null,
+          deleteOperationId: null
+        }
+      })
+    })
+  }
+
   // A partial filesystem scan cannot identify which project was omitted, so this marker is global
   // until a later complete scan synchronizes every session and reconciliation succeeds.
   markReconciliationIncomplete(): void {
@@ -418,17 +614,24 @@ class ManagedFileIndexRepository {
 
   // Counts are always queryable, but isIndexComplete distinguishes an authoritative result from a
   // usable partial projection after scan, sync, or reconciliation failure.
-  async getOverview(projectId: string): Promise<ProjectFilesOverview> {
+  async getOverview(
+    request: string | GetProjectFilesOverviewRequest
+  ): Promise<ProjectFilesOverview> {
+    const { projectId, search: rawSearch } =
+      typeof request === 'string' ? { projectId: request, search: undefined } : request
     requireIdentifier(projectId, 'projectId')
+    const search = normalizeSearch(rawSearch)
     const client = await this.getClient()
-    const [totalCount, uploadCount, artifactCount, artifactGroupCount] = await Promise.all([
-      client.managedFile.count({ where: { projectId, deletedAt: null } }),
-      client.managedFile.count({ where: { projectId, source: 'upload', deletedAt: null } }),
-      client.managedFile.count({ where: { projectId, source: 'artifact', deletedAt: null } }),
-      client.managedFileSessionSync.count({
-        where: { projectId, deletedAt: null, artifactCount: { gt: 0 } }
-      })
-    ])
+    const [totalCount, uploadCount, artifactCount, artifactGroupCount] = search
+      ? await getMatchingOverviewCounts(client, projectId, search)
+      : await Promise.all([
+          client.managedFile.count({ where: { projectId, deletedAt: null } }),
+          client.managedFile.count({ where: { projectId, source: 'upload', deletedAt: null } }),
+          client.managedFile.count({ where: { projectId, source: 'artifact', deletedAt: null } }),
+          client.managedFileSessionSync.count({
+            where: { projectId, deletedAt: null, artifactCount: { gt: 0 } }
+          })
+        ])
 
     return {
       totalCount,
@@ -451,7 +654,9 @@ class ManagedFileIndexRepository {
     requireIdentifier(request.projectId, 'projectId')
     const collection = request.collection as { kind?: unknown; sessionId?: unknown }
     let normalizedCollection: ListProjectFilesRequest['collection']
-    if (collection.kind === 'uploads') {
+    if (collection.kind === 'all') {
+      normalizedCollection = { kind: 'all' }
+    } else if (collection.kind === 'uploads') {
       normalizedCollection = { kind: 'uploads' }
     } else if (collection.kind === 'sessionArtifacts' && typeof collection.sessionId === 'string') {
       requireIdentifier(collection.sessionId, 'sessionId')
@@ -462,13 +667,19 @@ class ManagedFileIndexRepository {
     const normalizedRequest = { ...request, collection: normalizedCollection }
     const client = await this.getClient()
     const limit = normalizeLimit(request.limit)
-    const source = normalizedCollection.kind === 'uploads' ? 'upload' : 'artifact'
+    const search = normalizeSearch(request.search)
+    const source =
+      normalizedCollection.kind === 'all'
+        ? undefined
+        : normalizedCollection.kind === 'uploads'
+          ? 'upload'
+          : 'artifact'
     const sessionId =
       normalizedCollection.kind === 'sessionArtifacts' ? normalizedCollection.sessionId : undefined
     const cursor = request.cursor ? decodeFileCursor(request.cursor, normalizedRequest) : undefined
     const where: Prisma.ManagedFileWhereInput = {
       projectId: request.projectId,
-      source,
+      ...(source ? { source } : {}),
       deletedAt: null,
       ...(sessionId !== undefined ? { sessionId } : {}),
       ...(cursor
@@ -480,38 +691,139 @@ class ManagedFileIndexRepository {
           }
         : {})
     }
-    const [rows, totalCount] = await Promise.all([
-      client.managedFile.findMany({
-        where,
-        orderBy: [{ sortAtMs: 'desc' }, { seq: 'desc' }],
-        take: limit + 1
-      }),
-      client.managedFile.count({
-        where: {
-          projectId: request.projectId,
+    const [rows, totalCount] = search
+      ? await this.listMatchingFiles(
+          client,
+          request.projectId,
           source,
-          deletedAt: null,
-          ...(sessionId !== undefined ? { sessionId } : {})
-        }
-      })
-    ])
+          sessionId,
+          search,
+          cursor,
+          limit
+        )
+      : await Promise.all([
+          client.managedFile.findMany({
+            where,
+            orderBy: [{ sortAtMs: 'desc' }, { seq: 'desc' }],
+            take: limit + 1
+          }),
+          client.managedFile.count({
+            where: {
+              projectId: request.projectId,
+              ...(source ? { source } : {}),
+              deletedAt: null,
+              ...(sessionId !== undefined ? { sessionId } : {})
+            }
+          })
+        ])
     const pageRows = rows.slice(0, limit)
     const lastRow = pageRows.at(-1)
+    const origins = await client.fileOriginSession.findMany({
+      where: {
+        projectId: request.projectId,
+        sessionId: { in: [...new Set(pageRows.map((row) => row.sessionId))] }
+      }
+    })
+    const originsBySession = new Map(origins.map((origin) => [origin.sessionId, origin]))
 
     return {
-      items: pageRows.map((row) => toProjectFileItem(row, this.dataRoot)),
+      items: pageRows.map((row) =>
+        toProjectFileItem(row, this.dataRoot, originsBySession.get(row.sessionId))
+      ),
       totalCount,
       nextCursor:
         rows.length > limit && lastRow
           ? encodeCursor({
-              version: 1,
+              version: 2,
               kind: normalizedCollection.kind,
               projectId: request.projectId,
               sessionId,
+              queryKey: search?.queryKey ?? '',
               sortAtMs: lastRow.sortAtMs.toString(),
               seq: lastRow.seq
             })
           : undefined
+    }
+  }
+
+  // Global search keeps its cross-project scope deliberately bounded: the primary project is
+  // independently paged while every other project shares a single latest-artifact sample.
+  async searchArtifacts(request: SearchArtifactsRequest): Promise<SearchArtifactsResult> {
+    requireIdentifier(request.primaryProjectId, 'primaryProjectId')
+    if (!Array.isArray(request.otherProjectIds)) {
+      throw new Error('Project files otherProjectIds must be an array.')
+    }
+    const otherProjectIds = [...new Set(request.otherProjectIds)]
+      .filter((projectId) => projectId !== request.primaryProjectId)
+      .map((projectId) => {
+        requireIdentifier(projectId, 'otherProjectId')
+        return projectId
+      })
+    if (request.otherLimit !== 0 && request.otherLimit !== 1) {
+      throw new Error('Project files otherLimit must be 0 or 1.')
+    }
+
+    const primaryLimit = normalizeLimit(request.primaryLimit)
+    const search =
+      request.filenameContains === undefined
+        ? undefined
+        : normalizeSearch({ filenameContains: request.filenameContains })
+    const cursor = request.primaryCursor
+      ? decodeSearchArtifactCursor(request.primaryCursor, request.primaryProjectId, search)
+      : undefined
+    const client = await this.getClient()
+    const [primaryRows, primaryTotalCount, otherRows] = await Promise.all([
+      listMatchingArtifacts(client, request.primaryProjectId, search, cursor, primaryLimit),
+      countMatchingArtifacts(client, request.primaryProjectId, search),
+      request.otherLimit === 1 && otherProjectIds.length > 0
+        ? listOtherProjectArtifacts(client, otherProjectIds, search)
+        : Promise.resolve([])
+    ])
+    const primaryPageRows = primaryRows.slice(0, primaryLimit)
+    const lastPrimaryRow = primaryPageRows.at(-1)
+    const rows = [...primaryPageRows, ...otherRows]
+    const origins =
+      rows.length === 0
+        ? []
+        : await client.fileOriginSession.findMany({
+            where: {
+              OR: [
+                ...new Map(rows.map((row) => [`${row.projectId}:${row.sessionId}`, row])).values()
+              ].map((row) => ({ projectId: row.projectId, sessionId: row.sessionId }))
+            }
+          })
+    const originsBySession = new Map(
+      origins.map((origin) => [`${origin.projectId}:${origin.sessionId}`, origin])
+    )
+    const toItem = (row: ManagedFile): ProjectFileItem =>
+      toProjectFileItem(
+        row,
+        this.dataRoot,
+        originsBySession.get(`${row.projectId}:${row.sessionId}`)
+      )
+
+    return {
+      primary: {
+        items: primaryPageRows.map(toItem),
+        totalCount: primaryTotalCount,
+        nextCursor:
+          primaryRows.length > primaryLimit && lastPrimaryRow
+            ? encodeCursor({
+                version: 2,
+                kind: 'globalArtifacts',
+                primaryProjectId: request.primaryProjectId,
+                queryKey: search?.queryKey ?? '',
+                sortAtMs: lastPrimaryRow.sortAtMs.toString(),
+                seq: lastPrimaryRow.seq
+              })
+            : undefined
+      },
+      other: otherRows.map(toItem),
+      isIndexComplete: [request.primaryProjectId, ...otherProjectIds].every(
+        (projectId) =>
+          !this.isReconciliationIncomplete &&
+          ![...this.incompleteSessions.keys()].some((key) => key.startsWith(`${projectId}:`))
+      )
     }
   }
 
@@ -521,6 +833,7 @@ class ManagedFileIndexRepository {
     requireIdentifier(request.projectId, 'projectId')
     const client = await this.getClient()
     const limit = normalizeLimit(request.limit)
+    const search = normalizeSearch(request.search)
     const cursor = request.cursor ? decodeGroupCursor(request.cursor, request) : undefined
     const where: Prisma.ManagedFileSessionSyncWhereInput = {
       projectId: request.projectId,
@@ -538,31 +851,42 @@ class ManagedFileIndexRepository {
           }
         : {})
     }
-    const [rows, totalCount] = await Promise.all([
-      client.managedFileSessionSync.findMany({
-        where,
-        orderBy: [{ groupSortAtMs: 'desc' }, { sessionId: 'desc' }],
-        take: limit + 1
-      }),
-      client.managedFileSessionSync.count({
-        where: { projectId: request.projectId, deletedAt: null, artifactCount: { gt: 0 } }
-      })
-    ])
+    const [rows, totalCount] = search
+      ? await listMatchingArtifactGroups(client, request.projectId, search, cursor, limit)
+      : await Promise.all([
+          client.managedFileSessionSync.findMany({
+            where,
+            orderBy: [{ groupSortAtMs: 'desc' }, { sessionId: 'desc' }],
+            take: limit + 1
+          }),
+          client.managedFileSessionSync.count({
+            where: { projectId: request.projectId, deletedAt: null, artifactCount: { gt: 0 } }
+          })
+        ])
     const pageRows = rows.slice(0, limit)
     const lastRow = pageRows.at(-1)
+    const origins = await client.fileOriginSession.findMany({
+      where: {
+        projectId: request.projectId,
+        sessionId: { in: pageRows.map((row) => row.sessionId) }
+      }
+    })
+    const originsBySession = new Map(origins.map((origin) => [origin.sessionId, origin]))
 
     return {
       items: pageRows.map((row) => ({
         sessionId: row.sessionId,
-        artifactCount: row.artifactCount
+        artifactCount: toSafeCount(row.artifactCount, 'artifact group count'),
+        ...toOriginProjection(originsBySession.get(row.sessionId))
       })),
       totalCount,
       nextCursor:
         rows.length > limit && lastRow
           ? encodeCursor({
-              version: 1,
+              version: 2,
               kind: 'artifactGroups',
               projectId: request.projectId,
+              queryKey: search?.queryKey ?? '',
               groupSortAtMs: lastRow.groupSortAtMs.toString(),
               sessionId: lastRow.sessionId
             })
@@ -570,8 +894,118 @@ class ManagedFileIndexRepository {
     }
   }
 
+  // Search keeps the same collection predicates and keyset ordering as the unfiltered path. The
+  // paired count query intentionally omits only the cursor so totalCount describes every match.
+  private async listMatchingFiles(
+    client: ProjectFilesClient,
+    projectId: string,
+    source: ProjectFileSource | undefined,
+    sessionId: string | undefined,
+    search: NormalizedSearch,
+    cursor: FileCursor | undefined,
+    limit: number
+  ): Promise<[ManagedFile[], number]> {
+    const sourcePredicate =
+      source === undefined ? Prisma.empty : Prisma.sql`AND "source" = ${source}`
+    const sessionPredicate =
+      sessionId === undefined ? Prisma.empty : Prisma.sql`AND "sessionId" = ${sessionId}`
+    const cursorPredicate = cursor
+      ? Prisma.sql`AND ("sortAtMs" < ${BigInt(cursor.sortAtMs)} OR ("sortAtMs" = ${BigInt(cursor.sortAtMs)} AND "seq" < ${cursor.seq}))`
+      : Prisma.empty
+    const [rows, totalCount] = await Promise.all([
+      client.$queryRaw<ManagedFile[]>(Prisma.sql`
+        SELECT
+          "seq", "source", "sourceFileId", "sourceVersionId", "checksum",
+          "projectId", "sessionId", "messageId",
+          "displayName", "storageKey", "mimeType", "sizeBytes", "mtimeMs", "sortAtMs",
+          "createdAt", "updatedAt", "deletedAt", "deleteOperationId"
+        FROM "ManagedFile"
+        WHERE "projectId" = ${projectId}
+          ${sourcePredicate}
+          AND "deletedAt" IS NULL
+          ${sessionPredicate}
+          AND ${filenameContainsPredicate(Prisma.sql`"displayName"`, search)}
+          ${cursorPredicate}
+        ORDER BY "sortAtMs" DESC, "seq" DESC
+        LIMIT ${limit + 1}
+      `),
+      countMatchingFiles(client, projectId, search, source, sessionId)
+    ])
+    return [rows, totalCount]
+  }
+
   // Extracts finalized uploads and managed artifacts from authoritative session JSON. Identity is
   // deduplicated first by source id and then by storage key to normalize legacy duplicate metadata.
+  private async isFileProjectionCurrent(
+    client: ProjectFilesClient,
+    projectId: string,
+    sessionId: string
+  ): Promise<boolean> {
+    const [lineages, rows] = await Promise.all([
+      client.artifactLineage.findMany({
+        where: { projectId, sessionId },
+        include: {
+          versions: {
+            where: { state: 'finalized' },
+            orderBy: [{ versionNumber: 'desc' }, { id: 'desc' }],
+            take: 1
+          }
+        }
+      }),
+      client.managedFile.findMany({
+        where: { projectId, sessionId, deletedAt: null },
+        select: {
+          source: true,
+          sourceFileId: true,
+          sourceVersionId: true,
+          sessionId: true,
+          storageKey: true
+        }
+      })
+    ])
+    const expectedArtifacts = new Map(
+      lineages.flatMap((lineage) => {
+        const version = lineage.versions[0]
+        return version ? [[lineage.id, version.id] as const] : []
+      })
+    )
+    const projectedArtifacts = rows.filter(
+      (row) => row.source === 'artifact' && row.sourceVersionId !== null
+    )
+    if (
+      projectedArtifacts.length !== expectedArtifacts.size ||
+      projectedArtifacts.some(
+        (row) => expectedArtifacts.get(row.sourceFileId) !== row.sourceVersionId
+      )
+    ) {
+      return false
+    }
+
+    const hasMismatchedLegacyUploadOwner = rows.some((row) => {
+      if (row.source !== 'upload' || row.sourceVersionId !== null) return false
+      const storageSessionId = getLegacyUploadStorageSessionId(row.storageKey)
+      return storageSessionId !== undefined && storageSessionId !== row.sessionId
+    })
+    if (hasMismatchedLegacyUploadOwner) return false
+
+    // A native Upload row is owned by its source Session, even when another Session references it.
+    // Detect old derived rows that copied the referencing Session so one startup sync repairs their
+    // locator scope instead of repeatedly sending unauthorized preview requests.
+    const nativeUploadIds = [
+      ...new Set(
+        rows
+          .filter((row) => row.source === 'upload' && row.sourceVersionId !== null)
+          .map((row) => row.sourceFileId)
+      )
+    ]
+    if (nativeUploadIds.length === 0) return true
+    const ownedUploads = await client.uploadFile.findMany({
+      where: { id: { in: nativeUploadIds }, projectId, sessionId },
+      select: { id: true }
+    })
+    return ownedUploads.length === nativeUploadIds.length
+  }
+
   private async extractSessionFiles(
     session: PersistedChatSession
   ): Promise<{ files: IndexedFileInput[]; errors: string[] }> {
@@ -589,7 +1023,17 @@ class ManagedFileIndexRepository {
       }
     }
 
-    for (const message of session.messages) {
+    // Project Files is a Project-scoped library, not an active-conversation projection. Preserve
+    // files referenced by every immutable Message Branch so switching revisions cannot hide an Upload
+    // or Artifact from this Session or from another Session's @ picker. Active messages are applied
+    // last because their streamed/finalized payload may be newer than the persisted graph node.
+    const messagesById = new Map(
+      [...(session.conversationGraph?.messages ?? []), ...session.messages].map((message) => [
+        message.id,
+        message
+      ])
+    )
+    for (const message of messagesById.values()) {
       for (const artifactId of message.artifactIds ?? []) {
         artifactMessageIds.set(artifactId, message.id)
       }
@@ -597,11 +1041,57 @@ class ManagedFileIndexRepository {
       if (message.role !== 'user') continue
       for (const upload of message.uploads ?? []) {
         if (upload.sessionId === PENDING_UPLOAD_SESSION_ID) continue
+        if (upload.versionId) {
+          try {
+            const client = await this.getClient()
+            const file = await client.uploadFile.findFirst({
+              where: {
+                id: upload.id,
+                projectId: session.projectId,
+                sessionId: upload.sessionId
+              },
+              include: {
+                versions: {
+                  where: { id: upload.versionId, state: 'ready' },
+                  take: 1
+                }
+              }
+            })
+            const version = file?.versions[0]
+            if (!file || !version) {
+              throw new Error(`Upload Version is unavailable: ${upload.versionId}`)
+            }
+            files.push({
+              source: 'upload',
+              sourceFileId: file.id,
+              sourceVersionId: version.id,
+              checksum: version.checksum,
+              projectId: session.projectId,
+              sessionId: upload.sessionId,
+              messageId: message.id,
+              displayName: version.originalFilename || version.filename,
+              storageKey: version.contentStorageKey,
+              mimeType: version.contentType ?? undefined,
+              sizeBytes: version.sizeBytes,
+              mtimeMs: version.createdAt ? BigInt(version.createdAt.getTime()) : undefined,
+              sortAtMs: BigInt(message.updatedAt || message.createdAt)
+            })
+          } catch (error) {
+            errors.push(describeError(error))
+          }
+          continue
+        }
+        if (!upload.path) {
+          errors.push(`Legacy upload identity is unavailable: ${upload.id}`)
+          continue
+        }
         await collectFile({
           source: 'upload',
           sourceFileId: upload.id,
+          sourceVersionId: upload.versionId,
+          checksum: upload.sha256 ?? upload.checksum,
           projectId: session.projectId,
-          sessionId: session.id,
+          sessionId: upload.sessionId,
           messageId: message.id,
           displayName: getUploadedAttachmentName(upload),
           path: upload.path,
@@ -611,8 +1101,58 @@ class ManagedFileIndexRepository {
       }
     }
 
+    // Native Artifact identity and version order live in SQLite. Session JSON is intentionally a
+    // compatibility projection and can lag a newly finalized Version or retain an older branch's
+    // descriptor, so it must not choose the Files tile content for a provenance lineage.
+    const authoritativeArtifactIds = new Set<string>()
+    try {
+      const client = await this.getClient()
+      const lineages = await client.artifactLineage.findMany({
+        where: { projectId: session.projectId, sessionId: session.id },
+        include: {
+          versions: {
+            where: { state: 'finalized' },
+            orderBy: [{ versionNumber: 'desc' }, { id: 'desc' }],
+            take: 1
+          }
+        }
+      })
+
+      for (const lineage of lineages) {
+        authoritativeArtifactIds.add(lineage.id)
+        const version = lineage.versions[0]
+        if (!version) continue
+        const createdAtMs = BigInt(version.createdAt.getTime())
+        files.push({
+          source: 'artifact',
+          sourceFileId: lineage.id,
+          sourceVersionId: version.id,
+          checksum: version.checksum,
+          projectId: session.projectId,
+          sessionId: session.id,
+          messageId: version.messageId ?? undefined,
+          displayName: version.filename || lineage.filename,
+          storageKey: version.contentStorageKey,
+          mimeType: version.contentType ?? undefined,
+          sizeBytes: version.sizeBytes,
+          mtimeMs: createdAtMs,
+          sortAtMs: createdAtMs
+        })
+      }
+    } catch (error) {
+      errors.push(`Artifact Version catalog is unavailable: ${describeError(error)}`)
+    }
+
     for (const artifact of session.artifacts ?? []) {
       if (artifact.kind !== 'managed-file' || isPendingArtifactPath(artifact.path)) continue
+      if (artifact.artifactId || artifact.versionId) {
+        if (!artifact.artifactId || !authoritativeArtifactIds.has(artifact.artifactId)) {
+          errors.push(
+            `Artifact Version identity is unavailable: ${artifact.versionId ?? artifact.id}`
+          )
+        }
+        continue
+      }
       const artifactSortAtMs = artifact.mtimeMs ?? session.updatedAt
       if (!Number.isFinite(artifactSortAtMs)) {
         errors.push('Managed artifact modification time must be finite.')
@@ -620,7 +1160,9 @@ class ManagedFileIndexRepository {
       }
       await collectFile({
         source: 'artifact',
-        sourceFileId: artifact.id,
+        sourceFileId: artifact.artifactId ?? artifact.id,
+        sourceVersionId: artifact.versionId,
+        checksum: artifact.sha256,
         projectId: session.projectId,
         sessionId: session.id,
         messageId: artifactMessageIds.get(artifact.id),
@@ -698,6 +1240,8 @@ class ManagedFileIndexRepository {
     return {
       source: input.source,
       sourceFileId: input.sourceFileId,
+      sourceVersionId: input.sourceVersionId,
+      checksum: input.checksum,
       projectId: input.projectId,
       sessionId: input.sessionId,
       messageId: input.messageId,
@@ -732,8 +1276,226 @@ const normalizeLimit = (limit: number): number => {
   return limit
 }
 
+// Normalizes untrusted IPC input once so SQL predicates and cursor identity share the same bounded,
+// trimmed query. Blank input deliberately falls back to the indexed non-search path.
+const normalizeSearch = (search: unknown): NormalizedSearch | undefined => {
+  if (search === undefined) return undefined
+  if (!isRecord(search) || typeof search.filenameContains !== 'string') {
+    throw new Error('Project files search is invalid.')
+  }
+  const filenameContains = search.filenameContains.trim()
+  if (!filenameContains) return undefined
+  if (filenameContains.length > 256) {
+    throw new Error('Project files search must be at most 256 characters.')
+  }
+  return { filenameContains, queryKey: foldAsciiCase(filenameContains) }
+}
+
+// SQLite's built-in lower() folds ASCII only. Bind cursors with the same transformation so query
+// identity never promises broader Unicode case-insensitivity than the SQL predicate provides.
+const foldAsciiCase = (value: string): string =>
+  value.replace(/[A-Z]/g, (character) => character.toLowerCase())
+
+// Every search query shares the same SQLite ASCII-folding behavior while selecting its own column
+// alias. Keeping the predicate in one fragment prevents counts and pages from drifting apart.
+const filenameContainsPredicate = (
+  displayNameColumn: Prisma.Sql,
+  search: NormalizedSearch
+): Prisma.Sql =>
+  Prisma.sql`instr(lower(${displayNameColumn}), lower(${search.filenameContains})) > 0`
+
 const requireIdentifier = (value: string, field: string): void => {
   if (!value.trim()) throw new Error(`Project files ${field} is required.`)
+}
+
+// One conditional aggregate keeps the debounced all-source search from scanning the same project
+// four times merely to populate the toolbar count and overview state.
+const getMatchingOverviewCounts = async (
+  client: ProjectFilesClient,
+  projectId: string,
+  search: NormalizedSearch
+): Promise<[number, number, number, number]> => {
+  const rows = await client.$queryRaw<SearchOverviewRow[]>(Prisma.sql`
+    SELECT
+      COUNT(file."seq") AS "totalCount",
+      COALESCE(SUM(CASE WHEN file."source" = 'upload' THEN 1 ELSE 0 END), 0) AS "uploadCount",
+      COALESCE(SUM(CASE WHEN file."source" = 'artifact' THEN 1 ELSE 0 END), 0) AS "artifactCount",
+      COUNT(DISTINCT CASE
+        WHEN file."source" = 'artifact' AND sync."sessionId" IS NOT NULL THEN file."sessionId"
+      END) AS "artifactGroupCount"
+    FROM "ManagedFile" AS file
+    LEFT JOIN "ManagedFileSessionSync" AS sync
+      ON sync."projectId" = file."projectId"
+      AND sync."sessionId" = file."sessionId"
+      AND sync."deletedAt" IS NULL
+    WHERE file."projectId" = ${projectId}
+      AND file."deletedAt" IS NULL
+      AND ${filenameContainsPredicate(Prisma.sql`file."displayName"`, search)}
+  `)
+  const counts = rows[0]
+
+  return [
+    toSafeCount(counts?.totalCount ?? 0n, 'search result count'),
+    toSafeCount(counts?.uploadCount ?? 0n, 'upload search result count'),
+    toSafeCount(counts?.artifactCount ?? 0n, 'artifact search result count'),
+    toSafeCount(counts?.artifactGroupCount ?? 0n, 'artifact group count')
+  ]
+}
+
+// Mirrors the optional source and session constraints used by listMatchingFiles so each collection
+// reports its own complete match count rather than the current page size.
+const countMatchingFiles = async (
+  client: ProjectFilesClient,
+  projectId: string,
+  search: NormalizedSearch,
+  source?: ProjectFileSource,
+  sessionId?: string
+): Promise<number> => {
+  const sourcePredicate = source === undefined ? Prisma.empty : Prisma.sql`AND "source" = ${source}`
+  const sessionPredicate =
+    sessionId === undefined ? Prisma.empty : Prisma.sql`AND "sessionId" = ${sessionId}`
+  const rows = await client.$queryRaw<Array<{ count: bigint }>>(Prisma.sql`
+    SELECT COUNT(*) AS "count"
+    FROM "ManagedFile"
+    WHERE "projectId" = ${projectId}
+      AND "deletedAt" IS NULL
+      ${sourcePredicate}
+      ${sessionPredicate}
+      AND ${filenameContainsPredicate(Prisma.sql`"displayName"`, search)}
+  `)
+  return toSafeCount(rows[0]?.count ?? 0n, 'search result count')
+}
+
+// The global-search projection is intentionally Artifact-only. Keep its predicate and keyset local
+// instead of widening listFiles' collections, whose cursor contract serves the Files surface.
+const listMatchingArtifacts = async (
+  client: ProjectFilesClient,
+  projectId: string,
+  search: NormalizedSearch | undefined,
+  cursor: SearchArtifactCursor | undefined,
+  limit: number
+): Promise<ManagedFile[]> => {
+  const filenamePredicate = search
+    ? Prisma.sql`AND ${filenameContainsPredicate(Prisma.sql`"displayName"`, search)}`
+    : Prisma.empty
+  const cursorPredicate = cursor
+    ? Prisma.sql`AND ("sortAtMs" < ${BigInt(cursor.sortAtMs)} OR ("sortAtMs" = ${BigInt(cursor.sortAtMs)} AND "seq" < ${cursor.seq}))`
+    : Prisma.empty
+
+  return client.$queryRaw<ManagedFile[]>(Prisma.sql`
+    SELECT
+      "seq", "source", "sourceFileId", "sourceVersionId", "checksum",
+      "projectId", "sessionId", "messageId",
+      "displayName", "storageKey", "mimeType", "sizeBytes", "mtimeMs", "sortAtMs",
+      "createdAt", "updatedAt", "deletedAt", "deleteOperationId"
+    FROM "ManagedFile"
+    WHERE "projectId" = ${projectId}
+      AND "source" = 'artifact'
+      AND "deletedAt" IS NULL
+      ${filenamePredicate}
+      ${cursorPredicate}
+    ORDER BY "sortAtMs" DESC, "seq" DESC
+    LIMIT ${limit + 1}
+  `)
+}
+
+const countMatchingArtifacts = async (
+  client: ProjectFilesClient,
+  projectId: string,
+  search: NormalizedSearch | undefined
+): Promise<number> => {
+  const filenamePredicate = search
+    ? Prisma.sql`AND ${filenameContainsPredicate(Prisma.sql`"displayName"`, search)}`
+    : Prisma.empty
+  const rows = await client.$queryRaw<Array<{ count: bigint }>>(Prisma.sql`
+    SELECT COUNT(*) AS "count"
+    FROM "ManagedFile"
+    WHERE "projectId" = ${projectId}
+      AND "source" = 'artifact'
+      AND "deletedAt" IS NULL
+      ${filenamePredicate}
+  `)
+  return toSafeCount(rows[0]?.count ?? 0n, 'artifact search result count')
+}
+
+const listOtherProjectArtifacts = async (
+  client: ProjectFilesClient,
+  projectIds: string[],
+  search: NormalizedSearch | undefined
+): Promise<ManagedFile[]> => {
+  const filenamePredicate = search
+    ? Prisma.sql`AND ${filenameContainsPredicate(Prisma.sql`"displayName"`, search)}`
+    : Prisma.empty
+
+  return client.$queryRaw<ManagedFile[]>(Prisma.sql`
+    SELECT
+      "seq", "source", "sourceFileId", "sourceVersionId", "checksum",
+      "projectId", "sessionId", "messageId",
+      "displayName", "storageKey", "mimeType", "sizeBytes", "mtimeMs", "sortAtMs",
+      "createdAt", "updatedAt", "deletedAt", "deleteOperationId"
+    FROM "ManagedFile"
+    WHERE "projectId" IN (${Prisma.join(projectIds)})
+      AND "source" = 'artifact'
+      AND "deletedAt" IS NULL
+      ${filenamePredicate}
+    ORDER BY "sortAtMs" DESC, "seq" DESC
+    LIMIT 1
+  `)
+}
+
+// Counts only session groups that still own at least one active artifact matching the search.
+const countMatchingArtifactGroups = async (
+  client: ProjectFilesClient,
+  projectId: string,
+  search: NormalizedSearch
+): Promise<number> => {
+  const rows = await client.$queryRaw<Array<{ count: bigint }>>(Prisma.sql`
+    SELECT COUNT(DISTINCT sync."sessionId") AS "count"
+    FROM "ManagedFileSessionSync" AS sync
+    INNER JOIN "ManagedFile" AS file
+      ON file."projectId" = sync."projectId" AND file."sessionId" = sync."sessionId"
+    WHERE sync."projectId" = ${projectId}
+      AND sync."deletedAt" IS NULL
+      AND file."source" = 'artifact'
+      AND file."deletedAt" IS NULL
+      AND ${filenameContainsPredicate(Prisma.sql`file."displayName"`, search)}
+  `)
+  return toSafeCount(rows[0]?.count ?? 0n, 'artifact group count')
+}
+
+// Applies the group-header keyset after filtering artifacts, preserving independent pagination for
+// session headers while returning per-group match counts instead of catalog artifact counts.
+const listMatchingArtifactGroups = async (
+  client: ProjectFilesClient,
+  projectId: string,
+  search: NormalizedSearch,
+  cursor: GroupCursor | undefined,
+  limit: number
+): Promise<[SearchArtifactGroupRow[], number]> => {
+  const cursorPredicate = cursor
+    ? Prisma.sql`AND (sync."groupSortAtMs" < ${BigInt(cursor.groupSortAtMs)} OR (sync."groupSortAtMs" = ${BigInt(cursor.groupSortAtMs)} AND sync."sessionId" < ${cursor.sessionId}))`
+    : Prisma.empty
+  return Promise.all([
+    client.$queryRaw<SearchArtifactGroupRow[]>(Prisma.sql`
+      SELECT
+        sync."sessionId" AS "sessionId",
+        sync."groupSortAtMs" AS "groupSortAtMs",
+        COUNT(file."seq") AS "artifactCount"
+      FROM "ManagedFileSessionSync" AS sync
+      INNER JOIN "ManagedFile" AS file
+        ON file."projectId" = sync."projectId" AND file."sessionId" = sync."sessionId"
+      WHERE sync."projectId" = ${projectId}
+        AND sync."deletedAt" IS NULL
+        AND file."source" = 'artifact'
+        AND file."deletedAt" IS NULL
+        AND ${filenameContainsPredicate(Prisma.sql`file."displayName"`, search)}
+        ${cursorPredicate}
+      GROUP BY sync."sessionId", sync."groupSortAtMs"
+      ORDER BY sync."groupSortAtMs" DESC, sync."sessionId" DESC
+      LIMIT ${limit + 1}
+    `),
+    countMatchingArtifactGroups(client, projectId, search)
+  ])
 }
 
 const sessionKey = (projectId: string, sessionId: string): string => `${projectId}:${sessionId}`
@@ -743,6 +1505,8 @@ const sessionKey = (projectId: string, sessionId: string): string => `${projectI
 const getFileProjectionKey = (file: ManagedFile | IndexedFileInput): string =>
   JSON.stringify([
     file.sourceFileId,
+    file.sourceVersionId ?? null,
+    file.checksum ?? null,
     file.messageId ?? null,
     file.displayName,
     file.storageKey,
@@ -807,12 +1571,21 @@ const isPathInsideRoot = (root: string, filePath: string): boolean => {
 const isPendingArtifactPath = (path: string): boolean =>
   path.split(/[\\/]+/).includes(PENDING_ARTIFACT_DIR)
 
+const getLegacyUploadStorageSessionId = (storageKey: string): string | undefined => {
+  const segments = storageKey.split('/')
+  return segments[0] === UPLOADS_DIR &&
+    segments[1] === DEFAULT_UPLOAD_PROJECT_NAME &&
+    segments.length >= 4
+    ? segments[2]
+    : undefined
+}
+
 const describeError = (error: unknown): string =>
   error instanceof Error ? error.message : String(error)
 
 // Cursors are opaque transport tokens, not security credentials; decoders below provide the required
 // collection and shape validation before any value reaches Prisma.
-const encodeCursor = (cursor: FileCursor | GroupCursor): string =>
+const encodeCursor = (cursor: FileCursor | GroupCursor | SearchArtifactCursor): string =>
   Buffer.from(JSON.stringify(cursor), 'utf8').toString('base64url')
 
 const parseCursor = (cursor: string): unknown => {
@@ -829,13 +1602,15 @@ const decodeFileCursor = (cursor: string, request: ListProjectFilesRequest): Fil
   const value = parseCursor(cursor)
   const expectedSessionId =
     request.collection.kind === 'sessionArtifacts' ? request.collection.sessionId : undefined
+  const expectedQueryKey = normalizeSearch(request.search)?.queryKey ?? ''
 
   if (
     !isRecord(value) ||
-    value.version !== 1 ||
+    value.version !== 2 ||
     value.kind !== request.collection.kind ||
     value.projectId !== request.projectId ||
     value.sessionId !== expectedSessionId ||
+    typeof value.queryKey !== 'string' ||
     typeof value.sortAtMs !== 'string' ||
     !/^-?\d+$/.test(value.sortAtMs) ||
     typeof value.seq !== 'number' ||
@@ -843,26 +1618,62 @@ const decodeFileCursor = (cursor: string, request: ListProjectFilesRequest): Fil
   ) {
     throw new Error('Project files cursor does not match the requested collection.')
   }
+  if (value.queryKey !== expectedQueryKey) {
+    throw new Error('Project files cursor does not match the requested search.')
+  }
 
   return value as FileCursor
 }
 
 const decodeGroupCursor = (cursor: string, request: ListArtifactGroupsRequest): GroupCursor => {
   const value = parseCursor(cursor)
+  const expectedQueryKey = normalizeSearch(request.search)?.queryKey ?? ''
 
   if (
     !isRecord(value) ||
-    value.version !== 1 ||
+    value.version !== 2 ||
     value.kind !== 'artifactGroups' ||
     value.projectId !== request.projectId ||
+    typeof value.queryKey !== 'string' ||
     typeof value.groupSortAtMs !== 'string' ||
     !/^-?\d+$/.test(value.groupSortAtMs) ||
     typeof value.sessionId !== 'string'
   ) {
     throw new Error('Project files cursor does not match the requested collection.')
   }
+  if (value.queryKey !== expectedQueryKey) {
+    throw new Error('Project files cursor does not match the requested search.')
+  }
 
   return value as GroupCursor
+}
+
+const decodeSearchArtifactCursor = (
+  cursor: string,
+  primaryProjectId: string,
+  search: NormalizedSearch | undefined
+): SearchArtifactCursor => {
+  const value = parseCursor(cursor)
+  const expectedQueryKey = search?.queryKey ?? ''
+
+  if (
+    !isRecord(value) ||
+    value.version !== 2 ||
+    value.kind !== 'globalArtifacts' ||
+    value.primaryProjectId !== primaryProjectId ||
+    typeof value.queryKey !== 'string' ||
+    typeof value.sortAtMs !== 'string' ||
+    !/^-?\d+$/.test(value.sortAtMs) ||
+    typeof value.seq !== 'number' ||
+    !Number.isInteger(value.seq)
+  ) {
+    throw new Error('Project files cursor does not match the global artifact search.')
+  }
+  if (value.queryKey !== expectedQueryKey) {
+    throw new Error('Project files cursor does not match the requested search.')
+  }
+
+  return value as SearchArtifactCursor
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -874,21 +1685,59 @@ const toSafeNumber = (value: bigint, field: string): number => {
   return number
 }
 
-// Reconstructs an absolute managed path only after a storageKey has been produced by trusted indexing.
-// Bigint fields are range-checked before crossing Electron IPC, which serializes the numeric DTO.
-const toProjectFileItem = (row: ManagedFile, dataRoot: string): ProjectFileItem => ({
+// Raw SQL aggregates may be bigint or number depending on the SQLite expression and test adapter.
+const toSafeCount = (value: bigint | number, field: string): number =>
+  typeof value === 'number' ? value : toSafeNumber(value, field)
+
+// Carries durable source-session metadata independently from the live renderer session store.
+const toOriginProjection = (
+  origin: FileOriginSession | undefined
+): { originSession?: ProjectFileOriginSession } =>
+  origin
+    ? {
+        originSession: {
+          state: origin.state as ProjectFileOriginSession['state'],
+          ...(origin.titleSnapshot ? { title: origin.titleSnapshot } : {}),
+          ...(origin.deletedAt ? { deletedAt: origin.deletedAt.toISOString() } : {})
+        }
+      }
+    : {}
+
+// Reconstructs an absolute managed path only after trusted indexing produced the storageKey. Bigint
+// fields are range-checked here before the renderer-visible DTO crosses Electron IPC.
+const toProjectFileItem = (
+  row: ManagedFile,
+  dataRoot: string,
+  origin?: FileOriginSession
+): ProjectFileItem => ({
   id: row.source === 'upload' ? `upload:${row.sourceFileId}` : row.sourceFileId,
   source: row.source as ProjectFileSource,
   sourceFileId: row.sourceFileId,
+  sourceVersionId: row.sourceVersionId ?? undefined,
+  checksum: row.checksum ?? undefined,
   projectId: row.projectId,
   sessionId: row.sessionId,
   messageId: row.messageId ?? undefined,
   name: row.displayName,
-  path: join(dataRoot, ...row.storageKey.split('/')),
+  path:
+    row.source === 'upload' && row.sourceVersionId
+      ? createUploadVersionReference(row.sourceVersionId, {
+          projectId: row.projectId,
+          sessionId: row.sessionId
+        })
+      : row.source === 'artifact' && row.sourceVersionId
+        ? createArtifactVersionLocator({
+            projectId: row.projectId,
+            appSessionId: row.sessionId,
+            artifactId: row.sourceFileId,
+            versionId: row.sourceVersionId
+          })
+        : join(dataRoot, ...row.storageKey.split('/')),
   mimeType: row.mimeType ?? undefined,
   size: toSafeNumber(row.sizeBytes, 'size'),
   mtimeMs: row.mtimeMs === null ? undefined : toSafeNumber(row.mtimeMs, 'mtime'),
-  sortAtMs: toSafeNumber(row.sortAtMs, 'sort time')
+  sortAtMs: toSafeNumber(row.sortAtMs, 'sort time'),
+  ...toOriginProjection(origin)
 })
 
 export { createManagedFileIndexRepository, ManagedFileIndexRepository }

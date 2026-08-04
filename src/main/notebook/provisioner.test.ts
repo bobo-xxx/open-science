@@ -8,8 +8,10 @@ import {
   DEFAULT_ENV_VERSION,
   DEFAULT_PY_ENV,
   DEFAULT_R_ENV,
+  envDirectoryName,
   envPrefix,
   legacyDefaultEnvPrefix,
+  logicalEnvNameFromDirectory,
   pkgsCache,
   pythonBin,
   rBin,
@@ -32,7 +34,7 @@ import {
 } from './provisioner'
 import { CHILD_UNCONFIRMED } from './provisioner-runtime'
 import { envsLockDir } from './runtime-relocation'
-import { serializeProvisioner } from './env-ipc'
+import { serializeProvisioner } from './environment-operation-foundation'
 import { withExclusiveCacheLock, withSharedCacheLock } from './pkgs-cache-lock'
 import { micromambaCacheLockKey, selectMicromambaCache } from './micromamba-cache'
 import {
@@ -44,6 +46,13 @@ import {
 } from './operation-journal'
 
 const makeRoot = (): string => mkdtempSync(join(tmpdir(), 'os-prov-'))
+const logicalNameForPrefix = (prefix: string): string =>
+  logicalEnvNameFromDirectory(basename(prefix))
+const expectedMarker = (name: string, preparedAt: string): Record<string, string | number> => ({
+  defaultEnvVersion: DEFAULT_ENV_VERSION,
+  preparedAt,
+  ...(process.platform === 'win32' ? { prefixDirectory: envDirectoryName(name) } : {})
+})
 
 // Builds injected deps whose create "materializes" the interpreter file so verify passes.
 const makeDeps = (root: string, overrides: Partial<ProvisionerDeps> = {}): ProvisionerDeps => {
@@ -80,7 +89,7 @@ describe('DefaultRuntimeProvisioner.provisionPython', () => {
     await provisioner.provisionPython((p) => events.push(p))
 
     const marker = readReadyMarker(root)
-    expect(marker).toEqual({ defaultEnvVersion: DEFAULT_ENV_VERSION, preparedAt: 't-now' })
+    expect(marker).toEqual(expectedMarker(DEFAULT_PY_ENV, 't-now'))
     expect(events.at(-1)).toMatchObject({ phase: 'done', progress: 1 })
     const progresses = events.map((e) => e.progress)
     for (let i = 1; i < progresses.length; i++)
@@ -113,7 +122,8 @@ describe('DefaultRuntimeProvisioner.provisionPython', () => {
         new Promise<void>((resolve) => {
           // Materialize the interpreter now so verify passes once we let the create resolve.
           const prefix = argv[argv.findIndex((a) => a === '-p' || a === '--prefix') + 1]
-          const bin = prefix.endsWith(DEFAULT_PY_ENV) ? pythonBin(prefix) : rBin(prefix)
+          const bin =
+            logicalNameForPrefix(prefix) === DEFAULT_PY_ENV ? pythonBin(prefix) : rBin(prefix)
           mkdirSync(join(bin, '..'), { recursive: true })
           writeFileSync(bin, 'x')
           resolveCreate = resolve
@@ -662,6 +672,52 @@ describe('DefaultRuntimeProvisioner.provisionPython', () => {
     expect(creates).toBe(2)
   })
 
+  it('retains BOTH full micromamba tails on MaxPathRetryError.data when the errors are runMicromamba-style', async () => {
+    // runMicromamba now caps Error.message to a short excerpt and keeps the full tails on error.data.
+    // The MAX_PATH retry wrapper composes its message from the two short .message excerpts, so without
+    // capturing error.data it would lose both full outputs — the exact post-mortem this PR preserves.
+    const root = makeRoot()
+    const cache = pkgsCache(root)
+    const leaf = 'broken-package-1.0-0'
+    const packageDir = join(cache, 'https', 'host', 'channel', 'noarch', leaf)
+    mkdirSync(packageDir, { recursive: true })
+    const missing = join(packageDir, 'Library', 'x'.repeat(280))
+    let creates = 0
+    const provisioner = new DefaultRuntimeProvisioner(
+      makeDeps(root, {
+        platform: 'win32',
+        cache: { path: cache, lockKey: cache },
+        fetchBundle: async (): Promise<FetchedBundle> => ({
+          lockPath: join(root, 'p.lock'),
+          pathBudget: { maxCacheRelativePath: 1, maxEnvRelativePath: 1 }
+        }),
+        runArgv: async () => {
+          creates += 1
+          // Both spawns fail runMicromamba-style: short message excerpt, full tail only on `data`.
+          const stderrTail =
+            creates === 1
+              ? `Invalid package cache, file '${missing}' is missing for '${leaf}.conda'; Package cache error`
+              : 'ORIGINAL_FULL_TAIL_MARKER: a different disk error with lots of detail'
+          throw Object.assign(new Error(`micromamba failed (exit 1; mm create): …short-excerpt`), {
+            code: 'MICROMAMBA_EXIT',
+            data: { argv: ['mm', 'create'], exitCode: 1, stderrTail }
+          })
+        }
+      })
+    )
+
+    const failure = provisioner.provisionPython(() => {}).catch((error: unknown) => error)
+    const error = (await failure) as Error & {
+      data?: { originalDiagnostics?: string; retryDiagnostics?: string }
+    }
+    expect(error.name).toBe('MaxPathRetryError')
+    // The full tails of BOTH the original failure and the retry survive on the structured data.
+    expect(error.data?.originalDiagnostics).toContain('Invalid package cache')
+    expect(error.data?.originalDiagnostics).toContain(missing)
+    expect(error.data?.retryDiagnostics).toContain('ORIGINAL_FULL_TAIL_MARKER')
+    expect(creates).toBe(2)
+  })
+
   it('wires the spawned micromamba child pid into the materialize journal, then clears it on completion', async () => {
     const root = makeRoot()
     const prefix = envPrefix(root, DEFAULT_PY_ENV)
@@ -827,7 +883,7 @@ describe('serializeProvisioner cancel over a real queue', () => {
     const deps = makeDeps(root, {
       runArgv: (argv: string[]) => {
         const prefix = argv[argv.findIndex((a) => a === '-p' || a === '--prefix') + 1]
-        if (prefix.endsWith(DEFAULT_R_ENV)) {
+        if (logicalNameForPrefix(prefix) === DEFAULT_R_ENV) {
           rRunArgv()
           const bin = rBin(prefix)
           mkdirSync(join(bin, '..'), { recursive: true })
@@ -863,8 +919,9 @@ describe('serializeProvisioner cancel over a real queue', () => {
     const deps = makeDeps(root, {
       runArgv: async (argv: string[]) => {
         const prefix = argv[argv.findIndex((a) => a === '-p' || a === '--prefix') + 1]
-        if (prefix.endsWith(DEFAULT_R_ENV)) rRunArgv()
-        const bin = prefix.endsWith(DEFAULT_R_ENV) ? rBin(prefix) : pythonBin(prefix)
+        if (logicalNameForPrefix(prefix) === DEFAULT_R_ENV) rRunArgv()
+        const bin =
+          logicalNameForPrefix(prefix) === DEFAULT_R_ENV ? rBin(prefix) : pythonBin(prefix)
         mkdirSync(join(bin, '..'), { recursive: true })
         writeFileSync(bin, 'x')
       }
@@ -1200,8 +1257,9 @@ describe('DefaultRuntimeProvisioner.upgradeIfNeeded (shared pkgs cache lock)', (
     const deps = makeDeps(root, {
       runArgv: async (argv) => {
         const prefix = argv[argv.findIndex((a) => a === '-p' || a === '--prefix') + 1]
-        upgraded.push(basename(prefix))
-        const bin = prefix.endsWith(DEFAULT_PY_ENV) ? pythonBin(prefix) : rBin(prefix)
+        upgraded.push(logicalNameForPrefix(prefix))
+        const bin =
+          logicalNameForPrefix(prefix) === DEFAULT_PY_ENV ? pythonBin(prefix) : rBin(prefix)
         mkdirSync(join(bin, '..'), { recursive: true })
         writeFileSync(bin, 'x')
       },
@@ -1234,7 +1292,7 @@ describe('DefaultRuntimeProvisioner journals every prefix write', () => {
         expect(found?.childPid).toBe(pid)
         capture(found as RuntimeOperationRecord)
       })
-      const bin = prefix.endsWith(DEFAULT_R_ENV) ? rBin(prefix) : pythonBin(prefix)
+      const bin = logicalNameForPrefix(prefix) === DEFAULT_R_ENV ? rBin(prefix) : pythonBin(prefix)
       mkdirSync(join(bin, '..'), { recursive: true })
       writeFileSync(bin, 'x')
     }
@@ -1466,7 +1524,8 @@ describe('DefaultRuntimeProvisioner.restoreRelocatedEnvs', () => {
         argvs.push(argv)
         const pIdx = argv.findIndex((a) => a === '-p' || a === '--prefix')
         const prefix = argv[pIdx + 1]
-        const bin = prefix.endsWith(DEFAULT_PY_ENV) ? pythonBin(prefix) : rBin(prefix)
+        const bin =
+          logicalNameForPrefix(prefix) === DEFAULT_PY_ENV ? pythonBin(prefix) : rBin(prefix)
         mkdirSync(join(bin, '..'), { recursive: true })
         writeFileSync(bin, 'x')
       }
@@ -1496,8 +1555,9 @@ describe('DefaultRuntimeProvisioner.restoreRelocatedEnvs', () => {
     const deps = makeDeps(root, {
       runArgv: async (argv) => {
         const prefix = argv[argv.findIndex((a) => a === '-p' || a === '--prefix') + 1]
-        order.push(basename(prefix))
-        const bin = prefix.endsWith(DEFAULT_PY_ENV) ? pythonBin(prefix) : rBin(prefix)
+        order.push(logicalNameForPrefix(prefix))
+        const bin =
+          logicalNameForPrefix(prefix) === DEFAULT_PY_ENV ? pythonBin(prefix) : rBin(prefix)
         mkdirSync(join(bin, '..'), { recursive: true })
         writeFileSync(bin, 'x')
       }
@@ -2350,8 +2410,9 @@ describe('DefaultRuntimeProvisioner prefix-block self-guard (startup gate path)'
     const deps = blocking(root, envPrefix(root, 'my-analysis'), {
       runArgv: async (argv) => {
         const prefix = argv[argv.findIndex((a) => a === '-p' || a === '--prefix') + 1]
-        restored.push(basename(prefix))
-        const bin = prefix.endsWith(DEFAULT_PY_ENV) ? pythonBin(prefix) : rBin(prefix)
+        restored.push(logicalNameForPrefix(prefix))
+        const bin =
+          logicalNameForPrefix(prefix) === DEFAULT_PY_ENV ? pythonBin(prefix) : rBin(prefix)
         mkdirSync(join(bin, '..'), { recursive: true })
         writeFileSync(bin, 'x')
       }

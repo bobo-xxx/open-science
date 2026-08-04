@@ -4,14 +4,46 @@ import {
   CLOSE_ACTIVE_PANE_CHANNEL,
   CLOSE_ACTIVE_PANE_READY_CHANNEL,
   CLOSE_ACTIVE_PANE_UNREADY_CHANNEL,
+  WINDOW_FIND_READY_CHANNEL,
+  WINDOW_FIND_UNREADY_CHANNEL,
+  WINDOW_FIND_APPEARANCE_CHANGED_CHANNEL,
   type KeyChordInput
 } from '../shared/window-controls'
 
 // Hoisted so the electron mock and the test body share the same spies.
-const { openExternalMock, ipcMainOnMock, ipcMainRemoveListenerMock } = vi.hoisted(() => ({
-  openExternalMock: vi.fn(),
-  ipcMainOnMock: vi.fn(),
-  ipcMainRemoveListenerMock: vi.fn()
+const { openExternalMock, ipcMainOnMock, ipcMainRemoveListenerMock, showMessageBoxMock } =
+  vi.hoisted(() => ({
+    openExternalMock: vi.fn(),
+    ipcMainOnMock: vi.fn(),
+    ipcMainRemoveListenerMock: vi.fn(),
+    showMessageBoxMock: vi.fn()
+  }))
+
+const { windowLogSpies } = vi.hoisted(() => ({
+  windowLogSpies: {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn()
+  }
+}))
+
+vi.mock('./logger', () => ({
+  createLogger: () => windowLogSpies
+}))
+
+// The overlay manager is a collaborator with its own deep test suite; here we only need to observe
+// that the chord/Escape wiring drives it, so the real module is replaced with a spy object.
+const { findOverlayMock } = vi.hoisted(() => ({
+  findOverlayMock: {
+    open: vi.fn(),
+    close: vi.fn(),
+    destroy: vi.fn(),
+    updateAppearance: vi.fn(),
+    isOpen: vi.fn(() => false)
+  }
+}))
+vi.mock('./find-overlay', () => ({
+  createFindOverlayManager: () => findOverlayMock
 }))
 
 // Captured window-open handler so tests can drive it directly, mirroring how Electron invokes it on a
@@ -31,6 +63,8 @@ let lastWindow: FakeBrowserWindow | undefined
 
 class FakeBrowserWindow {
   closeMock = vi.fn()
+  destroyMock = vi.fn()
+  loadFileMock = vi.fn(() => Promise.resolve())
   sendMock = vi.fn()
   webContentsHandlers = new Map<string, WebContentsHandler>()
   handlers = new Map<string, Array<(event: CloseEvent) => void>>()
@@ -69,6 +103,11 @@ class FakeBrowserWindow {
     if (!event.defaultPrevented) this.destroyed = true
   }
 
+  destroy(): void {
+    this.destroyMock()
+    this.destroyed = true
+  }
+
   show(): void {
     this.hidden = false
   }
@@ -87,13 +126,13 @@ class FakeBrowserWindow {
   }
 
   loadFile(): Promise<void> {
-    return Promise.resolve()
+    return this.loadFileMock()
   }
 }
 
 vi.mock('electron', () => ({
   // isPackaged=true skips the dev title-suffix branch, keeping the fake focused on the open + close handlers.
-  app: { isPackaged: true },
+  app: { isPackaged: true, getAppPath: () => '/app' },
   BrowserWindow: class {
     constructor() {
       currentWindow = new FakeBrowserWindow()
@@ -101,6 +140,8 @@ vi.mock('electron', () => ({
       return currentWindow as unknown as object
     }
   },
+  WebContentsView: class {},
+  dialog: { showMessageBox: showMessageBoxMock },
   ipcMain: { on: ipcMainOnMock, removeListener: ipcMainRemoveListenerMock },
   shell: { openExternal: openExternalMock }
 }))
@@ -116,6 +157,17 @@ const { createMainWindow } = await import('./windows')
 const closeChord = (overrides: Partial<KeyChordInput> = {}): KeyChordInput => ({
   type: 'keyDown',
   key: 'w',
+  control: process.platform !== 'darwin',
+  meta: process.platform === 'darwin',
+  alt: false,
+  shift: false,
+  isAutoRepeat: false,
+  ...overrides
+})
+
+const findChord = (overrides: Partial<KeyChordInput> = {}): KeyChordInput => ({
+  type: 'keyDown',
+  key: 'f',
   control: process.platform !== 'darwin',
   meta: process.platform === 'darwin',
   alt: false,
@@ -162,6 +214,12 @@ describe('window navigation policy', () => {
     expect(policy).toBeDefined()
     expect(
       policy?.isAllowedFrameNavigation('open-science-preview://resource/report.html', false)
+    ).toBe(true)
+    expect(
+      policy?.isAllowedFrameNavigation(
+        'open-science-office-preview://runtime/office-preview.html?sessionId=session-1',
+        false
+      )
     ).toBe(true)
     expect(policy?.isAllowedFrameNavigation('https://example.com/exfiltrate', false)).toBe(false)
     expect(
@@ -220,6 +278,16 @@ describe('close chord interception', () => {
     currentWindow = undefined
     ipcMainOnMock.mockReset()
     ipcMainRemoveListenerMock.mockReset()
+    findOverlayMock.open.mockClear()
+    findOverlayMock.close.mockClear()
+    findOverlayMock.destroy.mockClear()
+    findOverlayMock.updateAppearance.mockClear()
+    findOverlayMock.isOpen.mockReturnValue(false)
+    windowLogSpies.info.mockClear()
+    windowLogSpies.warn.mockClear()
+    windowLogSpies.error.mockClear()
+    showMessageBoxMock.mockReset()
+    showMessageBoxMock.mockResolvedValue({ response: 0 })
   })
 
   // Fires an ipcMain handshake signal that main registered via ipcMain.on, spoofing the sender as this
@@ -231,11 +299,25 @@ describe('close chord interception', () => {
     handler!({ sender: window.webContents })
   }
 
+  const fireAppearance = (sender: unknown, appearance: unknown): void => {
+    const handler = ipcMainOnMock.mock.calls.find(
+      ([registered]) => registered === WINDOW_FIND_APPEARANCE_CHANGED_CHANNEL
+    )?.[1] as ((event: { sender: unknown }, payload: unknown) => void) | undefined
+    expect(handler).toBeDefined()
+    handler!({ sender }, appearance)
+  }
+
   const signalRendererReady = (window: FakeBrowserWindow): void =>
     fireHandshake(window, CLOSE_ACTIVE_PANE_READY_CHANNEL)
 
   const signalRendererGone = (window: FakeBrowserWindow): void =>
     fireHandshake(window, CLOSE_ACTIVE_PANE_UNREADY_CHANNEL)
+
+  const signalWindowFindReady = (window: FakeBrowserWindow): void =>
+    fireHandshake(window, WINDOW_FIND_READY_CHANNEL)
+
+  const signalWindowFindGone = (window: FakeBrowserWindow): void =>
+    fireHandshake(window, WINDOW_FIND_UNREADY_CHANNEL)
 
   // Drives one of the captured webContents lifecycle handlers (render-process-gone, unresponsive, ...).
   const fireWebContentsEvent = (
@@ -283,6 +365,89 @@ describe('close chord interception', () => {
     expect(window.closeMock).not.toHaveBeenCalled()
   })
 
+  it('opens the find overlay only after the Workspace listener is ready', () => {
+    createMainWindow()
+    const window = currentWindow!
+
+    signalWindowFindReady(window)
+    const preventDefault = fireInput(window, findChord())
+
+    expect(preventDefault).toHaveBeenCalled()
+    expect(findOverlayMock.open).toHaveBeenCalledTimes(1)
+    // The overlay is opened directly in main now; no OPEN message is sent to the renderer.
+    expect(window.sendMock).not.toHaveBeenCalled()
+    expect(window.closeMock).not.toHaveBeenCalled()
+  })
+
+  it('forwards valid theme changes from this renderer to the overlay manager', () => {
+    createMainWindow()
+    const window = currentWindow!
+    const appearance = { theme: 'dark', followsSystem: false }
+
+    fireAppearance(window.webContents, appearance)
+
+    expect(findOverlayMock.updateAppearance).toHaveBeenCalledWith(appearance)
+  })
+
+  it('rejects malformed theme changes and messages from another renderer', () => {
+    createMainWindow()
+    const window = currentWindow!
+
+    fireAppearance(window.webContents, { theme: 'sepia', followsSystem: false })
+    fireAppearance({}, { theme: 'dark', followsSystem: false })
+
+    expect(findOverlayMock.updateAppearance).not.toHaveBeenCalled()
+  })
+
+  it('unregisters the window-scoped theme listener with the same handler on close', () => {
+    createMainWindow()
+    const window = currentWindow!
+    const registeredHandler = ipcMainOnMock.mock.calls.find(
+      ([registered]) => registered === WINDOW_FIND_APPEARANCE_CHANGED_CHANNEL
+    )?.[1]
+    const closedHandler = window.handlers.get('closed')?.[0]
+
+    expect(registeredHandler).toBeDefined()
+    expect(closedHandler).toBeDefined()
+    closedHandler!({ preventDefault: vi.fn(), defaultPrevented: false })
+
+    expect(ipcMainRemoveListenerMock).toHaveBeenCalledWith(
+      WINDOW_FIND_APPEARANCE_CHANGED_CHANNEL,
+      registeredHandler
+    )
+  })
+
+  it('closes the find overlay when the searchable Workspace unmounts', () => {
+    createMainWindow()
+    const window = currentWindow!
+    signalWindowFindReady(window)
+    fireInput(window, findChord())
+    findOverlayMock.close.mockClear()
+
+    signalWindowFindGone(window)
+
+    expect(findOverlayMock.close).toHaveBeenCalledTimes(1)
+  })
+
+  it('closes the find overlay on Escape while it is open, regardless of input focus', () => {
+    createMainWindow()
+    const window = currentWindow!
+    findOverlayMock.isOpen.mockReturnValue(true)
+
+    const preventDefault = fireInput(window, {
+      type: 'keyDown',
+      key: 'Escape',
+      control: false,
+      meta: false,
+      alt: false,
+      shift: false,
+      isAutoRepeat: false
+    })
+
+    expect(preventDefault).toHaveBeenCalled()
+    expect(findOverlayMock.close).toHaveBeenCalledTimes(1)
+  })
+
   it('re-arms the direct-close fallback after a top-level navigation clears renderer readiness', () => {
     createMainWindow()
     const window = currentWindow!
@@ -295,6 +460,18 @@ describe('close chord interception', () => {
 
     expect(window.closeMock).toHaveBeenCalledTimes(1)
     expect(window.sendMock).not.toHaveBeenCalled()
+  })
+
+  it('closes the find overlay before a top-level document navigation', () => {
+    createMainWindow()
+    const window = currentWindow!
+    signalWindowFindReady(window)
+    fireInput(window, findChord())
+    findOverlayMock.close.mockClear()
+
+    fireWebContentsEvent(window, 'did-start-navigation', mainFrameNavigation)
+
+    expect(findOverlayMock.close).toHaveBeenCalledTimes(1)
   })
 
   it('keeps forwarding when a subframe or same-document navigation fires', () => {
@@ -339,12 +516,200 @@ describe('close chord interception', () => {
 
     signalRendererReady(window)
     // The renderer crashed; its listener died with the process until a fresh one re-handshakes.
-    fireWebContentsEvent(window, 'render-process-gone')
+    fireWebContentsEvent(window, 'render-process-gone', {}, { reason: 'crashed', exitCode: 1 })
 
     fireInput(window, closeChord())
 
     expect(window.closeMock).toHaveBeenCalledTimes(1)
     expect(window.sendMock).not.toHaveBeenCalled()
+  })
+
+  it('records why the renderer process terminated', () => {
+    createMainWindow()
+    const window = currentWindow!
+
+    fireWebContentsEvent(window, 'render-process-gone', {}, { reason: 'crashed', exitCode: 139 })
+
+    expect(windowLogSpies.error).toHaveBeenCalledWith('renderer process gone', {
+      reason: 'crashed',
+      exitCode: 139,
+      wasUnresponsive: false
+    })
+  })
+
+  it('records a main-frame load failure without logging its URL', () => {
+    createMainWindow()
+    const window = currentWindow!
+
+    fireWebContentsEvent(
+      window,
+      'did-fail-load',
+      {},
+      -105,
+      'NAME_NOT_RESOLVED',
+      'file:///private/session-content/index.html',
+      true
+    )
+
+    expect(windowLogSpies.error).toHaveBeenCalledWith('renderer document failed to load', {
+      errorCode: -105,
+      errorDescription: 'NAME_NOT_RESOLVED'
+    })
+    expect(JSON.stringify(windowLogSpies.error.mock.calls)).not.toContain('session-content')
+  })
+
+  it('records a preload failure without logging its path or error text', () => {
+    createMainWindow()
+    const window = currentWindow!
+
+    fireWebContentsEvent(
+      window,
+      'preload-error',
+      {},
+      'C:\\Users\\person\\private-preload.js',
+      new Error('secret from local data')
+    )
+
+    expect(windowLogSpies.error).toHaveBeenCalledWith('renderer preload failed', {
+      errorName: 'Error'
+    })
+    expect(JSON.stringify(windowLogSpies.error.mock.calls)).not.toContain('private-preload')
+    expect(JSON.stringify(windowLogSpies.error.mock.calls)).not.toContain('secret from local data')
+  })
+
+  it('reloads the safe renderer entry after an unexpected renderer exit', () => {
+    createMainWindow()
+    const window = currentWindow!
+    expect(window.loadFileMock).toHaveBeenCalledTimes(1)
+
+    fireWebContentsEvent(window, 'render-process-gone', {}, { reason: 'crashed', exitCode: 139 })
+
+    expect(window.loadFileMock).toHaveBeenCalledTimes(2)
+    expect(windowLogSpies.warn).toHaveBeenCalledWith('reloading renderer after process exit', {
+      reason: 'crashed',
+      automaticRecoveryAttempt: 1
+    })
+  })
+
+  it.each(['clean-exit', 'killed'])('does not reload after an intentional %s', (reason) => {
+    createMainWindow()
+    const window = currentWindow!
+
+    fireWebContentsEvent(window, 'render-process-gone', {}, { reason, exitCode: 0 })
+
+    expect(window.loadFileMock).toHaveBeenCalledTimes(1)
+    expect(showMessageBoxMock).not.toHaveBeenCalled()
+  })
+
+  it('stops automatic reloads and asks before retrying a renderer crash loop', async () => {
+    createMainWindow()
+    const window = currentWindow!
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      fireWebContentsEvent(window, 'render-process-gone', {}, { reason: 'crashed', exitCode: 139 })
+    }
+
+    expect(window.loadFileMock).toHaveBeenCalledTimes(3)
+    expect(showMessageBoxMock).toHaveBeenCalledTimes(1)
+    expect(showMessageBoxMock).toHaveBeenCalledWith(
+      window,
+      expect.objectContaining({
+        type: 'error',
+        buttons: ['Reload', 'Close window'],
+        defaultId: 0,
+        cancelId: 1
+      })
+    )
+    await vi.waitFor(() => expect(window.loadFileMock).toHaveBeenCalledTimes(4))
+  })
+
+  it('destroys the blank window when the user closes a renderer crash-loop prompt', async () => {
+    showMessageBoxMock.mockResolvedValueOnce({ response: 1 })
+    createMainWindow({
+      classifyClose: () => 'hide',
+      resolveCloseAction: vi.fn(),
+      requestQuit: vi.fn()
+    })
+    const window = currentWindow!
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      fireWebContentsEvent(window, 'render-process-gone', {}, { reason: 'oom', exitCode: 5 })
+    }
+
+    await vi.waitFor(() => expect(window.destroyMock).toHaveBeenCalledTimes(1))
+    expect(window.hidden).toBe(false)
+  })
+
+  it('records the known hang duration when an unresponsive renderer terminates', () => {
+    const now = vi.spyOn(Date, 'now')
+    now.mockReturnValueOnce(2_000).mockReturnValueOnce(6_500)
+    try {
+      createMainWindow()
+      const window = currentWindow!
+
+      fireWebContentsEvent(window, 'unresponsive')
+      fireWebContentsEvent(window, 'render-process-gone', {}, { reason: 'oom', exitCode: 5 })
+
+      expect(windowLogSpies.error).toHaveBeenCalledWith('renderer process gone', {
+        reason: 'oom',
+        exitCode: 5,
+        wasUnresponsive: true,
+        unresponsiveDurationMs: 4_500
+      })
+    } finally {
+      now.mockRestore()
+    }
+  })
+
+  it.each([
+    ['close listener', signalRendererReady],
+    ['find listener', signalWindowFindReady]
+  ])('clears stale hang context when the %s READY handshake arrives', (_label, signalReady) => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_000)
+    try {
+      createMainWindow()
+      const window = currentWindow!
+
+      fireWebContentsEvent(window, 'unresponsive')
+      signalReady(window)
+      fireWebContentsEvent(window, 'render-process-gone', {}, { reason: 'crashed', exitCode: 1 })
+
+      expect(windowLogSpies.error).toHaveBeenCalledWith('renderer process gone', {
+        reason: 'crashed',
+        exitCode: 1,
+        wasUnresponsive: false
+      })
+    } finally {
+      now.mockRestore()
+    }
+  })
+
+  it('does not carry unresponsive state into a replacement renderer process', () => {
+    createMainWindow()
+    const window = currentWindow!
+
+    fireWebContentsEvent(window, 'unresponsive')
+    fireWebContentsEvent(window, 'render-process-gone', {}, { reason: 'crashed', exitCode: 1 })
+    windowLogSpies.error.mockClear()
+    fireWebContentsEvent(window, 'render-process-gone', {}, { reason: 'killed', exitCode: 2 })
+
+    expect(windowLogSpies.error).toHaveBeenCalledWith('renderer process gone', {
+      reason: 'killed',
+      exitCode: 2,
+      wasUnresponsive: false
+    })
+  })
+
+  it('closes the find overlay when the renderer process is gone', () => {
+    createMainWindow()
+    const window = currentWindow!
+    signalWindowFindReady(window)
+    fireInput(window, findChord())
+    findOverlayMock.close.mockClear()
+
+    fireWebContentsEvent(window, 'render-process-gone', {}, { reason: 'crashed', exitCode: 1 })
+
+    expect(findOverlayMock.close).toHaveBeenCalledTimes(1)
   })
 
   it('closes directly while the renderer is unresponsive, then forwards again once responsive', () => {
@@ -366,6 +731,45 @@ describe('close chord interception', () => {
     expect(window.closeMock).toHaveBeenCalledTimes(1)
   })
 
+  it('closes the find overlay when the renderer becomes unresponsive', () => {
+    createMainWindow()
+    const window = currentWindow!
+    signalWindowFindReady(window)
+    fireInput(window, findChord())
+    findOverlayMock.close.mockClear()
+
+    fireWebContentsEvent(window, 'unresponsive')
+
+    expect(findOverlayMock.close).toHaveBeenCalledTimes(1)
+  })
+
+  it('records when the renderer becomes unresponsive', () => {
+    createMainWindow()
+    const window = currentWindow!
+
+    fireWebContentsEvent(window, 'unresponsive')
+
+    expect(windowLogSpies.warn).toHaveBeenCalledWith('renderer became unresponsive')
+  })
+
+  it('records renderer recovery with the unresponsive duration', () => {
+    const now = vi.spyOn(Date, 'now')
+    now.mockReturnValueOnce(1_000).mockReturnValueOnce(3_750)
+    try {
+      createMainWindow()
+      const window = currentWindow!
+
+      fireWebContentsEvent(window, 'unresponsive')
+      fireWebContentsEvent(window, 'responsive')
+
+      expect(windowLogSpies.info).toHaveBeenCalledWith('renderer became responsive', {
+        unresponsiveDurationMs: 2_750
+      })
+    } finally {
+      now.mockRestore()
+    }
+  })
+
   it('forwards again after unresponsive -> crash -> reload -> ready, with no responsive event', () => {
     createMainWindow()
     const window = currentWindow!
@@ -375,7 +779,7 @@ describe('close chord interception', () => {
     // process never emits 'responsive' (that is a same-process recovery signal), so READY alone must
     // clear the stale unresponsive state or the chord stays a direct close forever.
     fireWebContentsEvent(window, 'unresponsive')
-    fireWebContentsEvent(window, 'render-process-gone')
+    fireWebContentsEvent(window, 'render-process-gone', {}, { reason: 'crashed', exitCode: 1 })
     fireWebContentsEvent(window, 'did-start-navigation', mainFrameNavigation)
     signalRendererReady(window)
 
@@ -471,6 +875,18 @@ describe('createMainWindow close-to-tray interceptor', () => {
     expect(event.defaultPrevented).toBe(false)
     expect(window.hideCalls).toBe(0)
     expect(window.isDestroyed()).toBe(true)
+  })
+
+  it('requests app quit without destroying the renderer when classifyClose returns "quit"', () => {
+    const requestQuit = vi.fn()
+    createMainWindow({ classifyClose: () => 'quit', resolveCloseAction: vi.fn(), requestQuit })
+    const window = lastWindow!
+
+    const event = emitClose(window)
+
+    expect(event.defaultPrevented).toBe(true)
+    expect(requestQuit).toHaveBeenCalledWith(false)
+    expect(window.isDestroyed()).toBe(false)
   })
 
   it('lets the window close when no options are provided', () => {

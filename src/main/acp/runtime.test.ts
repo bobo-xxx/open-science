@@ -1,28 +1,57 @@
 import * as acp from '@agentclientprotocol/sdk'
 import type {
   ContentBlock,
+  PromptResponse,
   SessionConfigOption,
   SessionModeState,
   SessionNotification
 } from '@agentclientprotocol/sdk'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { PassThrough, Readable, Writable } from 'node:stream'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { AcpRuntime } from './runtime'
-import type { ReasoningEffort } from '../../shared/settings'
+import { AcpPermissionContext } from './permission-context'
+import { ContextUsageTracker, type TokenCounter } from './context-usage-tracker'
+import {
+  ACP_PROMPT_FAILED_EVENT_TITLE,
+  type AcpContextUsage,
+  type AcpPermissionRequest,
+  type AcpRuntimeEvent,
+  type AcpStateSnapshot
+} from '../../shared/acp'
+import type { ModelReasoningEffort } from '../../shared/reasoning-effort'
 import { terminateProcessTree } from '../process-tree'
 import { AgentMcpHttpHost } from './mcp-http-host'
-import { claudeCodeFramework, codexFramework, opencodeFramework } from '../agent-framework'
+import { SkillRegistry } from '../skills/registry'
+import {
+  claudeCodeFramework,
+  codexFramework,
+  opencodeFramework,
+  type ResolvedAgentBackend
+} from '../agent-framework'
 import { ArtifactRepository } from '../artifacts/repository'
+import { ArtifactProvenanceRepository } from '../artifacts/provenance-repository'
+import type { ArtifactRunClaim } from '../artifacts/run-registry'
+import { createPngBytes, createPngInlineSource } from '../artifacts/artifact-test-fixtures'
 import { writeArtifactFileForCurrentRun } from '../artifacts/mcp-server'
+import { createArtifactVersionLocator } from '../../shared/artifact-provenance'
+import { BEGIN_ACTIVITY_GROUP_TOOL_NAME } from '../../shared/activity-groups'
 import type { UploadedAttachment } from '../../shared/uploads'
+import { projectConversationMessage } from '../../shared/conversation-graph'
+import type { PersistedChatSession } from '../../shared/session-persistence'
 import { UploadRepository } from '../uploads/repository'
+import { stageUploadFixtures } from '../uploads/repository.test-utils'
 import { MAX_INLINE_IMAGE_TOTAL_BASE64_BYTES } from '../uploads/attachment-media'
+import { ConversationSkillImporter, SkillImportApprovalBroker } from '../skills/conversation-import'
+import { createProjectDbClient, ensureProjectSchema } from '../projects/prisma-client'
+import { NotebookLocalRpcServer } from '../notebook/local-rpc-server'
+import { NotebookRuntimeService } from '../notebook/runtime-service'
+import { NotebookRunRepository } from '../notebook/repository'
 import {
   beginMigration,
   clearMigrationPending,
@@ -85,12 +114,30 @@ class FakeAgentProcess extends EventEmitter {
 const asAgentProcess = (process: FakeAgentProcess): ChildProcessWithoutNullStreams =>
   process as unknown as ChildProcessWithoutNullStreams
 
+const createBackendLeaseHarness = (): {
+  release: () => Promise<void>
+  lease: NonNullable<ResolvedAgentBackend['responsesBridgeLease']>
+} => {
+  const release = vi.fn(async () => undefined)
+  return {
+    release,
+    lease: {
+      selectSkills: vi.fn(async () => []),
+      registerReviewerSession: vi.fn(),
+      unregisterReviewerSession: vi.fn(() => false),
+      release
+    }
+  }
+}
+
 // Creates a manually controlled promise for ordering async protocol steps.
-const createDeferred = <Value = void>(): {
+type Deferred<Value = void> = {
   promise: Promise<Value>
   resolve: (value: Value) => void
   reject: (error: unknown) => void
-} => {
+}
+
+const createDeferred = <Value = void>(): Deferred<Value> => {
   let resolve!: (value: Value) => void
   let reject!: (error: unknown) => void
   const promise = new Promise<Value>((promiseResolve, promiseReject) => {
@@ -114,11 +161,15 @@ const startFakeAgent = (
     // session/new set; defaults to echoing configOptions.
     updatedConfigOptions?: SessionConfigOption[]
     rejectSetConfigOption?: boolean
+    onSetConfigOption?: (context: {
+      sessionId: string
+      configId: string
+      value: string | boolean
+    }) => Promise<void> | void
     // When true, the resume handler rejects with the ACP "Resource not found" (-32002) — the signal a
     // replaced agent (e.g. after a provider switch) gives for a session id it does not hold.
     resumeNotFound?: boolean
-    // When true, the resume handler rejects with a generic "Internal error" (-32603) — what some
-    // agents return instead of a clean not-found after their process was replaced by an app restart.
+    // When true, the resume handler rejects with a detail-free generic "Internal error" (-32603).
     resumeInternalError?: boolean
     // A plain handler error is serialized by the ACP SDK as -32603 with the original message in
     // data.details. This mirrors agents that do not translate their resume failure to resourceNotFound.
@@ -133,11 +184,25 @@ const startFakeAgent = (
     // the session/cancel notification on delete instead of a close request.
     supportsClose?: boolean
     rejectModeChange?: boolean
+    newSessionError?: unknown
+    onNewSession?: (context: { sessionId: string; index: number }) => Promise<void> | void
+    onResumeRequest?: (context: { sessionId: string; index: number }) => Promise<void> | void
+    onResume?: (sessionId: string) => Promise<void> | void
+    onSetMode?: (context: { sessionId: string; modeId: string }) => Promise<void> | void
+    onClose?: (sessionId: string) => Promise<void> | void
     onPrompt?: (context: {
       sessionId: string
       text: string
       prompt: ContentBlock[]
-    }) => Promise<void> | void
+    }) => Promise<PromptResponse | void> | PromptResponse | void
+    toolForPrompt?: (text: string) => { toolCallId: string; title: string } | undefined
+    replyForPrompt?: (text: string) => string
+    usageForPrompt?: (text: string) => { used: number; size: number } | undefined
+    claudeTurnCountForPrompt?: (text: string) => number | undefined
+    claudeResultMessagesForPrompt?: (text: string) => Array<{
+      numTurns: number
+      origin?: string
+    }>
   } = {}
 ): {
   authRequests: unknown[]
@@ -167,6 +232,7 @@ const startFakeAgent = (
   const configChanges: Array<{ sessionId: string; configId: string; value: string | boolean }> = []
   const actions: string[] = []
   let sessionIndex = 0
+  let resumeIndex = 0
 
   acp
     .agent({ name: 'test-agent' })
@@ -189,15 +255,20 @@ const startFakeAgent = (
       providerConfigurations.push(ctx.params)
       return {}
     })
-    .onRequest(acp.methods.agent.session.new, (ctx) => {
+    .onRequest(acp.methods.agent.session.new, async (ctx) => {
+      if (options.newSessionError !== undefined) throw options.newSessionError
+
       newSessions.push({
         cwd: ctx.params.cwd,
         mcpServers: ctx.params.mcpServers,
         ...(ctx.params._meta === undefined ? {} : { _meta: ctx.params._meta })
       })
       // Return deterministic ids so the tests can assert exact routing.
+      const index = sessionIndex
       const sessionId = sessionIds[sessionIndex]
       sessionIndex += 1
+
+      await options.onNewSession?.({ sessionId, index })
 
       return {
         sessionId,
@@ -205,7 +276,11 @@ const startFakeAgent = (
         ...(options.configOptions ? { configOptions: options.configOptions } : {})
       }
     })
-    .onRequest(acp.methods.agent.session.resume, (ctx) => {
+    .onRequest(acp.methods.agent.session.resume, async (ctx) => {
+      const index = resumeIndex
+      resumeIndex += 1
+      await options.onResumeRequest?.({ sessionId: ctx.params.sessionId, index })
+
       if (options.resumeNotFound) {
         throw acp.RequestError.resourceNotFound(ctx.params.sessionId)
       }
@@ -236,18 +311,32 @@ const startFakeAgent = (
         ...(ctx.params._meta === undefined ? {} : { _meta: ctx.params._meta })
       })
 
+      await options.onResume?.(ctx.params.sessionId)
+
       return { modes: options.modes }
     })
     .onRequest(acp.methods.agent.session.setMode, (ctx) => {
       if (options.rejectModeChange) throw new Error('set mode failed')
-      modeChanges.push({ sessionId: ctx.params.sessionId, modeId: ctx.params.modeId })
-      actions.push(`mode:${ctx.params.modeId}`)
-      return {}
+      const recordModeChange = (): Record<string, never> => {
+        modeChanges.push({ sessionId: ctx.params.sessionId, modeId: ctx.params.modeId })
+        actions.push(`mode:${ctx.params.modeId}`)
+        return {}
+      }
+      const pending = options.onSetMode?.({
+        sessionId: ctx.params.sessionId,
+        modeId: ctx.params.modeId
+      })
+      return pending ? pending.then(recordModeChange) : recordModeChange()
     })
-    .onRequest(acp.methods.agent.session.setConfigOption, (ctx) => {
+    .onRequest(acp.methods.agent.session.setConfigOption, async (ctx) => {
       if (options.rejectSetConfigOption) throw acp.RequestError.internalError()
 
       configChanges.push({
+        sessionId: ctx.params.sessionId,
+        configId: ctx.params.configId,
+        value: ctx.params.value
+      })
+      await options.onSetConfigOption?.({
         sessionId: ctx.params.sessionId,
         configId: ctx.params.configId,
         value: ctx.params.value
@@ -263,7 +352,44 @@ const startFakeAgent = (
 
       prompts.push({ sessionId: ctx.params.sessionId, text })
       actions.push(`prompt:${text}`)
-      await options.onPrompt?.({ sessionId: ctx.params.sessionId, text, prompt: ctx.params.prompt })
+      const promptResponse = await options.onPrompt?.({
+        sessionId: ctx.params.sessionId,
+        text,
+        prompt: ctx.params.prompt
+      })
+      const tool = options.toolForPrompt?.(text)
+      if (tool) {
+        await ctx.client.notify(acp.methods.client.session.update, {
+          sessionId: ctx.params.sessionId,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: tool.toolCallId,
+            title: tool.title,
+            status: 'completed'
+          }
+        })
+      }
+      const usage = options.usageForPrompt?.(text)
+      if (usage) {
+        await ctx.client.notify(acp.methods.client.session.update, {
+          sessionId: ctx.params.sessionId,
+          update: { sessionUpdate: 'usage_update', ...usage }
+        })
+      }
+      const claudeTurnCount = options.claudeTurnCountForPrompt?.(text)
+      const claudeResultMessages =
+        options.claudeResultMessagesForPrompt?.(text) ??
+        (claudeTurnCount === undefined ? [] : [{ numTurns: claudeTurnCount, origin: 'human' }])
+      for (const result of claudeResultMessages) {
+        await ctx.client.notify('_claude/sdkMessage', {
+          sessionId: ctx.params.sessionId,
+          message: {
+            type: 'result',
+            num_turns: result.numTurns,
+            ...(result.origin === undefined ? {} : { origin: { kind: result.origin } })
+          }
+        })
+      }
       // Stream one assistant chunk through the client callback path before stopping.
       await ctx.client.notify(acp.methods.client.session.update, {
         sessionId: ctx.params.sessionId,
@@ -272,20 +398,23 @@ const startFakeAgent = (
           messageId: `reply-${ctx.params.sessionId}`,
           content: {
             type: 'text',
-            text: `reply for ${ctx.params.sessionId}`
+            text: options.replyForPrompt?.(text) ?? `reply for ${ctx.params.sessionId}`
           }
         }
       })
-
-      return { stopReason: 'end_turn' }
+      return promptResponse ?? { stopReason: 'end_turn' }
     })
     .onNotification(acp.methods.agent.session.cancel, (ctx) => {
       cancelledSessions.push(ctx.params.sessionId)
       return undefined
     })
     .onRequest(acp.methods.agent.session.close, (ctx) => {
-      closedSessions.push(ctx.params.sessionId)
-      return {}
+      const recordClose = (): Record<string, never> => {
+        closedSessions.push(ctx.params.sessionId)
+        return {}
+      }
+      const pending = options.onClose?.(ctx.params.sessionId)
+      return pending ? pending.then(recordClose) : recordClose()
     })
     .connect(
       acp.ndJsonStream(
@@ -316,11 +445,163 @@ const createModes = (
   availableModes: ids.map((id) => ({ id, name: id }))
 })
 
+const startPendingReviewerRace = async (
+  sessionIds: string[]
+): Promise<{
+  fakeAgent: ReturnType<typeof startFakeAgent>
+  lease: NonNullable<ResolvedAgentBackend['responsesBridgeLease']>
+  runtime: AcpRuntime
+  reviewer: ReturnType<AcpRuntime['buildReviewerSession']>
+  request: Parameters<AcpRuntime['buildReviewerSession']>[0]
+  releaseReviewerMode: Deferred
+  modeRequestCount: () => number
+}> => {
+  const process = new FakeAgentProcess()
+  const reviewerModeStarted = createDeferred()
+  const releaseReviewerMode = createDeferred()
+  let modeRequestCount = 0
+  const fakeAgent = startFakeAgent(process, sessionIds, {
+    modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent'),
+    onSetMode: async () => {
+      modeRequestCount += 1
+      if (modeRequestCount === 1) {
+        reviewerModeStarted.resolve()
+        await releaseReviewerMode.promise
+      }
+    }
+  })
+  const { lease } = createBackendLeaseHarness()
+  const runtime = new AcpRuntime({
+    appVersion: '0.1.0',
+    defaultCwd: '/workspace',
+    resolveBackend: () => ({
+      framework: { ...codexFramework, spawn: () => asAgentProcess(process) },
+      executablePath: '/bin/codex-acp',
+      env: {},
+      responsesBridgeLease: lease
+    })
+  })
+  const request = {
+    cwd: '/workspace',
+    mcpServers: [
+      {
+        type: 'http' as const,
+        name: 'open-science-reviewer',
+        url: 'http://127.0.0.1:1/mcp',
+        headers: []
+      }
+    ]
+  }
+  const reviewer = runtime.buildReviewerSession(request)
+  await reviewerModeStarted.promise
+
+  return {
+    fakeAgent,
+    lease,
+    runtime,
+    reviewer,
+    request,
+    releaseReviewerMode,
+    modeRequestCount: () => modeRequestCount
+  }
+}
+
+type StartPrimarySession = (runtime: AcpRuntime) => ReturnType<AcpRuntime['createSession']>
+
+const startPendingPrimaryRace = async (
+  sessionIds: string[],
+  startPrimary: StartPrimarySession
+): Promise<{
+  fakeAgent: ReturnType<typeof startFakeAgent>
+  lease: NonNullable<ResolvedAgentBackend['responsesBridgeLease']>
+  runtime: AcpRuntime
+  primary: ReturnType<AcpRuntime['createSession']>
+  reviewer: ReturnType<AcpRuntime['buildReviewerSession']>
+  releasePrimaryMode: Deferred
+  modeRequestCount: () => number
+}> => {
+  const process = new FakeAgentProcess()
+  const primaryModeStarted = createDeferred()
+  const releasePrimaryMode = createDeferred()
+  let modeRequestCount = 0
+  const fakeAgent = startFakeAgent(process, sessionIds, {
+    modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent'),
+    onSetMode: async () => {
+      modeRequestCount += 1
+      if (modeRequestCount === 1) {
+        primaryModeStarted.resolve()
+        await releasePrimaryMode.promise
+      }
+    }
+  })
+  const { lease } = createBackendLeaseHarness()
+  const runtime = new AcpRuntime({
+    appVersion: '0.1.0',
+    defaultCwd: '/workspace',
+    resolveBackend: () => ({
+      framework: { ...codexFramework, spawn: () => asAgentProcess(process) },
+      executablePath: '/bin/codex-acp',
+      env: {},
+      responsesBridgeLease: lease
+    })
+  })
+  const primary = startPrimary(runtime)
+  await primaryModeStarted.promise
+  const reviewer = runtime.buildReviewerSession({
+    cwd: '/workspace',
+    mcpServers: [
+      {
+        type: 'http',
+        name: 'open-science-reviewer',
+        url: 'http://127.0.0.1:1/mcp',
+        headers: []
+      }
+    ]
+  })
+
+  return {
+    fakeAgent,
+    lease,
+    runtime,
+    primary,
+    reviewer,
+    releasePrimaryMode,
+    modeRequestCount: () => modeRequestCount
+  }
+}
+
 let temporaryRoot: string | undefined
+const temporaryDisconnections: Array<() => Promise<void>> = []
 
 const createTemporaryRoot = async (): Promise<string> => {
   temporaryRoot = await mkdtemp(join(tmpdir(), 'open-science-runtime-artifacts-'))
   return temporaryRoot
+}
+
+const buildStoredSkillArchive = (skillName: string): Buffer => {
+  const path = Buffer.from('SKILL.md', 'utf8')
+  const content = Buffer.from(`---\nname: ${skillName}\n---\nFollow the workflow.`, 'utf8')
+  const local = Buffer.alloc(30 + path.length)
+  local.writeUInt32LE(0x04034b50, 0)
+  local.writeUInt32LE(content.length, 18)
+  local.writeUInt32LE(content.length, 22)
+  local.writeUInt16LE(path.length, 26)
+  path.copy(local, 30)
+
+  const central = Buffer.alloc(46 + path.length)
+  central.writeUInt32LE(0x02014b50, 0)
+  central.writeUInt32LE(content.length, 20)
+  central.writeUInt32LE(content.length, 24)
+  central.writeUInt16LE(path.length, 28)
+  path.copy(central, 46)
+
+  const end = Buffer.alloc(22)
+  end.writeUInt32LE(0x06054b50, 0)
+  end.writeUInt16LE(1, 8)
+  end.writeUInt16LE(1, 10)
+  end.writeUInt32LE(central.length, 12)
+  end.writeUInt32LE(local.length + content.length, 16)
+  return Buffer.concat([local, content, central, end])
 }
 
 const getEnvValue = (mcpServer: unknown, name: string): string => {
@@ -355,12 +636,17 @@ const startPermissionProbeAgent = (
     toolCallId: string
     toolTitle: string
     toolKind?: 'other' | 'execute' | 'read' | null
+    toolRawInput?: unknown
     providerToolName?: string
+    announcedProviderToolName?: string
     codexMcpIdentity?: {
       server: string
       tool: string
       arguments?: Record<string, unknown>
     }
+    codexMcpMarker?: boolean
+    codexMcpTitle?: string
+    announceToolCall?: boolean
     sparseCodexMcpApproval?: boolean
     modes?: SessionModeState
     permissionOptions?: Array<{
@@ -395,6 +681,23 @@ const startPermissionProbeAgent = (
       return {}
     })
     .onRequest(acp.methods.agent.session.prompt, async (ctx) => {
+      if (options.announceToolCall) {
+        await ctx.client.notify(acp.methods.client.session.update, {
+          sessionId: ctx.params.sessionId,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: options.toolCallId,
+            title: options.toolTitle,
+            kind: options.toolKind ?? 'other',
+            status: 'pending',
+            ...(options.toolRawInput === undefined ? {} : { rawInput: options.toolRawInput }),
+            ...(options.announcedProviderToolName
+              ? { _meta: { toolName: options.announcedProviderToolName } }
+              : {})
+          }
+        })
+      }
+
       if (options.codexMcpIdentity) {
         await ctx.client.notify(acp.methods.client.session.update, {
           sessionId: ctx.params.sessionId,
@@ -402,14 +705,16 @@ const startPermissionProbeAgent = (
             sessionUpdate: 'tool_call',
             toolCallId: options.toolCallId,
             kind: 'execute',
-            title: `mcp.${options.codexMcpIdentity.server}.${options.codexMcpIdentity.tool}`,
+            title:
+              options.codexMcpTitle ??
+              `mcp.${options.codexMcpIdentity.server}.${options.codexMcpIdentity.tool}`,
             status: 'pending',
             rawInput: {
               server: options.codexMcpIdentity.server,
               tool: options.codexMcpIdentity.tool,
               arguments: options.codexMcpIdentity.arguments ?? {}
             },
-            _meta: { is_mcp_tool_call: true }
+            ...(options.codexMcpMarker === false ? {} : { _meta: { is_mcp_tool_call: true } })
           }
         })
       }
@@ -425,6 +730,7 @@ const startPermissionProbeAgent = (
           ...(options.toolKind === null
             ? {}
             : { kind: options.toolKind ?? (options.sparseCodexMcpApproval ? 'execute' : 'other') }),
+          ...(options.toolRawInput === undefined ? {} : { rawInput: options.toolRawInput }),
           ...(!options.sparseCodexMcpApproval && options.providerToolName
             ? { _meta: { claudeCode: { toolName: options.providerToolName } } }
             : {})
@@ -448,33 +754,163 @@ const startPermissionProbeAgent = (
     )
 }
 
-// White-box view of the per-session MCP name map so cleanup paths (no black-box signal) can be
-// asserted directly.
-const mcpServerNamesMap = (runtime: AcpRuntime): Map<string, string[]> =>
-  (runtime as unknown as { sessionMcpServerNames: Map<string, string[]> }).sessionMcpServerNames
+const mcpServerNamesFor = (runtime: AcpRuntime, sessionId: string): readonly string[] =>
+  (
+    runtime as unknown as {
+      sessionCapabilities: { mcpServerNamesFor: (sessionId: string) => readonly string[] }
+    }
+  ).sessionCapabilities.mcpServerNamesFor(sessionId)
 
-const agentToAppSessionMap = (runtime: AcpRuntime): Map<string, string> =>
-  (runtime as unknown as { agentToAppSessionId: Map<string, string> }).agentToAppSessionId
+const activeSessionForTest = (
+  runtime: AcpRuntime,
+  sessionId: string
+): { dispose: () => void } | undefined =>
+  (
+    runtime as unknown as {
+      activeSessionFor: (sessionId: string) => { dispose: () => void } | undefined
+    }
+  ).activeSessionFor(sessionId)
 
-const sessionFrameworksMap = (runtime: AcpRuntime): Map<string, string> =>
-  (runtime as unknown as { sessionFrameworks: Map<string, string> }).sessionFrameworks
+const contextUsageMap = (
+  runtime: AcpRuntime
+): { set: (sessionId: string, usage: AcpContextUsage) => void } => {
+  const tracker = (runtime as unknown as { contextUsageTracker: ContextUsageTracker })
+    .contextUsageTracker
+  return {
+    set: (sessionId, usage) => tracker.reconcileProviderUsage(sessionId, usage)
+  }
+}
+
+const promptContentLifecycle = (
+  runtime: AcpRuntime
+): { resetSession: (sessionId: string) => void } =>
+  (
+    runtime as unknown as {
+      promptContentOwner: { resetSession: (sessionId: string) => void }
+    }
+  ).promptContentOwner
+
+const resolveArtifactRunClaim = (runtime: AcpRuntime, claimId: string): ArtifactRunClaim =>
+  (
+    runtime as unknown as {
+      artifactRunRegistry: { resolve: (id: string) => ArtifactRunClaim }
+    }
+  ).artifactRunRegistry.resolve(claimId)
+
+const handleSessionUpdate = (runtime: AcpRuntime, notification: SessionNotification): void =>
+  (
+    runtime as unknown as {
+      handleSessionUpdate: (value: SessionNotification) => void
+    }
+  ).handleSessionUpdate(notification)
+
+type ReviewerOwnerProbe = {
+  contextFor: (sessionId: string) =>
+    | {
+        frameworkId: string
+        mcpServerNames: readonly string[]
+        role: 'reviewer'
+      }
+    | undefined
+  snapshot: () => Array<{
+    lifecycle: 'pending' | 'active'
+    role: 'reviewer'
+    sessionId: string
+  }>
+}
+
+const reviewerOwnerProbe = (runtime: AcpRuntime): ReviewerOwnerProbe =>
+  (runtime as unknown as { reviewerSessions: ReviewerOwnerProbe }).reviewerSessions
 
 const reviewerSessionIds = (runtime: AcpRuntime): Set<string> =>
-  (runtime as unknown as { reviewerSessionIds: Set<string> }).reviewerSessionIds
+  new Set(
+    reviewerOwnerProbe(runtime)
+      .snapshot()
+      .filter(({ lifecycle }) => lifecycle === 'active')
+      .map(({ sessionId }) => sessionId)
+  )
+
+const pendingReviewerSessionIds = (runtime: AcpRuntime): Map<string, symbol> =>
+  new Map(
+    reviewerOwnerProbe(runtime)
+      .snapshot()
+      .filter(({ lifecycle }) => lifecycle === 'pending')
+      .map(({ sessionId }) => [sessionId, Symbol.for(sessionId)])
+  )
+
+const contextUsageSelectionForTest = (
+  runtime: AcpRuntime,
+  sessionId: string
+): { model?: string; contextWindow?: number } =>
+  (
+    runtime as unknown as {
+      contextUsageSelectionFor: (sessionId: string) => {
+        model?: string
+        contextWindow?: number
+      }
+    }
+  ).contextUsageSelectionFor(sessionId)
+
+const permissionContext = (runtime: AcpRuntime): AcpPermissionContext =>
+  (runtime as unknown as { permissionContext: AcpPermissionContext }).permissionContext
 
 const codexMcpToolIdentitiesMap = (runtime: AcpRuntime): Map<string, Map<string, unknown>> =>
-  (runtime as unknown as { codexMcpToolIdentities: Map<string, Map<string, unknown>> })
-    .codexMcpToolIdentities
+  (
+    permissionContext(runtime) as unknown as {
+      codexMcpToolIdentities: Map<string, Map<string, unknown>>
+    }
+  ).codexMcpToolIdentities
 
-const observeCodexMcpToolIdentity = (
+const opencodeMcpToolInputsMap = (runtime: AcpRuntime): Map<string, Map<string, unknown>> =>
+  (
+    permissionContext(runtime) as unknown as {
+      opencodeMcpToolInputs: Map<string, Map<string, unknown>>
+    }
+  ).opencodeMcpToolInputs
+
+const opencodeMcpToolInputWaitersMap = (
+  runtime: AcpRuntime
+): Map<string, Map<string, Set<unknown>>> =>
+  (
+    permissionContext(runtime) as unknown as {
+      opencodeMcpToolInputWaiters: Map<string, Map<string, Set<unknown>>>
+    }
+  ).opencodeMcpToolInputWaiters
+
+const waitForOpenCodeMcpToolInput = (
+  runtime: AcpRuntime,
+  sessionId: string,
+  toolCallId: string
+): Promise<'ready' | 'timeout' | 'cancelled'> =>
+  (
+    permissionContext(runtime) as unknown as {
+      waitForOpenCodeMcpToolInput: (
+        currentSessionId: string,
+        currentToolCallId: string,
+        context: {
+          sessionId: string
+          framework: 'opencode'
+          mcpServerNames: readonly string[]
+          isCancelled: () => boolean
+        }
+      ) => Promise<'ready' | 'timeout' | 'cancelled'>
+    }
+  ).waitForOpenCodeMcpToolInput(sessionId, toolCallId, {
+    sessionId,
+    framework: 'opencode',
+    mcpServerNames: ['open-science-notebook'],
+    isCancelled: () => false
+  })
+
+const observePermissionToolContext = (
   runtime: AcpRuntime,
   notification: SessionNotification
 ): void =>
   (
     runtime as unknown as {
-      observeCodexMcpToolIdentity: (value: SessionNotification) => void
+      observePermissionToolContext: (value: SessionNotification) => void
     }
-  ).observeCodexMcpToolIdentity(notification)
+  ).observePermissionToolContext(notification)
 
 // Finds the isMcp flag the runtime logged for a given permission request (identified by toolCallId).
 const auditedIsMcp = (toolCallId: string): boolean | undefined => {
@@ -488,6 +924,7 @@ const auditedIsMcp = (toolCallId: string): boolean | undefined => {
 }
 
 afterEach(async () => {
+  await Promise.allSettled(temporaryDisconnections.splice(0).map((disconnect) => disconnect()))
   if (temporaryRoot) {
     await rm(temporaryRoot, { recursive: true, force: true })
     temporaryRoot = undefined
@@ -538,6 +975,217 @@ describe('ACP runtime migration write-gate', () => {
     ])
   })
 
+  it('publishes connected only after initialize, authentication, and provider configuration', async () => {
+    const process = new FakeAgentProcess()
+    const actions: string[] = []
+    acp
+      .agent({ name: 'connection-order-agent' })
+      .onRequest(acp.methods.agent.initialize, () => {
+        actions.push('initialize')
+        return {
+          protocolVersion: acp.PROTOCOL_VERSION,
+          agentCapabilities: { loadSession: false },
+          authMethods: []
+        }
+      })
+      .onRequest(acp.methods.agent.authenticate, () => {
+        actions.push('authenticate')
+        return {}
+      })
+      .onRequest(acp.methods.agent.providers.set, () => {
+        actions.push('configure-provider')
+        return {}
+      })
+      .connect(
+        acp.ndJsonStream(
+          Writable.toWeb(process.stdout) as WritableStream<Uint8Array>,
+          Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>
+        )
+      )
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...claudeCodeFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/agent',
+        env: {},
+        authentication: { methodId: 'api-key' },
+        providerConfiguration: {
+          providerId: 'custom-gateway',
+          apiType: 'openai',
+          baseUrl: 'http://127.0.0.1:1234/v1',
+          headers: {}
+        }
+      }),
+      callbacks: {
+        onEvent: (event) => {
+          if (event.title === 'Agent initialized') actions.push('initialized-event')
+        },
+        onStateChanged: (snapshot) => {
+          if (snapshot.status === 'connected') actions.push('publish-connected')
+        }
+      }
+    })
+
+    await runtime.connect({ cwd: '/workspace' })
+
+    expect(actions).toEqual([
+      'initialize',
+      'authenticate',
+      'configure-provider',
+      'initialized-event',
+      'publish-connected'
+    ])
+    await runtime.disconnect()
+  })
+
+  it('ignores a detached connection closing after its replacement is connected', async () => {
+    const oldProcess = new FakeAgentProcess()
+    const replacementProcess = new FakeAgentProcess()
+    startFakeAgent(oldProcess, ['old-session'])
+    startFakeAgent(replacementProcess, ['replacement-session'])
+    let spawnCount = 0
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(spawnCount++ === 0 ? oldProcess : replacementProcess)
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    await runtime.disconnect()
+    await runtime.createSession({ cwd: '/workspace' })
+
+    oldProcess.stdout.end()
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 0))
+
+    expect(runtime.getSnapshot()).toMatchObject({
+      status: 'connected',
+      sessionIds: ['replacement-session']
+    })
+    expect(replacementProcess.killed).toBe(false)
+    await runtime.disconnect()
+  })
+
+  it('ignores detached process events after a replacement connection is published', async () => {
+    const oldProcess = new FakeAgentProcess()
+    const replacementProcess = new FakeAgentProcess()
+    startFakeAgent(oldProcess, ['old-session'])
+    startFakeAgent(replacementProcess, ['replacement-session'])
+    const events: AcpRuntimeEvent[] = []
+    let spawnCount = 0
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      callbacks: { onEvent: (event) => events.push(event) },
+      spawnAgent: () => asAgentProcess(spawnCount++ === 0 ? oldProcess : replacementProcess)
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    await runtime.disconnect()
+    await runtime.createSession({ cwd: '/workspace' })
+    events.length = 0
+
+    oldProcess.stderr.emit('data', Buffer.from('late detached stderr'))
+    oldProcess.emit('error', new Error('late detached error'))
+    oldProcess.emit('exit', 1, null)
+
+    expect(runtime.getSnapshot()).toMatchObject({
+      status: 'connected',
+      sessionIds: ['replacement-session']
+    })
+    expect(events).toEqual([])
+    await runtime.disconnect()
+  })
+
+  it('keeps using a published connection when teardown fails before resource detach', async () => {
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['first-session', 'successor-session'])
+    const spawnAgent = vi.fn(() => asAgentProcess(process))
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent
+    })
+    await runtime.createSession({ cwd: '/workspace' })
+    const internal = runtime as unknown as {
+      disconnectCurrent: (emitClosedStatus?: boolean) => Promise<AcpStateSnapshot>
+    }
+    const disconnectCurrentSpy = vi
+      .spyOn(internal, 'disconnectCurrent')
+      .mockRejectedValueOnce(new Error('disconnect failed before detach'))
+
+    try {
+      await expect(runtime.disconnect()).rejects.toThrow('disconnect failed before detach')
+      await expect(runtime.createSession({ cwd: '/workspace' })).resolves.toMatchObject({
+        sessionId: 'successor-session'
+      })
+      expect(fakeAgent.newSessions).toHaveLength(2)
+      expect(spawnAgent).toHaveBeenCalledOnce()
+      expect(process.killed).toBe(false)
+    } finally {
+      disconnectCurrentSpy.mockRestore()
+      await runtime.disconnect().catch(() => undefined)
+    }
+  })
+
+  it.each(['initialize', 'authenticate'] as const)(
+    'clears one-shot connection intents when %s fails',
+    async (failureStage) => {
+      const process = new FakeAgentProcess()
+      const providerSet = vi.fn()
+      acp
+        .agent({ name: `failing-${failureStage}-agent` })
+        .onRequest(acp.methods.agent.initialize, () => {
+          if (failureStage === 'initialize') throw new Error('initialize failed')
+          return {
+            protocolVersion: acp.PROTOCOL_VERSION,
+            agentCapabilities: { loadSession: false },
+            authMethods: []
+          }
+        })
+        .onRequest(acp.methods.agent.authenticate, () => {
+          throw new Error('authenticate failed')
+        })
+        .onRequest(acp.methods.agent.providers.set, providerSet)
+        .connect(
+          acp.ndJsonStream(
+            Writable.toWeb(process.stdout) as WritableStream<Uint8Array>,
+            Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>
+          )
+        )
+
+      const runtime = new AcpRuntime({
+        appVersion: '0.1.0',
+        defaultCwd: '/workspace',
+        resolveBackend: () => ({
+          framework: { ...claudeCodeFramework, spawn: () => asAgentProcess(process) },
+          executablePath: '/bin/agent',
+          env: {},
+          authentication: {
+            methodId: 'api-key',
+            _meta: { 'api-key': { apiKey: 'test-only-key' } }
+          },
+          providerConfiguration: {
+            providerId: 'custom-gateway',
+            apiType: 'openai',
+            baseUrl: 'http://127.0.0.1:1234/v1',
+            headers: { authorization: 'Bearer test-only-token' }
+          }
+        })
+      })
+
+      await expect(runtime.connect({ cwd: '/workspace' })).rejects.toThrow()
+
+      const internal = runtime as unknown as {
+        pendingAuthentication?: unknown
+        pendingProviderConfiguration?: unknown
+      }
+      expect(internal.pendingAuthentication).toBeUndefined()
+      expect(internal.pendingProviderConfiguration).toBeUndefined()
+      expect(providerSet).not.toHaveBeenCalled()
+    }
+  )
+
   it('rejects session creation when a required subscription model is unavailable', async () => {
     const process = new FakeAgentProcess()
     startFakeAgent(process, ['subscription-session'], {
@@ -558,10 +1206,96 @@ describe('ACP runtime migration write-gate', () => {
       }),
       framework: codexFramework
     })
+    const disposeSpy = vi
+      .spyOn(acp.ActiveSession.prototype, 'dispose')
+      .mockImplementationOnce(() => {
+        throw new Error('unavailable-model disposal failed')
+      })
 
-    await expect(runtime.createSession({ cwd: '/workspace' })).rejects.toThrow(
-      'The selected model "gpt-subscription" is not available for this Codex account.'
-    )
+    try {
+      await expect(runtime.createSession({ cwd: '/workspace' })).rejects.toThrow(
+        'The selected model "gpt-subscription" is not available for this Codex account.'
+      )
+    } finally {
+      disposeSpy.mockRestore()
+    }
+  })
+
+  it('does not tokenize against an optional model that the Agent could not apply', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['fallback-session'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...opencodeFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/opencode-acp',
+        env: {},
+        sessionModel: 'claude-sonnet-4-5',
+        contextUsageModel: 'claude-sonnet-4-5',
+        contextWindow: 1_000_000
+      }),
+      framework: opencodeFramework
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    handleSessionUpdate(runtime, {
+      sessionId: 'fallback-session',
+      update: { sessionUpdate: 'usage_update', used: 15, size: 128000 }
+    })
+
+    expect(
+      runtime.getSnapshot().contextUsageBySession['fallback-session']?.breakdown
+    ).toMatchObject({
+      tokenizer: 'cl100k_base'
+    })
+    expect(
+      runtime.getSnapshot().contextUsageBySession['fallback-session']?.breakdown
+    ).not.toHaveProperty('model')
+    expect(runtime.getSnapshot().contextUsageBySession['fallback-session']?.size).toBe(128_000)
+  })
+
+  it('tokenizes against an optional OpenCode model after the Agent confirms it', async () => {
+    const process = new FakeAgentProcess()
+    const configOptions = [
+      {
+        type: 'select',
+        id: 'model',
+        name: 'Model',
+        category: 'model',
+        currentValue: 'openai/gpt-4.1-mini',
+        options: [
+          { value: 'openai/gpt-4.1-mini', name: 'GPT-4.1 mini' },
+          { value: 'anthropic/claude-sonnet-4-5', name: 'Claude Sonnet 4.5' }
+        ]
+      } as SessionConfigOption
+    ]
+    startFakeAgent(process, ['selected-session'], { configOptions })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...opencodeFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/opencode-acp',
+        env: {},
+        sessionModel: 'claude-sonnet-4-5',
+        contextUsageModel: 'claude-sonnet-4-5'
+      }),
+      framework: opencodeFramework
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    handleSessionUpdate(runtime, {
+      sessionId: 'selected-session',
+      update: { sessionUpdate: 'usage_update', used: 15, size: 200000 }
+    })
+
+    expect(
+      runtime.getSnapshot().contextUsageBySession['selected-session']?.breakdown
+    ).toMatchObject({
+      tokenizer: 'anthropic',
+      model: 'claude-sonnet-4-5'
+    })
   })
 
   it('rejects session creation when a required subscription model cannot be applied', async () => {
@@ -596,10 +1330,19 @@ describe('ACP runtime migration write-gate', () => {
       }),
       framework: codexFramework
     })
+    const disposeSpy = vi
+      .spyOn(acp.ActiveSession.prototype, 'dispose')
+      .mockImplementationOnce(() => {
+        throw new Error('required-model disposal failed')
+      })
 
-    await expect(runtime.createSession({ cwd: '/workspace' })).rejects.toThrow(
-      'The selected model "gpt-subscription" could not be applied'
-    )
+    try {
+      await expect(runtime.createSession({ cwd: '/workspace' })).rejects.toThrow(
+        'The selected model "gpt-subscription" could not be applied'
+      )
+    } finally {
+      disposeSpy.mockRestore()
+    }
   })
 
   it('skips set_config_option when a required subscription model already matches currentValue', async () => {
@@ -705,6 +1448,196 @@ describe('ACP runtime migration write-gate', () => {
 })
 
 describe('ACP runtime session management', () => {
+  it('keeps the current primary capability set separate from reviewer-only authority', async () => {
+    const root = await createTemporaryRoot()
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['primary-session', 'reviewer-session'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.2.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      artifacts: {
+        configRoot: root,
+        dataRoot: root,
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js'
+      },
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({
+          endpoint: 'http://127.0.0.1:4567',
+          token: 'notebook-token'
+        })
+      },
+      skillImport: {
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({
+          endpoint: 'http://127.0.0.1:4568',
+          token: 'skill-token'
+        })
+      }
+    })
+
+    const reviewerServer = {
+      type: 'http' as const,
+      name: 'open-science-reviewer',
+      url: 'http://127.0.0.1:1/mcp',
+      headers: []
+    }
+
+    try {
+      await runtime.createSession({ cwd: '/workspace' })
+      const reviewer = await runtime.buildReviewerSession({
+        cwd: '/workspace',
+        mcpServers: [reviewerServer]
+      })
+
+      expect(
+        fakeAgent.newSessions[0].mcpServers.map((server) => (server as { name: string }).name)
+      ).toEqual(['open-science-artifacts', 'open-science-notebook', 'open-science-skills'])
+      expect(fakeAgent.newSessions[1].mcpServers).toEqual([reviewerServer])
+      expect(reviewer.role).toBe('reviewer')
+
+      await runtime.disposeReviewerSession(reviewer.session)
+    } finally {
+      await runtime.disconnect()
+    }
+  })
+
+  it('omits activity-group declarations from main and reviewer sessions', async () => {
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['main-session', 'reviewer-session'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.2.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process)
+    })
+
+    const mainSession = await runtime.createSession({ cwd: '/workspace' })
+    await runtime.sendPrompt({ sessionId: mainSession.sessionId, text: 'Search PubMed' })
+
+    expect(fakeAgent.newSessions[0].mcpServers).toEqual([])
+    expect(JSON.stringify(fakeAgent.newSessions[0]._meta)).not.toContain(
+      BEGIN_ACTIVITY_GROUP_TOOL_NAME
+    )
+    expect(JSON.stringify(fakeAgent.newSessions[0]._meta)).toContain(
+      'Do not describe a tool-backed action as future work'
+    )
+    expect(fakeAgent.prompts[0].text).not.toContain(
+      'mcp__open-science-activity__begin_activity_group'
+    )
+    expect(fakeAgent.prompts[0].text).not.toContain('Before each coherent tool group this turn')
+
+    const reviewerServer = {
+      type: 'http' as const,
+      name: 'open-science-reviewer',
+      url: 'http://127.0.0.1:1/mcp',
+      headers: []
+    }
+    const { session: reviewerSession } = await runtime.buildReviewerSession({
+      cwd: '/workspace',
+      mcpServers: [reviewerServer],
+      systemPromptAppend: 'Reviewer-only instructions'
+    })
+    await reviewerSession.prompt([{ type: 'text', text: 'Review this turn' }])
+
+    expect(fakeAgent.newSessions[1].mcpServers).toEqual([reviewerServer])
+    expect(JSON.stringify(fakeAgent.newSessions[1]._meta)).not.toContain(
+      BEGIN_ACTIVITY_GROUP_TOOL_NAME
+    )
+    expect(fakeAgent.newSessions[1]._meta).toMatchObject({
+      claudeCode: { options: { tools: [] } }
+    })
+    expect(fakeAgent.prompts[1].text).toBe('Review this turn')
+  })
+
+  it.each([
+    ['opencode', opencodeFramework],
+    ['codex', codexFramework]
+  ] as const)(
+    'omits activity-group tooling and prompt guidance for %s',
+    async (_name, framework) => {
+      const process = new FakeAgentProcess()
+      const fakeAgent = startFakeAgent(process, ['main-session'], {
+        modes:
+          framework.id === 'codex'
+            ? createModes(['read-only', 'agent', 'agent-full-access'], 'agent')
+            : undefined
+      })
+      const runtime = new AcpRuntime({
+        appVersion: '0.2.0',
+        defaultCwd: '/workspace',
+        spawnAgent: () => asAgentProcess(process),
+        framework
+      })
+
+      const session = await runtime.createSession({ cwd: '/workspace' })
+      await runtime.sendPrompt({ sessionId: session.sessionId, text: 'Inspect the project' })
+
+      expect(fakeAgent.newSessions[0].mcpServers).toEqual([])
+      expect(fakeAgent.prompts[0].text).not.toContain(BEGIN_ACTIVITY_GROUP_TOOL_NAME)
+      expect(fakeAgent.prompts[0].text).toContain(
+        'Do not describe a tool-backed action as future work'
+      )
+    }
+  )
+
+  it('gives OpenCode stable underscore names for app-owned action MCPs on create and resume', async () => {
+    const root = await createTemporaryRoot()
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['opencode-session'], { supportsResume: true })
+    const runtime = new AcpRuntime({
+      appVersion: '0.2.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: opencodeFramework,
+      artifacts: {
+        configRoot: root,
+        dataRoot: root,
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js'
+      },
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({ endpoint: 'http://127.0.0.1:4567', token: 'nb' })
+      },
+      skillImport: {
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({
+          endpoint: 'http://127.0.0.1:4568',
+          token: 'skill'
+        })
+      }
+    })
+
+    const created = await runtime.createSession({ cwd: '/workspace' })
+    await runtime.sendPrompt({ sessionId: created.sessionId, text: 'Use every app tool' })
+    await runtime.resumeSession({ sessionId: 'resumed-opencode-session', cwd: '/workspace' })
+    await runtime.sendPrompt({ sessionId: 'resumed-opencode-session', text: 'Continue with tools' })
+
+    const expectedServerNames = [
+      'open_science_artifacts',
+      'open_science_notebook',
+      'open_science_skills'
+    ]
+    expect(
+      fakeAgent.newSessions[0].mcpServers.map((server) => (server as { name: string }).name)
+    ).toEqual(expectedServerNames)
+    expect(
+      fakeAgent.resumedSessions[0].mcpServers.map((server) => (server as { name: string }).name)
+    ).toEqual(expectedServerNames)
+
+    for (const prompt of fakeAgent.prompts) {
+      expect(prompt.text).not.toContain('`open_science_activity_begin_activity_group`')
+      expect(prompt.text).toContain('`open_science_artifacts_write_artifact_file`')
+      expect(prompt.text).toContain('`open_science_notebook_notebook_execute`')
+      expect(prompt.text).toContain('open_science_skills_request_skill_import')
+      expect(prompt.text).not.toContain('`open-science-')
+    }
+  })
+
   it('applies native Full access before the first prompt', async () => {
     const process = new FakeAgentProcess()
     const fakeAgent = startFakeAgent(process, ['full-session'], {
@@ -735,11 +1668,17 @@ describe('ACP runtime session management', () => {
 
   it('kills the agent process synchronously on shutdown so it cannot outlive the app', async () => {
     const process = new FakeAgentProcess()
+    const { lease, release } = createBackendLeaseHarness()
     startFakeAgent(process, ['shutdown-session'])
     const runtime = new AcpRuntime({
       appVersion: '0.2.0',
       defaultCwd: '/workspace',
-      spawnAgent: () => asAgentProcess(process)
+      resolveBackend: () => ({
+        framework: { ...claudeCodeFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/agent',
+        env: {},
+        responsesBridgeLease: lease
+      })
     })
 
     await runtime.createSession({ cwd: '/workspace' })
@@ -751,6 +1690,7 @@ describe('ACP runtime session management', () => {
 
     // Calling it again after the process is gone is a no-op, not a crash.
     expect(() => runtime.shutdown()).not.toThrow()
+    await vi.waitFor(() => expect(release).toHaveBeenCalledOnce())
   })
 
   it('kills a child that finishes spawning after shutdown began, so quit-during-connect cannot orphan it', async () => {
@@ -863,12 +1803,220 @@ describe('ACP runtime session management', () => {
       spawnAgent: () => asAgentProcess(process)
     })
 
-    await runtime.createSession({ cwd: '/workspace' })
+    const session = await runtime.createSession({ cwd: '/workspace', permissionProfile: 'ask' })
     process.stdout.end()
 
     await vi.waitFor(() => expect(runtime.getSnapshot().status).toBe('closed'))
     await vi.waitFor(() => expect(process.killed).toBe(true))
     expect(runtime.getSnapshot().sessionIds).toEqual([])
+    expect(runtime.getSnapshot().permissionProfiles[session.sessionId]?.selectedProfile).toBe('ask')
+    expect(runtime.getSessionFramework(session.sessionId)).toBe('claude-code')
+  })
+
+  it('publishes reattached sessions in their new attachment order', async () => {
+    const initialProcess = new FakeAgentProcess()
+    const resumedProcess = new FakeAgentProcess()
+    startFakeAgent(initialProcess, ['session-a', 'session-b'])
+    startFakeAgent(resumedProcess, [])
+    let spawnCount = 0
+    const runtime = new AcpRuntime({
+      appVersion: '0.2.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(spawnCount++ === 0 ? initialProcess : resumedProcess)
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    await runtime.createSession({ cwd: '/workspace' })
+    expect(runtime.getSnapshot().sessionIds).toEqual(['session-a', 'session-b'])
+
+    await runtime.disconnect()
+    await runtime.resumeSession({ sessionId: 'session-b', cwd: '/workspace' })
+    await runtime.resumeSession({ sessionId: 'session-a', cwd: '/workspace' })
+
+    expect(runtime.getSnapshot().sessionIds).toEqual(['session-b', 'session-a'])
+  })
+
+  it('moves a context-reset session to its new attachment order', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['session-a', 'session-b', 'replacement-a'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.2.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process)
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    await runtime.createSession({ cwd: '/workspace' })
+    expect(runtime.getSnapshot().sessionIds).toEqual(['session-a', 'session-b'])
+
+    await runtime.resetSessionContext({ sessionId: 'session-a', cwd: '/workspace' })
+
+    expect(runtime.getSnapshot().sessionIds).toEqual(['session-b', 'session-a'])
+  })
+
+  it('keeps active ordering stable when resume only refreshes metadata', async () => {
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['session-a', 'session-b'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.2.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process)
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    await runtime.createSession({ cwd: '/workspace' })
+    await runtime.resumeSession({ sessionId: 'session-a', cwd: '/updated-workspace' })
+
+    expect(runtime.getSnapshot().sessionIds).toEqual(['session-a', 'session-b'])
+    expect(fakeAgent.resumedSessions).toEqual([])
+  })
+
+  it('releases the backend lease exactly once after an unexpected protocol close', async () => {
+    const process = new FakeAgentProcess()
+    const { lease, release } = createBackendLeaseHarness()
+    startFakeAgent(process, ['unexpected-close-lease-session'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.2.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...claudeCodeFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/agent',
+        env: {},
+        responsesBridgeLease: lease
+      })
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    process.stdout.end()
+
+    await vi.waitFor(() => expect(runtime.getSnapshot().status).toBe('closed'))
+    await vi.waitFor(() => expect(release).toHaveBeenCalledOnce())
+
+    runtime.shutdown()
+    expect(release).toHaveBeenCalledOnce()
+  })
+
+  it('releases the backend lease once when synchronous shutdown overlaps protocol close', async () => {
+    const process = new FakeAgentProcess()
+    const { lease, release } = createBackendLeaseHarness()
+    startFakeAgent(process, ['overlapping-close-session'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.2.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...claudeCodeFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/agent',
+        env: {},
+        responsesBridgeLease: lease
+      })
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    process.stdout.end()
+    runtime.shutdown()
+
+    await vi.waitFor(() => expect(release).toHaveBeenCalledOnce())
+    expect(process.killed).toBe(true)
+  })
+
+  it('releases notebook RPC capabilities after an unexpected protocol close', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['unexpected-close-session'])
+    const releaseSessionCapabilities = vi.fn()
+    const runtime = new AcpRuntime({
+      appVersion: '0.2.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({
+          endpoint: 'http://127.0.0.1:4567',
+          token: 'secret-token'
+        }),
+        releaseSessionCapabilities
+      }
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    process.stdout.end()
+
+    await vi.waitFor(() => expect(runtime.getSnapshot().status).toBe('closed'))
+    expect(releaseSessionCapabilities).toHaveBeenCalledOnce()
+    expect(releaseSessionCapabilities).toHaveBeenCalledWith(session.sessionId)
+  })
+
+  it('emits a terminal failure for every in-flight prompt before an unexpected close clears state', async () => {
+    const process = new FakeAgentProcess()
+    const promptGate = createDeferred()
+    const fakeAgent = startFakeAgent(process, ['unexpected-close-session'], {
+      onPrompt: () => promptGate.promise
+    })
+    const events: AcpRuntimeEvent[] = []
+    const runtime = new AcpRuntime({
+      appVersion: '0.2.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      callbacks: { onEvent: (event) => events.push(event) }
+    })
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    const prompt = runtime.sendPrompt({ sessionId: session.sessionId, text: 'stay pending' })
+    void prompt.catch(() => undefined)
+    await vi.waitFor(() => expect(fakeAgent.prompts).toHaveLength(1))
+
+    process.stdout.end()
+
+    await vi.waitFor(() => expect(runtime.getSnapshot().status).toBe('closed'))
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: 'error',
+        sessionId: session.sessionId,
+        title: ACP_PROMPT_FAILED_EVENT_TITLE,
+        text: 'ACP connection closed'
+      })
+    )
+    promptGate.resolve()
+  })
+
+  it('does not attribute a resumed session event to a prompt from a closed connection', async () => {
+    const sessionId = '123e4567-e89b-42d3-a456-426614174000'
+    const oldProcess = new FakeAgentProcess()
+    const newProcess = new FakeAgentProcess()
+    const oldPromptGate = createDeferred()
+    const oldAgent = startFakeAgent(oldProcess, [sessionId], {
+      onPrompt: () => oldPromptGate.promise
+    })
+    startFakeAgent(newProcess, [])
+    const events: AcpRuntimeEvent[] = []
+    let spawnCount = 0
+    const runtime = new AcpRuntime({
+      appVersion: '0.2.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(spawnCount++ === 0 ? oldProcess : newProcess),
+      callbacks: { onEvent: (event) => events.push(event) }
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    const prompt = runtime
+      .sendPrompt({
+        sessionId: session.sessionId,
+        text: 'stay pending',
+        provenanceContext: { promptMessageId: 'closed-prompt-message' }
+      })
+      .catch(() => undefined)
+    await vi.waitFor(() => expect(oldAgent.prompts).toHaveLength(1))
+
+    oldProcess.stdout.end()
+    await vi.waitFor(() => expect(runtime.getSnapshot().status).toBe('closed'))
+
+    await runtime.resumeSession({ sessionId, cwd: '/workspace' })
+    const resumedEvent = events.filter((event) => event.title === 'Session resumed').at(-1)
+    expect(resumedEvent).toMatchObject({ kind: 'system', sessionId })
+    expect(resumedEvent?.promptMessageId).toBeUndefined()
+
+    oldPromptGate.resolve()
+    await prompt
+    await runtime.disconnect()
   })
 
   it('shutdownForQuit latches shutting-down so a later connect is refused', async () => {
@@ -1105,10 +2253,53 @@ describe('ACP runtime session management', () => {
     )
   })
 
+  it('keeps a text-only prompt free of omitted ambient context', async () => {
+    const root = await createTemporaryRoot()
+    const ambientSecret = 'AMBIENT_FILE_MUST_NOT_ENTER_PROMPT'
+    await writeFile(join(root, 'ambient-secret.txt'), ambientSecret, 'utf8')
+    const uploadRepository = new UploadRepository(root)
+    const finalizeUploads = vi.spyOn(uploadRepository, 'finalizePendingSessionUploads')
+    const resolveManagedUpload = vi.spyOn(uploadRepository, 'resolveManagedUploadPath')
+    const resolveSessionUpload = vi.spyOn(uploadRepository, 'resolveSessionUploadPath')
+    const registerTurnInputs = vi.fn(async () => undefined)
+    const process = new FakeAgentProcess()
+    const receivedPrompts: ContentBlock[][] = []
+    startFakeAgent(process, ['remote-session-1'], {
+      onPrompt: ({ prompt }) => {
+        receivedPrompts.push(prompt)
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: root,
+      spawnAgent: () => asAgentProcess(process),
+      uploads: { repository: uploadRepository },
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({ endpoint: 'http://127.0.0.1:1/notebook', token: 'nb' }),
+        registerTurnInputs
+      }
+    })
+
+    const session = await runtime.createSession({ cwd: root })
+    finalizeUploads.mockClear()
+    resolveManagedUpload.mockClear()
+    resolveSessionUpload.mockClear()
+    await runtime.sendPrompt({ sessionId: session.sessionId, text: 'summarize without context' })
+
+    expect(receivedPrompts).toEqual([[{ type: 'text', text: 'summarize without context' }]])
+    expect(JSON.stringify(receivedPrompts)).not.toContain(ambientSecret)
+    expect(finalizeUploads).not.toHaveBeenCalled()
+    expect(resolveManagedUpload).not.toHaveBeenCalled()
+    expect(resolveSessionUpload).not.toHaveBeenCalled()
+    expect(registerTurnInputs).not.toHaveBeenCalled()
+  })
+
   it('sends staged uploads as ACP prompt content blocks', async () => {
     const root = await createTemporaryRoot()
     const uploadRepository = new UploadRepository(root)
-    const stagedAttachments = await uploadRepository.stageFiles({
+    const stagedAttachments = await stageUploadFixtures(uploadRepository, {
       files: [
         {
           name: 'paste.png',
@@ -1169,12 +2360,224 @@ describe('ACP runtime session management', () => {
     ).resolves.toBe('hello from upload')
   })
 
+  it('preserves prompt content order across replay images, uploads, and references', async () => {
+    const root = await createTemporaryRoot()
+    const uploadRepository = new UploadRepository(root)
+    const [historyUpload, currentUpload, mentionedUpload] = await stageUploadFixtures(
+      uploadRepository,
+      {
+        files: [
+          {
+            name: 'history.txt',
+            mimeType: 'text/plain',
+            content: Buffer.from('history upload').toString('base64')
+          },
+          {
+            name: 'current.txt',
+            mimeType: 'text/plain',
+            content: Buffer.from('current upload').toString('base64')
+          },
+          {
+            name: 'mentioned.txt',
+            mimeType: 'text/plain',
+            content: Buffer.from('mentioned upload').toString('base64')
+          }
+        ]
+      }
+    )
+    const [mentionedReference] = await uploadRepository.finalizePendingSessionUploads(
+      'remote-session-1',
+      [mentionedUpload]
+    )
+    const process = new FakeAgentProcess()
+    const receivedPrompts: ContentBlock[][] = []
+    startFakeAgent(process, ['remote-session-1'], {
+      onPrompt: ({ prompt }) => {
+        receivedPrompts.push(prompt)
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      uploads: { repository: uploadRepository }
+    })
+    const historyImageData = Buffer.from('history-image').toString('base64')
+
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    await runtime.sendPrompt({
+      sessionId: session.sessionId,
+      text: 'inspect all context',
+      historyImages: [
+        {
+          mimeType: 'image/png',
+          data: historyImageData,
+          byteLength: Buffer.byteLength('history-image')
+        }
+      ],
+      historyAttachments: [historyUpload],
+      attachments: [currentUpload],
+      referencedArtifacts: [
+        {
+          id: mentionedReference.id,
+          name: mentionedReference.originalName,
+          path: mentionedReference.path,
+          source: 'upload',
+          mimeType: mentionedReference.mimeType
+        }
+      ]
+    })
+
+    expect(receivedPrompts).toHaveLength(1)
+    expect(receivedPrompts[0]).toMatchObject([
+      { type: 'text', text: 'inspect all context' },
+      { type: 'image', mimeType: 'image/png', data: historyImageData },
+      { type: 'resource', resource: { text: 'history upload' } },
+      { type: 'resource', resource: { text: 'current upload' } },
+      { type: 'resource', resource: { text: 'mentioned upload' } }
+    ])
+  })
+
+  it('keeps ordinary ZIPs on provider-safe references and marks only Skill packages eligible', async () => {
+    const root = await createTemporaryRoot()
+    const uploadRepository = new UploadRepository(root)
+    const skillArchive = buildStoredSkillArchive('Example Package')
+    const stagedAttachments = await stageUploadFixtures(uploadRepository, {
+      files: [
+        {
+          name: 'ordinary-data.zip',
+          mimeType: 'application/zip',
+          content: Buffer.from('zip-bytes').toString('base64')
+        },
+        {
+          name: 'ordinary-data.bin',
+          mimeType: ' Application/ZIP ; charset=binary ',
+          content: Buffer.from('zip-bytes').toString('base64')
+        },
+        {
+          name: 'example-package.skill',
+          mimeType: 'application/octet-stream',
+          content: skillArchive.toString('base64')
+        },
+        {
+          name: 'renamed-garbage.skill',
+          mimeType: 'application/octet-stream',
+          content: Buffer.from('not a Skill archive').toString('base64')
+        }
+      ]
+    })
+    const process = new FakeAgentProcess()
+    const receivedPrompts: ContentBlock[][] = []
+    const onSkillImportAttachmentEligible = vi.fn()
+    startFakeAgent(process, ['remote-session-1'], {
+      onPrompt: ({ prompt }) => {
+        receivedPrompts.push(prompt)
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      uploads: { repository: uploadRepository },
+      callbacks: { onSkillImportAttachmentEligible }
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    await runtime.sendPrompt({
+      sessionId: session.sessionId,
+      text: 'import this Skill',
+      attachments: stagedAttachments
+    })
+
+    expect(receivedPrompts).toHaveLength(1)
+    expect(receivedPrompts[0][1]).toMatchObject({
+      type: 'text',
+      text: expect.stringMatching(
+        /<attached_local_archive>[\s\S]*ordinary-data\.zip[\s\S]*"skillImportEligible":false/
+      )
+    })
+    expect(receivedPrompts[0][2]).toMatchObject({
+      type: 'text',
+      text: expect.stringMatching(
+        /<attached_local_archive>[\s\S]*ordinary-data\.bin[\s\S]*"skillImportEligible":false/
+      )
+    })
+    expect(receivedPrompts[0][3]).toMatchObject({
+      type: 'text',
+      text: expect.stringMatching(
+        /<attached_skill_package>[\s\S]*example-package\.skill[\s\S]*"skillImportEligible":true[\s\S]*"skillImportTurnToken":"[0-9a-f-]{36}"/
+      )
+    })
+    expect(receivedPrompts[0][4]).toMatchObject({
+      type: 'text',
+      text: expect.stringMatching(
+        /<attached_local_archive>[\s\S]*renamed-garbage\.skill[\s\S]*"skillImportEligible":false/
+      )
+    })
+    expect(onSkillImportAttachmentEligible).toHaveBeenCalledOnce()
+    expect(onSkillImportAttachmentEligible).toHaveBeenCalledWith(
+      session.sessionId,
+      expect.stringMatching(/^[0-9a-f-]{36}$/),
+      expect.stringMatching(/example-package\.skill$/)
+    )
+  })
+
+  it('keeps Skill packages as ordinary archive references when conversation import is disabled', async () => {
+    const root = await createTemporaryRoot()
+    const uploadRepository = new UploadRepository(root)
+    const stagedAttachments = await stageUploadFixtures(uploadRepository, {
+      files: [
+        {
+          name: 'example-package.skill',
+          mimeType: 'application/octet-stream',
+          content: buildStoredSkillArchive('Example Package').toString('base64')
+        }
+      ]
+    })
+    const process = new FakeAgentProcess()
+    const receivedPrompts: ContentBlock[][] = []
+    const onSkillImportAttachmentEligible = vi.fn()
+    startFakeAgent(process, ['remote-session-1'], {
+      onPrompt: ({ prompt }) => {
+        receivedPrompts.push(prompt)
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      uploads: { repository: uploadRepository },
+      skillImport: {
+        mcpEntryPath: '/app/out/main/index.js',
+        isEnabled: async () => false,
+        getRpcConnection: async () => ({ endpoint: 'http://127.0.0.1:4567', token: 'secret' })
+      },
+      callbacks: { onSkillImportAttachmentEligible }
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    await runtime.sendPrompt({
+      sessionId: session.sessionId,
+      text: 'inspect this archive',
+      attachments: stagedAttachments
+    })
+
+    expect(receivedPrompts[0][1]).toMatchObject({
+      type: 'text',
+      text: expect.stringMatching(
+        /<attached_local_archive>[\s\S]*example-package\.skill[\s\S]*"skillImportEligible":false/
+      )
+    })
+    expect(JSON.stringify(receivedPrompts[0])).not.toContain('skillImportTurnToken')
+    expect(onSkillImportAttachmentEligible).not.toHaveBeenCalled()
+  })
+
   it('inlines an image attachment as pixels when the browser sent no usable MIME type', async () => {
     const root = await createTemporaryRoot()
     const uploadRepository = new UploadRepository(root)
     // Some drag/drop and paste sources omit the MIME (undefined) or send a generic octet-stream; the
     // runtime must still recognize these as images by extension and send real pixels, not a file link.
-    const stagedAttachments = await uploadRepository.stageFiles({
+    const stagedAttachments = await stageUploadFixtures(uploadRepository, {
       files: [
         {
           name: 'no-mime.png',
@@ -1227,7 +2630,7 @@ describe('ACP runtime session management', () => {
   it('degrades an image attachment to a resource link when replay images consume the inline budget', async () => {
     const root = await createTemporaryRoot()
     const uploadRepository = new UploadRepository(root)
-    const [attachment] = await uploadRepository.stageFiles({
+    const [attachment] = await stageUploadFixtures(uploadRepository, {
       files: [
         {
           name: 'overflow.png',
@@ -1296,7 +2699,7 @@ describe('ACP runtime session management', () => {
     const session = await runtime.createSession({ cwd: '/workspace' })
 
     const stageImage = (name: string): Promise<UploadedAttachment[]> =>
-      uploadRepository.stageFiles({
+      stageUploadFixtures(uploadRepository, {
         files: [
           { name, mimeType: 'image/png', content: Buffer.from('png-bytes').toString('base64') }
         ]
@@ -1335,7 +2738,133 @@ describe('ACP runtime session management', () => {
     )
   })
 
-  it('sends an oversized text upload as a bounded preview + resource_link, never the full contents', async () => {
+  it('keeps image bytes charged when later prompt content preparation fails', async () => {
+    const root = await createTemporaryRoot()
+    const uploadRepository = new UploadRepository(root)
+    const process = new FakeAgentProcess()
+    const receivedPrompts: ContentBlock[][] = []
+    startFakeAgent(process, ['remote-session-1'], {
+      onPrompt: ({ prompt }) => {
+        receivedPrompts.push(prompt)
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      uploads: { repository: uploadRepository },
+      inlineImageBudgetBytes: 15
+    })
+    const stageImage = (name: string): Promise<UploadedAttachment[]> =>
+      stageUploadFixtures(uploadRepository, {
+        files: [
+          { name, mimeType: 'image/png', content: Buffer.from('png-bytes').toString('base64') }
+        ]
+      })
+
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    await expect(
+      runtime.sendPrompt({
+        sessionId: session.sessionId,
+        text: 'first image then invalid reference',
+        attachments: await stageImage('first.png'),
+        referencedArtifacts: [
+          {
+            id: 'missing-artifact',
+            name: 'missing.txt',
+            path: '/not-configured/missing.txt',
+            source: 'artifact',
+            mimeType: 'text/plain'
+          }
+        ]
+      })
+    ).rejects.toThrow('File reference source is not configured: artifact')
+    expect(receivedPrompts).toHaveLength(0)
+
+    await runtime.sendPrompt({
+      sessionId: session.sessionId,
+      text: 'second image',
+      attachments: await stageImage('second.png')
+    })
+
+    expect(receivedPrompts).toHaveLength(1)
+    expect(receivedPrompts[0][1]).toMatchObject({
+      type: 'resource_link',
+      name: 'second.png',
+      title: 'second.png',
+      mimeType: 'image/png',
+      uri: expect.stringContaining('second.png')
+    })
+    expect(JSON.stringify(receivedPrompts[0])).not.toContain(
+      Buffer.from('png-bytes').toString('base64')
+    )
+  })
+
+  it('registers every finalized prompt Upload Version with the trusted Notebook bridge', async () => {
+    const root = await createTemporaryRoot()
+    const uploadRepository = new UploadRepository(root)
+    const [historyUpload, currentUpload] = await stageUploadFixtures(uploadRepository, {
+      files: [
+        { name: 'history.csv', mimeType: 'text/csv', content: 'group\nA\n' },
+        { name: 'current.csv', mimeType: 'text/csv', content: 'group\nB\n' }
+      ]
+    })
+    const finalize = uploadRepository.finalizePendingSessionUploads.bind(uploadRepository)
+    vi.spyOn(uploadRepository, 'finalizePendingSessionUploads').mockImplementation(
+      async (...args) =>
+        (await finalize(...args)).map((attachment, index) => ({
+          ...attachment,
+          versionId: `upload-version-${index + 1}`,
+          versionNumber: 1,
+          checksum: String(index + 1).repeat(64),
+          createdAt: '2026-07-27T10:00:00.000Z'
+        }))
+    )
+    const registerTurnInputs = vi.fn(async () => undefined)
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['remote-session-1'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      uploads: { repository: uploadRepository },
+      artifacts: {
+        configRoot: root,
+        dataRoot: root,
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        repository: new ArtifactRepository(root)
+      },
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({ endpoint: 'http://127.0.0.1:1/notebook', token: 'nb' }),
+        registerTurnInputs
+      }
+    })
+    const session = await runtime.createSession({ cwd: '/workspace' })
+
+    await runtime.sendPrompt({
+      sessionId: session.sessionId,
+      text: 'analyze groups',
+      provenanceContext: { promptMessageId: 'message-user-1' },
+      historyAttachments: [historyUpload],
+      attachments: [currentUpload]
+    })
+
+    expect(registerTurnInputs).toHaveBeenCalledWith({
+      projectId: 'default-project',
+      appSessionId: 'remote-session-1',
+      promptMessageId: 'message-user-1',
+      uploads: [
+        expect.objectContaining({ id: historyUpload.id, versionId: 'upload-version-1' }),
+        expect.objectContaining({ id: currentUpload.id, versionId: 'upload-version-2' })
+      ],
+      references: []
+    })
+  })
+
+  it('sends compute files as bounded local references without ACP file blocks', async () => {
     const root = await createTemporaryRoot()
     const uploadRepository = new UploadRepository(root)
     // A >512 KB CSV: a unique marker after the preview window must never reach the prompt.
@@ -1344,9 +2873,14 @@ describe('ACP runtime session management', () => {
     const tailMarker = '\nSENTINEL_PAST_PREVIEW_WINDOW'
     const csvBody = `${header}${filler}${tailMarker}`
     expect(Buffer.byteLength(csvBody, 'utf8')).toBeGreaterThan(512 * 1024)
-    const stagedAttachments = await uploadRepository.stageFiles({
+    const stagedAttachments = await stageUploadFixtures(uploadRepository, {
       files: [
-        { name: 'big.csv', mimeType: 'text/csv', content: Buffer.from(csvBody).toString('base64') }
+        { name: 'big.csv', mimeType: 'text/csv', content: Buffer.from(csvBody).toString('base64') },
+        {
+          name: 'matrix.xlsx',
+          mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          content: Buffer.from('workbook-bytes').toString('base64')
+        }
       ]
     })
     const process = new FakeAgentProcess()
@@ -1372,29 +2906,43 @@ describe('ACP runtime session management', () => {
 
     expect(receivedPrompts).toHaveLength(1)
     const [prompt] = receivedPrompts
-    // Order is preserved: user text, then the file's preview notice, then its link.
+    // Order is preserved: user text, then the file's preview notice and local reference.
     expect(prompt[0]).toEqual({ type: 'text', text: 'analyze this table' })
     const notice = prompt[1] as Extract<ContentBlock, { type: 'text' }>
     expect(notice.type).toBe('text')
     expect(notice.text).toContain('big.csv')
     expect(notice.text).toContain('too large to include in full')
     expect(notice.text).toContain('id,name,value')
-    expect(prompt[2]).toMatchObject({
-      type: 'resource_link',
-      name: 'big.csv',
-      mimeType: 'text/csv',
-      uri: expect.stringContaining('/uploads/default-project/remote-session-1/big.csv')
-    })
-    // The full contents are never inlined: no `resource` block, and the past-preview marker never ships.
+    expect(notice.text).toContain('<attached_local_file>')
+    expect(notice.text).toContain('/uploads/default-project/remote-session-1/big.csv')
+    const datasetNotice = prompt[2] as Extract<ContentBlock, { type: 'text' }>
+    expect(datasetNotice.text).toContain('matrix.xlsx')
+    expect(datasetNotice.text).toContain('<attached_local_file>')
+    expect(prompt).toHaveLength(3)
+    // ACP file/resource blocks can be eagerly hydrated downstream, so only bounded text ships.
+    expect(prompt.some((block) => block.type === 'resource_link')).toBe(false)
     expect(prompt.some((block) => block.type === 'resource')).toBe(false)
     expect(JSON.stringify(prompt)).not.toContain('SENTINEL_PAST_PREVIEW_WINDOW')
   })
 
   it('adopts a fresh agent session under the same app id on a context reset', async () => {
+    const root = await createTemporaryRoot()
+    const connectorCall = vi.fn(async () => ({ ok: true }))
+    const notebookService = new NotebookRuntimeService({
+      configRoot: root,
+      dataRoot: root,
+      projectName: 'default-project',
+      repository: new NotebookRunRepository(root)
+    })
+    const notebookRpcServer = new NotebookLocalRpcServer(notebookService, {
+      token: 'control-token',
+      connectorService: { call: connectorCall }
+    })
+    temporaryDisconnections.push(() => notebookRpcServer.close())
     const process = new FakeAgentProcess()
     const receivedPrompts: ContentBlock[][] = []
     // A second agent session id is available for the fresh adoption that the reset performs.
-    startFakeAgent(process, ['remote-session-1', 'remote-session-2'], {
+    const fakeAgent = startFakeAgent(process, ['remote-session-1', 'remote-session-2'], {
       onPrompt: ({ prompt }) => {
         receivedPrompts.push(prompt)
       }
@@ -1402,14 +2950,32 @@ describe('ACP runtime session management', () => {
     const runtime = new AcpRuntime({
       appVersion: '0.1.0',
       defaultCwd: '/workspace',
-      spawnAgent: () => asAgentProcess(process)
+      spawnAgent: () => asAgentProcess(process),
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: ({ sessionId, projectId }) =>
+          notebookRpcServer.issueSessionConnection(sessionId, projectId),
+        registerSessionAlias: (aliasSessionId, sessionId) =>
+          notebookRpcServer.registerSessionAlias(aliasSessionId, sessionId),
+        releaseSessionCapabilities: (sessionId) =>
+          notebookRpcServer.releaseSessionCapabilities(sessionId)
+      }
     })
 
     const session = await runtime.createSession({ cwd: '/workspace' })
+    const initialNotebookServer = fakeAgent.newSessions[0]?.mcpServers[0]
+    const initialEndpoint = getEnvValue(initialNotebookServer, 'OPEN_SCIENCE_NOTEBOOK_RPC_ENDPOINT')
+    const initialToken = getEnvValue(initialNotebookServer, 'OPEN_SCIENCE_NOTEBOOK_RPC_TOKEN')
     const reset = await runtime.resetSessionContext({
       sessionId: session.sessionId,
       cwd: '/workspace'
     })
+    const replacementNotebookServer = fakeAgent.newSessions[1]?.mcpServers[0]
+    const replacementToken = getEnvValue(
+      replacementNotebookServer,
+      'OPEN_SCIENCE_NOTEBOOK_RPC_TOKEN'
+    )
 
     // The app-facing id stays attached (a brand-new agent session now backs it), and the caller is told
     // to replay a transcript because the agent-side context was dropped.
@@ -1420,6 +2986,619 @@ describe('ACP runtime session management', () => {
     // The fresh session still accepts prompts, so the conversation continues after the reset.
     await runtime.sendPrompt({ sessionId: session.sessionId, text: 'continue after compaction' })
     expect(receivedPrompts.at(-1)).toBeDefined()
+
+    const callConnector = (token: string): Promise<Response> =>
+      fetch(initialEndpoint, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${token}`,
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({
+          method: 'mcpCall',
+          params: { server: 'pubmed', method: 'search', args: {} }
+        })
+      })
+
+    expect(replacementToken).not.toBe(initialToken)
+    await expect(callConnector(initialToken)).resolves.toMatchObject({ status: 401 })
+    await expect(callConnector(replacementToken)).resolves.toMatchObject({ status: 200 })
+    expect(connectorCall).toHaveBeenCalledOnce()
+  })
+
+  it.each([true, false])(
+    'releases each Notebook capability generation exactly once across context reset and delete (replacement release: %s)',
+    async (replacementProvidesRelease) => {
+      const process = new FakeAgentProcess()
+      startFakeAgent(process, ['remote-session-1', 'remote-session-2'])
+      const capabilityReleases: Array<ReturnType<typeof vi.fn> | undefined> = []
+      const runtime = new AcpRuntime({
+        appVersion: '0.1.0',
+        defaultCwd: '/workspace',
+        spawnAgent: () => asAgentProcess(process),
+        notebook: {
+          projectName: 'default-project',
+          mcpEntryPath: '/app/out/main/index.js',
+          getRpcConnection: async () => {
+            const release =
+              capabilityReleases.length === 0 || replacementProvidesRelease ? vi.fn() : undefined
+            capabilityReleases.push(release)
+            return {
+              endpoint: 'http://127.0.0.1:4567',
+              token: `notebook-token-${capabilityReleases.length}`,
+              ...(release ? { release } : {})
+            }
+          }
+        }
+      })
+
+      try {
+        const session = await runtime.createSession({ cwd: '/workspace' })
+        expect(capabilityReleases).toHaveLength(1)
+        expect(capabilityReleases[0]).toBeDefined()
+        expect(capabilityReleases[0]).not.toHaveBeenCalled()
+
+        await runtime.resetSessionContext({ sessionId: session.sessionId, cwd: '/workspace' })
+        expect(capabilityReleases).toHaveLength(2)
+        expect(capabilityReleases[0]).toHaveBeenCalledOnce()
+        if (replacementProvidesRelease) {
+          expect(capabilityReleases[1]).not.toHaveBeenCalled()
+        } else {
+          expect(capabilityReleases[1]).toBeUndefined()
+        }
+
+        await runtime.deleteSession({ sessionId: session.sessionId })
+        expect(capabilityReleases[0]).toHaveBeenCalledOnce()
+        if (replacementProvidesRelease) {
+          expect(capabilityReleases[1]).toHaveBeenCalledOnce()
+        }
+      } finally {
+        await runtime.disconnect().catch(() => undefined)
+      }
+    }
+  )
+
+  it('uses the framework native command to compact without adding command output to chat events', async () => {
+    const process = new FakeAgentProcess()
+    const agent = startFakeAgent(process, ['remote-session-1'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: claudeCodeFramework
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    const resetPromptContent = vi.spyOn(promptContentLifecycle(runtime), 'resetSession')
+    contextUsageMap(runtime).set(session.sessionId, { used: 180_000, size: 200_000 })
+    expect(runtime.getSnapshot().nativeContextCompactionSessionIds).toEqual([session.sessionId])
+    await runtime.compactSession({ sessionId: session.sessionId })
+
+    expect(agent.prompts).toEqual([{ sessionId: 'remote-session-1', text: '/compact' }])
+    expect(resetPromptContent).toHaveBeenCalledOnce()
+    expect(resetPromptContent).toHaveBeenCalledWith(session.sessionId)
+    expect(runtime.getSnapshot().contextUsageBySession).toEqual({})
+    expect(
+      runtime
+        .getSnapshot()
+        .events.filter((event) => event.kind === 'message' || event.kind === 'thought')
+    ).toEqual([])
+  })
+
+  it('serializes prompts and compaction per session without blocking another session', async () => {
+    const process = new FakeAgentProcess()
+    const firstPromptGate = createDeferred<PromptResponse>()
+    const secondCompactionGate = createDeferred<PromptResponse>()
+    const agent = startFakeAgent(process, ['remote-session-1', 'remote-session-2'], {
+      onPrompt: ({ sessionId, text }) => {
+        if (sessionId === 'remote-session-1' && text === 'first prompt') {
+          return firstPromptGate.promise
+        }
+        if (sessionId === 'remote-session-2' && text === '/compact') {
+          return secondCompactionGate.promise
+        }
+        return undefined
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: claudeCodeFramework
+    })
+    const first = await runtime.createSession({ cwd: '/workspace' })
+    const second = await runtime.createSession({ cwd: '/workspace' })
+
+    // Claim compaction first to retain the public snapshot's historical grouping: prompt sessions
+    // precede compaction sessions regardless of the cross-kind claim order.
+    const compacting = runtime.compactSession({ sessionId: second.sessionId })
+    await vi.waitFor(() =>
+      expect(agent.prompts).toContainEqual({ sessionId: 'remote-session-2', text: '/compact' })
+    )
+    await expect(
+      runtime.sendPrompt({ sessionId: second.sessionId, text: 'blocked prompt' })
+    ).rejects.toThrow(/already running/)
+
+    const prompting = runtime.sendPrompt({ sessionId: first.sessionId, text: 'first prompt' })
+    await vi.waitFor(() =>
+      expect(agent.prompts).toContainEqual({
+        sessionId: 'remote-session-1',
+        text: 'first prompt'
+      })
+    )
+    await expect(runtime.compactSession({ sessionId: first.sessionId })).rejects.toThrow(
+      /already running/
+    )
+    expect(runtime.getSnapshot().promptInFlightSessionIds).toEqual([
+      first.sessionId,
+      second.sessionId
+    ])
+
+    firstPromptGate.resolve({ stopReason: 'end_turn' })
+    secondCompactionGate.resolve({ stopReason: 'end_turn' })
+    await expect(Promise.all([prompting, compacting])).resolves.toHaveLength(2)
+    expect(runtime.getSnapshot().promptInFlightSessionIds).toEqual([])
+  })
+
+  it('drops estimated pre-compaction categories when no fresh usage update arrives', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['remote-session-1'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: claudeCodeFramework
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    await runtime.sendPrompt({
+      sessionId: session.sessionId,
+      text: 'discarded history before compaction'
+    })
+    handleSessionUpdate(runtime, {
+      sessionId: session.sessionId,
+      update: { sessionUpdate: 'usage_update', used: 180_000, size: 200_000 }
+    })
+    expect(
+      runtime.getSnapshot().contextUsageBySession[session.sessionId]?.breakdown?.categories
+    ).toContainEqual(expect.objectContaining({ key: 'messages' }))
+
+    await runtime.compactSession({ sessionId: session.sessionId })
+    handleSessionUpdate(runtime, {
+      sessionId: session.sessionId,
+      update: { sessionUpdate: 'usage_update', used: 10, size: 200_000 }
+    })
+
+    expect(
+      runtime.getSnapshot().contextUsageBySession[session.sessionId]?.breakdown?.categories
+    ).not.toContainEqual(expect.objectContaining({ key: 'messages' }))
+  })
+
+  it('settles a cancelled native command without reporting compaction failure', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['remote-session-1'], {
+      onPrompt: ({ text }) =>
+        text === '/compact' ? { stopReason: 'cancelled' as const } : undefined
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: claudeCodeFramework
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    const resetPromptContent = vi.spyOn(promptContentLifecycle(runtime), 'resetSession')
+
+    await expect(runtime.compactSession({ sessionId: session.sessionId })).resolves.toMatchObject({
+      stopReason: 'cancelled'
+    })
+
+    expect(resetPromptContent).not.toHaveBeenCalled()
+    expect(
+      runtime
+        .getSnapshot()
+        .events.filter((event) => event.kind === 'compaction')
+        .map(({ status, title, text }) => ({ status, title, text }))
+    ).toEqual([
+      { status: 'in_progress', title: 'Compacting context', text: undefined },
+      {
+        status: 'cancelled',
+        title: 'Context compaction cancelled',
+        text: undefined
+      }
+    ])
+    expect(runtime.getSnapshot().promptInFlightSessionIds).toEqual([])
+  })
+
+  it('preserves the image budget when the adapter reports native compaction failure as output', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['remote-session-1'], {
+      replyForPrompt: (text) =>
+        text === '/compact' ? '\n\nCompacting failed: media_unstrippable' : 'reply'
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: claudeCodeFramework
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    const resetPromptContent = vi.spyOn(promptContentLifecycle(runtime), 'resetSession')
+
+    await expect(runtime.compactSession({ sessionId: session.sessionId })).rejects.toThrow(
+      'Compacting failed: media_unstrippable'
+    )
+
+    expect(resetPromptContent).not.toHaveBeenCalled()
+    expect(runtime.getSnapshot().events).toContainEqual(
+      expect.objectContaining({
+        kind: 'compaction',
+        status: 'failed',
+        text: 'Compacting failed: media_unstrippable'
+      })
+    )
+  })
+
+  it('keeps overflow-recovery compaction locked while the failed prompt finishes unwinding', async () => {
+    const root = await createTemporaryRoot()
+    const repository = new ArtifactRepository(root)
+    const releaseFailedCleanup = createDeferred()
+    vi.spyOn(repository, 'listPendingRunFiles').mockImplementation(async () => {
+      await releaseFailedCleanup.promise
+      return []
+    })
+    const process = new FakeAgentProcess()
+    const compactTurn = createDeferred<PromptResponse>()
+    const retryTurn = createDeferred<PromptResponse>()
+    const overflowObserved = createDeferred()
+    let cancelTimer:
+      | {
+          active: boolean
+          fire: () => void
+        }
+      | undefined
+    const agent = startFakeAgent(process, ['remote-session-1'], {
+      onPrompt: ({ text }) => {
+        if (text === '/compact') return compactTurn.promise
+        if (text === 'retry after overflow') return retryTurn.promise
+        throw acp.RequestError.internalError({ errorKind: 'request_too_large' }, 'Internal error')
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: claudeCodeFramework,
+      cancelTimeoutMs: 5,
+      setTimer: (callback) => {
+        const timer = {
+          active: true,
+          fire: (): void => {
+            if (timer.active) callback()
+          }
+        }
+        cancelTimer = timer
+        return timer as unknown as ReturnType<typeof setTimeout>
+      },
+      clearTimer: (handle) => {
+        const timer = handle as unknown as { active: boolean }
+        timer.active = false
+      },
+      artifacts: {
+        configRoot: root,
+        dataRoot: root,
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        repository
+      },
+      callbacks: {
+        onEvent: (event) => {
+          if (event.kind === 'error' && event.recoverable === 'context-overflow') {
+            overflowObserved.resolve()
+          }
+        }
+      }
+    })
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    const failedPrompt = runtime.sendPrompt({
+      sessionId: session.sessionId,
+      text: 'oversized prompt'
+    })
+    void failedPrompt.catch(() => undefined)
+    await overflowObserved.promise
+
+    await expect(runtime.compactSession({ sessionId: session.sessionId })).rejects.toThrow(
+      /already running/
+    )
+    const compacting = runtime.compactSession({
+      sessionId: session.sessionId,
+      reason: 'overflow-recovery'
+    })
+    await vi.waitFor(() => expect(agent.prompts.at(-1)?.text).toBe('/compact'))
+
+    // Ownership moved away from the failed prompt, but native compaction still keeps the session
+    // unavailable to another user turn until the framework control turn stops.
+    expect(runtime.getSnapshot().promptInFlightSessionIds).toEqual([session.sessionId])
+    await runtime.cancelPrompt({ sessionId: session.sessionId })
+    expect(agent.cancelledSessions).toEqual([session.sessionId])
+
+    compactTurn.resolve({ stopReason: 'end_turn' })
+    await compacting
+    expect(runtime.getSnapshot().promptInFlightSessionIds).toEqual([])
+    expect(cancelTimer?.active).toBe(false)
+    const retry = runtime.sendPrompt({ sessionId: session.sessionId, text: 'retry after overflow' })
+    await vi.waitFor(() => expect(agent.prompts.at(-1)?.text).toBe('retry after overflow'))
+
+    cancelTimer?.fire()
+    expect(runtime.getSnapshot().status).toBe('connected')
+
+    // The failed prompt can finish cleanup only after the retry owns the same stable App Session.
+    // Its stale finally must not clear the replacement interaction.
+    releaseFailedCleanup.resolve()
+    await expect(failedPrompt).rejects.toThrow()
+    expect(runtime.getSnapshot().promptInFlightSessionIds).toEqual([session.sessionId])
+
+    retryTurn.resolve({ stopReason: 'end_turn' })
+    await expect(retry).resolves.toMatchObject({ stopReason: 'end_turn' })
+  })
+
+  it('automatically invokes native compaction after a turn reaches the framework threshold', async () => {
+    const process = new FakeAgentProcess()
+    const agent = startFakeAgent(process, ['remote-session-1'], {
+      usageForPrompt: (text) =>
+        text === '/compact' ? { used: 24_000, size: 200_000 } : { used: 180_000, size: 200_000 }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: claudeCodeFramework
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    await runtime.sendPrompt({ sessionId: session.sessionId, text: 'analyze the results' })
+
+    expect(agent.prompts).toEqual([
+      { sessionId: 'remote-session-1', text: 'analyze the results' },
+      { sessionId: 'remote-session-1', text: '/compact' }
+    ])
+    expect(runtime.getSnapshot().contextUsageBySession[session.sessionId]).toMatchObject({
+      used: 24_000,
+      size: 200_000
+    })
+  })
+
+  it('exposes manual compaction without duplicating framework-owned automatic compaction', async () => {
+    const process = new FakeAgentProcess()
+    const agent = startFakeAgent(process, ['remote-session-1'], {
+      usageForPrompt: () => ({ used: 180_000, size: 200_000 })
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: {
+        ...claudeCodeFramework,
+        contextCompaction: { kind: 'native-command', command: '/compact' }
+      }
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    await runtime.sendPrompt({ sessionId: session.sessionId, text: 'analyze the results' })
+
+    expect(agent.prompts).toEqual([{ sessionId: 'remote-session-1', text: 'analyze the results' }])
+
+    await runtime.compactSession({ sessionId: session.sessionId })
+    expect(agent.prompts.at(-1)).toEqual({ sessionId: 'remote-session-1', text: '/compact' })
+  })
+
+  it('clears the previous context usage before a context reset replacement reports usage', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['remote-session-1', 'remote-session-2'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process)
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    contextUsageMap(runtime).set(session.sessionId, { used: 6400, size: 128000 })
+
+    await runtime.resetSessionContext({ sessionId: session.sessionId, cwd: '/workspace' })
+
+    expect(runtime.getSnapshot().contextUsageBySession).toEqual({})
+  })
+
+  it('drops stale permission tool context when resetting the provider session', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['remote-session-1', 'remote-session-2'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: opencodeFramework,
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({ endpoint: 'http://127.0.0.1:4567', token: 'nb' })
+      }
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    observePermissionToolContext(runtime, {
+      sessionId: session.sessionId,
+      update: {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'reused-call-id',
+        title: 'open-science-notebook_notebook_execute',
+        kind: 'other',
+        status: 'pending',
+        rawInput: { language: 'python', code: 'print(1)' }
+      }
+    })
+    expect(opencodeMcpToolInputsMap(runtime).has(session.sessionId)).toBe(true)
+
+    await runtime.resetSessionContext({ sessionId: session.sessionId, cwd: '/workspace' })
+
+    expect(opencodeMcpToolInputsMap(runtime).has(session.sessionId)).toBe(false)
+  })
+
+  it('does not carry OpenCode input across an explicit tool title change', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['remote-session-1'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: opencodeFramework,
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({ endpoint: 'http://127.0.0.1:4567', token: 'nb' })
+      }
+    })
+    const session = await runtime.createSession({ cwd: '/workspace' })
+
+    observePermissionToolContext(runtime, {
+      sessionId: session.sessionId,
+      update: {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'retitled-call',
+        title: 'open-science-notebook_notebook_status',
+        kind: 'other',
+        status: 'pending',
+        rawInput: { language: 'python', code: 'print(1)' }
+      }
+    })
+    observePermissionToolContext(runtime, {
+      sessionId: session.sessionId,
+      update: {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'retitled-call',
+        title: 'open-science-notebook_notebook_execute',
+        status: 'in_progress',
+        rawInput: {}
+      }
+    })
+
+    expect(opencodeMcpToolInputsMap(runtime).get(session.sessionId)?.get('retitled-call')).toEqual({
+      title: 'open-science-notebook_notebook_execute',
+      providerToolName: 'open-science-notebook_notebook_execute',
+      mcpIdentity: 'open-science-notebook/notebook_execute'
+    })
+  })
+
+  it('accepts a reused OpenCode tool call id after resetting provider context', async () => {
+    const process = new FakeAgentProcess()
+    const sessionIds = ['opencode-before-reset', 'opencode-after-reset']
+    const permissionRequests: AcpPermissionRequest[] = []
+    const permissionResponses: acp.RequestPermissionResponse[] = []
+    let promptIndex = 0
+
+    acp
+      .agent({ name: 'opencode-reset-reused-call-agent' })
+      .onRequest(acp.methods.agent.initialize, () => ({
+        protocolVersion: acp.PROTOCOL_VERSION,
+        agentCapabilities: {
+          loadSession: false,
+          sessionCapabilities: { close: {} }
+        },
+        authMethods: []
+      }))
+      .onRequest(acp.methods.agent.session.new, () => ({ sessionId: sessionIds.shift()! }))
+      .onRequest(acp.methods.agent.session.prompt, async (ctx) => {
+        const toolCallId = 'reused-after-reset'
+        if (promptIndex++ === 0) {
+          await ctx.client.notify(acp.methods.client.session.update, {
+            sessionId: ctx.params.sessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId,
+              title: 'open_science_notebook_notebook_execute',
+              kind: 'other',
+              status: 'pending',
+              rawInput: { language: 'python', code: 'print(1)' }
+            }
+          })
+          await ctx.client.notify(acp.methods.client.session.update, {
+            sessionId: ctx.params.sessionId,
+            update: {
+              sessionUpdate: 'tool_call_update',
+              toolCallId,
+              status: 'completed'
+            }
+          })
+          return { stopReason: 'end_turn' }
+        }
+
+        const pendingPermission = ctx.client.request(acp.methods.client.session.requestPermission, {
+          sessionId: ctx.params.sessionId,
+          toolCall: {
+            toolCallId,
+            title: 'open_science_notebook_notebook_execute',
+            kind: 'other',
+            status: 'pending',
+            rawInput: {}
+          },
+          options: [
+            { optionId: 'once', kind: 'allow_once', name: 'Allow once' },
+            { optionId: 'reject', kind: 'reject_once', name: 'Reject' }
+          ]
+        })
+        await ctx.client.notify(acp.methods.client.session.update, {
+          sessionId: ctx.params.sessionId,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId,
+            title: 'open_science_notebook_notebook_execute',
+            kind: 'other',
+            status: 'in_progress',
+            rawInput: { language: 'r', code: 'print(2)' }
+          }
+        })
+        permissionResponses.push(await pendingPermission)
+        return { stopReason: 'end_turn' }
+      })
+      .onRequest(acp.methods.agent.session.close, () => ({}))
+      .connect(
+        acp.ndJsonStream(
+          Writable.toWeb(process.stdout) as WritableStream<Uint8Array>,
+          Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>
+        )
+      )
+
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: opencodeFramework,
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({ endpoint: 'http://127.0.0.1:4567', token: 'nb' })
+      },
+      callbacks: {
+        onPermissionRequest: (request) => {
+          permissionRequests.push(request)
+          const sessionOptionId = request.options.find(
+            (option) => option.scope === 'session'
+          )?.optionId
+          if (!sessionOptionId) throw new Error('Missing conversation permission option')
+          runtime.respondToPermission({ requestId: request.requestId, optionId: sessionOptionId })
+        }
+      }
+    })
+    const session = await runtime.createSession({ cwd: '/workspace', permissionProfile: 'ask' })
+    await runtime.sendPrompt({ sessionId: session.sessionId, text: 'run before reset' })
+    await runtime.resetSessionContext({ sessionId: session.sessionId, cwd: '/workspace' })
+
+    await runtime.sendPrompt({ sessionId: session.sessionId, text: 'run after reset' })
+
+    expect(permissionRequests).toHaveLength(1)
+    expect(permissionRequests[0].rawInput).toEqual({ language: 'r', code: 'print(2)' })
+    expect(permissionResponses).toEqual([{ outcome: { outcome: 'selected', optionId: 'once' } }])
   })
 
   it('releases the in-flight prompt lock on reset so the recovery resend is not rejected', async () => {
@@ -1491,10 +3670,12 @@ describe('ACP runtime session management', () => {
         return gateB.promise
       }
     })
+    const events: AcpRuntimeEvent[] = []
     const runtime = new AcpRuntime({
       appVersion: '0.1.0',
       defaultCwd: '/workspace',
       spawnAgent: () => asAgentProcess(process),
+      callbacks: { onEvent: (event) => events.push(event) },
       artifacts: {
         configRoot: root,
         dataRoot: root,
@@ -1507,7 +3688,11 @@ describe('ACP runtime session management', () => {
     const session = await runtime.createSession({ cwd: '/workspace' })
     // The lock is claimed synchronously at turn start, so no polling is needed to observe it.
     const failedTurn = runtime
-      .sendPrompt({ sessionId: session.sessionId, text: 'oversized turn' })
+      .sendPrompt({
+        sessionId: session.sessionId,
+        text: 'oversized turn',
+        provenanceContext: { promptMessageId: 'old-prompt-message' }
+      })
       .catch(() => undefined)
     expect(runtime.getSnapshot().promptInFlightSessionIds).toContain(session.sessionId)
 
@@ -1519,7 +3704,11 @@ describe('ACP runtime session management', () => {
     // The replay turn re-claims the lock for the same app session id while the abandoned turn's finally is
     // still parked in listPendingRunFiles.
     const replayTurn = runtime
-      .sendPrompt({ sessionId: session.sessionId, text: 'replayed turn' })
+      .sendPrompt({
+        sessionId: session.sessionId,
+        text: 'replayed turn',
+        provenanceContext: { promptMessageId: 'replacement-prompt-message' }
+      })
       .catch(() => undefined)
     expect(runtime.getSnapshot().promptInFlightSessionIds).toContain(session.sessionId)
 
@@ -1534,13 +3723,21 @@ describe('ACP runtime session management', () => {
     gateA.resolve()
     gateB.resolve()
     await replayTurn
+    expect(
+      events
+        .filter((event) => event.kind === 'error' || event.kind === 'stop')
+        .map((event) => ({
+          kind: event.kind,
+          promptMessageId: event.promptMessageId
+        }))
+    ).toEqual([{ kind: 'stop', promptMessageId: 'replacement-prompt-message' }])
   })
 
   it('sends PDFs as extracted text, never as an inlined base64 file', async () => {
     const root = await createTemporaryRoot()
     const uploadRepository = new UploadRepository(root)
     // Non-PDF bytes make extraction fail deterministically; the block must still be text, not the file.
-    const stagedAttachments = await uploadRepository.stageFiles({
+    const stagedAttachments = await stageUploadFixtures(uploadRepository, {
       files: [
         {
           name: 'doc.pdf',
@@ -1647,13 +3844,82 @@ describe('ACP runtime session management', () => {
     await Promise.all([promptA, promptB])
   })
 
+  it('publishes app-side artifact writes as durable Provenance Versions', async () => {
+    const root = await createTemporaryRoot()
+    const artifactRepository = new ArtifactRepository(root)
+    const process = new FakeAgentProcess()
+    const promptGate = createDeferred()
+    const fakeAgent = startFakeAgent(process, ['remote-session-1'], {
+      onPrompt: () => promptGate.promise
+    })
+    const version = {
+      id: 'version-1',
+      artifactId: 'artifact-1',
+      versionId: 'version-1',
+      versionNumber: 1,
+      checksum: 'a'.repeat(64),
+      createdAt: '2026-07-28T00:00:00.000Z',
+      projectName: 'project-1',
+      sessionId: 'remote-session-1',
+      runId: 'artifact-run-1',
+      name: 'aspirin.mol',
+      path: join(root, 'immutable-content'),
+      fileUrl: 'file:///immutable-content',
+      mimeType: 'chemical/x-mdl-molfile',
+      size: 3,
+      mtimeMs: 1
+    }
+    const versions: (typeof version)[] = []
+    const provenance = {
+      writeAppGeneratedVersion: vi.fn(async () => {
+        versions.push(version)
+        return version
+      }),
+      listRunVersions: vi.fn(async () => versions)
+    }
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      artifacts: {
+        configRoot: root,
+        dataRoot: root,
+        projectName: 'default-project',
+        mcpEntryPath: '/unused',
+        repository: artifactRepository,
+        provenance
+      }
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace', projectName: 'project-1' })
+    const prompt = runtime.sendPrompt({ sessionId: session.sessionId, text: 'preview aspirin' })
+    await vi.waitFor(() => expect(fakeAgent.prompts).toHaveLength(1))
+
+    const artifact = await runtime.writeArtifactForCurrentRun(session.sessionId, {
+      filename: 'aspirin.mol',
+      content: 'mol',
+      mimeType: 'chemical/x-mdl-molfile'
+    })
+
+    expect(artifact).toMatchObject({ id: 'version-1', versionId: 'version-1' })
+    expect(provenance.writeAppGeneratedVersion).toHaveBeenCalledOnce()
+    promptGate.resolve()
+    await prompt
+    expect(runtime.getSnapshot().events).toContainEqual(
+      expect.objectContaining({
+        kind: 'artifact',
+        artifacts: [expect.objectContaining({ versionId: 'version-1' })]
+      })
+    )
+  })
+
   it('appends referenced artifacts as content blocks by file type', async () => {
     const root = await createTemporaryRoot()
     const uploadRepository = new UploadRepository(root)
     const artifactRepository = new ArtifactRepository(root)
 
     // A referenced upload (an already-staged file) resolves through the upload path validator.
-    const [uploadRef] = await uploadRepository.stageFiles({
+    const [uploadRef] = await stageUploadFixtures(uploadRepository, {
       files: [
         {
           name: 'summary.txt',
@@ -1670,11 +3936,7 @@ describe('ACP runtime session management', () => {
       runId: 'run-1',
       filename: 'chart.png',
       mimeType: 'image/png',
-      source: {
-        kind: 'inline',
-        content: Buffer.from('png-bytes').toString('base64'),
-        encoding: 'base64'
-      }
+      source: createPngInlineSource('runtime referenced image')
     })
 
     // A referenced binary output has no rich representation, so it falls through to a resource link.
@@ -1687,6 +3949,21 @@ describe('ACP runtime session management', () => {
       source: {
         kind: 'inline',
         content: Buffer.from([0, 1, 2, 3]).toString('base64'),
+        encoding: 'base64'
+      }
+    })
+
+    // An artifact-backed Skill package is not owned by the upload-only import tool, so the prompt
+    // must retain it as an ordinary resource instead of advertising an unusable import URI.
+    const skillArtifact = await artifactRepository.writePendingFile({
+      projectName: 'default-project',
+      sessionId: 'remote-session-1',
+      runId: 'run-1',
+      filename: 'generated.skill',
+      mimeType: 'application/octet-stream',
+      source: {
+        kind: 'inline',
+        content: Buffer.from('skill-archive-bytes').toString('base64'),
         encoding: 'base64'
       }
     })
@@ -1737,6 +4014,13 @@ describe('ACP runtime session management', () => {
           path: binaryArtifact.path,
           source: 'artifact',
           mimeType: binaryArtifact.mimeType
+        },
+        {
+          id: 'a3',
+          name: skillArtifact.name,
+          path: skillArtifact.path,
+          source: 'artifact',
+          mimeType: skillArtifact.mimeType
         }
       ]
     })
@@ -1756,7 +4040,7 @@ describe('ACP runtime session management', () => {
     expect(receivedPrompts[0][2]).toMatchObject({
       type: 'image',
       mimeType: 'image/png',
-      data: Buffer.from('png-bytes').toString('base64'),
+      data: createPngBytes('runtime referenced image').toString('base64'),
       uri: expect.stringContaining('chart.png')
     })
     // Referenced binary artifact -> resource link.
@@ -1767,6 +4051,325 @@ describe('ACP runtime session management', () => {
       mimeType: 'application/octet-stream',
       uri: expect.stringContaining('data.bin')
     })
+    // Artifact-backed Skill package -> provider-safe ordinary archive reference, never the
+    // current-session import wrapper.
+    expect(receivedPrompts[0][4]).toMatchObject({
+      type: 'text',
+      text: expect.stringMatching(
+        /<attached_local_archive>[\s\S]*generated\.skill[\s\S]*"skillImportEligible":false/
+      )
+    })
+  })
+
+  it('resolves a version-backed artifact mention before sending the prompt', async () => {
+    const root = await createTemporaryRoot()
+    const artifactRepository = new ArtifactRepository(root)
+    const immutablePath = join(root, 'provenance', 'artifact-version-1', 'content')
+    await mkdir(join(root, 'provenance', 'artifact-version-1'), { recursive: true })
+    await writeFile(immutablePath, 'version-backed artifact')
+
+    const process = new FakeAgentProcess()
+    const receivedPrompts: ContentBlock[][] = []
+    startFakeAgent(process, ['remote-session-1'], {
+      onPrompt: ({ prompt }) => {
+        receivedPrompts.push(prompt)
+      }
+    })
+    const resolveVersionContent = vi.fn(async () => ({
+      path: immutablePath,
+      filename: 'report.txt',
+      contentType: 'text/plain'
+    }))
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      artifacts: {
+        configRoot: root,
+        dataRoot: root,
+        projectName: 'default-project',
+        mcpEntryPath: '/unused',
+        repository: artifactRepository,
+        provenance: {
+          listRunVersions: vi.fn(async () => []),
+          writeAppGeneratedVersion: vi.fn(),
+          resolveVersionContent
+        }
+      }
+    })
+
+    const session = await runtime.createSession({
+      cwd: '/workspace',
+      projectName: 'project-1'
+    })
+    await runtime.sendPrompt({
+      sessionId: session.sessionId,
+      text: 'inspect this artifact',
+      referencedArtifacts: [
+        {
+          id: 'artifact-version-1',
+          name: 'report.txt',
+          path: createArtifactVersionLocator({
+            projectId: 'project-1',
+            appSessionId: 'source-session',
+            artifactId: 'artifact-1',
+            versionId: 'artifact-version-1'
+          }),
+          source: 'artifact',
+          mimeType: 'text/plain'
+        }
+      ]
+    })
+
+    expect(resolveVersionContent).toHaveBeenCalledWith({
+      projectId: 'project-1',
+      appSessionId: 'source-session',
+      artifactId: 'artifact-1',
+      versionId: 'artifact-version-1'
+    })
+    expect(receivedPrompts[0][1]).toMatchObject({
+      type: 'resource',
+      resource: {
+        mimeType: 'text/plain',
+        text: 'version-backed artifact',
+        uri: expect.stringContaining('content')
+      }
+    })
+  })
+
+  it('advertises only current-session upload references to the Skill importer', async () => {
+    const root = await createTemporaryRoot()
+    const uploadRepository = new UploadRepository(root)
+    const currentSkillArchive = buildStoredSkillArchive('Current Skill')
+    const staged = await stageUploadFixtures(uploadRepository, {
+      files: [
+        {
+          name: 'current.skill',
+          mimeType: 'application/octet-stream',
+          content: currentSkillArchive.toString('base64')
+        },
+        {
+          name: 'other.skill',
+          mimeType: 'application/octet-stream',
+          content: Buffer.from('other skill bytes').toString('base64')
+        }
+      ]
+    })
+    const [currentSessionUpload] = await uploadRepository.finalizePendingSessionUploads(
+      'remote-session-1',
+      [staged[0]]
+    )
+    const [otherSessionUpload] = await uploadRepository.finalizePendingSessionUploads(
+      'remote-session-2',
+      [staged[1]]
+    )
+
+    const process = new FakeAgentProcess()
+    const receivedPrompts: ContentBlock[][] = []
+    startFakeAgent(process, ['remote-session-1'], {
+      onPrompt: ({ prompt }) => {
+        receivedPrompts.push(prompt)
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      uploads: { repository: uploadRepository }
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    const resolvedCurrentUpload = await uploadRepository.resolveSessionUploadPath(
+      session.sessionId,
+      { path: currentSessionUpload.path }
+    )
+    expect(resolvedCurrentUpload.endsWith(join('remote-session-1', 'current.skill'))).toBe(true)
+    await expect(
+      uploadRepository.resolveSessionUploadPath(session.sessionId, {
+        path: otherSessionUpload.path
+      })
+    ).rejects.toThrow(/different (?:project or )?session/)
+    await runtime.sendPrompt({
+      sessionId: session.sessionId,
+      text: 'compare these packages',
+      referencedArtifacts: [
+        {
+          id: 'current',
+          name: currentSessionUpload.originalName,
+          path: currentSessionUpload.path,
+          source: 'upload',
+          mimeType: currentSessionUpload.mimeType
+        },
+        {
+          id: 'other',
+          name: otherSessionUpload.originalName,
+          path: otherSessionUpload.path,
+          source: 'upload',
+          mimeType: otherSessionUpload.mimeType
+        }
+      ]
+    })
+
+    expect(receivedPrompts[0][1]).toMatchObject({
+      type: 'text',
+      text: expect.stringMatching(
+        /<attached_skill_package>[\s\S]*current\.skill[\s\S]*"skillImportTurnToken":"[0-9a-f-]{36}"/
+      )
+    })
+    expect(receivedPrompts[0][2]).toMatchObject({
+      type: 'text',
+      text: expect.stringMatching(
+        /<attached_local_archive>[\s\S]*other\.skill[\s\S]*"skillImportEligible":false/
+      )
+    })
+  })
+
+  it('allows a cross-session Skill upload only while the user explicitly references it', async () => {
+    const root = await realpath(await createTemporaryRoot())
+    const legacyUploads = new UploadRepository(root)
+    const [staged] = await stageUploadFixtures(legacyUploads, {
+      files: [
+        {
+          name: 'paper-finder.skill',
+          mimeType: 'application/zip',
+          content: buildStoredSkillArchive('Paper Finder').toString('base64')
+        }
+      ]
+    })
+    const [attachment] = await legacyUploads.finalizePendingSessionUploads('owning-session', [
+      staged
+    ])
+    const client = createProjectDbClient(root)
+    temporaryDisconnections.push(() => client.$disconnect())
+    await ensureProjectSchema(client)
+    await client.fileOriginSession.create({
+      data: { projectId: 'project-1', sessionId: 'owning-session' }
+    })
+    const uploads = new UploadRepository(root, {
+      getClient: () => Promise.resolve(client)
+    })
+    const approvalBroker = new SkillImportApprovalBroker({
+      generateId: () => 'approval-1',
+      broadcast: vi.fn()
+    })
+    const importer = new ConversationSkillImporter({
+      uploads,
+      createCancellationGuard: (sessionId, turnToken, attachmentUri) =>
+        approvalBroker.createCancellationGuard(sessionId, turnToken, attachmentUri),
+      previewBundle: async () => ({
+        previews: [
+          {
+            subPath: 'paper-finder',
+            name: 'Paper Finder',
+            description: 'Finds papers.',
+            metadata: {},
+            body: 'Follow the workflow.',
+            files: ['SKILL.md'],
+            alreadyImported: false
+          }
+        ],
+        skipped: []
+      }),
+      importBundle: async (_bundle, items) =>
+        items.map((item) => ({
+          subPath: item.subPath,
+          outcome: { status: 'imported' as const, id: 'imported-paper-finder' }
+        })),
+      requestApproval: async (request) => ({
+        id: 'approval-1',
+        items: [{ subPath: request.previews[0].subPath }]
+      })
+    })
+    let importResult: Awaited<ReturnType<ConversationSkillImporter['request']>> | undefined
+    let activeTurnToken: string | undefined
+    let advertisedAttachmentUri: string | undefined
+    let promptError: unknown
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['current-session'], {
+      onPrompt: async ({ prompt }) => {
+        try {
+          if (!activeTurnToken) throw new Error('Expected an active Skill import turn token.')
+          const reference = prompt.find(
+            (block) => block.type === 'text' && block.text.includes('<attached_skill_package>')
+          )
+          if (reference?.type !== 'text') {
+            throw new Error('Expected an import-eligible Skill package reference.')
+          }
+          advertisedAttachmentUri = (JSON.parse(reference.text.split('\n')[1]) as { uri: string })
+            .uri
+          importResult = await importer.request({
+            sessionId: 'current-session',
+            turnToken: activeTurnToken,
+            attachmentUri: advertisedAttachmentUri
+          })
+        } catch (error) {
+          promptError = error
+        }
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      uploads: { repository: uploads },
+      skillImport: {
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({
+          endpoint: 'http://127.0.0.1:4567',
+          token: 'secret-token'
+        }),
+        authorizeReferencedUploads: (projectId, sessionId, paths) =>
+          importer.authorizeReferencedUploads(projectId, sessionId, paths)
+      },
+      callbacks: {
+        onPromptStarted: (sessionId, turnToken) => {
+          activeTurnToken = turnToken
+          approvalBroker.beginSessionTurn(sessionId, turnToken)
+        },
+        onPromptEnded: (sessionId, turnToken) =>
+          approvalBroker.endSessionTurn(sessionId, turnToken),
+        onSkillImportAttachmentEligible: (sessionId, turnToken, attachmentUri) =>
+          approvalBroker.allowSessionTurnAttachment(sessionId, turnToken, attachmentUri)
+      }
+    })
+
+    // Legacy uploads live under `default-project` even when the Session is now opened from a real
+    // Project. The explicit `@` selection grants cross-Session access only after the persisted
+    // Session-to-Project binding proves the source belongs to the same Project.
+    const session = await runtime.createSession({ cwd: '/workspace', projectName: 'project-1' })
+    await runtime.sendPrompt({
+      sessionId: session.sessionId,
+      text: 'import @Paper Finder',
+      referencedArtifacts: [
+        {
+          id: 'upload-1',
+          name: attachment.originalName,
+          path: attachment.path,
+          source: 'upload',
+          mimeType: attachment.mimeType
+        }
+      ]
+    })
+
+    expect(promptError).toBeUndefined()
+    expect(importResult).toEqual({
+      status: 'imported',
+      skills: [{ id: 'imported-paper-finder', name: 'Paper Finder', status: 'imported' }]
+    })
+    if (!advertisedAttachmentUri) throw new Error('Expected an advertised Skill attachment URI.')
+    approvalBroker.beginSessionTurn(session.sessionId, 'retry-turn')
+    approvalBroker.allowSessionTurnAttachment(
+      session.sessionId,
+      'retry-turn',
+      advertisedAttachmentUri
+    )
+    await expect(
+      importer.request({
+        sessionId: session.sessionId,
+        turnToken: 'retry-turn',
+        attachmentUri: advertisedAttachmentUri
+      })
+    ).rejects.toThrow(/different (?:project or )?session/)
   })
 
   it('resolves a bare-filename artifact write against the final-session notebook dir despite the alias', async () => {
@@ -1780,7 +4383,8 @@ describe('ACP runtime session management', () => {
     // The kernel's real cwd for this session, keyed by the FINAL id (not the notebook alias).
     const notebookDataDir = join(root, 'notebooks', 'default-project', finalSessionId, 'data')
     await mkdir(notebookDataDir, { recursive: true })
-    await writeFile(join(notebookDataDir, 'sine.png'), 'PNGDATA', 'utf8')
+    const sourcePng = createPngBytes('runtime notebook image')
+    await writeFile(join(notebookDataDir, 'sine.png'), sourcePng)
 
     let writtenPath: string | undefined
     let capturedContext: Record<string, unknown> | undefined
@@ -1845,7 +4449,81 @@ describe('ACP runtime session management', () => {
     expect(capturedContext?.notebookDataDir).not.toContain('notebook-session-')
     // And the bare-filename write actually copied the kernel file into pending artifacts.
     expect(writtenPath).toBeDefined()
-    await expect(readFile(writtenPath as string, 'utf8')).resolves.toBe('PNGDATA')
+    await expect(readFile(writtenPath as string)).resolves.toEqual(sourcePng)
+  })
+
+  it('writes a run-scoped Artifact RPC capability into the handoff and revokes it after the turn', async () => {
+    const root = await createTemporaryRoot()
+    const artifactRepository = new ArtifactRepository(root)
+    const issuedBindings: unknown[] = []
+    const revokedTokens: string[] = []
+    let capturedContext: Record<string, unknown> | undefined
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['remote-session-1'], {
+      onPrompt: async () => {
+        const projectDir = join(root, 'artifacts', 'default-project')
+        const [artifactSessionId] = await readdir(projectDir)
+        const currentRunFile = join(projectDir, artifactSessionId, '.pending', 'current-run.json')
+        capturedContext = JSON.parse(await readFile(currentRunFile, 'utf8')) as Record<
+          string,
+          unknown
+        >
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      artifacts: {
+        configRoot: root,
+        dataRoot: root,
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        repository: artifactRepository,
+        getRpcConnection: async () => ({ endpoint: 'http://127.0.0.1:4567', token: 'global' }),
+        issueRpcCapability: (binding) => {
+          issuedBindings.push(binding)
+          return 'run-capability-1'
+        },
+        revokeRpcCapability: (token) => {
+          revokedTokens.push(token)
+        }
+      }
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    await runtime.sendPrompt({
+      sessionId: session.sessionId,
+      text: 'plot a sine wave',
+      provenanceContext: {
+        rootFrameId: 'root-frame-1',
+        agentFrameId: 'agent-frame-1',
+        messageBranchId: 'branch-1',
+        runtimeSegmentId: 'runtime-1',
+        promptMessageId: 'message-user-1'
+      }
+    })
+
+    expect(capturedContext).toMatchObject({
+      artifactRunId: expect.stringMatching(/^artifact-run-/u),
+      appSessionId: session.sessionId,
+      rootFrameId: 'root-frame-1',
+      agentFrameId: 'agent-frame-1',
+      messageBranchId: 'branch-1',
+      runtimeSegmentId: 'runtime-1',
+      promptMessageId: 'message-user-1',
+      rpcCapabilityToken: 'run-capability-1'
+    })
+    expect(issuedBindings).toEqual([
+      expect.objectContaining({
+        projectId: 'default-project',
+        appSessionId: session.sessionId,
+        artifactRunId: capturedContext?.artifactRunId,
+        rootFrameId: 'root-frame-1',
+        allowedMethods: ['artifactCreateVersion', 'artifactReplayVersion']
+      })
+    ])
+    expect(revokedTokens).toEqual(['run-capability-1'])
   })
 
   it('gives opencode the stdio artifact MCP server + tool guidance (it accepts stdio like Claude)', async () => {
@@ -1878,6 +4556,10 @@ describe('ACP runtime session management', () => {
     expect(fakeAgent.newSessions[0]._meta).toBeUndefined()
     expect(fakeAgent.prompts[0].text).toContain('hello opencode')
     expect(fakeAgent.prompts[0].text).toContain('write_artifact_file')
+    expect(fakeAgent.prompts[0].text).toContain('producerRunId')
+    expect(fakeAgent.prompts[0].text).toContain('Only claim a generated file is available after')
+    expect(fakeAgent.prompts[0].text).not.toContain('Pass only the filename')
+    expect(fakeAgent.prompts[0].text).not.toContain('<open_science_skill_privacy_instructions>')
   })
 
   it('gives bridge-backed Codex the artifact server through its explicit function alias', async () => {
@@ -1963,6 +4645,25 @@ describe('ACP runtime session management', () => {
     expect(fakeAgent.prompts[0].text).not.toContain('<open_science_artifact_instructions>')
   })
 
+  it('does not tell Codex to skip the native SKILL.md read required for progressive loading', async () => {
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['codex-session'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'read-only')
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: codexFramework
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    await runtime.sendPrompt({ sessionId: session.sessionId, text: 'Search PubMed' })
+
+    expect(fakeAgent.prompts[0].text).toContain('Search PubMed')
+    expect(fakeAgent.prompts[0].text).not.toContain('<open_science_skill_privacy_instructions>')
+  })
+
   it('delivers the large-data-file guidance to Claude session metadata on create and resume', async () => {
     const process = new FakeAgentProcess()
     const fakeAgent = startFakeAgent(process, ['remote-session-1'], { supportsResume: true })
@@ -1993,28 +4694,193 @@ describe('ACP runtime session management', () => {
     })
   })
 
-  it('delivers the large-data-file guidance to opencode as a prompt prefix', async () => {
+  it('delivers resolved connector guidance to Claude session metadata on create and resume', async () => {
     const process = new FakeAgentProcess()
-    const fakeAgent = startFakeAgent(process, ['oc-session'])
+    const fakeAgent = startFakeAgent(process, ['remote-session-1'], { supportsResume: true })
+    const connectorInstructions =
+      'Load the matching `mcp-*` skill before using a connector, then call host.mcp(...).'
     const runtime = new AcpRuntime({
       appVersion: '0.1.0',
       defaultCwd: '/workspace',
-      spawnAgent: () => asAgentProcess(process),
-      framework: opencodeFramework
+      resolveBackend: () => ({
+        framework: { ...claudeCodeFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/agent',
+        env: {},
+        systemPromptAppends: [connectorInstructions]
+      })
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    await runtime.resumeSession({ sessionId: 'remote-session-2', cwd: '/workspace' })
+
+    expect(fakeAgent.newSessions[0]._meta).toMatchObject({
+      systemPrompt: { append: expect.stringContaining(connectorInstructions) }
+    })
+    expect(fakeAgent.resumedSessions[0]._meta).toMatchObject({
+      systemPrompt: { append: expect.stringContaining(connectorInstructions) }
+    })
+  })
+
+  it('keeps backend-persistent Codex guidance out of the user prompt', async () => {
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['codex-session'], {
+      modes: {
+        currentModeId: 'agent',
+        availableModes: ['read-only', 'agent', 'agent-full-access'].map((id) => ({ id, name: id }))
+      }
+    })
+    const persistentInstructions = 'Stable Codex developer instructions.'
+    let resolvedContext: { forcedSkillIds: string[]; systemPromptAppends?: string[] } | undefined
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: (context) => {
+        resolvedContext = context
+        return {
+          framework: { ...codexFramework, spawn: () => asAgentProcess(process) },
+          executablePath: '/bin/codex-acp',
+          env: {},
+          persistentSystemPrompt: persistentInstructions
+        }
+      }
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    await runtime.sendPrompt({ sessionId: session.sessionId, text: 'search PubMed' })
+    await runtime.sendPrompt({ sessionId: session.sessionId, text: 'summarize the results' })
+
+    expect(resolvedContext?.systemPromptAppends).toEqual(
+      expect.arrayContaining([expect.stringContaining('open_science_large_file_instructions')])
+    )
+    expect(fakeAgent.prompts.map(({ text }) => text)).toEqual([
+      'search PubMed',
+      'summarize the results'
+    ])
+    expect(fakeAgent.prompts.every(({ text }) => !text.includes(persistentInstructions))).toBe(true)
+  })
+
+  it('forwards resolved Claude session options on create and resume', async () => {
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['remote-session-1'], { supportsResume: true })
+    const sessionOptions = {
+      settings: '/app/claude/settings.json',
+      plugins: [{ type: 'local', path: '/app/claude', skipMcpDiscovery: true }]
+    }
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...claudeCodeFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/agent',
+        env: {},
+        sessionOptions
+      })
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    await runtime.resumeSession({ sessionId: 'remote-session-2', cwd: '/workspace' })
+
+    expect(fakeAgent.newSessions[0]._meta).toMatchObject({
+      claudeCode: { options: { ...sessionOptions, settingSources: ['user'] } }
+    })
+    expect(fakeAgent.resumedSessions[0]._meta).toMatchObject({
+      claudeCode: { options: { ...sessionOptions, settingSources: ['user'] } }
+    })
+  })
+
+  it('keeps backend-persistent OpenCode guidance out of the user prompt', async () => {
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['oc-session'])
+    let resolvedContext: { forcedSkillIds: string[]; systemPromptAppends?: string[] } | undefined
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: (context) => {
+        resolvedContext = context
+        return {
+          framework: { ...opencodeFramework, spawn: () => asAgentProcess(process) },
+          executablePath: '/bin/opencode',
+          env: {},
+          persistentSystemPrompt: 'Stable OpenCode instructions.'
+        }
+      }
     })
 
     const session = await runtime.createSession({ cwd: '/workspace' })
     await runtime.sendPrompt({ sessionId: session.sessionId, text: 'hello opencode' })
+    await runtime.sendPrompt({ sessionId: session.sessionId, text: 'continue' })
 
-    // opencode has no system-prompt preset, so the guidance rides the prompt prefix ahead of user text.
     expect(fakeAgent.newSessions[0]._meta).toBeUndefined()
-    expect(fakeAgent.prompts[0].text).toContain('open_science_large_file_instructions')
-    expect(fakeAgent.prompts[0].text).toContain('hello opencode')
+    expect(resolvedContext?.systemPromptAppends).toEqual(
+      expect.arrayContaining([expect.stringContaining('open_science_large_file_instructions')])
+    )
+    expect(fakeAgent.prompts.map(({ text }) => text)).toEqual(['hello opencode', 'continue'])
   })
 
-  it('serves artifact/notebook MCP over the http host for an http-only framework', async () => {
+  it('waits for session-scoped MCP capability readiness before creating the agent session', async () => {
+    const httpHost = {
+      ensureStarted: vi.fn(async () => ({
+        endpoint: 'http://127.0.0.1:4321',
+        token: 'host-token'
+      })),
+      registerNotebook: vi.fn(),
+      urlFor: vi.fn(
+        (kind: string, routingId: string) =>
+          `http://127.0.0.1:4321/mcp/${kind}/${encodeURIComponent(routingId)}`
+      ),
+      unregister: vi.fn(),
+      clear: vi.fn(),
+      close: vi.fn(async () => undefined)
+    } as unknown as AgentMcpHttpHost
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['http-session'])
+    const capabilityRequested = createDeferred()
+    const capabilityReady = createDeferred<{ endpoint: string; token: string }>()
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: { ...opencodeFramework, acceptsStdioMcp: false },
+      mcpHttpHost: httpHost,
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => {
+          capabilityRequested.resolve()
+          return capabilityReady.promise
+        }
+      }
+    })
+
+    try {
+      const creating = runtime.createSession({ cwd: '/workspace' })
+      await capabilityRequested.promise
+
+      // The backend must not observe a session whose advertised Notebook MCP endpoint/token is not
+      // ready yet. This ordering is part of the runtime composition contract, not an HTTP-host detail.
+      expect(fakeAgent.newSessions).toEqual([])
+
+      capabilityReady.resolve({ endpoint: 'http://127.0.0.1:4567', token: 'notebook-token' })
+      await expect(creating).resolves.toMatchObject({ sessionId: 'http-session' })
+      expect(fakeAgent.newSessions).toHaveLength(1)
+      expect(fakeAgent.newSessions[0].mcpServers).toEqual([
+        expect.objectContaining({
+          type: 'http',
+          name: 'open_science_notebook',
+          url: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\/mcp\/notebook\//)
+        })
+      ])
+    } finally {
+      capabilityReady.resolve({ endpoint: 'http://127.0.0.1:4567', token: 'notebook-token' })
+      await runtime.disconnect()
+    }
+  })
+
+  it('serves app MCP tools over the http host for an http-only framework', async () => {
     const root = await createTemporaryRoot()
     const httpHost = new AgentMcpHttpHost()
+    const closeHttpHost = vi.spyOn(httpHost, 'close')
+    const unregisterHttpSession = vi.spyOn(httpHost, 'unregister')
     const process = new FakeAgentProcess()
     const fakeAgent = startFakeAgent(process, ['oc-session'])
     const runtime = new AcpRuntime({
@@ -2035,11 +4901,19 @@ describe('ACP runtime session management', () => {
         projectName: 'default-project',
         mcpEntryPath: '/app/out/main/index.js',
         getRpcConnection: async () => ({ endpoint: 'http://127.0.0.1:1/notebook', token: 'nb' })
+      },
+      skillImport: {
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({
+          endpoint: 'http://127.0.0.1:1/skill-import',
+          token: 'skill'
+        })
       }
     })
 
     try {
-      await runtime.createSession({ cwd: '/workspace' })
+      const session = await runtime.createSession({ cwd: '/workspace' })
+      await runtime.sendPrompt({ sessionId: session.sessionId, text: 'install this skill' })
 
       const servers = fakeAgent.newSessions[0].mcpServers as Array<{
         type?: string
@@ -2049,17 +4923,316 @@ describe('ACP runtime session management', () => {
       }>
 
       // opencode gets http MCP configs (not stdio) pointing at the local host, with bearer auth.
-      expect(servers.map((server) => server.type)).toEqual(['http', 'http'])
+      expect(servers.map((server) => server.type)).toEqual(['http', 'http', 'http'])
       expect(servers.map((server) => server.name)).toEqual(
-        expect.arrayContaining(['open-science-artifacts', 'open-science-notebook'])
+        expect.arrayContaining([
+          'open_science_artifacts',
+          'open_science_notebook',
+          'open_science_skills'
+        ])
       )
-      const artifactServer = servers.find((server) => server.name === 'open-science-artifacts')
+      const artifactServer = servers.find((server) => server.name === 'open_science_artifacts')
       expect(artifactServer?.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/mcp\/artifact\//)
       expect(artifactServer?.headers?.[0]).toMatchObject({ name: 'authorization' })
+      const skillImportServer = servers.find((server) => server.name === 'open_science_skills')
+      expect(skillImportServer?.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/mcp\/skill-import\//)
+      expect(fakeAgent.prompts[0].text).toContain('request_skill_import')
+
+      const skillImportRoutingId = decodeURIComponent(
+        new URL(skillImportServer?.url ?? '').pathname.split('/').at(-1) ?? ''
+      )
+      await runtime.deleteSession({ sessionId: session.sessionId })
+      expect(unregisterHttpSession).toHaveBeenCalledWith(skillImportRoutingId)
+
+      await runtime.requestRetirement()
+      expect(closeHttpHost).toHaveBeenCalledOnce()
     } finally {
       await httpHost.close()
     }
   })
+
+  it('cleans provisional http MCP routes when fresh adoption collides', async () => {
+    const root = await createTemporaryRoot()
+    const httpHost = {
+      ensureStarted: vi.fn(async () => ({
+        endpoint: 'http://127.0.0.1:4321',
+        token: 'host-token'
+      })),
+      registerArtifact: vi.fn(),
+      registerNotebook: vi.fn(),
+      registerSkillImport: vi.fn(),
+      urlFor: vi.fn(
+        (kind: string, routingId: string) =>
+          `http://127.0.0.1:4321/mcp/${kind}/${encodeURIComponent(routingId)}`
+      ),
+      unregister: vi.fn(),
+      clear: vi.fn(),
+      close: vi.fn(async () => undefined)
+    } as unknown as AgentMcpHttpHost
+    const process = new FakeAgentProcess()
+    const reviewerModeStarted = createDeferred()
+    const releaseReviewerMode = createDeferred()
+    const fakeAgent = startFakeAgent(
+      process,
+      ['reserved-provider-session', 'reserved-provider-session'],
+      {
+        modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent'),
+        onSetMode: async () => {
+          reviewerModeStarted.resolve()
+          await releaseReviewerMode.promise
+        }
+      }
+    )
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: {
+          ...codexFramework,
+          acceptsStdioMcp: false,
+          spawn: () => asAgentProcess(process)
+        },
+        executablePath: '/bin/codex-acp',
+        env: {}
+      }),
+      mcpHttpHost: httpHost,
+      artifacts: {
+        configRoot: root,
+        dataRoot: root,
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js'
+      },
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({ endpoint: 'http://127.0.0.1:4567', token: 'nb' })
+      },
+      skillImport: {
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({
+          endpoint: 'http://127.0.0.1:4568',
+          token: 'skill'
+        })
+      }
+    })
+    const reviewer = runtime.buildReviewerSession({
+      cwd: '/workspace',
+      mcpServers: [
+        {
+          type: 'http',
+          name: 'open-science-reviewer',
+          url: 'http://127.0.0.1:1/mcp',
+          headers: []
+        }
+      ]
+    })
+    await reviewerModeStarted.promise
+
+    try {
+      await expect(
+        runtime.resumeSession({ sessionId: 'stable-app-session', cwd: '/workspace' })
+      ).rejects.toThrow(
+        'Primary session id collision with pending reviewer: reserved-provider-session'
+      )
+      expect(fakeAgent.newSessions).toHaveLength(2)
+      expect(httpHost.registerArtifact).toHaveBeenCalledWith(
+        'stable-app-session',
+        expect.any(Object)
+      )
+      expect(httpHost.registerNotebook).toHaveBeenCalledWith(
+        'stable-app-session',
+        expect.any(Object)
+      )
+      expect(httpHost.registerSkillImport).toHaveBeenCalledWith(
+        'stable-app-session',
+        expect.any(Object)
+      )
+      expect(httpHost.unregister).toHaveBeenCalledOnce()
+      expect(httpHost.unregister).toHaveBeenCalledWith('stable-app-session')
+    } finally {
+      releaseReviewerMode.resolve()
+      await reviewer.then(
+        ({ session }) => runtime.disposeReviewerSession(session),
+        () => undefined
+      )
+      await runtime.disconnect().catch(() => undefined)
+    }
+  })
+
+  it('cleans partial provisional routes after a framework switch without replacing the startup error', async () => {
+    const root = await createTemporaryRoot()
+    const startupFailure = new Error('notebook capability setup failed')
+    let unregisterAttempt = 0
+    const unregister = vi.fn((routingId: string) => {
+      void routingId
+      unregisterAttempt += 1
+      if (unregisterAttempt === 1) {
+        throw new Error('first provisional route cleanup failed')
+      }
+    })
+    const httpHost = {
+      ensureStarted: vi.fn(async () => ({
+        endpoint: 'http://127.0.0.1:4321',
+        token: 'host-token'
+      })),
+      registerArtifact: vi.fn(),
+      registerNotebook: vi.fn(),
+      registerSkillImport: vi.fn(),
+      urlFor: vi.fn(
+        (kind: string, routingId: string) =>
+          `http://127.0.0.1:4321/mcp/${kind}/${encodeURIComponent(routingId)}`
+      ),
+      unregister,
+      clear: vi.fn(),
+      close: vi.fn(async () => undefined)
+    } as unknown as AgentMcpHttpHost
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, [])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: { ...opencodeFramework, acceptsStdioMcp: false },
+      mcpHttpHost: httpHost,
+      artifacts: {
+        configRoot: root,
+        dataRoot: root,
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js'
+      },
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => {
+          setRuntimeFramework(runtime, claudeCodeFramework)
+          throw startupFailure
+        }
+      },
+      skillImport: {
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({
+          endpoint: 'http://127.0.0.1:4568',
+          token: 'skill'
+        })
+      }
+    })
+
+    await expect(runtime.createSession({ cwd: '/workspace' })).rejects.toBe(startupFailure)
+
+    expect(httpHost.registerArtifact).toHaveBeenCalledOnce()
+    expect(httpHost.registerNotebook).not.toHaveBeenCalled()
+    expect(httpHost.registerSkillImport).not.toHaveBeenCalled()
+    expect(unregister).toHaveBeenCalledTimes(3)
+    expect(new Set(unregister.mock.calls.map(([routingId]) => routingId)).size).toBe(3)
+  })
+
+  it.each(['notebook alias', 'skill alias', 'specialist registration', 'event', 'state'] as const)(
+    'keeps published http MCP ownership when the %s callback throws',
+    async (failingCallback) => {
+      const httpHost = {
+        ensureStarted: vi.fn(async () => ({
+          endpoint: 'http://127.0.0.1:4321',
+          token: 'host-token'
+        })),
+        registerNotebook: vi.fn(),
+        registerSkillImport: vi.fn(),
+        urlFor: vi.fn(
+          (kind: string, routingId: string) =>
+            `http://127.0.0.1:4321/mcp/${kind}/${encodeURIComponent(routingId)}`
+        ),
+        unregister: vi.fn(),
+        clear: vi.fn(),
+        close: vi.fn(async () => undefined)
+      } as unknown as AgentMcpHttpHost
+      const release = vi.fn()
+      const process = new FakeAgentProcess()
+      const fakeAgent = startFakeAgent(process, ['published-session'])
+      let observerFailurePending = true
+      const runtime = new AcpRuntime({
+        appVersion: '0.1.0',
+        defaultCwd: '/workspace',
+        spawnAgent: () => asAgentProcess(process),
+        framework: { ...opencodeFramework, acceptsStdioMcp: false },
+        mcpHttpHost: httpHost,
+        callbacks: {
+          onEvent: (event) => {
+            if (
+              observerFailurePending &&
+              failingCallback === 'event' &&
+              event.sessionId === 'published-session'
+            ) {
+              observerFailurePending = false
+              throw new Error('event callback failed')
+            }
+          },
+          onStateChanged: (snapshot) => {
+            if (
+              observerFailurePending &&
+              failingCallback === 'state' &&
+              snapshot.sessionIds.includes('published-session')
+            ) {
+              observerFailurePending = false
+              throw new Error('state callback failed')
+            }
+          }
+        },
+        notebook: {
+          projectName: 'default-project',
+          mcpEntryPath: '/app/out/main/index.js',
+          getRpcConnection: async () => ({
+            endpoint: 'http://127.0.0.1:4567',
+            token: 'notebook-token',
+            release
+          }),
+          registerSessionAlias: () => {
+            if (failingCallback === 'notebook alias') {
+              throw new Error('notebook alias callback failed')
+            }
+          },
+          registerSessionSpecialist: () => {
+            if (failingCallback === 'specialist registration') {
+              throw new Error('specialist registration callback failed')
+            }
+          }
+        },
+        skillImport: {
+          mcpEntryPath: '/app/out/main/index.js',
+          getRpcConnection: async () => ({
+            endpoint: 'http://127.0.0.1:4568',
+            token: 'skill-import-token'
+          }),
+          registerSessionAlias: () => {
+            if (failingCallback === 'skill alias') {
+              throw new Error('skill alias callback failed')
+            }
+          }
+        }
+      })
+
+      try {
+        await expect(runtime.createSession({ cwd: '/workspace' })).resolves.toMatchObject({
+          sessionId: 'published-session'
+        })
+        expect(runtime.getSnapshot().sessionIds).toEqual(['published-session'])
+        expect(httpHost.unregister).not.toHaveBeenCalled()
+        expect(release).not.toHaveBeenCalled()
+
+        await runtime.sendPrompt({ sessionId: 'published-session', text: 'still usable' })
+        expect(fakeAgent.prompts.at(-1)).toMatchObject({
+          sessionId: 'published-session',
+          text: expect.stringContaining('still usable')
+        })
+
+        await runtime.deleteSession({ sessionId: 'published-session' })
+        expect(release).toHaveBeenCalledOnce()
+      } finally {
+        if (runtime.getSnapshot().sessionIds.includes('published-session')) {
+          await runtime.deleteSession({ sessionId: 'published-session' }).catch(() => undefined)
+        }
+        await runtime.disconnect().catch(() => undefined)
+      }
+    }
+  )
 
   it('allows prompts from different sessions to run concurrently', async () => {
     const process = new FakeAgentProcess()
@@ -2229,6 +5402,64 @@ describe('ACP runtime session management', () => {
     expect(runtime.getSnapshot().sessionIds).toEqual(['remote-session-1', 'remote-session-2'])
   })
 
+  it('does not reuse a superseded connection while its replacement connect is starting', async () => {
+    const oldProcess = new FakeAgentProcess()
+    const replacementProcess = new FakeAgentProcess()
+    const oldAgent = startFakeAgent(oldProcess, ['old-session', 'wrong-old-session'])
+    const replacementAgent = startFakeAgent(replacementProcess, ['replacement-session'])
+    let spawnCount = 0
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(spawnCount++ === 0 ? oldProcess : replacementProcess)
+    })
+    await runtime.createSession({ cwd: '/workspace' })
+
+    const reconnect = runtime.connect({ cwd: '/workspace' })
+    const successor = runtime.createSession({ cwd: '/workspace' })
+    const [, session] = await Promise.all([reconnect, successor])
+
+    expect(session.sessionId).toBe('replacement-session')
+    expect(oldAgent.newSessions).toHaveLength(1)
+    expect(replacementAgent.newSessions).toHaveLength(1)
+    expect(spawnCount).toBe(2)
+  })
+
+  it('releases a spawned resource superseded immediately before owner attach', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, [])
+    const { lease, release } = createBackendLeaseHarness()
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...claudeCodeFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/agent',
+        env: {},
+        responsesBridgeLease: lease
+      })
+    })
+    const internal = runtime as unknown as {
+      createClientConnection: (
+        stream: acp.Stream
+      ) => import('@agentclientprotocol/sdk').ClientConnection
+    }
+    const createConnection = internal.createClientConnection.bind(runtime)
+    let disconnect: Promise<unknown> | undefined
+    vi.spyOn(internal, 'createClientConnection').mockImplementation((stream) => {
+      const connection = createConnection(stream)
+      disconnect = runtime.disconnect()
+      return connection
+    })
+
+    await expect(runtime.connect({ cwd: '/workspace' })).rejects.toThrow(/superseded/i)
+    await disconnect
+
+    expect(process.killed).toBe(true)
+    expect(release).toHaveBeenCalledOnce()
+    expect(runtime.getSnapshot().sessionIds).toEqual([])
+  })
+
   it('invalidates an in-flight connection when disconnect is requested before initialization finishes', async () => {
     const initializeStarted = createDeferred()
     const firstInitializeCanFinish = createDeferred()
@@ -2297,6 +5528,36 @@ describe('ACP runtime session management', () => {
       status: 'connected',
       sessionIds: ['remote-session-2']
     })
+  })
+
+  it('does not commit connected after an initialized-event callback disconnects', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['reentrant-disconnect-session'])
+    const statuses: string[] = []
+    let disconnect: Promise<unknown> | undefined
+    const callbacks: { disconnectRuntime?: () => Promise<unknown> } = {}
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      callbacks: {
+        onEvent: (event) => {
+          if (event.title === 'Agent initialized') disconnect = callbacks.disconnectRuntime?.()
+        },
+        onStateChanged: (snapshot) => statuses.push(snapshot.status)
+      }
+    })
+    callbacks.disconnectRuntime = () => runtime.disconnect()
+
+    await expect(runtime.connect({ cwd: '/workspace' })).rejects.toThrow(
+      'ACP connection was superseded.'
+    )
+    expect(disconnect).toBeDefined()
+    await disconnect
+
+    expect(runtime.getSnapshot()).toMatchObject({ status: 'closed', sessionIds: [] })
+    expect(statuses.at(-1)).toBe('closed')
+    expect(statuses).not.toContain('connected')
   })
 
   it('rejects filesystem callbacks for unknown sessions instead of falling back to global cwd', async () => {
@@ -2418,8 +5679,10 @@ describe('ACP runtime session management', () => {
     expect(runtime.getSnapshot().pendingPermissions).toEqual([])
   })
 
-  it('audits each permission request, classifying MCP origin without logging the tool title', async () => {
+  it('audits OpenCode MCP calls with canonical identities without logging raw tool titles', async () => {
     infoLogSpy.mockClear()
+    warnLogSpy.mockClear()
+    errorLogSpy.mockClear()
     const process = new FakeAgentProcess()
 
     acp
@@ -2436,12 +5699,22 @@ describe('ACP runtime session management', () => {
       }))
       .onRequest(acp.methods.agent.session.new, () => ({ sessionId: 'remote-session-1' }))
       .onRequest(acp.methods.agent.session.prompt, async (ctx) => {
-        // opencode renames the artifact MCP tool <server>_<tool>; classification must not rely on mcp__.
+        await ctx.client.notify(acp.methods.client.session.update, {
+          sessionId: 'remote-session-1',
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: 'tool-mcp',
+            title: 'open_science_artifacts_write_artifact_file',
+            kind: 'other',
+            status: 'pending',
+            rawInput: { filename: 'result.md', content: '# Result' }
+          }
+        })
         await ctx.client.request(acp.methods.client.session.requestPermission, {
           sessionId: 'remote-session-1',
           toolCall: {
             toolCallId: 'tool-mcp',
-            title: 'open-science-artifacts_write_artifact_file',
+            title: 'open_science_artifacts_write_artifact_file',
             kind: 'other',
             status: 'pending'
           },
@@ -2455,6 +5728,28 @@ describe('ACP runtime session management', () => {
             title: 'https://example.com/secret?token=abc123',
             kind: 'fetch',
             status: 'pending'
+          },
+          options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }]
+        })
+        await ctx.client.notify(acp.methods.client.session.update, {
+          sessionId: 'remote-session-1',
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: 'tool-failed',
+            title: 'open_science_artifacts_write_artifact_file',
+            kind: 'other',
+            status: 'failed',
+            _meta: { toolName: 'open_science_artifacts_write_artifact_file' }
+          }
+        })
+        await ctx.client.request(acp.methods.client.session.requestPermission, {
+          sessionId: 'remote-session-1',
+          toolCall: {
+            toolCallId: 'tool-error',
+            title: 'open_science_artifacts_delete_artifact',
+            kind: 'other',
+            status: 'pending',
+            _meta: { toolName: 'open_science_artifacts_delete_artifact' }
           },
           options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }]
         })
@@ -2475,6 +5770,7 @@ describe('ACP runtime session management', () => {
       appVersion: '0.1.0',
       defaultCwd: '/workspace',
       spawnAgent: () => asAgentProcess(process),
+      framework: opencodeFramework,
       artifacts: {
         configRoot: root,
         dataRoot: root,
@@ -2484,33 +5780,57 @@ describe('ACP runtime session management', () => {
       },
       callbacks: {
         onPermissionRequest: (request) => {
+          if (request.title === 'open_science_artifacts_delete_artifact') {
+            throw new Error('permission callback failed')
+          }
           runtime.respondToPermission({ requestId: request.requestId, optionId: 'allow-once' })
         }
       }
     })
     const session = await runtime.createSession({ cwd: '/workspace' })
 
-    await runtime.sendPrompt({ sessionId: session.sessionId, text: 'trigger permission audit' })
+    await expect(
+      runtime.sendPrompt({ sessionId: session.sessionId, text: 'trigger permission audit' })
+    ).rejects.toThrow('Internal error')
 
     const auditCalls = infoLogSpy.mock.calls.filter(
       ([message]) => message === 'permission request received'
     )
-    expect(auditCalls).toHaveLength(2)
+    expect(auditCalls).toHaveLength(3)
 
     const dataFor = (toolCallId: string): Record<string, unknown> =>
       auditCalls.find(
         ([, data]) => (data as { toolCallId?: string }).toolCallId === toolCallId
       )?.[1] as Record<string, unknown>
 
-    // The opencode-named MCP tool is classified as MCP even though it lacks the mcp__ prefix.
+    // OpenCode's model-facing identity is classified as MCP but logged with the canonical identity.
     expect(dataFor('tool-mcp').isMcp).toBe(true)
+    expect(dataFor('tool-mcp').tool).toBe('open-science-artifacts/write_artifact_file')
     expect(dataFor('tool-fetch').isMcp).toBe(false)
 
-    // No audit payload may carry the raw tool title (MCP tool name or WebFetch URL are user/sensitive).
-    for (const [, data] of auditCalls) {
+    const failureAudit = warnLogSpy.mock.calls.find(([message]) => message === 'tool call failed')
+    expect(failureAudit?.[1]).toMatchObject({
+      tool: 'open-science-artifacts/write_artifact_file',
+      toolCallId: 'tool-failed'
+    })
+
+    const errorAudit = errorLogSpy.mock.calls.find(
+      ([message]) => message === 'permission request failed'
+    )
+    expect(errorAudit?.[1]).toMatchObject({
+      tool: 'open-science-artifacts/delete_artifact',
+      toolCallId: 'tool-error'
+    })
+
+    // No audit payload may carry the raw model-facing title or WebFetch URL.
+    for (const [, data] of [
+      ...auditCalls,
+      ...(failureAudit ? [failureAudit] : []),
+      ...(errorAudit ? [errorAudit] : [])
+    ]) {
       const serialized = JSON.stringify(data)
       expect(serialized).not.toContain('example.com')
-      expect(serialized).not.toContain('write_artifact_file')
+      expect(serialized).not.toContain('open_science_artifacts_write_artifact_file')
     }
   })
 
@@ -2522,6 +5842,7 @@ describe('ACP runtime session management', () => {
       rawInput?: unknown
       requestId: string
       isMcp?: boolean
+      options: Array<{ optionId: string; scope?: string }>
     }> = []
     const permissionResponses: unknown[] = []
 
@@ -2567,14 +5888,14 @@ describe('ACP runtime session management', () => {
               status: 'pending'
             },
             options: [
-              { optionId: 'allow-once', name: 'Allow', kind: 'allow_once' },
+              { optionId: 'allow_once', name: 'Allow', kind: 'allow_once' },
               {
-                optionId: 'allow-session',
+                optionId: 'allow_session',
                 name: 'Allow for This Session',
                 kind: 'allow_always'
               },
               {
-                optionId: 'allow-always',
+                optionId: 'allow_always',
                 name: "Allow and Don't Ask Again",
                 kind: 'allow_always'
               },
@@ -2608,9 +5929,13 @@ describe('ACP runtime session management', () => {
       callbacks: {
         onPermissionRequest: (request) => {
           permissionRequests.push(request)
+          const sessionOptionId = request.options.find(
+            (option) => option.scope === 'session'
+          )?.optionId
+          if (!sessionOptionId) throw new Error('Missing Open Science session permission option')
           runtime.respondToPermission({
             requestId: request.requestId,
-            optionId: 'allow-session'
+            optionId: sessionOptionId
           })
         }
       }
@@ -2627,27 +5952,910 @@ describe('ACP runtime session management', () => {
       title: 'mcp.open-science-notebook.notebook_execute',
       providerToolName: 'notebook_execute',
       isMcp: true,
-      rawInput: { code: 'print(1)', language: 'python' }
+      rawInput: { code: 'print(1)', language: 'python' },
+      options: [
+        { optionId: 'allow_once', scope: 'once' },
+        { optionId: 'decline' },
+        { scope: 'session' }
+      ]
     })
     expect(permissionResponses).toEqual([
-      { outcome: { outcome: 'selected', optionId: 'allow-session' } },
-      { outcome: { outcome: 'selected', optionId: 'allow-once' } }
+      { outcome: { outcome: 'selected', optionId: 'allow_once' } },
+      { outcome: { outcome: 'selected', optionId: 'allow_once' } }
     ])
     expect(runtime.getSnapshot().permissionGrants[session.sessionId]).toEqual([
       {
-        categoryKey: 'mcp:mcp.open-science-notebook.notebook_execute',
+        categoryKey: 'mcp:open-science-notebook/notebook_execute:python',
         kind: 'mcp',
-        label: 'mcp.open-science-notebook.notebook_execute'
+        label: 'Notebook REPL (Python)',
+        scope: 'session'
       }
     ])
   })
 
-  it('shows sparse Codex commands and remembers Always for the same command only', async () => {
+  it('silently allows OpenCode native skill loading without publishing a permission request', async () => {
+    const process = new FakeAgentProcess()
+    const permissionRequests: AcpPermissionRequest[] = []
+    let permissionResponse: unknown
+    startPermissionProbeAgent(process, {
+      newSessionId: 'opencode-skill-session',
+      toolCallId: 'opencode-skill-call',
+      toolTitle: 'skill',
+      toolKind: 'other',
+      toolRawInput: { name: 'mcp-pubmed' },
+      announceToolCall: true,
+      permissionOptions: [
+        { optionId: 'once', kind: 'allow_once', name: 'Allow once' },
+        { optionId: 'always', kind: 'allow_always', name: 'Always allow' },
+        { optionId: 'reject', kind: 'reject_once', name: 'Reject' }
+      ],
+      onPermissionResponse: (response) => {
+        permissionResponse = response
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: opencodeFramework,
+      callbacks: {
+        onPermissionRequest: (request) => permissionRequests.push(request)
+      }
+    })
+    const session = await runtime.createSession({ cwd: '/workspace', permissionProfile: 'ask' })
+
+    await runtime.sendPrompt({ sessionId: session.sessionId, text: 'load a skill' })
+
+    expect(permissionRequests).toEqual([])
+    expect(permissionResponse).toEqual({ outcome: { outcome: 'selected', optionId: 'once' } })
+    expect(runtime.getSnapshot().permissionGrants[session.sessionId]).toEqual([])
+  })
+
+  it('does not trust an isolated OpenCode permission title as native Skill identity', async () => {
+    const process = new FakeAgentProcess()
+    const permissionRequests: AcpPermissionRequest[] = []
+    let permissionResponse: unknown
+    startPermissionProbeAgent(process, {
+      newSessionId: 'opencode-untrusted-skill-session',
+      toolCallId: 'opencode-untrusted-skill-call',
+      toolTitle: 'skill',
+      toolKind: 'other',
+      toolRawInput: {},
+      permissionOptions: [
+        { optionId: 'once', kind: 'allow_once', name: 'Allow once' },
+        { optionId: 'reject', kind: 'reject_once', name: 'Reject' }
+      ],
+      onPermissionResponse: (response) => {
+        permissionResponse = response
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: opencodeFramework,
+      callbacks: {
+        onPermissionRequest: (request) => {
+          permissionRequests.push(request)
+          runtime.respondToPermission({ requestId: request.requestId, optionId: 'reject' })
+        }
+      }
+    })
+    const session = await runtime.createSession({ cwd: '/workspace', permissionProfile: 'ask' })
+
+    await runtime.sendPrompt({ sessionId: session.sessionId, text: 'request an unknown tool' })
+
+    expect(permissionRequests).toHaveLength(1)
+    expect(permissionRequests[0]).toMatchObject({ title: 'skill', providerToolName: undefined })
+    expect(permissionResponse).toEqual({ outcome: { outcome: 'selected', optionId: 'reject' } })
+  })
+
+  it('does not use the OpenCode Skill fallback when tool metadata names a different tool', async () => {
+    const process = new FakeAgentProcess()
+    const permissionRequests: AcpPermissionRequest[] = []
+    let permissionResponse: unknown
+    startPermissionProbeAgent(process, {
+      newSessionId: 'opencode-explicit-tool-session',
+      toolCallId: 'opencode-explicit-tool-call',
+      toolTitle: 'skill',
+      toolKind: 'other',
+      toolRawInput: { name: 'mcp-pubmed' },
+      announceToolCall: true,
+      announcedProviderToolName: 'Bash',
+      permissionOptions: [
+        { optionId: 'once', kind: 'allow_once', name: 'Allow once' },
+        { optionId: 'reject', kind: 'reject_once', name: 'Reject' }
+      ],
+      onPermissionResponse: (response) => {
+        permissionResponse = response
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: opencodeFramework,
+      callbacks: {
+        onPermissionRequest: (request) => {
+          permissionRequests.push(request)
+          runtime.respondToPermission({ requestId: request.requestId, optionId: 'reject' })
+        }
+      }
+    })
+    const session = await runtime.createSession({ cwd: '/workspace', permissionProfile: 'ask' })
+
+    await runtime.sendPrompt({ sessionId: session.sessionId, text: 'run a non-Skill tool' })
+
+    expect(permissionRequests).toHaveLength(1)
+    expect(permissionResponse).toEqual({ outcome: { outcome: 'selected', optionId: 'reject' } })
+  })
+
+  it('restores OpenCode MCP inputs before separating notebook grants by language', async () => {
+    const process = new FakeAgentProcess()
+    const permissionRequests: AcpPermissionRequest[] = []
+    const permissionResponses: unknown[] = []
+    const toolInputs = [
+      { code: 'x = 1', language: 'python' },
+      { code: 'x = 1', language: 'python' },
+      { code: 'x = 1', language: 'python' },
+      { code: 'x <- 1\n'.repeat(2_000), language: 'r' }
+    ] as const
+    const permissionInputs = [{}, {}, { code: 'x <- provider', language: 'r' }, {}]
+    let promptIndex = 0
+
+    acp
+      .agent({ name: 'opencode-mcp-permission-agent' })
+      .onRequest(acp.methods.agent.initialize, () => ({
+        protocolVersion: acp.PROTOCOL_VERSION,
+        agentCapabilities: {
+          loadSession: false,
+          sessionCapabilities: { close: {} }
+        },
+        authMethods: []
+      }))
+      .onRequest(acp.methods.agent.session.new, () => ({ sessionId: 'opencode-mcp-session' }))
+      .onRequest(acp.methods.agent.session.prompt, async (ctx) => {
+        const currentPromptIndex = promptIndex
+        const toolInput = toolInputs[currentPromptIndex]
+        const permissionInput = permissionInputs[currentPromptIndex]
+        const toolCallId = `opencode-notebook-${currentPromptIndex + 1}`
+        promptIndex += 1
+
+        await ctx.client.notify(acp.methods.client.session.update, {
+          sessionId: ctx.params.sessionId,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId,
+            title: 'open_science_notebook_notebook_execute',
+            kind: 'other',
+            status: 'pending',
+            rawInput: {}
+          }
+        })
+
+        const requestPermission = (): Promise<acp.RequestPermissionResponse> =>
+          ctx.client.request(acp.methods.client.session.requestPermission, {
+            sessionId: ctx.params.sessionId,
+            toolCall: {
+              toolCallId,
+              title: 'open_science_notebook_notebook_execute',
+              kind: 'other',
+              status: 'pending',
+              locations: [],
+              rawInput: permissionInput
+            },
+            options: [
+              { optionId: 'once', kind: 'allow_once', name: 'Allow once' },
+              { optionId: 'always', kind: 'allow_always', name: 'Always allow' },
+              { optionId: 'reject', kind: 'reject_once', name: 'Reject' }
+            ]
+          })
+        const notifyRunningTool = (): Promise<void> =>
+          ctx.client.notify(acp.methods.client.session.update, {
+            sessionId: ctx.params.sessionId,
+            update: {
+              sessionUpdate: 'tool_call_update',
+              toolCallId,
+              status: 'in_progress',
+              rawInput: toolInput
+            }
+          })
+
+        let response: acp.RequestPermissionResponse
+        if (currentPromptIndex === 0 || currentPromptIndex === 3) {
+          // OpenCode can put the permission request on the wire before the SDK has dispatched the
+          // immediately preceding running update. The runtime must rendezvous them by toolCallId.
+          const pendingPermission = requestPermission()
+          await notifyRunningTool()
+          response = await pendingPermission
+        } else {
+          await notifyRunningTool()
+          response = await requestPermission()
+        }
+        permissionResponses.push(response)
+
+        return { stopReason: 'end_turn' }
+      })
+      .onRequest(acp.methods.agent.session.close, () => ({}))
+      .connect(
+        acp.ndJsonStream(
+          Writable.toWeb(process.stdout) as WritableStream<Uint8Array>,
+          Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>
+        )
+      )
+
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: opencodeFramework,
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({ endpoint: 'http://127.0.0.1:4567', token: 'nb' })
+      },
+      callbacks: {
+        onPermissionRequest: (request) => {
+          permissionRequests.push(request)
+          const sessionOptionId = request.options.find(
+            (option) => option.scope === 'session'
+          )?.optionId
+          if (!sessionOptionId) {
+            throw new Error('Expected Open Science to provide a conversation permission option')
+          }
+          runtime.respondToPermission({
+            requestId: request.requestId,
+            optionId: sessionOptionId
+          })
+        }
+      }
+    })
+    const session = await runtime.createSession({ cwd: '/workspace', permissionProfile: 'ask' })
+    expect(mcpServerNamesFor(runtime, session.sessionId)).toContain('open-science-notebook')
+
+    for (const toolInput of toolInputs) {
+      await runtime.sendPrompt({ sessionId: session.sessionId, text: `run ${toolInput.language}` })
+    }
+
+    expect(permissionRequests).toHaveLength(2)
+    expect(permissionRequests.map((request) => request.rawInput)).toEqual([
+      { code: 'x = 1', language: 'python' },
+      { code: 'x <- provider', language: 'r' }
+    ])
+    expect(permissionResponses).toEqual(
+      toolInputs.map(() => ({ outcome: { outcome: 'selected', optionId: 'once' } }))
+    )
+    expect(runtime.getSnapshot().permissionGrants[session.sessionId]).toEqual([
+      {
+        categoryKey: 'mcp:open-science-notebook/notebook_execute:python',
+        kind: 'mcp',
+        label: 'Notebook REPL (Python)',
+        scope: 'session'
+      },
+      {
+        categoryKey: 'mcp:open-science-notebook/notebook_execute:r',
+        kind: 'mcp',
+        label: 'Notebook REPL (R)',
+        scope: 'session'
+      }
+    ])
+  })
+
+  it('maps an OpenCode underscore MCP permission to a canonical notebook grant', async () => {
+    const process = new FakeAgentProcess()
+    const permissionRequests: AcpPermissionRequest[] = []
+    let permissionResponse: unknown
+    startPermissionProbeAgent(process, {
+      newSessionId: 'opencode-underscore-notebook-session',
+      toolCallId: 'opencode-underscore-notebook-call',
+      toolTitle: 'open_science_notebook_notebook_execute',
+      toolRawInput: { code: 'print(1)', language: 'python' },
+      permissionOptions: [
+        { optionId: 'once', kind: 'allow_once', name: 'Allow once' },
+        { optionId: 'always', kind: 'allow_always', name: 'Always allow' },
+        { optionId: 'reject', kind: 'reject_once', name: 'Reject' }
+      ],
+      onPermissionResponse: (response) => {
+        permissionResponse = response
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: opencodeFramework,
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({ endpoint: 'http://127.0.0.1:4567', token: 'nb' })
+      },
+      callbacks: {
+        onPermissionRequest: (request) => {
+          permissionRequests.push(request)
+          const sessionOptionId = request.options.find(
+            (option) => option.scope === 'session'
+          )?.optionId
+          if (!sessionOptionId) throw new Error('Missing conversation permission option')
+          runtime.respondToPermission({ requestId: request.requestId, optionId: sessionOptionId })
+        }
+      }
+    })
+    const session = await runtime.createSession({ cwd: '/workspace', permissionProfile: 'ask' })
+
+    await runtime.sendPrompt({ sessionId: session.sessionId, text: 'run notebook code' })
+
+    expect(permissionRequests).toHaveLength(1)
+    expect(permissionRequests[0]).toMatchObject({
+      title: 'open_science_notebook_notebook_execute',
+      isMcp: true,
+      rawInput: { code: 'print(1)', language: 'python' }
+    })
+    expect(permissionResponse).toEqual({ outcome: { outcome: 'selected', optionId: 'once' } })
+    expect(runtime.getSnapshot().permissionGrants[session.sessionId]).toEqual([
+      {
+        categoryKey: 'mcp:open-science-notebook/notebook_execute:python',
+        kind: 'mcp',
+        label: 'Notebook REPL (Python)',
+        scope: 'session'
+      }
+    ])
+  })
+
+  it('auto-allows the app-owned Artifact save without emitting a renderer permission', async () => {
+    const process = new FakeAgentProcess()
+    const permissionRequests: AcpPermissionRequest[] = []
+
+    acp
+      .agent({ name: 'opencode-artifact-permission-agent' })
+      .onRequest(acp.methods.agent.initialize, () => ({
+        protocolVersion: acp.PROTOCOL_VERSION,
+        agentCapabilities: {
+          loadSession: false,
+          sessionCapabilities: { close: {} }
+        },
+        authMethods: []
+      }))
+      .onRequest(acp.methods.agent.session.new, () => ({ sessionId: 'opencode-artifact-session' }))
+      .onRequest(acp.methods.agent.session.prompt, async (ctx) => {
+        const toolCallId = 'opencode-artifact-1'
+        await ctx.client.notify(acp.methods.client.session.update, {
+          sessionId: ctx.params.sessionId,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId,
+            title: 'open_science_artifacts_write_artifact_file',
+            kind: 'other',
+            status: 'pending',
+            rawInput: {}
+          }
+        })
+
+        const pendingPermission = ctx.client.request(acp.methods.client.session.requestPermission, {
+          sessionId: ctx.params.sessionId,
+          toolCall: {
+            toolCallId,
+            title: 'open_science_artifacts_write_artifact_file',
+            kind: 'other',
+            status: 'pending',
+            rawInput: {}
+          },
+          options: [
+            { optionId: 'once', kind: 'allow_once', name: 'Allow once' },
+            { optionId: 'always', kind: 'allow_always', name: 'Always allow' },
+            { optionId: 'reject', kind: 'reject_once', name: 'Reject' }
+          ]
+        })
+        await ctx.client.notify(acp.methods.client.session.update, {
+          sessionId: ctx.params.sessionId,
+          update: {
+            sessionUpdate: 'tool_call_update',
+            toolCallId,
+            status: 'in_progress',
+            rawInput: { path: 'results/report.md', content: '# Results' }
+          }
+        })
+
+        return { stopReason: 'end_turn', response: await pendingPermission }
+      })
+      .onRequest(acp.methods.agent.session.close, () => ({}))
+      .connect(
+        acp.ndJsonStream(
+          Writable.toWeb(process.stdout) as WritableStream<Uint8Array>,
+          Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>
+        )
+      )
+
+    const root = await createTemporaryRoot()
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: opencodeFramework,
+      artifacts: {
+        configRoot: root,
+        dataRoot: root,
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        repository: new ArtifactRepository(root)
+      },
+      callbacks: {
+        onPermissionRequest: (request) => {
+          permissionRequests.push(request)
+          runtime.respondToPermission({ requestId: request.requestId, optionId: 'once' })
+        }
+      }
+    })
+    const session = await runtime.createSession({ cwd: '/workspace', permissionProfile: 'ask' })
+
+    await runtime.sendPrompt({ sessionId: session.sessionId, text: 'write artifact' })
+
+    expect(permissionRequests).toHaveLength(0)
+  })
+
+  it('auto-allows a Codex Artifact save restored from its sparse MCP approval', async () => {
+    const process = new FakeAgentProcess()
+    const permissionRequests: AcpPermissionRequest[] = []
+    let permissionResponse: unknown
+    startPermissionProbeAgent(process, {
+      newSessionId: 'codex-artifact-session',
+      toolCallId: 'codex-artifact-1',
+      toolTitle: 'unused-by-sparse-codex-approval',
+      sparseCodexMcpApproval: true,
+      codexMcpIdentity: {
+        server: 'open-science-artifacts',
+        tool: 'write_artifact_file',
+        arguments: {
+          filename: 'results.md',
+          mimeType: 'text/markdown',
+          content: '# Results'
+        }
+      },
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent'),
+      permissionOptions: [
+        { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
+        { optionId: 'reject-once', name: 'Reject', kind: 'reject_once' }
+      ],
+      onPermissionResponse: (response) => {
+        permissionResponse = response
+      }
+    })
+    const root = await createTemporaryRoot()
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: codexFramework,
+      artifacts: {
+        configRoot: root,
+        dataRoot: root,
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        repository: new ArtifactRepository(root)
+      },
+      callbacks: {
+        onPermissionRequest: (request) => {
+          permissionRequests.push(request)
+          runtime.respondToPermission({ requestId: request.requestId, cancelled: true })
+        }
+      }
+    })
+    const session = await runtime.createSession({ cwd: '/workspace', permissionProfile: 'ask' })
+
+    await runtime.sendPrompt({ sessionId: session.sessionId, text: 'save results.md' })
+
+    expect(permissionRequests).toHaveLength(0)
+    expect(permissionResponse).toEqual({
+      outcome: { outcome: 'selected', optionId: 'allow-once' }
+    })
+  })
+
+  it.each([
+    { name: 'without the Codex MCP marker', codexMcpMarker: false },
+    {
+      name: 'with a mismatched qualified title',
+      codexMcpTitle: 'mcp.open-science-artifacts.unrelated_tool'
+    }
+  ])('does not auto-allow a Codex Artifact save $name', async (probeOptions) => {
+    const process = new FakeAgentProcess()
+    const permissionRequests: AcpPermissionRequest[] = []
+    let permissionResponse: unknown
+    startPermissionProbeAgent(process, {
+      newSessionId: 'untrusted-codex-artifact-session',
+      toolCallId: 'untrusted-codex-artifact-1',
+      toolTitle: 'unused-by-sparse-codex-approval',
+      sparseCodexMcpApproval: true,
+      codexMcpIdentity: {
+        server: 'open-science-artifacts',
+        tool: 'write_artifact_file'
+      },
+      ...probeOptions,
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent'),
+      permissionOptions: [
+        { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
+        { optionId: 'reject-once', name: 'Reject', kind: 'reject_once' }
+      ],
+      onPermissionResponse: (response) => {
+        permissionResponse = response
+      }
+    })
+    const root = await createTemporaryRoot()
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: codexFramework,
+      artifacts: {
+        configRoot: root,
+        dataRoot: root,
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        repository: new ArtifactRepository(root)
+      },
+      callbacks: {
+        onPermissionRequest: (request) => {
+          permissionRequests.push(request)
+          runtime.respondToPermission({ requestId: request.requestId, cancelled: true })
+        }
+      }
+    })
+    const session = await runtime.createSession({ cwd: '/workspace', permissionProfile: 'ask' })
+
+    await runtime.sendPrompt({ sessionId: session.sessionId, text: 'save results.md' })
+
+    expect(permissionRequests).toHaveLength(1)
+    expect(permissionResponse).toEqual({ outcome: { outcome: 'cancelled' } })
+  })
+
+  it('auto-allows a Claude Code Artifact save identified by its qualified MCP title', async () => {
+    const process = new FakeAgentProcess()
+    const permissionRequests: AcpPermissionRequest[] = []
+    let permissionResponse: unknown
+    startPermissionProbeAgent(process, {
+      newSessionId: 'claude-artifact-session',
+      toolCallId: 'call_00_artifact_save',
+      toolTitle: 'mcp__open-science-artifacts__write_artifact_file',
+      toolKind: 'other',
+      toolRawInput: { localPath: 'sin.png', filename: 'sin.png', mimeType: 'image/png' },
+      announceToolCall: true,
+      permissionOptions: [
+        { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
+        { optionId: 'reject-once', name: 'Reject', kind: 'reject_once' }
+      ],
+      onPermissionResponse: (response) => {
+        permissionResponse = response
+      }
+    })
+    const root = await createTemporaryRoot()
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: claudeCodeFramework,
+      artifacts: {
+        configRoot: root,
+        dataRoot: root,
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        repository: new ArtifactRepository(root)
+      },
+      callbacks: {
+        onPermissionRequest: (request) => {
+          permissionRequests.push(request)
+          runtime.respondToPermission({ requestId: request.requestId, cancelled: true })
+        }
+      }
+    })
+    const session = await runtime.createSession({ cwd: '/workspace', permissionProfile: 'ask' })
+
+    await runtime.sendPrompt({ sessionId: session.sessionId, text: 'save sin.png' })
+
+    expect(permissionRequests).toHaveLength(0)
+    expect(permissionResponse).toEqual({
+      outcome: { outcome: 'selected', optionId: 'allow-once' }
+    })
+  })
+
+  it('cancels an OpenCode permission that arrives after cancellation', async () => {
+    const process = new FakeAgentProcess()
+    const permissionResponses: acp.RequestPermissionResponse[] = []
+    const requestPermissionGate = createDeferred()
+
+    acp
+      .agent({ name: 'opencode-cancelled-permission-agent' })
+      .onRequest(acp.methods.agent.initialize, () => ({
+        protocolVersion: acp.PROTOCOL_VERSION,
+        agentCapabilities: {
+          loadSession: false,
+          sessionCapabilities: { close: {} }
+        },
+        authMethods: []
+      }))
+      .onRequest(acp.methods.agent.session.new, () => ({ sessionId: 'opencode-cancel-session' }))
+      .onRequest(acp.methods.agent.session.prompt, async (ctx) => {
+        const toolCallId = 'opencode-cancelled-notebook'
+        await ctx.client.notify(acp.methods.client.session.update, {
+          sessionId: ctx.params.sessionId,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId,
+            title: 'open-science-notebook_notebook_execute',
+            kind: 'other',
+            status: 'pending',
+            rawInput: {}
+          }
+        })
+        await requestPermissionGate.promise
+        permissionResponses.push(
+          await ctx.client.request(acp.methods.client.session.requestPermission, {
+            sessionId: ctx.params.sessionId,
+            toolCall: {
+              toolCallId,
+              title: 'open-science-notebook_notebook_execute',
+              kind: 'other',
+              status: 'pending',
+              rawInput: {}
+            },
+            options: [
+              { optionId: 'once', kind: 'allow_once', name: 'Allow once' },
+              { optionId: 'reject', kind: 'reject_once', name: 'Reject' }
+            ]
+          })
+        )
+        return { stopReason: 'cancelled' }
+      })
+      .onNotification(acp.methods.agent.session.cancel, () => undefined)
+      .onRequest(acp.methods.agent.session.close, () => ({}))
+      .connect(
+        acp.ndJsonStream(
+          Writable.toWeb(process.stdout) as WritableStream<Uint8Array>,
+          Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>
+        )
+      )
+
+    const onPermissionRequest = vi.fn()
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: opencodeFramework,
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({ endpoint: 'http://127.0.0.1:4567', token: 'nb' })
+      },
+      callbacks: { onPermissionRequest }
+    })
+    const session = await runtime.createSession({ cwd: '/workspace', permissionProfile: 'ask' })
+    const prompt = runtime.sendPrompt({ sessionId: session.sessionId, text: 'run python' })
+
+    await vi.waitFor(() =>
+      expect(opencodeMcpToolInputsMap(runtime).get(session.sessionId)?.size).toBe(1)
+    )
+    expect(opencodeMcpToolInputWaitersMap(runtime).has(session.sessionId)).toBe(false)
+    await runtime.cancelPrompt({ sessionId: session.sessionId })
+    requestPermissionGate.resolve()
+    await prompt
+
+    expect(onPermissionRequest).not.toHaveBeenCalled()
+    expect(permissionResponses).toEqual([{ outcome: { outcome: 'cancelled' } }])
+    expect(opencodeMcpToolInputWaitersMap(runtime).has(session.sessionId)).toBe(false)
+  })
+
+  it('does not miss OpenCode input received while registering its waiter', async () => {
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(new FakeAgentProcess()),
+      setTimer: () => 1 as unknown as ReturnType<typeof setTimeout>,
+      clearTimer: vi.fn()
+    })
+    const toolInputs = new Map<string, unknown>()
+    const readToolInput = toolInputs.get.bind(toolInputs)
+    let readCount = 0
+
+    vi.spyOn(toolInputs, 'get').mockImplementation((toolCallId) => {
+      const input = readToolInput(toolCallId)
+      if (readCount === 0) {
+        readCount += 1
+        toolInputs.set(toolCallId, {
+          title: 'open-science-notebook_notebook_execute',
+          rawInput: { code: 'print(1)' }
+        })
+        return undefined
+      }
+      return input
+    })
+    opencodeMcpToolInputsMap(runtime).set('session-1', toolInputs)
+
+    const outcome = waitForOpenCodeMcpToolInput(runtime, 'session-1', 'tool-1')
+
+    await expect(Promise.race([outcome, Promise.resolve('pending')])).resolves.toBe('ready')
+    expect(opencodeMcpToolInputWaitersMap(runtime).has('session-1')).toBe(false)
+  })
+
+  it('cancels an OpenCode permission already waiting for tool context', async () => {
+    const process = new FakeAgentProcess()
+    const permissionResponses: acp.RequestPermissionResponse[] = []
+
+    acp
+      .agent({ name: 'opencode-waiting-permission-agent' })
+      .onRequest(acp.methods.agent.initialize, () => ({
+        protocolVersion: acp.PROTOCOL_VERSION,
+        agentCapabilities: {
+          loadSession: false,
+          sessionCapabilities: { close: {} }
+        },
+        authMethods: []
+      }))
+      .onRequest(acp.methods.agent.session.new, () => ({ sessionId: 'opencode-wait-session' }))
+      .onRequest(acp.methods.agent.session.prompt, async (ctx) => {
+        const toolCallId = 'waiting-notebook-call'
+        await ctx.client.notify(acp.methods.client.session.update, {
+          sessionId: ctx.params.sessionId,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId,
+            title: 'open-science-notebook_notebook_execute',
+            kind: 'other',
+            status: 'pending',
+            rawInput: {}
+          }
+        })
+        permissionResponses.push(
+          await ctx.client.request(acp.methods.client.session.requestPermission, {
+            sessionId: ctx.params.sessionId,
+            toolCall: {
+              toolCallId,
+              title: 'open-science-notebook_notebook_execute',
+              kind: 'other',
+              status: 'pending',
+              rawInput: {}
+            },
+            options: [
+              { optionId: 'once', kind: 'allow_once', name: 'Allow once' },
+              { optionId: 'reject', kind: 'reject_once', name: 'Reject' }
+            ]
+          })
+        )
+        return { stopReason: 'cancelled' }
+      })
+      .onNotification(acp.methods.agent.session.cancel, () => undefined)
+      .onRequest(acp.methods.agent.session.close, () => ({}))
+      .connect(
+        acp.ndJsonStream(
+          Writable.toWeb(process.stdout) as WritableStream<Uint8Array>,
+          Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>
+        )
+      )
+
+    const onPermissionRequest = vi.fn()
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: opencodeFramework,
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({ endpoint: 'http://127.0.0.1:4567', token: 'nb' })
+      },
+      callbacks: { onPermissionRequest }
+    })
+    const session = await runtime.createSession({ cwd: '/workspace', permissionProfile: 'ask' })
+    const prompt = runtime.sendPrompt({ sessionId: session.sessionId, text: 'run python' })
+
+    await vi.waitFor(() =>
+      expect(opencodeMcpToolInputWaitersMap(runtime).get(session.sessionId)?.size).toBe(1)
+    )
+    await runtime.cancelPrompt({ sessionId: session.sessionId })
+    await prompt
+
+    expect(onPermissionRequest).not.toHaveBeenCalled()
+    expect(permissionResponses).toEqual([{ outcome: { outcome: 'cancelled' } }])
+    expect(opencodeMcpToolInputWaitersMap(runtime).has(session.sessionId)).toBe(false)
+  })
+
+  it('cancels an OpenCode permission when its tool call ends as context restore completes', async () => {
+    const process = new FakeAgentProcess()
+    const permissionResponses: acp.RequestPermissionResponse[] = []
+
+    acp
+      .agent({ name: 'opencode-late-permission-agent' })
+      .onRequest(acp.methods.agent.initialize, () => ({
+        protocolVersion: acp.PROTOCOL_VERSION,
+        agentCapabilities: {
+          loadSession: false,
+          sessionCapabilities: { close: {} }
+        },
+        authMethods: []
+      }))
+      .onRequest(acp.methods.agent.session.new, () => ({ sessionId: 'opencode-late-session' }))
+      .onRequest(acp.methods.agent.session.prompt, async (ctx) => {
+        const toolCallId = 'completed-notebook-call'
+        await ctx.client.notify(acp.methods.client.session.update, {
+          sessionId: ctx.params.sessionId,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId,
+            title: 'open-science-notebook_notebook_execute',
+            kind: 'other',
+            status: 'pending',
+            rawInput: { language: 'python', code: 'print(1)' }
+          }
+        })
+        permissionResponses.push(
+          await ctx.client.request(acp.methods.client.session.requestPermission, {
+            sessionId: ctx.params.sessionId,
+            toolCall: {
+              toolCallId,
+              title: 'open-science-notebook_notebook_execute',
+              kind: 'other',
+              status: 'pending',
+              rawInput: {}
+            },
+            options: [
+              { optionId: 'once', kind: 'allow_once', name: 'Allow once' },
+              { optionId: 'reject', kind: 'reject_once', name: 'Reject' }
+            ]
+          })
+        )
+        return { stopReason: 'end_turn' }
+      })
+      .onRequest(acp.methods.agent.session.close, () => ({}))
+      .connect(
+        acp.ndJsonStream(
+          Writable.toWeb(process.stdout) as WritableStream<Uint8Array>,
+          Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>
+        )
+      )
+
+    const onPermissionRequest = vi.fn()
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: opencodeFramework,
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({ endpoint: 'http://127.0.0.1:4567', token: 'nb' })
+      },
+      callbacks: {
+        onPermissionRequest: (request) => {
+          onPermissionRequest(request)
+          void runtime.respondToPermission({ requestId: request.requestId, cancelled: true })
+        }
+      }
+    })
+    const session = await runtime.createSession({ cwd: '/workspace', permissionProfile: 'ask' })
+    const context = permissionContext(runtime)
+    const restoreToolCall = context.restoreToolCall.bind(context)
+    vi.spyOn(context, 'restoreToolCall').mockImplementation(async (params, restoreContext) => {
+      const restored = await restoreToolCall(params, restoreContext)
+      observePermissionToolContext(runtime, {
+        sessionId: session.sessionId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: params.toolCall.toolCallId,
+          status: 'completed'
+        }
+      })
+      return restored
+    })
+
+    await runtime.sendPrompt({ sessionId: session.sessionId, text: 'run python' })
+
+    expect(onPermissionRequest).not.toHaveBeenCalled()
+    expect(permissionResponses).toEqual([{ outcome: { outcome: 'cancelled' } }])
+  })
+
+  it('shows a sparse Codex command and remembers only its command signature', async () => {
     const process = new FakeAgentProcess()
     const permissionRequests: Array<{
       title: string
       rawInput?: unknown
       requestId: string
+      options: Array<{ optionId: string; scope?: string }>
     }> = []
     const permissionResponses: unknown[] = []
 
@@ -2719,9 +6927,14 @@ describe('ACP runtime session management', () => {
       callbacks: {
         onPermissionRequest: (request) => {
           permissionRequests.push(request)
+          const optionId =
+            permissionRequests.length === 1
+              ? request.options.find((option) => option.scope === 'session')?.optionId
+              : request.options.find((option) => option.scope === 'once')?.optionId
+          if (!optionId) throw new Error('Missing projected permission option')
           runtime.respondToPermission({
             requestId: request.requestId,
-            optionId: permissionRequests.length === 1 ? 'allow-session' : 'allow-once'
+            optionId
           })
         }
       }
@@ -2742,19 +6955,41 @@ describe('ACP runtime session management', () => {
       }
     ])
     expect(permissionResponses).toEqual([
-      { outcome: { outcome: 'selected', optionId: 'allow-session' } },
+      { outcome: { outcome: 'selected', optionId: 'allow-once' } },
       { outcome: { outcome: 'selected', optionId: 'allow-once' } },
       { outcome: { outcome: 'selected', optionId: 'allow-once' } }
     ])
     expect(runtime.getSnapshot().permissionGrants[session.sessionId]).toEqual([
-      { categoryKey: 'bash:npm run lint', kind: 'shell', label: 'npm run lint' }
+      {
+        categoryKey: 'shell:npm run lint',
+        kind: 'shell',
+        label: 'npm run lint',
+        scope: 'session'
+      }
+    ])
+
+    await runtime.resetSessionContext({
+      sessionId: session.sessionId,
+      cwd: '/workspace',
+      permissionProfile: 'ask'
+    })
+    expect(runtime.getSnapshot().permissionGrants[session.sessionId]).toEqual([
+      {
+        categoryKey: 'shell:npm run lint',
+        kind: 'shell',
+        label: 'npm run lint',
+        scope: 'session'
+      }
     ])
   })
 
   it('strips Codex policy amendments using the session framework after this.framework moves', async () => {
     const process = new FakeAgentProcess()
-    const permissionRequests: Array<{ requestId: string; options: Array<{ optionId: string }> }> =
-      []
+    const permissionRequests: Array<{
+      requestId: string
+      options: Array<{ optionId: string }>
+      commandPrefix?: string[]
+    }> = []
 
     acp
       .agent({ name: 'codex-amendment-reconnect-agent' })
@@ -2783,7 +7018,8 @@ describe('ACP runtime session management', () => {
             {
               optionId: 'accept_execpolicy_amendment',
               name: 'Allow Commands Starting With `./deploy`',
-              kind: 'allow_always'
+              kind: 'allow_always',
+              _meta: { codex: { execpolicyAmendment: ['./deploy'] } }
             },
             { optionId: 'decline', name: 'Decline', kind: 'reject_once' }
           ]
@@ -2822,9 +7058,10 @@ describe('ACP runtime session management', () => {
     expect(permissionRequests).toHaveLength(1)
     expect(permissionRequests[0].options.map((option) => option.optionId)).toEqual([
       'allow-once',
-      'allow-session',
-      'decline'
+      'decline',
+      expect.stringContaining('open-science:allow-session:')
     ])
+    expect(permissionRequests[0].commandPrefix).toEqual(['./deploy'])
   })
 
   it('bounds pending Codex MCP identities and clears unmatched entries when the turn stops', async () => {
@@ -2854,7 +7091,7 @@ describe('ACP runtime session management', () => {
     await promptStarted.promise
 
     for (let index = 0; index < 40; index += 1) {
-      observeCodexMcpToolIdentity(runtime, {
+      observePermissionToolContext(runtime, {
         sessionId: session.sessionId,
         update: {
           sessionUpdate: 'tool_call',
@@ -2866,7 +7103,8 @@ describe('ACP runtime session management', () => {
             server: 'open-science-notebook',
             tool: 'notebook_execute',
             arguments: { code: `print(${index})` }
-          }
+          },
+          _meta: { is_mcp_tool_call: true }
         }
       })
     }
@@ -2879,6 +7117,68 @@ describe('ACP runtime session management', () => {
     promptCanStop.resolve()
     await prompt
     expect(codexMcpToolIdentitiesMap(runtime).has(session.sessionId)).toBe(false)
+  })
+
+  it('records a conversation grant for an app-owned Codex MCP leaf name', async () => {
+    const process = new FakeAgentProcess()
+    const permissionRequests: AcpPermissionRequest[] = []
+    let permissionResponse: unknown
+    startPermissionProbeAgent(process, {
+      newSessionId: 'codex-leaf-mcp-session',
+      toolCallId: 'codex-leaf-execute',
+      toolTitle: 'execute',
+      toolKind: 'other',
+      toolRawInput: { code: 'print(1)', language: 'python' },
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent'),
+      onPermissionResponse: (response) => {
+        permissionResponse = response
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: codexFramework,
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({ endpoint: 'http://127.0.0.1:4567', token: 'nb' })
+      },
+      callbacks: {
+        onPermissionRequest: (request) => {
+          permissionRequests.push(request)
+          const sessionOptionId = request.options.find(
+            (option) => option.scope === 'session'
+          )?.optionId
+          if (!sessionOptionId) throw new Error('Missing Open Science conversation option')
+          runtime.respondToPermission({ requestId: request.requestId, optionId: sessionOptionId })
+        }
+      }
+    })
+    const session = await runtime.createSession({ cwd: '/workspace', permissionProfile: 'ask' })
+
+    await runtime.sendPrompt({ sessionId: session.sessionId, text: 'run notebook code' })
+
+    expect(permissionRequests).toHaveLength(1)
+    expect(permissionRequests[0]).toMatchObject({
+      title: 'execute',
+      isMcp: true,
+      rawInput: { code: 'print(1)', language: 'python' },
+      options: expect.arrayContaining([
+        expect.objectContaining({ name: 'This session', scope: 'session' })
+      ])
+    })
+    expect(permissionResponse).toEqual({
+      outcome: { outcome: 'selected', optionId: 'allow-once' }
+    })
+    expect(runtime.getSnapshot().permissionGrants[session.sessionId]).toEqual([
+      {
+        categoryKey: 'mcp:open-science-notebook/notebook_execute:python',
+        kind: 'mcp',
+        label: 'Notebook REPL (Python)',
+        scope: 'session'
+      }
+    ])
   })
 
   it('records MCP server names on resume so a resumed session audits its MCP tool calls as MCP', async () => {
@@ -2915,7 +7215,7 @@ describe('ACP runtime session management', () => {
     await runtime.sendPrompt({ sessionId: 'resumed-session', text: 'continue resumed session' })
 
     expect(auditedIsMcp('resumed-mcp')).toBe(true)
-    expect(mcpServerNamesMap(runtime).get('resumed-session')).toEqual(['open-science-artifacts'])
+    expect(mcpServerNamesFor(runtime, 'resumed-session')).toEqual(['open-science-artifacts'])
   })
 
   it('records MCP server names when adopting a fresh session after an unresumable resume', async () => {
@@ -2959,10 +7259,10 @@ describe('ACP runtime session management', () => {
     // The adopted session recorded its MCP names under the app-facing id, so the relabeled permission
     // request audits as MCP.
     expect(auditedIsMcp('adopted-mcp')).toBe(true)
-    expect(mcpServerNamesMap(runtime).get('switched-session')).toEqual(['open-science-artifacts'])
+    expect(mcpServerNamesFor(runtime, 'switched-session')).toEqual(['open-science-artifacts'])
   })
 
-  it('registers a reviewer session MCP names for auditing and clears them on dispose', async () => {
+  it('returns an explicit reviewer role while preserving MCP audit routing', async () => {
     infoLogSpy.mockClear()
     const process = new FakeAgentProcess()
     startPermissionProbeAgent(process, {
@@ -2979,7 +7279,7 @@ describe('ACP runtime session management', () => {
 
     // The reviewer session records its MCP server name so its (auto-approved) tool calls still audit
     // with the correct isMcp classification.
-    const { session } = await runtime.buildReviewerSession({
+    const built = await runtime.buildReviewerSession({
       cwd: '/workspace',
       mcpServers: [
         {
@@ -2990,19 +7290,100 @@ describe('ACP runtime session management', () => {
         }
       ]
     })
+    const { session } = built
+    expect(built.role).toBe('reviewer')
     expect(session.sessionId).toBe('reviewer-session-1')
-    expect(mcpServerNamesMap(runtime).has('reviewer-session-1')).toBe(true)
-    expect(sessionFrameworksMap(runtime).get('reviewer-session-1')).toBe('claude-code')
+    expect(reviewerOwnerProbe(runtime).contextFor('reviewer-session-1')).toEqual({
+      frameworkId: 'claude-code',
+      mcpServerNames: ['open-science-reviewer'],
+      role: 'reviewer'
+    })
+    expect(mcpServerNamesFor(runtime, 'reviewer-session-1')).toEqual([])
+    expect(runtime.getSessionFramework('reviewer-session-1')).toBeUndefined()
 
     // Drive a tool-call permission request through the reviewer session (auto-approved by the runtime).
     await session.prompt([{ type: 'text', text: 'review this turn' }])
 
     expect(auditedIsMcp('reviewer-mcp')).toBe(true)
 
-    // Disposing the reviewer session unregisters its MCP names.
+    // Disposing the reviewer session clears only the owner-private invocation context.
     runtime.disposeReviewerSession(session)
-    expect(mcpServerNamesMap(runtime).has('reviewer-session-1')).toBe(false)
-    expect(sessionFrameworksMap(runtime).has('reviewer-session-1')).toBe(false)
+    expect(reviewerOwnerProbe(runtime).contextFor('reviewer-session-1')).toBeUndefined()
+    expect(mcpServerNamesFor(runtime, 'reviewer-session-1')).toEqual([])
+    expect(runtime.getSessionFramework('reviewer-session-1')).toBeUndefined()
+  })
+
+  it('keeps reviewer ownership out of public primary state and capability hooks', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['primary-session', 'reviewer-session'])
+    const resolveSpecialistIdentity = vi.fn(async () => ({ append: '', prefix: '' }))
+    const resolveSpecialistSkills = vi.fn(async () => ({
+      kind: 'specialist' as const,
+      skillIds: [],
+      frameworkNames: [],
+      missingSkillIds: []
+    }))
+    const registerSessionSpecialist = vi.fn()
+    const onPermissionRequest = vi.fn()
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      resolveSpecialistIdentity,
+      resolveSpecialistSkills,
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({
+          endpoint: 'http://127.0.0.1:4567',
+          token: 'notebook-token'
+        }),
+        registerSessionSpecialist
+      },
+      callbacks: { onPermissionRequest }
+    })
+    await runtime.createSession({ cwd: '/workspace' })
+    resolveSpecialistIdentity.mockClear()
+    resolveSpecialistSkills.mockClear()
+    registerSessionSpecialist.mockClear()
+
+    const primaryProjection = (): object => {
+      const snapshot = runtime.getSnapshot()
+      return {
+        sessionId: snapshot.sessionId,
+        sessionIds: snapshot.sessionIds,
+        pendingPermissions: snapshot.pendingPermissions,
+        permissionProfiles: snapshot.permissionProfiles,
+        permissionGrants: snapshot.permissionGrants,
+        contextUsageBySession: snapshot.contextUsageBySession
+      }
+    }
+    const before = primaryProjection()
+    const built = await runtime.buildReviewerSession({
+      cwd: '/workspace',
+      mcpServers: [
+        {
+          type: 'http',
+          name: 'open-science-reviewer',
+          url: 'http://127.0.0.1:1/mcp',
+          headers: []
+        }
+      ]
+    })
+
+    expect(primaryProjection()).toEqual(before)
+    expect(reviewerOwnerProbe(runtime).snapshot()).toEqual([
+      { lifecycle: 'active', role: 'reviewer', sessionId: 'reviewer-session' }
+    ])
+    expect(reviewerOwnerProbe(runtime).snapshot()[0]).not.toHaveProperty('cwd')
+    expect(resolveSpecialistIdentity).not.toHaveBeenCalled()
+    expect(resolveSpecialistSkills).not.toHaveBeenCalled()
+    expect(registerSessionSpecialist).not.toHaveBeenCalled()
+    expect(onPermissionRequest).not.toHaveBeenCalled()
+
+    runtime.disposeReviewerSession(built.session)
+    expect(primaryProjection()).toEqual(before)
+    await runtime.disconnect()
   })
 
   it.each([
@@ -3182,8 +7563,10 @@ describe('ACP runtime session management', () => {
     expect(permissionResponse).toEqual({
       outcome: { outcome: 'selected', optionId: 'allow-once' }
     })
-    expect(runtime.reviewerRejectedToolCallCount(session.sessionId)).toBe(0)
-    runtime.disposeReviewerSession(session)
+    expect(runtime.disposeReviewerSession(session)).toEqual({
+      rejectedToolCalls: 0,
+      reviewerBridgeScoped: undefined
+    })
   })
 
   // Claude Code preserves hyphens in MCP server names in real tool traces, so the permission title
@@ -3226,8 +7609,10 @@ describe('ACP runtime session management', () => {
     expect(permissionResponse).toEqual({
       outcome: { outcome: 'selected', optionId: 'allow-once' }
     })
-    expect(runtime.reviewerRejectedToolCallCount(session.sessionId)).toBe(0)
-    runtime.disposeReviewerSession(session)
+    expect(runtime.disposeReviewerSession(session)).toEqual({
+      rejectedToolCalls: 0,
+      reviewerBridgeScoped: undefined
+    })
   })
 
   // Security: the toolCallId is agent-controlled, so a reviewer-shaped id must NOT authorize a call
@@ -3266,8 +7651,10 @@ describe('ACP runtime session management', () => {
     expect(permissionResponse).toEqual({
       outcome: { outcome: 'selected', optionId: 'reject-once' }
     })
-    expect(runtime.reviewerRejectedToolCallCount(session.sessionId)).toBe(1)
-    runtime.disposeReviewerSession(session)
+    expect(runtime.disposeReviewerSession(session)).toEqual({
+      rejectedToolCalls: 1,
+      reviewerBridgeScoped: undefined
+    })
   })
 
   it('counts reviewer tool calls rejected by the strict gate', async () => {
@@ -3297,10 +7684,11 @@ describe('ACP runtime session management', () => {
     })
     await session.prompt([{ type: 'text', text: 'run a shell command' }])
 
-    expect(runtime.reviewerRejectedToolCallCount(session.sessionId)).toBe(1)
     // dispose returns the final count and clears it atomically — the orchestrator relies on this.
-    expect(runtime.disposeReviewerSession(session)).toBe(1)
-    expect(runtime.reviewerRejectedToolCallCount('reviewer-session-1')).toBe(0)
+    expect(runtime.disposeReviewerSession(session)).toEqual({
+      rejectedToolCalls: 1,
+      reviewerBridgeScoped: undefined
+    })
   })
 
   it('refuses a non-loopback reviewer MCP before starting an agent connection', async () => {
@@ -3326,6 +7714,2022 @@ describe('ACP runtime session management', () => {
       })
     ).rejects.toThrow(/loopback HTTP open-science-reviewer/)
     expect(spawnAgent).not.toHaveBeenCalled()
+  })
+
+  it('reserves a reviewer session id while its permission mode is still starting', async () => {
+    const {
+      fakeAgent,
+      lease,
+      runtime,
+      reviewer: first,
+      request,
+      releaseReviewerMode,
+      modeRequestCount
+    } = await startPendingReviewerRace(['shared-reviewer', 'shared-reviewer'])
+    const second = runtime.buildReviewerSession(request)
+
+    try {
+      await expect(second).rejects.toThrow('Reviewer session id collision: shared-reviewer')
+      expect(modeRequestCount()).toBe(1)
+      expect(lease.registerReviewerSession).not.toHaveBeenCalled()
+
+      const duplicateCwd = fakeAgent.newSessions[1]?.cwd
+      expect(duplicateCwd).toMatch(/open-science-reviewer-/)
+      await expect(stat(duplicateCwd!)).rejects.toMatchObject({ code: 'ENOENT' })
+
+      releaseReviewerMode.resolve()
+      const winner = await first
+      expect(lease.registerReviewerSession).toHaveBeenCalledOnce()
+      expect(lease.registerReviewerSession).toHaveBeenCalledWith('shared-reviewer')
+      await winner.session.prompt([{ type: 'text', text: 'winner keeps reviewer authority' }])
+      expect(fakeAgent.prompts).toEqual([
+        { sessionId: 'shared-reviewer', text: 'winner keeps reviewer authority' }
+      ])
+    } finally {
+      releaseReviewerMode.resolve()
+      await first.then(
+        ({ session }) => runtime.disposeReviewerSession(session),
+        () => undefined
+      )
+      await second.then(
+        ({ session }) => runtime.disposeReviewerSession(session),
+        () => undefined
+      )
+    }
+  })
+
+  it.each([
+    {
+      teardown: 'disconnect',
+      runTeardown: (runtime: AcpRuntime) => runtime.disconnect(),
+      canStartSuccessor: true
+    },
+    {
+      teardown: 'reconnect',
+      runTeardown: (runtime: AcpRuntime) => runtime.connect({ cwd: '/workspace' }),
+      canStartSuccessor: true
+    }
+  ])(
+    'invalidates a pending reviewer startup before a failing $teardown can strand it',
+    async ({ runTeardown, canStartSuccessor }) => {
+      const oldProcess = new FakeAgentProcess()
+      const newProcess = new FakeAgentProcess()
+      const reviewerModeStarted = createDeferred()
+      const releaseReviewerMode = createDeferred()
+      let modeRequestCount = 0
+      startFakeAgent(oldProcess, ['primary-session', 'stale-reviewer'], {
+        modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent'),
+        onSetMode: async () => {
+          modeRequestCount += 1
+          if (modeRequestCount === 2) {
+            reviewerModeStarted.resolve()
+            await releaseReviewerMode.promise
+          }
+        }
+      })
+      startFakeAgent(newProcess, ['stale-reviewer'], {
+        modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent')
+      })
+      const oldBridge = createBackendLeaseHarness()
+      const newBridge = createBackendLeaseHarness()
+      let spawnCount = 0
+      const runtime = new AcpRuntime({
+        appVersion: '0.1.0',
+        defaultCwd: '/workspace',
+        resolveBackend: () => {
+          const useOld = spawnCount === 0
+          spawnCount += 1
+          return {
+            framework: {
+              ...codexFramework,
+              spawn: () => asAgentProcess(useOld ? oldProcess : newProcess)
+            },
+            executablePath: '/bin/codex-acp',
+            env: {},
+            responsesBridgeLease: useOld ? oldBridge.lease : newBridge.lease
+          }
+        }
+      })
+      const primary = await runtime.createSession({ cwd: '/workspace' })
+      const activePrimary = activeSessionForTest(runtime, primary.sessionId)!
+      const disposePrimary = activePrimary.dispose.bind(activePrimary)
+      activePrimary.dispose = vi.fn(() => {
+        throw new Error('primary disconnect dispose failed')
+      })
+      const reviewerRequest: Parameters<AcpRuntime['buildReviewerSession']>[0] = {
+        cwd: '/workspace',
+        mcpServers: [
+          {
+            type: 'http',
+            name: 'open-science-reviewer',
+            url: 'http://127.0.0.1:1/mcp',
+            headers: []
+          }
+        ]
+      }
+      const reviewer = runtime.buildReviewerSession(reviewerRequest)
+      const reviewerOutcome = reviewer.then(
+        (value) => ({ value, error: undefined }),
+        (error: unknown) => ({ value: undefined, error })
+      )
+      await reviewerModeStarted.promise
+      let successor: Awaited<ReturnType<AcpRuntime['buildReviewerSession']>> | undefined
+
+      try {
+        expect(pendingReviewerSessionIds(runtime).has('stale-reviewer')).toBe(true)
+
+        await expect(runTeardown(runtime)).rejects.toThrow('primary disconnect dispose failed')
+
+        expect(pendingReviewerSessionIds(runtime).size).toBe(0)
+        if (canStartSuccessor) {
+          successor = await runtime.buildReviewerSession(reviewerRequest)
+          expect(reviewerSessionIds(runtime)).toEqual(new Set(['stale-reviewer']))
+        }
+
+        releaseReviewerMode.resolve()
+        const staleOutcome = await reviewerOutcome
+        expect(staleOutcome.error).toMatchObject({
+          message: 'ACP session startup was superseded.'
+        })
+        if (canStartSuccessor) {
+          expect(reviewerSessionIds(runtime)).toEqual(new Set(['stale-reviewer']))
+        } else {
+          expect(reviewerSessionIds(runtime).size).toBe(0)
+        }
+        expect(oldBridge.lease.registerReviewerSession).not.toHaveBeenCalled()
+        if (canStartSuccessor) {
+          expect(newBridge.lease.registerReviewerSession).toHaveBeenCalledWith('stale-reviewer')
+        }
+      } finally {
+        releaseReviewerMode.resolve()
+        await reviewer.then(
+          ({ session }) => runtime.disposeReviewerSession(session),
+          () => undefined
+        )
+        if (successor) runtime.disposeReviewerSession(successor.session)
+        activePrimary.dispose = disposePrimary
+        await runtime.disconnect().catch(() => undefined)
+      }
+    }
+  )
+
+  it('keeps a successor reviewer active when an older same-id session disposes late', async () => {
+    const oldProcess = new FakeAgentProcess()
+    const newProcess = new FakeAgentProcess()
+    startFakeAgent(oldProcess, ['shared-reviewer'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'read-only')
+    })
+    const newAgent = startFakeAgent(newProcess, ['shared-reviewer'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'read-only')
+    })
+    const oldBridge = createBackendLeaseHarness()
+    const newBridge = createBackendLeaseHarness()
+    let spawnCount = 0
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => {
+        const useOld = spawnCount === 0
+        spawnCount += 1
+        return {
+          framework: {
+            ...codexFramework,
+            spawn: () => asAgentProcess(useOld ? oldProcess : newProcess)
+          },
+          executablePath: '/bin/codex-acp',
+          env: {},
+          responsesBridgeLease: useOld ? oldBridge.lease : newBridge.lease
+        }
+      }
+    })
+    const request: Parameters<AcpRuntime['buildReviewerSession']>[0] = {
+      cwd: '/workspace',
+      mcpServers: [
+        {
+          type: 'http',
+          name: 'open-science-reviewer',
+          url: 'http://127.0.0.1:1/mcp',
+          headers: []
+        }
+      ]
+    }
+    const oldReviewer = await runtime.buildReviewerSession(request)
+    await runtime.disconnect()
+    const successor = await runtime.buildReviewerSession(request)
+    const successorCwd = newAgent.newSessions[0]!.cwd
+
+    try {
+      runtime.disposeReviewerSession(oldReviewer.session)
+
+      expect(reviewerSessionIds(runtime)).toEqual(new Set(['shared-reviewer']))
+      expect(newBridge.lease.unregisterReviewerSession).not.toHaveBeenCalled()
+      await expect(stat(successorCwd)).resolves.toBeDefined()
+      await successor.session.prompt([{ type: 'text', text: 'successor remains scoped' }])
+      expect(newAgent.prompts).toEqual([
+        { sessionId: 'shared-reviewer', text: 'successor remains scoped' }
+      ])
+    } finally {
+      runtime.disposeReviewerSession(successor.session)
+      await runtime.disconnect().catch(() => undefined)
+    }
+  })
+
+  it('completes unexpected-close cleanup when one reviewer bridge unregister throws', async () => {
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['reviewer-one', 'reviewer-two'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'read-only')
+    })
+    const { lease, release } = createBackendLeaseHarness()
+    lease.unregisterReviewerSession = vi.fn((sessionId: string) => {
+      if (sessionId === 'reviewer-one') throw new Error('reviewer unregister failed')
+      return false
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...codexFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/codex-acp',
+        env: {},
+        responsesBridgeLease: lease
+      })
+    })
+    const reviewerRequest: Parameters<AcpRuntime['buildReviewerSession']>[0] = {
+      cwd: '/workspace',
+      mcpServers: [
+        {
+          type: 'http',
+          name: 'open-science-reviewer',
+          url: 'http://127.0.0.1:1/mcp',
+          headers: []
+        }
+      ]
+    }
+    await runtime.buildReviewerSession(reviewerRequest)
+    await runtime.buildReviewerSession(reviewerRequest)
+    const reviewerCwds = fakeAgent.newSessions.map(({ cwd }) => cwd)
+    await runtime.requestProviderReconnect()
+    const handleConnectionClosed = (
+      runtime as unknown as { handleConnectionClosed: () => void }
+    ).handleConnectionClosed.bind(runtime)
+
+    try {
+      expect(handleConnectionClosed).not.toThrow()
+      expect(lease.unregisterReviewerSession).toHaveBeenCalledWith('reviewer-one')
+      expect(lease.unregisterReviewerSession).toHaveBeenCalledWith('reviewer-two')
+      expect(reviewerSessionIds(runtime).size).toBe(0)
+      expect(
+        (runtime as unknown as { reconnectBarrier?: Promise<void> }).reconnectBarrier
+      ).toBeUndefined()
+      await vi.waitFor(() => expect(release).toHaveBeenCalledOnce())
+      for (const reviewerCwd of reviewerCwds) {
+        await expect(stat(reviewerCwd)).rejects.toMatchObject({ code: 'ENOENT' })
+      }
+    } finally {
+      lease.unregisterReviewerSession = vi.fn(() => false)
+      if (reviewerSessionIds(runtime).size > 0) handleConnectionClosed()
+    }
+  })
+
+  it('activates reviewer routing before granting responses bridge authority', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['reviewer-session-1'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'read-only')
+    })
+    const routingObservedByBridge: Array<{ active: boolean; pending: boolean }> = []
+    const { lease } = createBackendLeaseHarness()
+    lease.registerReviewerSession = vi.fn((sessionId: string) => {
+      routingObservedByBridge.push({
+        active: reviewerSessionIds(runtime).has(sessionId),
+        pending: pendingReviewerSessionIds(runtime).has(sessionId)
+      })
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...codexFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/codex-acp',
+        env: {},
+        responsesBridgeLease: lease
+      })
+    })
+
+    const { session } = await runtime.buildReviewerSession({
+      cwd: '/workspace',
+      mcpServers: [
+        {
+          type: 'http',
+          name: 'open-science-reviewer',
+          url: 'http://127.0.0.1:1/mcp',
+          headers: []
+        }
+      ]
+    })
+
+    expect(routingObservedByBridge).toEqual([{ active: true, pending: false }])
+    runtime.disposeReviewerSession(session)
+  })
+
+  it('rolls back reviewer activation when responses bridge registration throws', async () => {
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['reviewer-session-1'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'read-only')
+    })
+    const { lease } = createBackendLeaseHarness()
+    lease.registerReviewerSession = vi.fn(() => {
+      throw new Error('reviewer bridge registration failed')
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...codexFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/codex-acp',
+        env: {},
+        responsesBridgeLease: lease
+      })
+    })
+
+    await expect(
+      runtime.buildReviewerSession({
+        cwd: '/workspace',
+        mcpServers: [
+          {
+            type: 'http',
+            name: 'open-science-reviewer',
+            url: 'http://127.0.0.1:1/mcp',
+            headers: []
+          }
+        ]
+      })
+    ).rejects.toThrow('reviewer bridge registration failed')
+
+    expect(reviewerSessionIds(runtime).size).toBe(0)
+    expect(pendingReviewerSessionIds(runtime).size).toBe(0)
+    expect(lease.unregisterReviewerSession).toHaveBeenCalledWith('reviewer-session-1')
+    await expect(stat(fakeAgent.newSessions[0]!.cwd)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('lets the first known create identity reservation win while another start is unresolved', async () => {
+    const process = new FakeAgentProcess()
+    const primaryStartReachedAgent = createDeferred()
+    const releasePrimaryStart = createDeferred()
+    const fakeAgent = startFakeAgent(process, ['shared-session', 'shared-session'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'read-only'),
+      onNewSession: async ({ index }) => {
+        if (index === 0) {
+          primaryStartReachedAgent.resolve()
+          await releasePrimaryStart.promise
+        }
+      }
+    })
+    const { lease } = createBackendLeaseHarness()
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...codexFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/codex-acp',
+        env: {},
+        responsesBridgeLease: lease
+      })
+    })
+    await runtime.connect({ cwd: '/workspace' })
+
+    const primary = runtime.createSession({ cwd: '/workspace' })
+    await primaryStartReachedAgent.promise
+    const reviewer = runtime.buildReviewerSession({
+      cwd: '/workspace',
+      mcpServers: [
+        {
+          type: 'http',
+          name: 'open-science-reviewer',
+          url: 'http://127.0.0.1:1/mcp',
+          headers: []
+        }
+      ]
+    })
+
+    try {
+      const winner = await reviewer
+      expect(reviewerSessionIds(runtime)).toEqual(new Set(['shared-session']))
+      expect(lease.registerReviewerSession).toHaveBeenCalledWith('shared-session')
+
+      releasePrimaryStart.resolve()
+      await expect(primary).rejects.toThrow(
+        'Primary session id collision with reviewer: shared-session'
+      )
+      expect(runtime.getSnapshot().sessionIds).toEqual([])
+      await winner.session.prompt([{ type: 'text', text: 'first reservation keeps authority' }])
+      expect(fakeAgent.prompts).toEqual([
+        { sessionId: 'shared-session', text: 'first reservation keeps authority' }
+      ])
+    } finally {
+      releasePrimaryStart.resolve()
+      await reviewer.then(
+        ({ session }) => runtime.disposeReviewerSession(session),
+        () => undefined
+      )
+      await primary.then(
+        ({ sessionId }) => runtime.deleteSession({ sessionId }),
+        () => undefined
+      )
+    }
+  })
+
+  it('reserves a new primary session id while its permission mode is still starting', async () => {
+    const { fakeAgent, lease, runtime, primary, reviewer, releasePrimaryMode, modeRequestCount } =
+      await startPendingPrimaryRace(['shared-session', 'shared-session'], (runtime) =>
+        runtime.createSession({ cwd: '/workspace' })
+      )
+
+    try {
+      await expect(reviewer).rejects.toThrow('Reviewer session id collision: shared-session')
+      expect(modeRequestCount()).toBe(1)
+      expect(lease.registerReviewerSession).not.toHaveBeenCalled()
+      const duplicateCwd = fakeAgent.newSessions[1]?.cwd
+      expect(duplicateCwd).toMatch(/open-science-reviewer-/)
+      await expect(stat(duplicateCwd!)).rejects.toMatchObject({ code: 'ENOENT' })
+
+      releasePrimaryMode.resolve()
+      const winner = await primary
+      expect(runtime.getSnapshot()).toMatchObject({
+        sessionIds: ['shared-session'],
+        permissionProfiles: {
+          'shared-session': {
+            selectedProfile: 'ask',
+            effectiveProfile: 'ask',
+            currentModeId: 'read-only'
+          }
+        }
+      })
+      await runtime.sendPrompt({
+        sessionId: winner.sessionId,
+        text: 'primary keeps normal authority'
+      })
+      expect(fakeAgent.prompts).toHaveLength(1)
+      expect(fakeAgent.prompts[0]).toMatchObject({ sessionId: 'shared-session' })
+      expect(fakeAgent.prompts[0]?.text).toContain('primary keeps normal authority')
+    } finally {
+      releasePrimaryMode.resolve()
+      await reviewer.then(
+        ({ session }) => runtime.disposeReviewerSession(session),
+        () => undefined
+      )
+      await primary.then(
+        ({ sessionId }) => runtime.deleteSession({ sessionId }),
+        () => undefined
+      )
+    }
+  })
+
+  it.each([
+    {
+      teardown: 'disconnect',
+      runTeardown: (runtime: AcpRuntime) => runtime.disconnect(),
+      canStartSuccessor: true
+    },
+    {
+      teardown: 'reconnect',
+      runTeardown: (runtime: AcpRuntime) => runtime.connect({ cwd: '/workspace' }),
+      canStartSuccessor: true
+    }
+  ])(
+    'invalidates a pending primary startup before a failing $teardown can strand it',
+    async ({ runTeardown, canStartSuccessor }) => {
+      const oldProcess = new FakeAgentProcess()
+      const newProcess = new FakeAgentProcess()
+      const pendingModeStarted = createDeferred()
+      const releasePendingMode = createDeferred()
+      let modeRequestCount = 0
+      startFakeAgent(oldProcess, ['active-primary', 'stale-primary'], {
+        modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent'),
+        onSetMode: async () => {
+          modeRequestCount += 1
+          if (modeRequestCount === 2) {
+            pendingModeStarted.resolve()
+            await releasePendingMode.promise
+          }
+        }
+      })
+      startFakeAgent(newProcess, ['stale-primary'], {
+        modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent')
+      })
+      let spawnCount = 0
+      const runtime = new AcpRuntime({
+        appVersion: '0.1.0',
+        defaultCwd: '/workspace',
+        resolveBackend: () => {
+          const useOld = spawnCount === 0
+          spawnCount += 1
+          return {
+            framework: {
+              ...codexFramework,
+              spawn: () => asAgentProcess(useOld ? oldProcess : newProcess)
+            },
+            executablePath: '/bin/codex-acp',
+            env: {}
+          }
+        }
+      })
+      const active = await runtime.createSession({ cwd: '/workspace' })
+      const activeSession = activeSessionForTest(runtime, active.sessionId)!
+      const disposeActive = activeSession.dispose.bind(activeSession)
+      activeSession.dispose = vi.fn(() => {
+        throw new Error('active primary disconnect dispose failed')
+      })
+      const pending = runtime.createSession({ cwd: '/workspace' })
+      const pendingOutcome = pending.then(
+        (value) => ({ value, error: undefined }),
+        (error: unknown) => ({ value: undefined, error })
+      )
+      await pendingModeStarted.promise
+      let successor: Awaited<ReturnType<AcpRuntime['createSession']>> | undefined
+
+      try {
+        await expect(runTeardown(runtime)).rejects.toThrow(
+          'active primary disconnect dispose failed'
+        )
+
+        if (canStartSuccessor) {
+          successor = await runtime.createSession({ cwd: '/workspace' })
+          expect(runtime.getSnapshot().sessionIds).toContain('stale-primary')
+        }
+
+        releasePendingMode.resolve()
+        const staleOutcome = await pendingOutcome
+        expect(staleOutcome.error).toMatchObject({
+          message: 'ACP session startup was superseded.'
+        })
+        if (canStartSuccessor) {
+          expect(runtime.getSnapshot().sessionIds).toContain('stale-primary')
+        } else {
+          expect(runtime.getSnapshot().sessionIds).not.toContain('stale-primary')
+        }
+      } finally {
+        releasePendingMode.resolve()
+        await pending.then(
+          ({ sessionId }) => runtime.deleteSession({ sessionId }),
+          () => undefined
+        )
+        if (successor) await runtime.deleteSession({ sessionId: successor.sessionId })
+        activeSession.dispose = disposeActive
+        await runtime.disconnect().catch(() => undefined)
+      }
+    }
+  )
+
+  it('does not let a stale primary startup publish specialist or permission state', async () => {
+    const process = new FakeAgentProcess()
+    const staleModeStarted = createDeferred()
+    const releaseStaleMode = createDeferred()
+    const fakeAgent = startFakeAgent(process, ['shared-primary', 'shared-primary'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent'),
+      onSetMode: async ({ modeId }) => {
+        if (modeId === 'agent-full-access') {
+          staleModeStarted.resolve()
+          await releaseStaleMode.promise
+        }
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...codexFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/codex-acp',
+        env: {}
+      }),
+      resolveSpecialistIdentity: async (specialistId) => ({
+        append: '',
+        prefix: `${specialistId} prefix`
+      })
+    })
+    await runtime.connect({ cwd: '/workspace' })
+    const disconnectCurrentSpy = vi
+      .spyOn(
+        runtime as unknown as {
+          disconnectCurrent: (emitClosedStatus?: boolean) => Promise<AcpStateSnapshot>
+        },
+        'disconnectCurrent'
+      )
+      .mockRejectedValueOnce(new Error('disconnect teardown failed'))
+    const stale = runtime.createSession({
+      cwd: '/workspace',
+      specialistId: 'stale-specialist',
+      permissionProfile: 'full'
+    })
+    await staleModeStarted.promise
+    let successor: Awaited<ReturnType<AcpRuntime['createSession']>> | undefined
+
+    try {
+      await expect(runtime.disconnect()).rejects.toThrow('disconnect teardown failed')
+      successor = await runtime.createSession({ cwd: '/workspace', permissionProfile: 'ask' })
+
+      releaseStaleMode.resolve()
+      await expect(stale).rejects.toThrow('ACP session startup was superseded.')
+      expect(runtime.getSnapshot().permissionProfiles['shared-primary']).toMatchObject({
+        selectedProfile: 'ask',
+        effectiveProfile: 'ask',
+        currentModeId: 'read-only'
+      })
+      await runtime.sendPrompt({ sessionId: 'shared-primary', text: 'successor turn' })
+      expect(fakeAgent.prompts.at(-1)?.text).toContain('successor turn')
+      expect(fakeAgent.prompts.at(-1)?.text).not.toContain('stale-specialist prefix')
+    } finally {
+      releaseStaleMode.resolve()
+      await stale.catch(() => undefined)
+      disconnectCurrentSpy.mockRestore()
+      if (successor) await runtime.deleteSession({ sessionId: successor.sessionId })
+      await runtime.disconnect().catch(() => undefined)
+    }
+  })
+
+  it('does not let stale permission setup target a same-id successor connection', async () => {
+    const oldProcess = new FakeAgentProcess()
+    const newProcess = new FakeAgentProcess()
+    startFakeAgent(oldProcess, ['shared-primary'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent')
+    })
+    const newAgent = startFakeAgent(newProcess, ['shared-primary'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent')
+    })
+    let spawnCount = 0
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => {
+        spawnCount += 1
+        return {
+          framework: {
+            ...codexFramework,
+            spawn: () => asAgentProcess(spawnCount === 1 ? oldProcess : newProcess)
+          },
+          executablePath: '/bin/codex-acp',
+          env: {}
+        }
+      }
+    })
+    const permissionSetupStarted = createDeferred()
+    const releasePermissionSetup = createDeferred()
+    const internal = runtime as unknown as {
+      configurePermissionProfile: (...args: unknown[]) => Promise<unknown>
+    }
+    const configurePermissionProfile = internal.configurePermissionProfile.bind(runtime)
+    vi.spyOn(internal, 'configurePermissionProfile').mockImplementationOnce(async (...args) => {
+      permissionSetupStarted.resolve()
+      await releasePermissionSetup.promise
+      return configurePermissionProfile(...args)
+    })
+
+    const stale = runtime.createSession({
+      cwd: '/workspace',
+      permissionProfile: 'full'
+    })
+    await permissionSetupStarted.promise
+    let successor: Awaited<ReturnType<AcpRuntime['createSession']>> | undefined
+
+    try {
+      await runtime.disconnect()
+      successor = await runtime.createSession({
+        cwd: '/workspace',
+        permissionProfile: 'ask'
+      })
+      expect(newAgent.modeChanges).toEqual([{ sessionId: 'shared-primary', modeId: 'read-only' }])
+
+      releasePermissionSetup.resolve()
+      await expect(stale).rejects.toThrow('ACP session startup was superseded.')
+      expect(newAgent.modeChanges).toEqual([{ sessionId: 'shared-primary', modeId: 'read-only' }])
+      expect(runtime.getSnapshot().permissionProfiles['shared-primary']).toMatchObject({
+        selectedProfile: 'ask',
+        effectiveProfile: 'ask',
+        currentModeId: 'read-only'
+      })
+    } finally {
+      releasePermissionSetup.resolve()
+      await stale.catch(() => undefined)
+      if (successor) await runtime.deleteSession({ sessionId: successor.sessionId })
+      await runtime.disconnect().catch(() => undefined)
+    }
+  })
+
+  it('does not let a stale primary model application replace its successor projection', async () => {
+    const process = new FakeAgentProcess()
+    const staleModelStarted = createDeferred()
+    const releaseStaleModel = createDeferred()
+    const configOptions = [
+      {
+        type: 'select',
+        id: 'model',
+        name: 'Model',
+        category: 'model',
+        currentValue: 'model-default',
+        options: [
+          { value: 'model-old', name: 'Old model' },
+          { value: 'model-new', name: 'New model' }
+        ]
+      } as SessionConfigOption
+    ]
+    startFakeAgent(process, ['shared-primary', 'shared-primary'], {
+      configOptions,
+      onSetConfigOption: async ({ value }) => {
+        if (value === 'model-old') {
+          staleModelStarted.resolve()
+          await releaseStaleModel.promise
+        }
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...opencodeFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/opencode-acp',
+        env: {},
+        sessionModel: 'model-old'
+      }),
+      framework: opencodeFramework
+    })
+    await runtime.connect({ cwd: '/workspace' })
+    const disconnectCurrentSpy = vi
+      .spyOn(
+        runtime as unknown as {
+          disconnectCurrent: (emitClosedStatus?: boolean) => Promise<AcpStateSnapshot>
+        },
+        'disconnectCurrent'
+      )
+      .mockRejectedValueOnce(new Error('disconnect teardown failed'))
+    const stale = runtime.createSession({ cwd: '/workspace' })
+    await staleModelStarted.promise
+    let successor: Awaited<ReturnType<AcpRuntime['createSession']>> | undefined
+
+    try {
+      await expect(runtime.disconnect()).rejects.toThrow('disconnect teardown failed')
+      ;(runtime as unknown as { pendingSessionModel?: string }).pendingSessionModel = 'model-new'
+      successor = await runtime.createSession({ cwd: '/workspace' })
+      expect(contextUsageSelectionForTest(runtime, 'shared-primary').model).toBe('model-new')
+
+      releaseStaleModel.resolve()
+      await expect(stale).rejects.toThrow('ACP session startup was superseded.')
+      expect(contextUsageSelectionForTest(runtime, 'shared-primary').model).toBe('model-new')
+    } finally {
+      releaseStaleModel.resolve()
+      await stale.catch(() => undefined)
+      disconnectCurrentSpy.mockRestore()
+      if (successor) await runtime.deleteSession({ sessionId: successor.sessionId })
+      await runtime.disconnect().catch(() => undefined)
+    }
+  })
+
+  it('disposes a created primary session when teardown invalidates its startup', async () => {
+    const process = new FakeAgentProcess()
+    const pendingModeStarted = createDeferred()
+    const releasePendingMode = createDeferred()
+    startFakeAgent(process, ['stale-primary'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent'),
+      onSetMode: async () => {
+        pendingModeStarted.resolve()
+        await releasePendingMode.promise
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...codexFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/codex-acp',
+        env: {}
+      })
+    })
+    await runtime.connect({ cwd: '/workspace' })
+    const disposeSpy = vi.spyOn(acp.ActiveSession.prototype, 'dispose')
+    const disconnectCurrentSpy = vi
+      .spyOn(
+        runtime as unknown as {
+          disconnectCurrent: (emitClosedStatus?: boolean) => Promise<AcpStateSnapshot>
+        },
+        'disconnectCurrent'
+      )
+      .mockRejectedValueOnce(new Error('disconnect teardown failed'))
+    const pending = runtime.createSession({ cwd: '/workspace' })
+    await pendingModeStarted.promise
+
+    try {
+      await expect(runtime.disconnect()).rejects.toThrow('disconnect teardown failed')
+      releasePendingMode.resolve()
+
+      await expect(pending).rejects.toThrow('ACP session startup was superseded.')
+      expect(disposeSpy).toHaveBeenCalledOnce()
+      expect((disposeSpy.mock.instances[0] as unknown as { sessionId?: string })?.sessionId).toBe(
+        'stale-primary'
+      )
+    } finally {
+      releasePendingMode.resolve()
+      await pending.catch(() => undefined)
+      disconnectCurrentSpy.mockRestore()
+      disposeSpy.mockRestore()
+      await runtime.disconnect().catch(() => undefined)
+    }
+  })
+
+  it('defers a provider reconnect until a pending primary startup publishes', async () => {
+    const process = new FakeAgentProcess()
+    const pendingModeStarted = createDeferred()
+    const releasePendingMode = createDeferred()
+    startFakeAgent(process, ['pending-primary'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent'),
+      onSetMode: async () => {
+        pendingModeStarted.resolve()
+        await releasePendingMode.promise
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...codexFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/codex-acp',
+        env: {}
+      })
+    })
+    const pending = runtime.createSession({ cwd: '/workspace' })
+    await pendingModeStarted.promise
+
+    await runtime.requestProviderReconnect()
+
+    expect(process.killed).toBe(false)
+    expect(
+      (runtime as unknown as { pendingProviderReconnect: boolean }).pendingProviderReconnect
+    ).toBe(true)
+
+    releasePendingMode.resolve()
+    await expect(pending).resolves.toMatchObject({ sessionId: 'pending-primary' })
+    await vi.waitFor(() => expect(process.killed).toBe(true))
+  })
+
+  it('defers a provider reconnect until a pending reviewer startup activates', async () => {
+    const { lease, runtime, reviewer, releaseReviewerMode } = await startPendingReviewerRace([
+      'pending-reviewer'
+    ])
+
+    try {
+      await runtime.requestProviderReconnect()
+
+      expect(
+        (runtime as unknown as { pendingProviderReconnect: boolean }).pendingProviderReconnect
+      ).toBe(true)
+      expect(pendingReviewerSessionIds(runtime).has('pending-reviewer')).toBe(true)
+
+      releaseReviewerMode.resolve()
+      const activeReviewer = await reviewer
+      expect(reviewerSessionIds(runtime)).toEqual(new Set(['pending-reviewer']))
+      expect(lease.registerReviewerSession).toHaveBeenCalledWith('pending-reviewer')
+      expect(activeReviewer.session.sessionId).toBe('pending-reviewer')
+    } finally {
+      releaseReviewerMode.resolve()
+      await reviewer.then(
+        ({ session }) => runtime.disposeReviewerSession(session),
+        () => undefined
+      )
+    }
+  })
+
+  it('resolves an armed reconnect barrier when explicitly disconnected', async () => {
+    const oldProcess = new FakeAgentProcess()
+    const newProcess = new FakeAgentProcess()
+    startFakeAgent(oldProcess, ['active-reviewer'])
+    startFakeAgent(newProcess, ['fresh-primary'])
+    let spawnCount = 0
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => {
+        spawnCount += 1
+        return {
+          framework: {
+            ...claudeCodeFramework,
+            spawn: () => asAgentProcess(spawnCount === 1 ? oldProcess : newProcess)
+          },
+          executablePath: '/bin/agent',
+          env: {}
+        }
+      }
+    })
+    await runtime.buildReviewerSession({
+      cwd: '/workspace',
+      mcpServers: [
+        {
+          type: 'http',
+          name: 'open-science-reviewer',
+          url: 'http://127.0.0.1:1/mcp',
+          headers: []
+        }
+      ]
+    })
+    await runtime.requestProviderReconnect()
+    expect(
+      (runtime as unknown as { reconnectBarrier?: Promise<void> }).reconnectBarrier
+    ).toBeDefined()
+
+    await runtime.disconnect()
+
+    expect(
+      (runtime as unknown as { reconnectBarrier?: Promise<void> }).reconnectBarrier
+    ).toBeUndefined()
+    expect(
+      (runtime as unknown as { pendingProviderReconnect: boolean }).pendingProviderReconnect
+    ).toBe(false)
+    await expect(runtime.createSession({ cwd: '/workspace' })).resolves.toMatchObject({
+      sessionId: 'fresh-primary'
+    })
+  })
+
+  it('fully detaches the old backend when a primary dispose fails during disconnect', async () => {
+    const oldProcess = new FakeAgentProcess()
+    const newProcess = new FakeAgentProcess()
+    startFakeAgent(oldProcess, ['active-primary'])
+    startFakeAgent(newProcess, ['fresh-primary'])
+    const oldBridge = createBackendLeaseHarness()
+    const newBridge = createBackendLeaseHarness()
+    let spawnCount = 0
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => {
+        const useOld = spawnCount === 0
+        spawnCount += 1
+        return {
+          framework: {
+            ...claudeCodeFramework,
+            spawn: () => asAgentProcess(useOld ? oldProcess : newProcess)
+          },
+          executablePath: '/bin/agent',
+          env: {},
+          responsesBridgeLease: useOld ? oldBridge.lease : newBridge.lease
+        }
+      }
+    })
+    const active = await runtime.createSession({ cwd: '/workspace' })
+    const activeSession = activeSessionForTest(runtime, active.sessionId)!
+    const disposeActive = activeSession.dispose.bind(activeSession)
+    activeSession.dispose = vi.fn(() => {
+      throw new Error('active primary dispose failed')
+    })
+
+    try {
+      await expect(runtime.disconnect()).rejects.toThrow('active primary dispose failed')
+      expect(oldProcess.killed).toBe(true)
+      expect(oldBridge.release).toHaveBeenCalledOnce()
+      expect(runtime.getSnapshot().sessionIds).toEqual([])
+
+      await expect(runtime.createSession({ cwd: '/workspace' })).resolves.toMatchObject({
+        sessionId: 'fresh-primary'
+      })
+      expect(spawnCount).toBe(2)
+    } finally {
+      activeSession.dispose = disposeActive
+      await runtime.disconnect().catch(() => undefined)
+    }
+  })
+
+  it('does not let an older teardown complete a newer reconnect intent', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, [])
+    const oldCloseStarted = createDeferred()
+    const releaseOldClose = createDeferred()
+    const mcpHttpHost = {
+      clear: vi.fn(),
+      close: vi.fn(async () => {
+        oldCloseStarted.resolve()
+        await releaseOldClose.promise
+      })
+    } as unknown as AgentMcpHttpHost
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      mcpHttpHost,
+      spawnAgent: () => asAgentProcess(process)
+    })
+    await runtime.connect({ cwd: '/workspace' })
+    const oldDisconnect = runtime.disconnect()
+    await oldCloseStarted.promise
+    const releaseActivity = createDeferred()
+    const activity = runtime.withActivity({}, async () => releaseActivity.promise)
+
+    try {
+      await runtime.requestProviderReconnect()
+      expect(
+        (runtime as unknown as { pendingProviderReconnect: boolean }).pendingProviderReconnect
+      ).toBe(true)
+      expect(
+        (runtime as unknown as { reconnectBarrier?: Promise<void> }).reconnectBarrier
+      ).toBeDefined()
+
+      releaseOldClose.resolve()
+      await oldDisconnect
+      expect(
+        (runtime as unknown as { pendingProviderReconnect: boolean }).pendingProviderReconnect
+      ).toBe(true)
+      expect(
+        (runtime as unknown as { reconnectBarrier?: Promise<void> }).reconnectBarrier
+      ).toBeDefined()
+
+      releaseActivity.resolve()
+      await activity
+      await vi.waitFor(() =>
+        expect(
+          (runtime as unknown as { reconnectBarrier?: Promise<void> }).reconnectBarrier
+        ).toBeUndefined()
+      )
+    } finally {
+      releaseOldClose.resolve()
+      releaseActivity.resolve()
+      await oldDisconnect.catch(() => undefined)
+      await activity.catch(() => undefined)
+      await runtime.disconnect().catch(() => undefined)
+    }
+  })
+
+  it('does not let an older disconnect close a successor HTTP MCP host', async () => {
+    const oldProcess = new FakeAgentProcess()
+    const newProcess = new FakeAgentProcess()
+    startFakeAgent(oldProcess, ['old-http-session'])
+    startFakeAgent(newProcess, ['new-http-session'])
+    const routes = new Set<string>()
+    const close = vi.fn(async () => {
+      routes.clear()
+    })
+    const httpHost = {
+      ensureStarted: vi.fn(async () => ({
+        endpoint: 'http://127.0.0.1:4321',
+        token: 'host-token'
+      })),
+      registerNotebook: vi.fn((routingId: string) => {
+        routes.add(routingId)
+      }),
+      urlFor: vi.fn(
+        (kind: string, routingId: string) =>
+          `http://127.0.0.1:4321/mcp/${kind}/${encodeURIComponent(routingId)}`
+      ),
+      unregister: vi.fn((routingId: string) => {
+        routes.delete(routingId)
+      }),
+      clear: vi.fn(() => routes.clear()),
+      close
+    } as unknown as AgentMcpHttpHost
+    let spawnCount = 0
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => {
+        const process = spawnCount === 0 ? oldProcess : newProcess
+        spawnCount += 1
+        return {
+          framework: {
+            ...opencodeFramework,
+            acceptsStdioMcp: false,
+            spawn: () => asAgentProcess(process)
+          },
+          executablePath: '/bin/agent',
+          env: {}
+        }
+      },
+      mcpHttpHost: httpHost,
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({
+          endpoint: 'http://127.0.0.1:4567',
+          token: 'notebook-token'
+        })
+      }
+    })
+    const first = await runtime.createSession({ cwd: '/workspace' })
+    const firstRoutingId = [...routes][0]
+    expect(first.sessionId).toBe('old-http-session')
+    expect(firstRoutingId).toBeDefined()
+    const oldKillStarted = createDeferred()
+    const releaseOldKill = createDeferred()
+    vi.mocked(terminateProcessTree).mockImplementationOnce(async (child) => {
+      oldKillStarted.resolve()
+      await releaseOldKill.promise
+      child?.kill()
+      return { reaped: true }
+    })
+    const oldDisconnect = runtime.disconnect()
+    await oldKillStarted.promise
+
+    try {
+      const successor = await runtime.createSession({ cwd: '/workspace' })
+      const successorRoutingId = [...routes][0]
+      expect(successor.sessionId).toBe('new-http-session')
+      expect(successorRoutingId).toBeDefined()
+      expect(successorRoutingId).not.toBe(firstRoutingId)
+      expect(routes.size).toBe(1)
+
+      releaseOldKill.resolve()
+      await oldDisconnect
+
+      expect(close).not.toHaveBeenCalled()
+      expect(routes).toContain(successorRoutingId)
+      expect(runtime.getSnapshot()).toMatchObject({
+        status: 'connected',
+        sessionIds: ['new-http-session']
+      })
+    } finally {
+      releaseOldKill.resolve()
+      await oldDisconnect.catch(() => undefined)
+      await runtime.disconnect().catch(() => undefined)
+      expect(close).toHaveBeenCalledOnce()
+    }
+  })
+
+  it('releases an armed reconnect barrier during synchronous shutdown', async () => {
+    const oldProcess = new FakeAgentProcess()
+    const abandonedProcess = new FakeAgentProcess()
+    startFakeAgent(oldProcess, ['active-reviewer'])
+    startFakeAgent(abandonedProcess, ['must-not-publish'])
+    let spawnCount = 0
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => {
+        const process = spawnCount === 0 ? oldProcess : abandonedProcess
+        spawnCount += 1
+        return {
+          framework: { ...claudeCodeFramework, spawn: () => asAgentProcess(process) },
+          executablePath: '/bin/agent',
+          env: {}
+        }
+      }
+    })
+    await runtime.buildReviewerSession({
+      cwd: '/workspace',
+      mcpServers: [
+        {
+          type: 'http',
+          name: 'open-science-reviewer',
+          url: 'http://127.0.0.1:1/mcp',
+          headers: []
+        }
+      ]
+    })
+    await runtime.requestProviderReconnect()
+    const blocked = runtime.createSession({ cwd: '/workspace' })
+
+    runtime.shutdown()
+
+    await expect(blocked).rejects.toThrow('ACP runtime is shutting down.')
+    expect(
+      (runtime as unknown as { reconnectBarrier?: Promise<void> }).reconnectBarrier
+    ).toBeUndefined()
+    expect(
+      (runtime as unknown as { pendingProviderReconnect: boolean }).pendingProviderReconnect
+    ).toBe(false)
+    expect(runtime.getSnapshot().sessionIds).toEqual([])
+  })
+
+  it('reserves a resumed primary session id while its permission mode is still starting', async () => {
+    const sessionId = '123e4567-e89b-42d3-a456-426614174000'
+    const { fakeAgent, runtime, primary, reviewer, releasePrimaryMode, modeRequestCount } =
+      await startPendingPrimaryRace([sessionId], (runtime) =>
+        runtime.resumeSession({ sessionId, cwd: '/workspace' })
+      )
+
+    try {
+      await expect(reviewer).rejects.toThrow(
+        'Reviewer session id collision: 123e4567-e89b-42d3-a456-426614174000'
+      )
+      expect(modeRequestCount()).toBe(1)
+      const duplicateCwd = fakeAgent.newSessions[0]?.cwd
+      expect(duplicateCwd).toMatch(/open-science-reviewer-/)
+      await expect(stat(duplicateCwd!)).rejects.toMatchObject({ code: 'ENOENT' })
+
+      releasePrimaryMode.resolve()
+      await expect(primary).resolves.toMatchObject({ sessionId })
+      expect(runtime.getSnapshot().sessionIds).toEqual([sessionId])
+      await runtime.sendPrompt({ sessionId, text: 'resumed primary remains active' })
+      expect(fakeAgent.prompts).toHaveLength(1)
+      expect(fakeAgent.prompts[0]).toMatchObject({ sessionId })
+      expect(fakeAgent.prompts[0]?.text).toContain('resumed primary remains active')
+    } finally {
+      releasePrimaryMode.resolve()
+      await reviewer.then(
+        ({ session }) => runtime.disposeReviewerSession(session),
+        () => undefined
+      )
+      await primary.then(
+        ({ sessionId: resumedSessionId }) => runtime.deleteSession({ sessionId: resumedSessionId }),
+        () => undefined
+      )
+    }
+  })
+
+  it.each([
+    { path: 'resume', previousFrameworkId: undefined, contextReset: undefined },
+    { path: 'fresh adoption', previousFrameworkId: 'opencode' as const, contextReset: true }
+  ])(
+    'does not let a stale $path overwrite its same-id successor projections',
+    async ({ previousFrameworkId, contextReset }) => {
+      const process = new FakeAgentProcess()
+      const staleModeStarted = createDeferred()
+      const releaseStaleMode = createDeferred()
+      const capabilityReleases: ReturnType<typeof vi.fn>[] = []
+      const releaseSessionCapabilities = vi.fn()
+      const mcpHttpHost = {
+        ensureStarted: vi.fn(async () => ({
+          endpoint: 'http://127.0.0.1:4321',
+          token: 'host-token'
+        })),
+        registerNotebook: vi.fn(),
+        urlFor: vi.fn(
+          (kind: string, routingId: string) =>
+            `http://127.0.0.1:4321/mcp/${kind}/${encodeURIComponent(routingId)}`
+        ),
+        unregister: vi.fn(),
+        clear: vi.fn(),
+        close: vi.fn(async () => undefined)
+      } as unknown as AgentMcpHttpHost
+      const fakeAgent = startFakeAgent(process, ['stale-provider', 'successor-provider'], {
+        modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent'),
+        onSetMode: async ({ modeId }) => {
+          if (modeId === 'agent-full-access') {
+            staleModeStarted.resolve()
+            await releaseStaleMode.promise
+          }
+        }
+      })
+      const runtime = new AcpRuntime({
+        appVersion: '0.1.0',
+        defaultCwd: '/workspace',
+        resolveBackend: () => ({
+          framework: {
+            ...codexFramework,
+            acceptsStdioMcp: false,
+            spawn: () => asAgentProcess(process)
+          },
+          executablePath: '/bin/codex-acp',
+          env: {}
+        }),
+        mcpHttpHost,
+        notebook: {
+          projectName: 'default-project',
+          mcpEntryPath: '/app/out/main/index.js',
+          releaseSessionCapabilities,
+          getRpcConnection: async () => {
+            const release = vi.fn()
+            capabilityReleases.push(release)
+            return {
+              endpoint: 'http://127.0.0.1:4567',
+              token: `notebook-token-${capabilityReleases.length}`,
+              release
+            }
+          }
+        },
+        resolveSpecialistIdentity: async (specialistId) => ({
+          append: '',
+          prefix: `${specialistId} prefix`
+        })
+      })
+      await runtime.connect({ cwd: '/workspace' })
+      const disconnectCurrentSpy = vi
+        .spyOn(
+          runtime as unknown as {
+            disconnectCurrent: (emitClosedStatus?: boolean) => Promise<AcpStateSnapshot>
+          },
+          'disconnectCurrent'
+        )
+        .mockRejectedValueOnce(new Error('disconnect teardown failed'))
+      const sessionId = '123e4567-e89b-42d3-a456-426614174000'
+      const stale = runtime.resumeSession({
+        sessionId,
+        cwd: '/workspace',
+        permissionProfile: 'full',
+        specialistId: 'stale-specialist',
+        ...(previousFrameworkId ? { previousFrameworkId } : {})
+      })
+      const staleOutcome = stale.then(
+        (value) => ({ value, error: undefined }),
+        (error: unknown) => ({ value: undefined, error })
+      )
+      await staleModeStarted.promise
+      let successor: Awaited<ReturnType<AcpRuntime['resumeSession']>> | undefined
+
+      try {
+        await expect(runtime.disconnect()).rejects.toThrow('disconnect teardown failed')
+        successor = await runtime.resumeSession({
+          sessionId,
+          cwd: '/workspace',
+          permissionProfile: 'ask',
+          ...(previousFrameworkId ? { previousFrameworkId } : {})
+        })
+        expect(successor.contextReset).toBe(contextReset)
+
+        releaseStaleMode.resolve()
+        const outcome = await staleOutcome
+        expect(outcome.error).toMatchObject({ message: 'ACP session startup was superseded.' })
+        expect(runtime.getSnapshot().permissionProfiles[sessionId]).toMatchObject({
+          selectedProfile: 'ask',
+          effectiveProfile: 'ask',
+          currentModeId: 'read-only'
+        })
+        await runtime.sendPrompt({ sessionId, text: 'successor turn' })
+        expect(fakeAgent.prompts.at(-1)?.text).toContain('successor turn')
+        expect(fakeAgent.prompts.at(-1)?.text).not.toContain('stale-specialist prefix')
+        expect(runtime.getSnapshot().sessionIds).toEqual([sessionId])
+        expect(mcpHttpHost.unregister).not.toHaveBeenCalled()
+        expect(capabilityReleases).toHaveLength(2)
+        expect(capabilityReleases[0]).toHaveBeenCalledOnce()
+        expect(capabilityReleases[1]).not.toHaveBeenCalled()
+        expect(releaseSessionCapabilities).not.toHaveBeenCalled()
+      } finally {
+        releaseStaleMode.resolve()
+        await staleOutcome
+        disconnectCurrentSpy.mockRestore()
+        if (successor) await runtime.deleteSession({ sessionId })
+        await runtime.disconnect().catch(() => undefined)
+      }
+    }
+  )
+
+  it('does not let a superseded failed resume revoke its same-id successor capability', async () => {
+    const sessionId = '123e4567-e89b-42d3-a456-426614174000'
+    const process = new FakeAgentProcess()
+    const staleResumeStarted = createDeferred()
+    const releaseStaleResume = createDeferred()
+    const releaseSessionCapabilities = vi.fn()
+    const fakeAgent = startFakeAgent(process, [], {
+      onResumeRequest: async ({ index }) => {
+        if (index !== 0) return
+        staleResumeStarted.resolve()
+        await releaseStaleResume.promise
+        throw acp.RequestError.resourceNotFound(sessionId)
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({
+          endpoint: 'http://127.0.0.1:4567',
+          token: 'legacy-notebook-token'
+        }),
+        releaseSessionCapabilities
+      }
+    })
+    await runtime.connect({ cwd: '/workspace' })
+
+    const stale = runtime.resumeSession({ sessionId, cwd: '/workspace' })
+    const staleOutcome = stale.then(
+      (value) => ({ value, error: undefined }),
+      (error: unknown) => ({ value: undefined, error })
+    )
+    await staleResumeStarted.promise
+    ;(
+      runtime as unknown as { invalidatePendingSessionStartups: () => void }
+    ).invalidatePendingSessionStartups()
+    const successor = await runtime.resumeSession({ sessionId, cwd: '/workspace' })
+
+    try {
+      releaseStaleResume.resolve()
+      const outcome = await staleOutcome
+      expect(outcome.error).toMatchObject({ message: 'ACP session startup was superseded.' })
+      expect(successor).toMatchObject({ sessionId })
+      expect(fakeAgent.newSessions).toHaveLength(0)
+      expect(fakeAgent.resumedSessions).toHaveLength(1)
+      expect(releaseSessionCapabilities).not.toHaveBeenCalled()
+      expect(runtime.getSnapshot().sessionIds).toEqual([sessionId])
+    } finally {
+      releaseStaleResume.resolve()
+      await staleOutcome
+      await runtime.deleteSession({ sessionId })
+    }
+  })
+
+  it('reserves a known resumed app id before provider attach completes', async () => {
+    const sessionId = '123e4567-e89b-42d3-a456-426614174000'
+    const process = new FakeAgentProcess()
+    const resumeStarted = createDeferred()
+    const releaseResume = createDeferred()
+    const fakeAgent = startFakeAgent(process, [sessionId], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'read-only'),
+      onResume: async () => {
+        resumeStarted.resolve()
+        await releaseResume.promise
+      }
+    })
+    const { lease } = createBackendLeaseHarness()
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...codexFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/codex-acp',
+        env: {},
+        responsesBridgeLease: lease
+      })
+    })
+    await runtime.connect({ cwd: '/workspace' })
+
+    const primary = runtime.resumeSession({ sessionId, cwd: '/workspace' })
+    await resumeStarted.promise
+    const reviewer = runtime.buildReviewerSession({
+      cwd: '/workspace',
+      mcpServers: [
+        {
+          type: 'http',
+          name: 'open-science-reviewer',
+          url: 'http://127.0.0.1:1/mcp',
+          headers: []
+        }
+      ]
+    })
+
+    try {
+      await expect(reviewer).rejects.toThrow(`Reviewer session id collision: ${sessionId}`)
+      await expect(stat(fakeAgent.newSessions[0]!.cwd)).rejects.toMatchObject({ code: 'ENOENT' })
+
+      releaseResume.resolve()
+      await expect(primary).resolves.toMatchObject({ sessionId })
+    } finally {
+      releaseResume.resolve()
+      await reviewer.then(
+        ({ session }) => runtime.disposeReviewerSession(session),
+        () => undefined
+      )
+      await primary.then(
+        ({ sessionId: resumedSessionId }) => runtime.deleteSession({ sessionId: resumedSessionId }),
+        () => undefined
+      )
+    }
+  })
+
+  it('rejects a second primary owner for a pending stable app id', async () => {
+    const sessionId = '123e4567-e89b-42d3-a456-426614174000'
+    const process = new FakeAgentProcess()
+    const resumeStarted = createDeferred()
+    const releaseResume = createDeferred()
+    const fakeAgent = startFakeAgent(process, [], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'read-only'),
+      onResume: async () => {
+        resumeStarted.resolve()
+        await releaseResume.promise
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...codexFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/codex-acp',
+        env: {}
+      })
+    })
+    await runtime.connect({ cwd: '/workspace' })
+
+    const first = runtime.resumeSession({ sessionId, cwd: '/workspace' })
+    await resumeStarted.promise
+
+    try {
+      await expect(runtime.resumeSession({ sessionId, cwd: '/workspace' })).rejects.toThrow(
+        `Primary session id collision: ${sessionId}`
+      )
+      expect(fakeAgent.resumedSessions).toHaveLength(1)
+
+      releaseResume.resolve()
+      await expect(first).resolves.toMatchObject({ sessionId })
+    } finally {
+      releaseResume.resolve()
+      await first.then(
+        ({ sessionId: resumedSessionId }) => runtime.deleteSession({ sessionId: resumedSessionId }),
+        () => undefined
+      )
+    }
+  })
+
+  it('reserves a fresh adoption app id before the provider session starts', async () => {
+    const process = new FakeAgentProcess()
+    const adoptionStarted = createDeferred()
+    const releaseAdoption = createDeferred()
+    const fakeAgent = startFakeAgent(process, ['new-provider-session', 'stable-app-session'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'read-only'),
+      onNewSession: async ({ index }) => {
+        if (index === 0) {
+          adoptionStarted.resolve()
+          await releaseAdoption.promise
+        }
+      }
+    })
+    const { lease } = createBackendLeaseHarness()
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...codexFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/codex-acp',
+        env: {},
+        responsesBridgeLease: lease
+      })
+    })
+    await runtime.connect({ cwd: '/workspace' })
+
+    const primary = runtime.resumeSession({
+      sessionId: 'stable-app-session',
+      cwd: '/workspace'
+    })
+    await adoptionStarted.promise
+    const reviewer = runtime.buildReviewerSession({
+      cwd: '/workspace',
+      mcpServers: [
+        {
+          type: 'http',
+          name: 'open-science-reviewer',
+          url: 'http://127.0.0.1:1/mcp',
+          headers: []
+        }
+      ]
+    })
+
+    try {
+      await expect(reviewer).rejects.toThrow('Reviewer session id collision: stable-app-session')
+      await expect(stat(fakeAgent.newSessions[1]!.cwd)).rejects.toMatchObject({ code: 'ENOENT' })
+
+      releaseAdoption.resolve()
+      await expect(primary).resolves.toMatchObject({
+        sessionId: 'stable-app-session',
+        contextReset: true
+      })
+    } finally {
+      releaseAdoption.resolve()
+      await reviewer.then(
+        ({ session }) => runtime.disposeReviewerSession(session),
+        () => undefined
+      )
+      await primary.then(
+        ({ sessionId }) => runtime.deleteSession({ sessionId }),
+        () => undefined
+      )
+    }
+  })
+
+  it('reserves a fresh adoption app-facing id while its permission mode is still starting', async () => {
+    const { fakeAgent, runtime, primary, reviewer, releasePrimaryMode, modeRequestCount } =
+      await startPendingPrimaryRace(['new-provider-session', 'stable-app-session'], (runtime) =>
+        runtime.resumeSession({
+          sessionId: 'stable-app-session',
+          cwd: '/workspace'
+        })
+      )
+
+    try {
+      await expect(reviewer).rejects.toThrow('Reviewer session id collision: stable-app-session')
+      expect(modeRequestCount()).toBe(1)
+      const duplicateCwd = fakeAgent.newSessions[1]?.cwd
+      expect(duplicateCwd).toMatch(/open-science-reviewer-/)
+      await expect(stat(duplicateCwd!)).rejects.toMatchObject({ code: 'ENOENT' })
+
+      releasePrimaryMode.resolve()
+      await expect(primary).resolves.toMatchObject({
+        sessionId: 'stable-app-session',
+        contextReset: true
+      })
+      expect(runtime.getSnapshot().sessionIds).toEqual(['stable-app-session'])
+      await runtime.sendPrompt({
+        sessionId: 'stable-app-session',
+        text: 'adopted primary remains active'
+      })
+      expect(fakeAgent.prompts).toHaveLength(1)
+      expect(fakeAgent.prompts[0]).toMatchObject({ sessionId: 'new-provider-session' })
+      expect(fakeAgent.prompts[0]?.text).toContain('adopted primary remains active')
+    } finally {
+      releasePrimaryMode.resolve()
+      await reviewer.then(
+        ({ session }) => runtime.disposeReviewerSession(session),
+        () => undefined
+      )
+      await primary.then(
+        ({ sessionId }) => runtime.deleteSession({ sessionId }),
+        () => undefined
+      )
+    }
+  })
+
+  it('reserves a fresh adoption provider id while its permission mode is still starting', async () => {
+    const { fakeAgent, runtime, primary, reviewer, releasePrimaryMode, modeRequestCount } =
+      await startPendingPrimaryRace(
+        ['reserved-provider-session', 'reserved-provider-session'],
+        (runtime) =>
+          runtime.resumeSession({
+            sessionId: 'stable-app-session',
+            cwd: '/workspace'
+          })
+      )
+
+    try {
+      await expect(reviewer).rejects.toThrow(
+        'Reviewer session id collision: reserved-provider-session'
+      )
+      expect(modeRequestCount()).toBe(1)
+      const duplicateCwd = fakeAgent.newSessions[1]?.cwd
+      expect(duplicateCwd).toMatch(/open-science-reviewer-/)
+      await expect(stat(duplicateCwd!)).rejects.toMatchObject({ code: 'ENOENT' })
+
+      releasePrimaryMode.resolve()
+      await expect(primary).resolves.toMatchObject({
+        sessionId: 'stable-app-session',
+        contextReset: true
+      })
+      expect(runtime.getSnapshot().sessionIds).toEqual(['stable-app-session'])
+      await runtime.sendPrompt({
+        sessionId: 'stable-app-session',
+        text: 'provider-owned primary remains active'
+      })
+      expect(fakeAgent.prompts).toHaveLength(1)
+      expect(fakeAgent.prompts[0]).toMatchObject({
+        sessionId: 'reserved-provider-session'
+      })
+      expect(fakeAgent.prompts[0]?.text).toContain('provider-owned primary remains active')
+    } finally {
+      releasePrimaryMode.resolve()
+      await reviewer.then(
+        ({ session }) => runtime.disposeReviewerSession(session),
+        () => undefined
+      )
+      await primary.then(
+        ({ sessionId }) => runtime.deleteSession({ sessionId }),
+        () => undefined
+      )
+    }
+  })
+
+  it('keeps the stable app id reserved while context reset starts a replacement provider session', async () => {
+    const process = new FakeAgentProcess()
+    const replacementStarted = createDeferred()
+    const releaseReplacement = createDeferred()
+    const fakeAgent = startFakeAgent(
+      process,
+      ['stable-app-session', 'replacement-provider-session', 'stable-app-session'],
+      {
+        modes: createModes(['read-only', 'agent', 'agent-full-access'], 'read-only'),
+        onNewSession: async ({ index }) => {
+          if (index === 1) {
+            replacementStarted.resolve()
+            await releaseReplacement.promise
+          }
+        }
+      }
+    )
+    const { lease } = createBackendLeaseHarness()
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...codexFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/codex-acp',
+        env: {},
+        responsesBridgeLease: lease
+      })
+    })
+    await runtime.createSession({ cwd: '/workspace' })
+
+    const reset = runtime.resetSessionContext({
+      sessionId: 'stable-app-session',
+      cwd: '/workspace'
+    })
+    await replacementStarted.promise
+    const reviewer = runtime.buildReviewerSession({
+      cwd: '/workspace',
+      mcpServers: [
+        {
+          type: 'http',
+          name: 'open-science-reviewer',
+          url: 'http://127.0.0.1:1/mcp',
+          headers: []
+        }
+      ]
+    })
+
+    try {
+      await expect(reviewer).rejects.toThrow('Reviewer session id collision: stable-app-session')
+      await expect(stat(fakeAgent.newSessions[2]!.cwd)).rejects.toMatchObject({ code: 'ENOENT' })
+
+      releaseReplacement.resolve()
+      await expect(reset).resolves.toMatchObject({
+        sessionId: 'stable-app-session',
+        contextReset: true
+      })
+      await runtime.sendPrompt({
+        sessionId: 'stable-app-session',
+        text: 'replacement primary remains active'
+      })
+      expect(fakeAgent.prompts.at(-1)).toMatchObject({
+        sessionId: 'replacement-provider-session'
+      })
+    } finally {
+      releaseReplacement.resolve()
+      await reviewer.then(
+        ({ session }) => runtime.disposeReviewerSession(session),
+        () => undefined
+      )
+      await reset.catch(() => undefined)
+      await runtime.deleteSession({ sessionId: 'stable-app-session' }).catch(() => undefined)
+    }
+  })
+
+  it('does not let an invalidated context reset replace a same-id successor session', async () => {
+    const oldProcess = new FakeAgentProcess()
+    const newProcess = new FakeAgentProcess()
+    startFakeAgent(oldProcess, ['stable-app-session'])
+    const newAgent = startFakeAgent(newProcess, ['stale-reset-provider-session'])
+    let spawnCount = 0
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => {
+        spawnCount += 1
+        return {
+          framework: {
+            ...claudeCodeFramework,
+            spawn: () => asAgentProcess(spawnCount === 1 ? oldProcess : newProcess)
+          },
+          executablePath: '/bin/agent',
+          env: {}
+        }
+      }
+    })
+    await runtime.createSession({ cwd: '/workspace' })
+
+    const ensureConnectedStarted = createDeferred()
+    const replacementConnection = createDeferred<unknown>()
+    const internal = runtime as unknown as {
+      connection: unknown
+      ensureConnected: (cwd: string) => Promise<unknown>
+    }
+    vi.spyOn(internal, 'ensureConnected').mockImplementationOnce(async () => {
+      ensureConnectedStarted.resolve()
+      return replacementConnection.promise
+    })
+
+    const reset = runtime.resetSessionContext({
+      sessionId: 'stable-app-session',
+      cwd: '/workspace'
+    })
+    await ensureConnectedStarted.promise
+    await runtime.disconnect()
+    const successor = await runtime.resumeSession({
+      sessionId: 'stable-app-session',
+      cwd: '/workspace'
+    })
+    replacementConnection.resolve(internal.connection)
+
+    try {
+      await expect(reset).rejects.toThrow('ACP session startup was superseded.')
+      expect(successor).toMatchObject({ sessionId: 'stable-app-session' })
+      expect(newAgent.newSessions).toHaveLength(0)
+      expect(runtime.getSnapshot().sessionIds).toEqual(['stable-app-session'])
+      await runtime.sendPrompt({
+        sessionId: 'stable-app-session',
+        text: 'successor remains active'
+      })
+      expect(newAgent.prompts.at(-1)).toMatchObject({
+        sessionId: 'stable-app-session',
+        text: expect.stringContaining('successor remains active')
+      })
+    } finally {
+      replacementConnection.resolve(internal.connection)
+      await reset.catch(() => undefined)
+      await runtime.deleteSession({ sessionId: 'stable-app-session' }).catch(() => undefined)
+      await runtime.disconnect().catch(() => undefined)
+    }
+  })
+
+  it.each([
+    {
+      operation: 'new primary session',
+      agentSessionIds: ['shared-session', 'shared-session'],
+      collisionId: 'shared-session',
+      expectedDisposals: 1,
+      disposalFailure: 'primary collision dispose failed',
+      start: (runtime: AcpRuntime) => runtime.createSession({ cwd: '/workspace' })
+    },
+    {
+      operation: 'fresh adoption app-facing id',
+      agentSessionIds: ['stable-app-session', 'new-provider-session'],
+      collisionId: 'stable-app-session',
+      expectedDisposals: 0,
+      start: (runtime: AcpRuntime) =>
+        runtime.resumeSession({ sessionId: 'stable-app-session', cwd: '/workspace' })
+    },
+    {
+      operation: 'fresh adoption provider id',
+      agentSessionIds: ['reserved-provider-session', 'reserved-provider-session'],
+      collisionId: 'reserved-provider-session',
+      expectedDisposals: 1,
+      disposalFailure: 'adoption collision dispose failed',
+      start: (runtime: AcpRuntime) =>
+        runtime.resumeSession({ sessionId: 'stable-app-session', cwd: '/workspace' })
+    },
+    {
+      operation: 'resumed primary session',
+      agentSessionIds: ['123e4567-e89b-42d3-a456-426614174000'],
+      collisionId: '123e4567-e89b-42d3-a456-426614174000',
+      expectedDisposals: 0,
+      start: (runtime: AcpRuntime) =>
+        runtime.resumeSession({
+          sessionId: '123e4567-e89b-42d3-a456-426614174000',
+          cwd: '/workspace'
+        })
+    }
+  ])(
+    'rejects a pending reviewer identity collision from a $operation',
+    async ({ agentSessionIds, collisionId, expectedDisposals, disposalFailure, start }) => {
+      errorLogSpy.mockClear()
+      const { runtime, reviewer, releaseReviewerMode, modeRequestCount } =
+        await startPendingReviewerRace(agentSessionIds)
+      const disposeSpy = vi.spyOn(acp.ActiveSession.prototype, 'dispose')
+      if (disposalFailure) {
+        disposeSpy.mockImplementationOnce(() => {
+          throw new Error(disposalFailure)
+        })
+      }
+      const primary = start(runtime)
+
+      try {
+        await expect(primary).rejects.toThrow(
+          'Primary session id collision with pending reviewer: ' + collisionId
+        )
+        expect(disposeSpy).toHaveBeenCalledTimes(expectedDisposals)
+        expect(modeRequestCount()).toBe(1)
+        expect(runtime.getSnapshot().sessionIds).toEqual([])
+        if (disposalFailure) {
+          expect(errorLogSpy).toHaveBeenCalledWith('primary collision session disposal failed', {
+            errorCategory: 'error',
+            sessionId: collisionId
+          })
+        }
+      } finally {
+        disposeSpy.mockRestore()
+        await primary.then(
+          ({ sessionId }) => runtime.deleteSession({ sessionId }),
+          () => undefined
+        )
+        releaseReviewerMode.resolve()
+        await reviewer.then(
+          ({ session }) => runtime.disposeReviewerSession(session),
+          () => undefined
+        )
+      }
+    }
+  )
+
+  it('rejects a reviewer session id that collides with a primary session before authority setup', async () => {
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['shared-session', 'shared-session'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process)
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+
+    await expect(
+      runtime.buildReviewerSession({
+        cwd: '/workspace',
+        mcpServers: [
+          {
+            type: 'http',
+            name: 'open-science-reviewer',
+            url: 'http://127.0.0.1:1/mcp',
+            headers: []
+          }
+        ]
+      })
+    ).rejects.toThrow('Reviewer session id collision: shared-session')
+
+    const reviewerCwd = fakeAgent.newSessions[1]?.cwd
+    expect(reviewerCwd).toMatch(/open-science-reviewer-/)
+    await expect(stat(reviewerCwd!)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(fakeAgent.modeChanges).toEqual([])
+    expect(runtime.getSnapshot().sessionIds).toEqual(['shared-session'])
+  })
+
+  it('keeps the reviewer collision as primary when the duplicate session cannot dispose', async () => {
+    errorLogSpy.mockClear()
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['shared-session', 'shared-session'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process)
+    })
+    await runtime.createSession({ cwd: '/workspace' })
+    const disposeSpy = vi
+      .spyOn(acp.ActiveSession.prototype, 'dispose')
+      .mockImplementationOnce(() => {
+        throw new Error('duplicate dispose failed')
+      })
+
+    try {
+      await expect(
+        runtime.buildReviewerSession({
+          cwd: '/workspace',
+          mcpServers: [
+            {
+              type: 'http',
+              name: 'open-science-reviewer',
+              url: 'http://127.0.0.1:1/mcp',
+              headers: []
+            }
+          ]
+        })
+      ).rejects.toThrow('Reviewer session id collision: shared-session')
+    } finally {
+      disposeSpy.mockRestore()
+    }
+
+    const reviewerCwd = fakeAgent.newSessions[1]?.cwd
+    await expect(stat(reviewerCwd!)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(errorLogSpy).toHaveBeenCalledWith('reviewer collision session disposal failed', {
+      errorCategory: 'error',
+      sessionId: 'shared-session'
+    })
+  })
+
+  it('rejects a reviewer session id that collides with a freshly adopted provider session', async () => {
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['provider-session', 'provider-session'], {
+      resumeNotFound: true
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process)
+    })
+
+    await expect(
+      runtime.resumeSession({ sessionId: 'stable-app-session', cwd: '/workspace' })
+    ).resolves.toMatchObject({ sessionId: 'stable-app-session', contextReset: true })
+
+    await expect(
+      runtime.buildReviewerSession({
+        cwd: '/workspace',
+        mcpServers: [
+          {
+            type: 'http',
+            name: 'open-science-reviewer',
+            url: 'http://127.0.0.1:1/mcp',
+            headers: []
+          }
+        ]
+      })
+    ).rejects.toThrow('Reviewer session id collision: provider-session')
+
+    const reviewerCwd = fakeAgent.newSessions[1]?.cwd
+    expect(reviewerCwd).toMatch(/open-science-reviewer-/)
+    await expect(stat(reviewerCwd!)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(fakeAgent.modeChanges).toEqual([])
+    expect(runtime.getSnapshot().sessionIds).toEqual(['stable-app-session'])
+  })
+
+  it('rejects a reviewer session id that collides with an existing reviewer', async () => {
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['reviewer-session', 'reviewer-session'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process)
+    })
+    const request = {
+      cwd: '/workspace',
+      mcpServers: [
+        {
+          type: 'http' as const,
+          name: 'open-science-reviewer',
+          url: 'http://127.0.0.1:1/mcp',
+          headers: []
+        }
+      ]
+    }
+
+    const first = await runtime.buildReviewerSession(request)
+
+    await expect(runtime.buildReviewerSession(request)).rejects.toThrow(
+      'Reviewer session id collision: reviewer-session'
+    )
+
+    const duplicateCwd = fakeAgent.newSessions[1]?.cwd
+    expect(duplicateCwd).toMatch(/open-science-reviewer-/)
+    await expect(stat(duplicateCwd!)).rejects.toMatchObject({ code: 'ENOENT' })
+    await first.session.prompt([{ type: 'text', text: 'first reviewer remains active' }])
+    expect(fakeAgent.prompts).toEqual([
+      { sessionId: 'reviewer-session', text: 'first reviewer remains active' }
+    ])
+    runtime.disposeReviewerSession(first.session)
   })
 
   it('removes the temporary reviewer directory when session startup fails', async () => {
@@ -3361,7 +9765,55 @@ describe('ACP runtime session management', () => {
     expect(reviewerCwd).toMatch(/open-science-reviewer-/)
     await expect(stat(reviewerCwd)).rejects.toMatchObject({ code: 'ENOENT' })
     expect(reviewerSessionIds(runtime).size).toBe(0)
-    expect(mcpServerNamesMap(runtime).has('reviewer-session-1')).toBe(false)
+    expect(pendingReviewerSessionIds(runtime).size).toBe(0)
+    expect(mcpServerNamesFor(runtime, 'reviewer-session-1')).toEqual([])
+  })
+
+  it('keeps setMode failure primary when reviewer startup disposal also fails', async () => {
+    errorLogSpy.mockClear()
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['reviewer-session-1'], {
+      modes: createModes(['default'], 'unexpected-mode'),
+      rejectModeChange: true
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process)
+    })
+    const disposeSpy = vi
+      .spyOn(acp.ActiveSession.prototype, 'dispose')
+      .mockImplementationOnce(() => {
+        throw new Error('startup dispose failed')
+      })
+
+    try {
+      await expect(
+        runtime.buildReviewerSession({
+          cwd: '/workspace',
+          mcpServers: [
+            {
+              type: 'http',
+              name: 'open-science-reviewer',
+              url: 'http://127.0.0.1:1/mcp',
+              headers: []
+            }
+          ]
+        })
+      ).rejects.toMatchObject({
+        message: 'Internal error',
+        data: { details: 'set mode failed' }
+      })
+    } finally {
+      disposeSpy.mockRestore()
+    }
+
+    const reviewerCwd = fakeAgent.newSessions[0]?.cwd
+    await expect(stat(reviewerCwd!)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(errorLogSpy).toHaveBeenCalledWith('reviewer startup session disposal failed', {
+      errorCategory: 'error',
+      sessionId: 'reviewer-session-1'
+    })
   })
 
   it('rejects tools from every MCP namespace except the dedicated reviewer server', async () => {
@@ -3518,6 +9970,26 @@ describe('ACP runtime session management', () => {
     expect(reviewerSessionIds(runtime).size).toBe(0)
   })
 
+  it('invalidates context usage when its agent connection disconnects', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['remote-session-1'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process)
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    contextUsageMap(runtime).set(session.sessionId, { used: 12000, size: 128000 })
+    expect(runtime.getSnapshot().contextUsageBySession).toEqual({
+      [session.sessionId]: { used: 12000, size: 128000 }
+    })
+
+    await runtime.disconnect()
+
+    expect(runtime.getSnapshot().contextUsageBySession).toEqual({})
+  })
+
   it('clears a session MCP server names when the session is deleted', async () => {
     const process = new FakeAgentProcess()
     startFakeAgent(process, ['remote-session-1'])
@@ -3536,11 +10008,65 @@ describe('ACP runtime session management', () => {
     })
 
     const session = await runtime.createSession({ cwd: '/workspace' })
-    expect(mcpServerNamesMap(runtime).get(session.sessionId)).toEqual(['open-science-artifacts'])
+    expect(mcpServerNamesFor(runtime, session.sessionId)).toEqual(['open-science-artifacts'])
 
     await runtime.deleteSession({ sessionId: session.sessionId })
 
-    expect(mcpServerNamesMap(runtime).has(session.sessionId)).toBe(false)
+    expect(mcpServerNamesFor(runtime, session.sessionId)).toEqual([])
+  })
+
+  it('releases notebook RPC capabilities when a session is deleted', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['remote-session-1'])
+    const releaseSessionCapabilities = vi.fn()
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({
+          endpoint: 'http://127.0.0.1:4567',
+          token: 'secret-token'
+        }),
+        releaseSessionCapabilities
+      }
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    await runtime.deleteSession({ sessionId: session.sessionId })
+
+    expect(releaseSessionCapabilities).toHaveBeenCalledOnce()
+    expect(releaseSessionCapabilities).toHaveBeenCalledWith(session.sessionId)
+  })
+
+  it('releases notebook RPC capabilities for every session on disconnect', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['remote-session-1', 'remote-session-2'])
+    const releaseSessionCapabilities = vi.fn()
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({
+          endpoint: 'http://127.0.0.1:4567',
+          token: 'secret-token'
+        }),
+        releaseSessionCapabilities
+      }
+    })
+
+    const first = await runtime.createSession({ cwd: '/workspace' })
+    const second = await runtime.createSession({ cwd: '/workspace' })
+    await runtime.disconnect()
+
+    expect(releaseSessionCapabilities).toHaveBeenCalledTimes(2)
+    expect(releaseSessionCapabilities).toHaveBeenCalledWith(first.sessionId)
+    expect(releaseSessionCapabilities).toHaveBeenCalledWith(second.sessionId)
   })
 
   it('clears all MCP server names on disconnect', async () => {
@@ -3561,11 +10087,11 @@ describe('ACP runtime session management', () => {
     })
 
     const session = await runtime.createSession({ cwd: '/workspace' })
-    expect(mcpServerNamesMap(runtime).has(session.sessionId)).toBe(true)
+    expect(mcpServerNamesFor(runtime, session.sessionId)).toEqual(['open-science-artifacts'])
 
     await runtime.disconnect()
 
-    expect(mcpServerNamesMap(runtime).size).toBe(0)
+    expect(mcpServerNamesFor(runtime, session.sessionId)).toEqual([])
   })
 
   it('removes a session so later prompts cannot target it', async () => {
@@ -3616,11 +10142,11 @@ describe('ACP runtime session management', () => {
     ).rejects.toThrow(/not found/)
   })
 
-  it('clears the reverse (agent id -> app id) mapping when an adopted session is deleted', async () => {
+  it('allows a deleted adopted provider id to be reused by a new session', async () => {
     const process = new FakeAgentProcess()
-    // Resume rejects, so the runtime adopts a fresh agent session (adopted-session-1) under the
-    // app-facing id (switched-session), registering the reverse mapping used to relabel agent events.
-    startFakeAgent(process, ['adopted-session-1'], { resumeNotFound: true })
+    const fakeAgent = startFakeAgent(process, ['adopted-session-1', 'adopted-session-1'], {
+      resumeNotFound: true
+    })
     const runtime = new AcpRuntime({
       appVersion: '0.1.0',
       defaultCwd: '/workspace',
@@ -3628,14 +10154,19 @@ describe('ACP runtime session management', () => {
     })
 
     await runtime.resumeSession({ sessionId: 'switched-session', cwd: '/workspace' })
-    // The adoption recorded the underlying id -> app id mapping.
-    expect(agentToAppSessionMap(runtime).get('adopted-session-1')).toBe('switched-session')
-
     await runtime.deleteSession({ sessionId: 'switched-session' })
 
-    // Delete removes the reverse entry, so a reused agent id or a late agent event carrying the
-    // underlying id no longer resolves to the deleted app session.
-    expect(agentToAppSessionMap(runtime).has('adopted-session-1')).toBe(false)
+    const reused = await runtime.createSession({ cwd: '/workspace' })
+    expect(reused.sessionId).toBe('adopted-session-1')
+    expect(runtime.getSnapshot().sessionIds).toEqual(['adopted-session-1'])
+
+    await runtime.sendPrompt({ sessionId: reused.sessionId, text: 'reuse provider identity' })
+    expect(fakeAgent.prompts.at(-1)).toEqual({
+      sessionId: 'adopted-session-1',
+      text: 'reuse provider identity'
+    })
+
+    await runtime.deleteSession({ sessionId: reused.sessionId })
   })
 
   it('cancels an adopted session by its own id when the agent lacks session/close', async () => {
@@ -3662,7 +10193,7 @@ describe('ACP runtime session management', () => {
     expect(runtime.getSnapshot().sessionIds).toEqual([])
   })
 
-  it('cleans up sessionFrameworks when deleting a detached session (post framework-switch)', async () => {
+  it('retains only resume affinity after disconnect and removes it on detached delete', async () => {
     const process = new FakeAgentProcess()
     const fakeAgent = startFakeAgent(process, ['remote-session-1'])
     const runtime = new AcpRuntime({
@@ -3671,20 +10202,30 @@ describe('ACP runtime session management', () => {
       spawnAgent: () => asAgentProcess(process)
     })
 
-    const session = await runtime.createSession({ cwd: '/workspace' })
-    // createSession records the session's framework; a framework switch disconnects (clearing
-    // this.sessions) but deliberately KEEPS sessionFrameworks so a later resume can detect the switch.
-    expect(sessionFrameworksMap(runtime).has(session.sessionId)).toBe(true)
-    await runtime.disconnect()
-    expect(runtime.getSnapshot().sessionIds).toEqual([])
-    // The framework entry survives the disconnect (by design).
-    expect(sessionFrameworksMap(runtime).has(session.sessionId)).toBe(true)
+    const session = await runtime.createSession({
+      cwd: '/workspace',
+      projectName: 'project-1',
+      permissionProfile: 'ask'
+    })
+    // Live routing, Permission projection, and framework affinity are all present while attached.
+    expect(runtime.hasLiveSession('project-1', session.sessionId)).toBe(true)
+    expect(runtime.isSessionUsingFramework(session.sessionId, 'claude-code')).toBe(true)
+    expect(runtime.getSnapshot().permissionProfiles[session.sessionId]).toMatchObject({
+      selectedProfile: 'ask'
+    })
 
-    // Deleting the now-detached session must not throw or talk to a torn-down agent, but must still
-    // drop the leaked framework entry so it cannot later mislead the cross-framework-resume check.
+    await runtime.disconnect()
+    // Connection-owned metadata is gone, while framework affinity survives so a later resume can
+    // detect a framework switch without attempting an incompatible provider resume.
+    expect(runtime.getSnapshot()).toMatchObject({ sessionIds: [], permissionProfiles: {} })
+    expect(runtime.hasLiveSession('project-1', session.sessionId)).toBe(false)
+    expect(runtime.isSessionUsingFramework(session.sessionId, 'claude-code')).toBe(true)
+
+    // Deleting the now-detached session must not talk to a torn-down agent and must remove the final
+    // affinity record so it cannot later mislead the cross-framework resume check.
     await runtime.deleteSession({ sessionId: session.sessionId })
 
-    expect(sessionFrameworksMap(runtime).has(session.sessionId)).toBe(false)
+    expect(runtime.isSessionUsingFramework(session.sessionId, 'claude-code')).toBe(false)
     expect(fakeAgent.closedSessions).toEqual([])
     expect(fakeAgent.cancelledSessions).toEqual([])
   })
@@ -3716,14 +10257,19 @@ describe('ACP runtime session management', () => {
         sessionId: 'remote-session-1',
         cwd: resolve('/workspace'),
         mcpServers: [],
-        // Every session (new or resumed) is restricted to the app-owned "user" settings scope, and
-        // carries the always-on skill-privacy guardrail in its system prompt.
+        // Every session (new or resumed) is restricted to the app-owned "user" settings scope.
         _meta: {
-          claudeCode: { options: { settingSources: ['user'] } },
+          claudeCode: {
+            emitRawSDKMessages: [{ type: 'result' }],
+            options: {
+              settingSources: ['user'],
+              tools: { type: 'preset', preset: 'claude_code' }
+            }
+          },
           systemPrompt: {
             type: 'preset',
             preset: 'claude_code',
-            append: expect.stringContaining('open_science_skill_privacy_instructions')
+            append: expect.not.stringContaining('open_science_skill_privacy_instructions')
           }
         }
       }
@@ -3739,6 +10285,253 @@ describe('ACP runtime session management', () => {
         { sessionId: 'remote-session-1', text: 'reply for remote-session-1' }
       ])
     )
+  })
+
+  it('releases the notebook RPC capability when resumed-session setup fails', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, [])
+    const releaseSessionCapabilities = vi.fn()
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({
+          endpoint: 'http://127.0.0.1:4567',
+          token: 'resumed-token'
+        }),
+        releaseSessionCapabilities
+      }
+    })
+    const failure = new Error('resumed permission setup failed')
+    vi.spyOn(
+      runtime as unknown as { configurePermissionProfile: () => Promise<void> },
+      'configurePermissionProfile'
+    ).mockRejectedValueOnce(failure)
+    const disposeSpy = vi
+      .spyOn(acp.ActiveSession.prototype, 'dispose')
+      .mockImplementationOnce(() => {
+        throw new Error('resumed-session disposal failed')
+      })
+
+    try {
+      await expect(
+        runtime.resumeSession({ sessionId: 'restored-session', cwd: '/workspace' })
+      ).rejects.toBe(failure)
+
+      expect(releaseSessionCapabilities).toHaveBeenCalledOnce()
+      expect(releaseSessionCapabilities).toHaveBeenCalledWith('restored-session')
+
+      const recovered = await runtime.resumeSession({
+        sessionId: 'restored-session',
+        cwd: '/workspace'
+      })
+      expect(recovered.sessionId).toBe('restored-session')
+      await runtime.deleteSession({ sessionId: recovered.sessionId })
+    } finally {
+      disposeSpy.mockRestore()
+    }
+  })
+
+  it('releases the notebook RPC capability when fresh-session adoption fails', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['adopted-session', 'adopted-session'])
+    const releaseSessionCapabilities = vi.fn()
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({
+          endpoint: 'http://127.0.0.1:4567',
+          token: 'adopted-token'
+        }),
+        releaseSessionCapabilities
+      }
+    })
+    const failure = new Error('adopted permission setup failed')
+    vi.spyOn(
+      runtime as unknown as { configurePermissionProfile: () => Promise<void> },
+      'configurePermissionProfile'
+    ).mockRejectedValueOnce(failure)
+    const disposeSpy = vi
+      .spyOn(acp.ActiveSession.prototype, 'dispose')
+      .mockImplementationOnce(() => {
+        throw new Error('adopted-session disposal failed')
+      })
+
+    try {
+      await expect(
+        runtime.resumeSession({
+          sessionId: 'switched-session',
+          cwd: '/workspace',
+          previousFrameworkId: 'codex'
+        })
+      ).rejects.toBe(failure)
+
+      expect(releaseSessionCapabilities).toHaveBeenCalledOnce()
+      expect(releaseSessionCapabilities).toHaveBeenCalledWith('switched-session')
+
+      const recovered = await runtime.resumeSession({
+        sessionId: 'switched-session',
+        cwd: '/workspace',
+        previousFrameworkId: 'codex'
+      })
+      expect(recovered).toMatchObject({ sessionId: 'switched-session', contextReset: true })
+      await runtime.deleteSession({ sessionId: recovered.sessionId })
+    } finally {
+      disposeSpy.mockRestore()
+    }
+  })
+
+  it.each([
+    {
+      path: 'resume event',
+      failingObserver: 'event' as const,
+      previousFrameworkId: undefined,
+      contextReset: undefined,
+      providerSessionIds: []
+    },
+    {
+      path: 'resume state',
+      failingObserver: 'state' as const,
+      previousFrameworkId: undefined,
+      contextReset: undefined,
+      providerSessionIds: []
+    },
+    {
+      path: 'fresh-adoption state',
+      failingObserver: 'state' as const,
+      previousFrameworkId: 'opencode' as const,
+      contextReset: true,
+      providerSessionIds: ['adopted-provider-session']
+    }
+  ])(
+    'keeps a published $path session usable when its observer throws',
+    async ({ failingObserver, previousFrameworkId, contextReset, providerSessionIds }) => {
+      const sessionId =
+        previousFrameworkId === undefined
+          ? '123e4567-e89b-42d3-a456-426614174000'
+          : 'stable-app-session'
+      const httpHost = {
+        ensureStarted: vi.fn(async () => ({
+          endpoint: 'http://127.0.0.1:4321',
+          token: 'host-token'
+        })),
+        registerNotebook: vi.fn(),
+        urlFor: vi.fn(
+          (kind: string, routingId: string) =>
+            `http://127.0.0.1:4321/mcp/${kind}/${encodeURIComponent(routingId)}`
+        ),
+        unregister: vi.fn(),
+        clear: vi.fn(),
+        close: vi.fn(async () => undefined)
+      } as unknown as AgentMcpHttpHost
+      const release = vi.fn()
+      const process = new FakeAgentProcess()
+      const fakeAgent = startFakeAgent(process, [...providerSessionIds], {
+        modes: createModes(['read-only', 'agent', 'agent-full-access'], 'read-only')
+      })
+      let observerFailurePending = true
+      const runtime = new AcpRuntime({
+        appVersion: '0.1.0',
+        defaultCwd: '/workspace',
+        spawnAgent: () => asAgentProcess(process),
+        framework: { ...codexFramework, acceptsStdioMcp: false },
+        mcpHttpHost: httpHost,
+        callbacks: {
+          onEvent: (event) => {
+            if (
+              observerFailurePending &&
+              failingObserver === 'event' &&
+              event.sessionId === sessionId
+            ) {
+              observerFailurePending = false
+              throw new Error('resume event callback failed')
+            }
+          },
+          onStateChanged: (snapshot) => {
+            if (
+              observerFailurePending &&
+              failingObserver === 'state' &&
+              snapshot.sessionIds.includes(sessionId)
+            ) {
+              observerFailurePending = false
+              throw new Error('session state callback failed')
+            }
+          }
+        },
+        notebook: {
+          projectName: 'default-project',
+          mcpEntryPath: '/app/out/main/index.js',
+          getRpcConnection: async () => ({
+            endpoint: 'http://127.0.0.1:4567',
+            token: 'notebook-token',
+            release
+          })
+        }
+      })
+
+      try {
+        await expect(
+          runtime.resumeSession({
+            sessionId,
+            cwd: '/workspace',
+            ...(previousFrameworkId ? { previousFrameworkId } : {})
+          })
+        ).resolves.toMatchObject({ sessionId, ...(contextReset ? { contextReset } : {}) })
+        expect(runtime.getSnapshot().sessionIds).toEqual([sessionId])
+        expect(httpHost.unregister).not.toHaveBeenCalled()
+        expect(release).not.toHaveBeenCalled()
+
+        await runtime.sendPrompt({ sessionId, text: 'still usable' })
+        expect(fakeAgent.prompts.at(-1)).toMatchObject({
+          sessionId: previousFrameworkId ? 'adopted-provider-session' : sessionId,
+          text: expect.stringContaining('still usable')
+        })
+
+        await runtime.deleteSession({ sessionId })
+        expect(release).toHaveBeenCalledOnce()
+      } finally {
+        if (runtime.getSnapshot().sessionIds.includes(sessionId)) {
+          await runtime.deleteSession({ sessionId }).catch(() => undefined)
+        }
+        await runtime.disconnect().catch(() => undefined)
+      }
+    }
+  )
+
+  it('replaces a failed resume capability without revoking the adopted session capability', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['adopted-session'], { resumeNotFound: true })
+    const getRpcConnection = vi.fn(async () => ({
+      endpoint: 'http://127.0.0.1:4567',
+      token: 'session-token'
+    }))
+    const releaseSessionCapabilities = vi.fn()
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection,
+        releaseSessionCapabilities
+      }
+    })
+
+    await expect(
+      runtime.resumeSession({ sessionId: 'restored-session', cwd: '/workspace' })
+    ).resolves.toMatchObject({ sessionId: 'restored-session', contextReset: true })
+
+    expect(getRpcConnection).toHaveBeenCalledTimes(2)
+    expect(releaseSessionCapabilities).toHaveBeenCalledOnce()
+    expect(releaseSessionCapabilities).toHaveBeenCalledWith('restored-session')
   })
 
   it('times out and tears down a reconnect when the agent never answers session/resume', async () => {
@@ -3857,6 +10650,92 @@ describe('ACP runtime session management', () => {
     expect(messageEvents).toEqual([{ role: 'user', text: 'keep going' }])
   })
 
+  it('sends an app-owned continuation without publishing its synthetic text as a user message', async () => {
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['session-1'], {
+      onPrompt: ({ text }) =>
+        text.includes('Captured outer tool completion')
+          ? {
+              stopReason: 'end_turn',
+              usage: {
+                totalTokens: 48,
+                inputTokens: 31,
+                cachedReadTokens: 8,
+                cachedWriteTokens: 2,
+                outputTokens: 7
+              }
+            }
+          : undefined,
+      toolForPrompt: (text) =>
+        text.includes('Captured outer tool completion')
+          ? { toolCallId: 'continuation-tool-1', title: 'Read continuation input' }
+          : undefined
+    })
+    const messageEvents: Array<{ role?: string; text?: string }> = []
+    const runtimeEvents: AcpRuntimeEvent[] = []
+    const promptStarts: string[] = []
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      callbacks: {
+        onEvent: (event) => {
+          runtimeEvents.push(event)
+          if (event.kind === 'message') {
+            messageEvents.push({ role: event.role, text: event.text })
+          }
+        },
+        onPromptStarted: (_sessionId, turnToken) => promptStarts.push(turnToken)
+      }
+    })
+    const session = await runtime.createSession({ cwd: '/workspace' })
+
+    await runtime.sendPrompt({ sessionId: session.sessionId, text: 'analyze the dataset' })
+    const userEventCount = messageEvents.filter(({ role }) => role === 'user').length
+    const syntheticCompletion =
+      'Continue after handoff. Captured outer tool completion returned: { rows: 42 }'
+    const continuationEventStart = runtimeEvents.length
+    await runtime.sendAppContinuation({
+      sessionId: session.sessionId,
+      text: syntheticCompletion,
+      provenanceContext: { promptMessageId: 'originating-user-message-1' }
+    })
+
+    expect(fakeAgent.prompts).toEqual([
+      { sessionId: session.sessionId, text: 'analyze the dataset' },
+      { sessionId: session.sessionId, text: syntheticCompletion }
+    ])
+    expect(messageEvents.filter(({ role }) => role === 'user')).toEqual([
+      { role: 'user', text: 'analyze the dataset' }
+    ])
+    expect(messageEvents.filter(({ role }) => role === 'user')).toHaveLength(userEventCount)
+    expect(messageEvents).not.toContainEqual({ role: 'user', text: syntheticCompletion })
+    expect(promptStarts).toHaveLength(2)
+    const continuationEvents = runtimeEvents.slice(continuationEventStart)
+    expect(
+      continuationEvents.filter((event) => event.kind === 'message' && event.role === 'assistant')
+    ).toEqual([
+      expect.objectContaining({
+        promptMessageId: 'originating-user-message-1',
+        text: 'reply for session-1'
+      })
+    ])
+    expect(continuationEvents.find((event) => event.kind === 'tool')).toMatchObject({
+      promptMessageId: 'originating-user-message-1',
+      toolCallId: 'continuation-tool-1'
+    })
+    expect(continuationEvents.find((event) => event.kind === 'stop')).toMatchObject({
+      promptMessageId: 'originating-user-message-1',
+      turnUsage: {
+        inputTokens: 31,
+        cacheTokens: 10,
+        cachedReadTokens: 8,
+        cachedWriteTokens: 2,
+        outputTokens: 7
+      }
+    })
+  })
+
   it('adopts a fresh session when the agent returns a generic Internal error on resume', async () => {
     const process = new FakeAgentProcess()
     const fakeAgent = startFakeAgent(process, ['adopted-session-1'], { resumeInternalError: true })
@@ -3922,6 +10801,125 @@ describe('ACP runtime session management', () => {
     await runtime.sendPrompt({ sessionId: 'restarted-session', text: 'keep going' })
 
     expect(fakeAgent.prompts).toEqual([{ sessionId: 'adopted-session-1', text: 'keep going' }])
+  })
+
+  it('adopts a fresh Codex session when an app-facing id is not a valid Codex UUID', async () => {
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['019fb8c8-6c66-7f22-9653-17b5b287dbbb'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent'),
+      resumeInternalErrorDetails:
+        'invalid session id: invalid character: expected an optional prefix of `urn:uuid:` followed by [0-9a-fA-F-], found `s` at 1'
+    })
+    const messageEvents: Array<{ sessionId?: string; role?: string; text?: string }> = []
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: codexFramework,
+      callbacks: {
+        onEvent: (event) => {
+          if (event.kind === 'message') {
+            messageEvents.push({ sessionId: event.sessionId, role: event.role, text: event.text })
+          }
+        }
+      }
+    })
+
+    const resumed = await runtime.resumeSession({
+      sessionId: 'ses_0458258b7ffeH2DeqPYBPk6fh2',
+      cwd: '/workspace',
+      previousFrameworkId: 'codex'
+    })
+    expect(resumed).toMatchObject({
+      sessionId: 'ses_0458258b7ffeH2DeqPYBPk6fh2',
+      contextReset: true
+    })
+    expect(fakeAgent.resumedSessions).toEqual([])
+    expect(fakeAgent.newSessions).toHaveLength(1)
+
+    await runtime.sendPrompt({
+      sessionId: resumed.sessionId,
+      text: 'continue the analysis',
+      historyPreamble: 'PRIOR CONTEXT: the last result was incomplete.'
+    })
+
+    expect(fakeAgent.prompts).toEqual([
+      {
+        sessionId: '019fb8c8-6c66-7f22-9653-17b5b287dbbb',
+        text: expect.stringContaining('PRIOR CONTEXT: the last result was incomplete.')
+      }
+    ])
+    expect(messageEvents).toEqual(
+      expect.arrayContaining([
+        {
+          sessionId: 'ses_0458258b7ffeH2DeqPYBPk6fh2',
+          role: 'user',
+          text: 'continue the analysis'
+        },
+        {
+          sessionId: 'ses_0458258b7ffeH2DeqPYBPk6fh2',
+          role: 'assistant',
+          text: 'reply for 019fb8c8-6c66-7f22-9653-17b5b287dbbb'
+        }
+      ])
+    )
+  })
+
+  it('adopts a fresh Claude session instead of resuming an OpenCode session id', async () => {
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['claude-session-replacement'], {
+      resumeInternalErrorDetails:
+        'Claude Code returned an error result: Error: --resume requires a valid session ID or session title when used with --print. Usage: claude -p --resume <session-id|title>. Provided value "ses_03fed93d1ffe1uw7XFraUNPhun" is not a UUID and does not match any session title.'
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process)
+    })
+
+    await expect(
+      runtime.resumeSession({
+        sessionId: 'ses_03fed93d1ffe1uw7XFraUNPhun',
+        cwd: '/workspace'
+      })
+    ).resolves.toMatchObject({
+      sessionId: 'ses_03fed93d1ffe1uw7XFraUNPhun',
+      frameworkId: 'claude-code',
+      contextReset: true
+    })
+    expect(fakeAgent.resumedSessions).toEqual([])
+    expect(fakeAgent.newSessions).toHaveLength(1)
+  })
+
+  it.each([
+    '019fb8c8-6c66-7f22-9653-17b5b287dbbb',
+    'urn:uuid:019fb8c8-6c66-7f22-9653-17b5b287dbbb'
+  ])('resumes a valid Codex protocol session id: %s', async (sessionId) => {
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, [], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent')
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: codexFramework
+    })
+
+    await expect(
+      runtime.resumeSession({
+        sessionId,
+        cwd: '/workspace',
+        previousFrameworkId: 'codex'
+      })
+    ).resolves.toMatchObject({ sessionId })
+    expect(fakeAgent.resumedSessions).toEqual([
+      expect.objectContaining({
+        sessionId,
+        cwd: resolve('/workspace')
+      })
+    ])
+    expect(fakeAgent.newSessions).toEqual([])
   })
 
   it('adopts a fresh session from a language-independent session-loss reason', async () => {
@@ -4142,10 +11140,896 @@ describe('ACP runtime session management', () => {
     expect(sharedAgent.resumedSessions).toEqual([])
   })
 
-  it('defers a provider reconnect until an in-flight prompt finishes', async () => {
+  it('returns detached snapshot collections without collapsing hidden event sequence slots', async () => {
     const process = new FakeAgentProcess()
-    const gate = createDeferred()
-    startFakeAgent(process, ['s1'], { onPrompt: () => gate.promise })
+    startPermissionProbeAgent(process, {
+      newSessionId: 's1',
+      toolCallId: 'snapshot-permission',
+      toolTitle: 'Run nested input',
+      toolKind: 'execute',
+      toolRawInput: { command: 'npm test', metadata: { source: 'provider' } },
+      modes: createModes(['read-only', 'agent'], 'agent'),
+      permissionOptions: [
+        { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
+        { optionId: 'reject', name: 'Reject', kind: 'reject_once' }
+      ]
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process)
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    const prompt = runtime.sendPrompt({ sessionId: session.sessionId, text: 'request permission' })
+    await vi.waitFor(() => expect(runtime.getSnapshot().pendingPermissions).toHaveLength(1))
+    const existingEventCount = runtime.getSnapshot().events.length
+    handleSessionUpdate(runtime, {
+      sessionId: 's1',
+      update: {
+        sessionUpdate: 'agent_message_chunk',
+        messageId: 'message-1',
+        content: { type: 'text', text: 'first' }
+      }
+    })
+    // Usage updates consume their normalized event id before being projected into context state. They
+    // intentionally remain absent from the visible event log, so the following message keeps the gap.
+    handleSessionUpdate(runtime, {
+      sessionId: 's1',
+      update: { sessionUpdate: 'usage_update', used: 12, size: 128_000 }
+    })
+    handleSessionUpdate(runtime, {
+      sessionId: 's1',
+      update: {
+        sessionUpdate: 'agent_message_chunk',
+        messageId: 'message-2',
+        content: { type: 'text', text: 'second' }
+      }
+    })
+
+    const snapshot = runtime.getSnapshot()
+    const messageEventIds = snapshot.events
+      .slice(existingEventCount)
+      .map(({ id }) => Number(id.replace('acp-event-', '')))
+    expect(messageEventIds).toHaveLength(2)
+    expect(messageEventIds[1] - messageEventIds[0]).toBe(2)
+    expect(snapshot.contextUsageBySession).toMatchObject({ s1: { used: 12, size: 128_000 } })
+
+    const retainedEventIds = snapshot.events.map(({ id }) => id)
+    const retainedEventTitles = snapshot.events.map(({ title }) => title)
+    const messageRaw = snapshot.events.find(({ messageId }) => messageId === 'message-1')?.raw as {
+      update: { content: { text: string } }
+    }
+    const contextCategory = snapshot.contextUsageBySession.s1.breakdown?.categories[0]
+    const pendingPermission = snapshot.pendingPermissions[0]
+    const pendingRawInput = pendingPermission.rawInput as {
+      metadata: { source: string }
+    }
+    const permissionProfile = snapshot.permissionProfiles.s1
+    expect(contextCategory).toBeDefined()
+    const retainedContextCategoryTokens = contextCategory!.tokens
+    messageRaw.update.content.text = 'mutated outside the runtime'
+    if (snapshot.events[0]) snapshot.events[0].title = 'mutated outside the runtime'
+    contextCategory!.tokens = 999
+    pendingRawInput.metadata.source = 'mutated outside the runtime'
+    pendingPermission.options[0].name = 'mutated outside the runtime'
+    permissionProfile.availableModeIds[0] = 'mutated outside the runtime'
+    snapshot.events.length = 0
+    delete snapshot.contextUsageBySession.s1
+
+    const retainedSnapshot = runtime.getSnapshot()
+    expect(retainedSnapshot.events.map(({ id }) => id)).toEqual(retainedEventIds)
+    expect(retainedSnapshot.events.map(({ title }) => title)).toEqual(retainedEventTitles)
+    expect(
+      (
+        retainedSnapshot.events.find(({ messageId }) => messageId === 'message-1')?.raw as {
+          update: { content: { text: string } }
+        }
+      ).update.content.text
+    ).toBe('first')
+    expect(retainedSnapshot.contextUsageBySession).toMatchObject({
+      s1: { used: 12, size: 128_000 }
+    })
+    expect(retainedSnapshot.contextUsageBySession.s1.breakdown?.categories[0]?.tokens).toBe(
+      retainedContextCategoryTokens
+    )
+    expect(retainedSnapshot.pendingPermissions[0].rawInput).toEqual({
+      command: 'npm test',
+      metadata: { source: 'provider' }
+    })
+    expect(retainedSnapshot.pendingPermissions[0].options[0]).toMatchObject({
+      optionId: 'allow-once',
+      name: 'Allow once'
+    })
+    expect(retainedSnapshot.permissionProfiles.s1.availableModeIds).toEqual(['read-only', 'agent'])
+
+    runtime.respondToPermission({
+      requestId: retainedSnapshot.pendingPermissions[0].requestId,
+      optionId: 'reject'
+    })
+    await prompt
+  })
+
+  it('recombines Codex uncached input and cache read for context usage', async () => {
+    const process = new FakeAgentProcess()
+    const usageSent = createDeferred()
+    const finishPrompt = createDeferred()
+    startFakeAgent(process, ['s1'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent'),
+      onPrompt: async ({ sessionId }) => {
+        handleSessionUpdate(runtime, {
+          sessionId,
+          // Patched codex-acp recombines its exclusive input and cache-read categories.
+          update: { sessionUpdate: 'usage_update', used: 15, size: 128000 }
+        })
+        usageSent.resolve()
+        await finishPrompt.promise
+
+        return {
+          stopReason: 'end_turn',
+          usage: {
+            totalTokens: 15,
+            inputTokens: 12,
+            cachedReadTokens: 3,
+            outputTokens: 3
+          }
+        }
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: codexFramework
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    const prompt = runtime.sendPrompt({ sessionId: 's1', text: 'hi' })
+    await usageSent.promise
+    const usageWhileGenerating = runtime.getSnapshot().contextUsageBySession
+    finishPrompt.resolve()
+    await prompt
+
+    expect(usageWhileGenerating).toMatchObject({
+      s1: { used: 15, size: 128000 }
+    })
+    expect(runtime.getSnapshot().contextUsageBySession).toMatchObject({
+      s1: { used: 15, size: 128000 }
+    })
+    expect(usageWhileGenerating.s1.breakdown).toMatchObject({
+      source: 'estimated',
+      tokenizer: 'o200k_base',
+      status: 'reconciled',
+      categories: expect.arrayContaining([
+        expect.objectContaining({ key: 'system', estimated: true }),
+        expect.objectContaining({ key: 'messages', estimated: true })
+      ])
+    })
+  })
+
+  it('keeps an MCP tool category across result-only ACP updates', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['s1'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: claudeCodeFramework
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    handleSessionUpdate(runtime, {
+      sessionId: 's1',
+      update: {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'mcp-1',
+        kind: 'other',
+        title: 'mcp__open-science-notebook__notebook_execute',
+        status: 'in_progress',
+        rawInput: 'run notebook cell'
+      }
+    })
+    handleSessionUpdate(runtime, {
+      sessionId: 's1',
+      update: {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'mcp-1',
+        kind: 'other',
+        status: 'completed',
+        rawOutput: 'notebook result data'
+      }
+    })
+    handleSessionUpdate(runtime, {
+      sessionId: 's1',
+      update: { sessionUpdate: 'usage_update', used: 100, size: 128_000 }
+    })
+
+    const categories = runtime.getSnapshot().contextUsageBySession.s1.breakdown?.categories
+    expect(categories).toContainEqual(expect.objectContaining({ key: 'mcp', estimated: true }))
+    expect(categories).not.toContainEqual(expect.objectContaining({ key: 'tools' }))
+  })
+
+  it('estimates the exact Claude system prompt after MCP tool-name rewriting', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['s1'])
+    const counter: TokenCounter = {
+      count: (text) => {
+        if (text.includes('Call mcp__open-science-notebook__notebook_execute exactly')) return 101
+        if (text.includes('Call notebook_execute exactly')) return 17
+        return 0
+      }
+    }
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      contextUsageTracker: new ContextUsageTracker(counter),
+      resolveBackend: () => ({
+        framework: { ...claudeCodeFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/claude-agent-acp',
+        env: {},
+        systemPromptAppends: ['Call notebook_execute exactly']
+      }),
+      framework: claudeCodeFramework
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    handleSessionUpdate(runtime, {
+      sessionId: 's1',
+      update: { sessionUpdate: 'usage_update', used: 150, size: 128_000 }
+    })
+
+    expect(runtime.getSnapshot().contextUsageBySession.s1.breakdown?.categories).toContainEqual({
+      key: 'system',
+      tokens: 101,
+      estimated: true
+    })
+  })
+
+  it('omits the retired activity schema from bridge-backed Codex context estimates', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['s1'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent')
+    })
+    const counter: TokenCounter = {
+      count: (text) => {
+        if (text.includes('mcp__open_science_activity__begin_activity_group')) return 101
+        if (text.includes('mcp.open-science-activity.begin_activity_group')) return 17
+        return 0
+      }
+    }
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      contextUsageTracker: new ContextUsageTracker(counter),
+      resolveBackend: () => ({
+        framework: { ...codexFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/codex-acp',
+        env: {},
+        providerConfiguration: {
+          providerId: 'custom-gateway',
+          apiType: 'openai',
+          baseUrl: 'http://127.0.0.1:1234/v1',
+          headers: { authorization: 'Bearer bridge' }
+        }
+      }),
+      framework: codexFramework
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    handleSessionUpdate(runtime, {
+      sessionId: 's1',
+      update: { sessionUpdate: 'usage_update', used: 150, size: 128_000 }
+    })
+
+    expect(runtime.getSnapshot().contextUsageBySession.s1.breakdown?.categories).not.toContainEqual(
+      expect.objectContaining({ key: 'mcp' })
+    )
+  })
+
+  it('publishes the local estimate while a prompt is still generating', async () => {
+    const process = new FakeAgentProcess()
+    const finishPrompt = createDeferred()
+    const fakeAgent = startFakeAgent(process, ['s1'], {
+      onPrompt: () => finishPrompt.promise
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...opencodeFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/opencode-acp',
+        env: {},
+        contextWindow: 1_000_000,
+        contextUsageModel: 'deepseek-v4-flash'
+      }),
+      framework: opencodeFramework
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    const prompt = runtime.sendPrompt({ sessionId: 's1', text: 'analyze these results' })
+    await vi.waitFor(() => expect(fakeAgent.prompts).toHaveLength(1))
+
+    const usageWhileGenerating = runtime.getSnapshot().contextUsageBySession.s1
+    expect(usageWhileGenerating).toMatchObject({
+      used: expect.any(Number),
+      size: 1_000_000,
+      breakdown: {
+        source: 'estimated',
+        tokenizer: 'cl100k_base',
+        model: 'deepseek-v4-flash',
+        status: 'preflight',
+        difference: 0
+      }
+    })
+    expect(usageWhileGenerating.used).toBeGreaterThan(0)
+    expect(usageWhileGenerating.used).toBe(usageWhileGenerating.breakdown?.estimatedTokens)
+
+    finishPrompt.resolve()
+    await prompt
+  })
+
+  it('publishes a token-only preflight estimate when the model window is unknown', async () => {
+    const process = new FakeAgentProcess()
+    const finishPrompt = createDeferred()
+    const fakeAgent = startFakeAgent(process, ['s1'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent'),
+      onPrompt: () => finishPrompt.promise
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...codexFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/codex-acp',
+        env: {}
+      }),
+      framework: codexFramework
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    const prompt = runtime.sendPrompt({ sessionId: 's1', text: 'estimate before first usage' })
+    await vi.waitFor(() => expect(fakeAgent.prompts).toHaveLength(1))
+
+    expect(runtime.getSnapshot().contextUsageBySession.s1).toMatchObject({
+      used: expect.any(Number),
+      breakdown: {
+        status: 'preflight',
+        estimatedTokens: expect.any(Number)
+      }
+    })
+    expect(runtime.getSnapshot().contextUsageBySession.s1.size).toBeUndefined()
+
+    finishPrompt.resolve()
+    await prompt
+  })
+
+  it('keeps the latest Agent total authoritative while preflight refreshes categories', async () => {
+    const process = new FakeAgentProcess()
+    const finishPrompt = createDeferred()
+    const fakeAgent = startFakeAgent(process, ['s1'], {
+      onPrompt: () => finishPrompt.promise
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: opencodeFramework
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    handleSessionUpdate(runtime, {
+      sessionId: 's1',
+      update: { sessionUpdate: 'usage_update', used: 96_000, size: 128_000 }
+    })
+
+    const prompt = runtime.sendPrompt({ sessionId: 's1', text: 'continue from this context' })
+    await vi.waitFor(() => expect(fakeAgent.prompts).toHaveLength(1))
+
+    const usageWhileGenerating = runtime.getSnapshot().contextUsageBySession.s1
+    expect(usageWhileGenerating.used).toBe(96_000)
+    expect(usageWhileGenerating.size).toBe(128_000)
+    expect(usageWhileGenerating.breakdown).toMatchObject({
+      status: 'preflight',
+      estimatedTokens: expect.any(Number)
+    })
+    expect(usageWhileGenerating.breakdown?.estimatedTokens).not.toBe(96_000)
+
+    handleSessionUpdate(runtime, {
+      sessionId: 's1',
+      update: {
+        sessionUpdate: 'agent_message_chunk',
+        messageId: 'live-estimate',
+        content: { type: 'text', text: 'streamed output updates the local breakdown' }
+      }
+    })
+    const refreshedUsage = runtime.getSnapshot().contextUsageBySession.s1
+    expect(refreshedUsage.used).toBe(96_000)
+    expect(refreshedUsage.agentUsed).toBe(96_000)
+
+    finishPrompt.resolve()
+    await prompt
+  })
+
+  it('restores the last reconciled usage when a turn stops without a fresh usage update', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['s1'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: opencodeFramework
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    handleSessionUpdate(runtime, {
+      sessionId: 's1',
+      update: { sessionUpdate: 'usage_update', used: 96_000, size: 128_000 }
+    })
+    const usageBeforePrompt = runtime.getSnapshot().contextUsageBySession.s1
+
+    await runtime.sendPrompt({ sessionId: 's1', text: 'continue without a usage update' })
+
+    expect(runtime.getSnapshot().contextUsageBySession.s1).toEqual(usageBeforePrompt)
+    expect(runtime.getSnapshot().contextUsageBySession.s1.breakdown?.status).toBe('reconciled')
+  })
+
+  it('does not auto-compact from a high local estimate before Agent reconciliation', async () => {
+    const process = new FakeAgentProcess()
+    const finishPrompt = createDeferred()
+    const fakeAgent = startFakeAgent(process, ['s1'], {
+      onPrompt: () => finishPrompt.promise
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...claudeCodeFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/claude-agent-acp',
+        env: {},
+        contextWindow: 10,
+        contextUsageModel: 'deepseek-v4-flash'
+      }),
+      framework: claudeCodeFramework
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    const prompt = runtime.sendPrompt({
+      sessionId: 's1',
+      text: 'This deliberately long prompt makes the local estimate exceed the tiny test window.'
+    })
+    await vi.waitFor(() => expect(fakeAgent.prompts).toHaveLength(1))
+
+    expect(runtime.getSnapshot().contextUsageBySession.s1.breakdown?.status).toBe('preflight')
+    expect(fakeAgent.prompts.map(({ text }) => text)).not.toContain('/compact')
+
+    finishPrompt.resolve()
+    await prompt
+
+    expect(runtime.getSnapshot().contextUsageBySession.s1).toBeUndefined()
+  })
+
+  it('reconciles Codex PromptResponse usage when it equals the local estimate', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['s1'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent'),
+      onPrompt: ({ sessionId }) => {
+        const estimated = runtime.getSnapshot().contextUsageBySession[sessionId]?.used ?? 0
+        return {
+          stopReason: 'end_turn',
+          usage: {
+            totalTokens: estimated,
+            inputTokens: estimated,
+            outputTokens: 0
+          }
+        }
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...codexFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/codex-acp',
+        env: {},
+        contextWindow: 128_000
+      }),
+      framework: codexFramework
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    await runtime.sendPrompt({ sessionId: 's1', text: 'match the local estimate' })
+
+    expect(runtime.getSnapshot().contextUsageBySession.s1.breakdown).toMatchObject({
+      status: 'reconciled',
+      difference: 0
+    })
+  })
+
+  it('removes a prompt-scoped Codex Skill estimate when the next turn omits it', async () => {
+    temporaryRoot = await mkdtemp(join(tmpdir(), 'open-science-context-skill-'))
+    const skillPath = join(temporaryRoot, 'skills', 'research', 'SKILL.md')
+    await mkdir(join(temporaryRoot, 'skills', 'research'), { recursive: true })
+    await writeFile(skillPath, 'research skill instructions')
+
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['s1'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent')
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: codexFramework,
+      skills: {
+        needForceLoad: vi.fn(async () => []),
+        namesForIds: vi.fn(async (ids: string[]) => ids),
+        descriptorsForIds: vi.fn(async (ids: string[]) =>
+          ids.includes('research') ? [{ name: 'research', path: skillPath }] : []
+        ),
+        catalogForCodexHome: vi.fn(async () => [])
+      }
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    await runtime.sendPrompt({
+      sessionId: 's1',
+      text: 'use the research skill',
+      forcedSkillIds: ['research']
+    })
+    handleSessionUpdate(runtime, {
+      sessionId: 's1',
+      update: { sessionUpdate: 'usage_update', used: 100, size: 128_000 }
+    })
+    expect(runtime.getSnapshot().contextUsageBySession.s1.breakdown?.categories).toContainEqual(
+      expect.objectContaining({ key: 'skills' })
+    )
+
+    await runtime.sendPrompt({ sessionId: 's1', text: 'continue without a skill' })
+    handleSessionUpdate(runtime, {
+      sessionId: 's1',
+      update: { sessionUpdate: 'usage_update', used: 120, size: 128_000 }
+    })
+
+    expect(runtime.getSnapshot().contextUsageBySession.s1.breakdown?.categories).not.toContainEqual(
+      expect.objectContaining({ key: 'skills' })
+    )
+  })
+
+  it('tokenizes context with the upstream model instead of the ACP framework default', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['s1'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: async () => ({
+        framework: { ...claudeCodeFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/claude-agent-acp',
+        env: {},
+        contextUsageModel: 'deepseek-v4-flash'
+      }),
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({ endpoint: 'http://127.0.0.1:4567', token: 'nb' })
+      }
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    handleSessionUpdate(runtime, {
+      sessionId: 's1',
+      update: { sessionUpdate: 'usage_update', used: 12, size: 1_000_000 }
+    })
+
+    expect(runtime.getSnapshot().contextUsageBySession.s1.breakdown).toMatchObject({
+      tokenizer: 'cl100k_base',
+      model: 'deepseek-v4-flash',
+      categories: expect.arrayContaining([expect.objectContaining({ key: 'mcp', estimated: true })])
+    })
+  })
+
+  it('rolls back the context estimate when an Agent prompt fails', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['s1'], {
+      onPrompt: () => {
+        throw new Error('provider rejected prompt')
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: opencodeFramework
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    handleSessionUpdate(runtime, {
+      sessionId: 's1',
+      update: { sessionUpdate: 'usage_update', used: 12, size: 128000 }
+    })
+    const beforeFailure = runtime.getSnapshot().contextUsageBySession.s1
+
+    await expect(
+      runtime.sendPrompt({ sessionId: 's1', text: 'failed prompt content must roll back' })
+    ).rejects.toThrow()
+
+    expect(runtime.getSnapshot().contextUsageBySession.s1).toEqual(beforeFailure)
+  })
+
+  it('retains partial turn context when an Agent prompt fails after streaming updates', async () => {
+    const process = new FakeAgentProcess()
+    let promptAttempt = 0
+    let secondTurnEstimate: AcpContextUsage['breakdown'] | undefined
+    startFakeAgent(process, ['s1'], {
+      onPrompt: ({ sessionId }) => {
+        promptAttempt += 1
+        if (promptAttempt === 1) {
+          handleSessionUpdate(runtime, {
+            sessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              messageId: 'partial-reply',
+              content: { type: 'text', text: 'partial assistant output retained by the provider' }
+            }
+          })
+          handleSessionUpdate(runtime, {
+            sessionId,
+            update: {
+              sessionUpdate: 'tool_call_update',
+              toolCallId: 'partial-tool',
+              status: 'completed',
+              rawOutput: { result: 'partial tool output retained by the provider' }
+            }
+          })
+          throw new Error('provider failed after partial output')
+        }
+
+        secondTurnEstimate = runtime.getSnapshot().contextUsageBySession[sessionId]?.breakdown
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: opencodeFramework
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    handleSessionUpdate(runtime, {
+      sessionId: 's1',
+      update: { sessionUpdate: 'usage_update', used: 12, size: 128000 }
+    })
+    const usageBeforeFailure = runtime.getSnapshot().contextUsageBySession.s1
+
+    await expect(
+      runtime.sendPrompt({ sessionId: 's1', text: 'fail after using a tool' })
+    ).rejects.toThrow()
+
+    expect(runtime.getSnapshot().contextUsageBySession.s1).toEqual(usageBeforeFailure)
+
+    await runtime.sendPrompt({ sessionId: 's1', text: 'continue the retained turn' })
+
+    expect(secondTurnEstimate?.categories).toContainEqual(
+      expect.objectContaining({ key: 'tools', estimated: true })
+    )
+  })
+
+  it.each([
+    ['Claude Code', claudeCodeFramework, 200_000],
+    ['OpenCode', opencodeFramework, 128_000],
+    ['Codex bridge', codexFramework, 258_400]
+  ] as const)(
+    'uses the selected model context window instead of the %s adapter window',
+    async (_name, framework, adapterWindow) => {
+      const process = new FakeAgentProcess()
+      startFakeAgent(process, ['s1'], {
+        modes:
+          framework.id === 'codex'
+            ? createModes(['read-only', 'agent', 'agent-full-access'], 'agent')
+            : undefined
+      })
+      const runtime = new AcpRuntime({
+        appVersion: '0.1.0',
+        defaultCwd: '/workspace',
+        resolveBackend: () => ({
+          framework: { ...framework, spawn: () => asAgentProcess(process) },
+          executablePath: '/bin/agent',
+          env: {},
+          contextWindow: 1_000_000
+        }),
+        framework
+      })
+
+      await runtime.createSession({ cwd: '/workspace' })
+      handleSessionUpdate(runtime, {
+        sessionId: 's1',
+        update: { sessionUpdate: 'usage_update', used: 15, size: adapterWindow }
+      })
+
+      expect(runtime.getSnapshot().contextUsageBySession).toMatchObject({
+        s1: { used: 15, size: 1_000_000 }
+      })
+    }
+  )
+
+  it('publishes a prompt terminal event exactly once when its callback throws', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['s1'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      callbacks: {
+        onEvent: (event) => {
+          if (event.kind === 'stop') throw new Error('stop callback failed')
+        }
+      }
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    await expect(runtime.sendPrompt({ sessionId: 's1', text: 'hi' })).rejects.toThrow(
+      'stop callback failed'
+    )
+
+    expect(
+      runtime
+        .getSnapshot()
+        .events.filter((event) => event.kind === 'stop' || event.kind === 'error')
+        .map((event) => event.kind)
+    ).toEqual(['stop'])
+  })
+
+  it.each(['connection close', 'context reset'] as const)(
+    'keeps an observed OpenCode stop authoritative through %s during usage collection',
+    async (disruption) => {
+      const process = new FakeAgentProcess()
+      const replacementStarted = createDeferred()
+      const releaseReplacement = createDeferred<PromptResponse>()
+      let runtime!: AcpRuntime
+      const fakeAgent = startFakeAgent(process, ['s1', 's2'], {
+        onPrompt: ({ text }) => {
+          if (!text.includes('replacement prompt')) return undefined
+          replacementStarted.resolve()
+          return releaseReplacement.promise
+        }
+      })
+      const finalUsageStarted = createDeferred()
+      const releaseFinalUsage = createDeferred()
+      let usageFetchCount = 0
+      const opencodeUsageFetch = vi.fn(async () => {
+        usageFetchCount += 1
+        if (usageFetchCount === 2) {
+          finalUsageStarted.resolve()
+          await releaseFinalUsage.promise
+        }
+        return new Response(JSON.stringify([]), {
+          headers: { 'content-type': 'application/json' }
+        })
+      })
+      const framework = { ...opencodeFramework, spawn: () => asAgentProcess(process) }
+      const now = vi.spyOn(Date, 'now').mockReturnValue(1000)
+      try {
+        runtime = new AcpRuntime({
+          appVersion: '0.1.0',
+          defaultCwd: '/workspace',
+          resolveBackend: () => ({
+            framework,
+            executablePath: '/bin/opencode',
+            env: {},
+            opencodeUsageApi: {
+              baseUrl: 'http://127.0.0.1:4242',
+              authorization: 'Basic test'
+            }
+          }),
+          framework,
+          opencodeUsageFetch
+        })
+
+        await runtime.createSession({ cwd: '/workspace' })
+        now.mockReturnValue(1234)
+        const prompt = runtime.sendPrompt({
+          sessionId: 's1',
+          text: 'hi',
+          suppressUserMessage: true,
+          provenanceContext: { promptMessageId: 'terminal-race-prompt' }
+        })
+        await finalUsageStarted.promise
+
+        if (disruption === 'connection close') {
+          process.stdout.end()
+          await vi.waitFor(() => expect(runtime.getSnapshot().status).toBe('closed'))
+        } else {
+          const reset = runtime.resetSessionContext({ sessionId: 's1', cwd: '/workspace' })
+          await vi.waitFor(() => expect(fakeAgent.newSessions).toHaveLength(2))
+          await reset
+        }
+
+        const replacement =
+          disruption === 'context reset'
+            ? runtime.sendPrompt({ sessionId: 's1', text: 'replacement prompt' })
+            : undefined
+        if (replacement) {
+          await vi.waitFor(() =>
+            expect(runtime.getSnapshot().promptInFlightSessionIds).toContain('s1')
+          )
+          handleSessionUpdate(runtime, {
+            sessionId: 's2',
+            update: { sessionUpdate: 'usage_update', used: 95, size: 100 }
+          })
+        }
+
+        now.mockReturnValue(5678)
+        releaseFinalUsage.resolve()
+        await vi.waitFor(() =>
+          expect(
+            runtime
+              .getSnapshot()
+              .events.some(
+                (event) => event.promptMessageId === 'terminal-race-prompt' && event.kind === 'stop'
+              )
+          ).toBe(true)
+        )
+        await prompt
+
+        expect(
+          runtime
+            .getSnapshot()
+            .events.filter(
+              (event) =>
+                event.promptMessageId === 'terminal-race-prompt' &&
+                (event.kind === 'stop' || event.kind === 'error')
+            )
+            .map((event) => ({ kind: event.kind, timestamp: event.timestamp }))
+        ).toEqual([{ kind: 'stop', timestamp: 1234 }])
+
+        if (replacement) {
+          await replacementStarted.promise
+          expect(fakeAgent.prompts.some((sent) => sent.text === '/compact')).toBe(false)
+          releaseReplacement.resolve({ stopReason: 'end_turn' })
+          await replacement
+        }
+      } finally {
+        now.mockRestore()
+      }
+    }
+  )
+
+  it('uses the latest Claude model request instead of accumulating the agent turn', async () => {
+    const process = new FakeAgentProcess()
+    const firstUsageSent = createDeferred()
+    const sendSecondUsage = createDeferred()
+    const secondUsageSent = createDeferred()
+    const finishPrompt = createDeferred()
+    startFakeAgent(process, ['s1'], {
+      onPrompt: async ({ sessionId }) => {
+        handleSessionUpdate(runtime, {
+          sessionId,
+          // First upstream model response: 12 input + 3 cache read.
+          update: { sessionUpdate: 'usage_update', used: 15, size: 200000 }
+        })
+        firstUsageSent.resolve()
+        await sendSecondUsage.promise
+        handleSessionUpdate(runtime, {
+          sessionId,
+          // A tool-followup model request replaces the first measurement: 19 input + 5 cache read.
+          update: { sessionUpdate: 'usage_update', used: 24, size: 200000 }
+        })
+        secondUsageSent.resolve()
+        await finishPrompt.promise
+
+        return {
+          stopReason: 'end_turn',
+          // claude-agent-acp accumulates PromptResponse.usage across the whole agent turn. The
+          // runtime must not let this overwrite the latest per-request usage_update.
+          usage: {
+            totalTokens: 60,
+            inputTokens: 31,
+            cachedReadTokens: 8,
+            cachedWriteTokens: 7,
+            outputTokens: 14
+          }
+        }
+      }
+    })
     const runtime = new AcpRuntime({
       appVersion: '0.1.0',
       defaultCwd: '/workspace',
@@ -4153,18 +12037,923 @@ describe('ACP runtime session management', () => {
     })
 
     await runtime.createSession({ cwd: '/workspace' })
+    const prompt = runtime.sendPrompt({ sessionId: 's1', text: 'hi' })
+    await firstUsageSent.promise
+    expect(runtime.getSnapshot().contextUsageBySession).toMatchObject({
+      s1: { used: 15, size: 200000 }
+    })
+
+    sendSecondUsage.resolve()
+    await secondUsageSent.promise
+    expect(runtime.getSnapshot().contextUsageBySession).toMatchObject({
+      s1: { used: 24, size: 200000 }
+    })
+
+    finishPrompt.resolve()
+    await prompt
+
+    expect(runtime.getSnapshot().contextUsageBySession).toMatchObject({
+      s1: { used: 24, size: 200000 }
+    })
+    expect(runtime.getSnapshot().events.find((event) => event.kind === 'stop')).toMatchObject({
+      turnUsage: {
+        inputTokens: 31,
+        cacheTokens: 15,
+        outputTokens: 14
+      }
+    })
+  })
+
+  it('attaches Claude SDK model-turn counts to completed turn usage', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['s1'], {
+      claudeTurnCountForPrompt: () => 3,
+      onPrompt: () => ({
+        stopReason: 'end_turn',
+        usage: {
+          totalTokens: 60,
+          inputTokens: 31,
+          cachedReadTokens: 8,
+          cachedWriteTokens: 7,
+          outputTokens: 14
+        }
+      })
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process)
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    await runtime.sendPrompt({ sessionId: 's1', text: 'use tools' })
+
+    expect(runtime.getSnapshot().events.find((event) => event.kind === 'stop')?.turnUsage).toEqual({
+      inputTokens: 31,
+      cacheTokens: 15,
+      cachedReadTokens: 8,
+      cachedWriteTokens: 7,
+      outputTokens: 14,
+      turnCount: 3
+    })
+  })
+
+  it('excludes autonomous Claude result lanes from the user prompt model-turn count', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['s1'], {
+      claudeResultMessagesForPrompt: () => [
+        ...['task-notification', 'peer', 'coordinator', 'observer', 'observer-activity'].map(
+          (origin) => ({ numTurns: 100, origin })
+        ),
+        { numTurns: 2, origin: 'human' },
+        // Unknown future origins remain eligible so a newly introduced user-driven lane does not
+        // silently under-report model turns until Open Science knows its name.
+        { numTurns: 3, origin: 'future-user-lane' }
+      ],
+      onPrompt: () => ({
+        stopReason: 'end_turn',
+        usage: {
+          totalTokens: 60,
+          inputTokens: 31,
+          cachedReadTokens: 8,
+          cachedWriteTokens: 7,
+          outputTokens: 14
+        }
+      })
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process)
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    await runtime.sendPrompt({ sessionId: 's1', text: 'use tools' })
+
+    expect(runtime.getSnapshot().events.find((event) => event.kind === 'stop')?.turnUsage).toEqual({
+      inputTokens: 31,
+      cacheTokens: 15,
+      cachedReadTokens: 8,
+      cachedWriteTokens: 7,
+      outputTokens: 14,
+      turnCount: 5
+    })
+  })
+
+  it('falls back to an unpatched Codex latest request usage at stop', async () => {
+    const process = new FakeAgentProcess()
+    const usageSent = createDeferred()
+    const finishPrompt = createDeferred()
+    startFakeAgent(process, ['s1'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent'),
+      onPrompt: async ({ sessionId }) => {
+        handleSessionUpdate(runtime, {
+          sessionId,
+          update: { sessionUpdate: 'usage_update', used: 15, size: 128000 }
+        })
+        usageSent.resolve()
+        await finishPrompt.promise
+        return {
+          stopReason: 'end_turn',
+          usage: {
+            totalTokens: 15,
+            inputTokens: 12,
+            cachedReadTokens: 3,
+            outputTokens: 3
+          }
+        }
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: codexFramework
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    const prompt = runtime.sendPrompt({ sessionId: 's1', text: 'hi' })
+    await usageSent.promise
+    expect(runtime.getSnapshot().contextUsageBySession).toMatchObject({
+      s1: { used: 15, size: 128000 }
+    })
+
+    finishPrompt.resolve()
+    await prompt
+
+    expect(runtime.getSnapshot().contextUsageBySession).toMatchObject({
+      s1: { used: 15, size: 128000 }
+    })
+    expect(runtime.getSnapshot().events.find((event) => event.kind === 'stop')?.turnUsage).toEqual({
+      inputTokens: 12,
+      cacheTokens: 3,
+      outputTokens: 3
+    })
+  })
+
+  it('keeps managed Codex turn totals separate from its latest context snapshot', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['s1'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent'),
+      onPrompt: () => ({
+        stopReason: 'end_turn',
+        usage: {
+          totalTokens: 22,
+          inputTokens: 19,
+          cachedReadTokens: 5,
+          outputTokens: 3
+        },
+        _meta: {
+          'open-science/turn-usage': {
+            totalTokens: 45,
+            inputTokens: 31,
+            cachedReadTokens: 8,
+            cachedWriteTokens: 7,
+            outputTokens: 14
+          },
+          'open-science/model-turn-count': 2
+        }
+      })
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: codexFramework
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    await runtime.sendPrompt({ sessionId: 's1', text: 'use a tool and summarize' })
+
+    expect(runtime.getSnapshot().contextUsageBySession).toMatchObject({
+      s1: { used: 24 }
+    })
+    expect(runtime.getSnapshot().events.find((event) => event.kind === 'stop')).toMatchObject({
+      turnUsage: {
+        inputTokens: 31,
+        cacheTokens: 15,
+        cachedReadTokens: 8,
+        cachedWriteTokens: 7,
+        outputTokens: 14,
+        turnCount: 2
+      }
+    })
+  })
+
+  it('keeps Codex bridge usage visible when the adapter omits whole-turn metadata', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['s1'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent'),
+      onPrompt: () => ({
+        stopReason: 'end_turn',
+        // A Responses bridge still returns standard ACP usage even when its adapter does not publish
+        // Open Science's private whole-turn metadata. The footer must not become entirely unavailable.
+        usage: {
+          totalTokens: 27,
+          inputTokens: 19,
+          cachedReadTokens: 5,
+          outputTokens: 3
+        }
+      })
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: codexFramework
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    await runtime.sendPrompt({ sessionId: 's1', text: 'answer through the bridge' })
+
+    expect(runtime.getSnapshot().events.find((event) => event.kind === 'stop')).toMatchObject({
+      turnUsage: { inputTokens: 19, cacheTokens: 5, outputTokens: 3 }
+    })
+  })
+
+  it('uses OpenCode native input and cache-read context usage', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['s1'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: opencodeFramework
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    handleSessionUpdate(runtime, {
+      sessionId: 's1',
+      update: { sessionUpdate: 'usage_update', used: 15, size: 128000 }
+    })
+
+    expect(runtime.getSnapshot().contextUsageBySession).toMatchObject({
+      s1: { used: 15, size: 128000 }
+    })
+  })
+
+  it('sums every OpenCode assistant model step created by one prompt turn', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['s1'], {
+      onPrompt: () => ({
+        stopReason: 'end_turn',
+        // OpenCode ACP currently exposes only the final assistant record here.
+        usage: {
+          totalTokens: 27,
+          inputTokens: 19,
+          cachedReadTokens: 5,
+          outputTokens: 3
+        }
+      })
+    })
+    const messageSnapshots = [
+      [{ info: { id: 'old', role: 'assistant' } }],
+      [
+        { info: { id: 'old', role: 'assistant' } },
+        {
+          info: {
+            id: 'step-1',
+            role: 'assistant',
+            tokens: { input: 12, output: 2, reasoning: 0, cache: { read: 3, write: 0 } }
+          }
+        },
+        {
+          info: {
+            id: 'step-2',
+            role: 'assistant',
+            tokens: { input: 19, output: 3, reasoning: 0, cache: { read: 5, write: 0 } }
+          }
+        }
+      ]
+    ]
+    const opencodeUsageFetch = vi.fn(
+      async () =>
+        new Response(JSON.stringify(messageSnapshots.shift() ?? []), {
+          headers: { 'content-type': 'application/json' }
+        })
+    )
+    const framework = { ...opencodeFramework, spawn: () => asAgentProcess(process) }
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework,
+        executablePath: '/bin/opencode',
+        env: {},
+        opencodeUsageApi: {
+          baseUrl: 'http://127.0.0.1:4242',
+          authorization: 'Basic test'
+        }
+      }),
+      framework,
+      opencodeUsageFetch
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    await runtime.sendPrompt({ sessionId: 's1', text: 'use a tool and summarize' })
+
+    expect(opencodeUsageFetch).toHaveBeenCalledTimes(2)
+    expect(runtime.getSnapshot().events.find((event) => event.kind === 'stop')).toMatchObject({
+      turnUsage: { inputTokens: 31, cacheTokens: 8, outputTokens: 5 }
+    })
+  })
+
+  it('defers a provider reconnect until an in-flight prompt finishes', async () => {
+    const process = new FakeAgentProcess()
+    const gate = createDeferred()
+    const usageSent = createDeferred()
+    const states: string[] = []
+    startFakeAgent(process, ['s1'], {
+      onPrompt: async ({ sessionId }) => {
+        handleSessionUpdate(runtime, {
+          sessionId,
+          update: { sessionUpdate: 'usage_update', used: 6800, size: 128000 }
+        })
+        usageSent.resolve()
+        await gate.promise
+        return {
+          stopReason: 'end_turn',
+          usage: {
+            totalTokens: 6800,
+            inputTokens: 6000,
+            cachedReadTokens: 400,
+            cachedWriteTokens: 100,
+            outputTokens: 300
+          }
+        }
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      callbacks: { onStateChanged: (snapshot) => states.push(snapshot.status) }
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    contextUsageMap(runtime).set('s1', { used: 6400, size: 128000 })
 
     // Start a prompt that stays in flight until the gate is released.
     const prompt = runtime.sendPrompt({ sessionId: 's1', text: 'hi' })
+    await usageSent.promise
 
     // A provider switch requested mid-turn must NOT disconnect the running agent.
     await runtime.requestProviderReconnect()
     expect(process.killed).toBe(false)
+    expect(runtime.getSnapshot().contextUsageBySession).toEqual({})
+
+    handleSessionUpdate(runtime, {
+      sessionId: 's1',
+      update: { sessionUpdate: 'usage_update', used: 7200, size: 128000 }
+    })
+    expect(runtime.getSnapshot().contextUsageBySession).toEqual({})
 
     // Once the turn finishes, the deferred reconnect is applied (agent torn down for a fresh spawn).
     gate.resolve()
     await prompt
     await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(process.killed).toBe(true)
+    expect(runtime.getSnapshot().status).toBe('idle')
+    expect(states).not.toContain('closed')
+    expect(runtime.getSnapshot().contextUsageBySession).toEqual({})
+  })
+
+  it('does not restore superseded context usage when a prompt fails during provider reconnect', async () => {
+    const process = new FakeAgentProcess()
+    const promptStarted = createDeferred()
+    const failPrompt = createDeferred()
+    startFakeAgent(process, ['s1'], {
+      onPrompt: async () => {
+        promptStarted.resolve()
+        await failPrompt.promise
+        throw new Error('old provider rejected prompt')
+      }
+    })
+    const snapshots: AcpStateSnapshot[] = []
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...opencodeFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/opencode-acp',
+        env: {},
+        contextWindow: 128_000
+      }),
+      framework: opencodeFramework,
+      callbacks: { onStateChanged: (snapshot) => snapshots.push(snapshot) }
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    handleSessionUpdate(runtime, {
+      sessionId: 's1',
+      update: { sessionUpdate: 'usage_update', used: 6400, size: 128000 }
+    })
+    const prompt = runtime.sendPrompt({ sessionId: 's1', text: 'continue on old provider' })
+    await promptStarted.promise
+    await runtime.requestProviderReconnect()
+    const clearedSnapshotIndex = snapshots.length - 1
+    handleSessionUpdate(runtime, {
+      sessionId: 's1',
+      update: {
+        sessionUpdate: 'agent_message_chunk',
+        messageId: 'superseded-output',
+        content: { type: 'text', text: 'late output from old provider' }
+      }
+    })
+
+    failPrompt.resolve()
+    await expect(prompt).rejects.toThrow()
+
+    expect(
+      snapshots
+        .slice(clearedSnapshotIndex)
+        .some((snapshot) => Object.hasOwn(snapshot.contextUsageBySession, 's1'))
+    ).toBe(false)
+  })
+
+  it('retires a framework runtime only after its in-flight prompt finishes', async () => {
+    const process = new FakeAgentProcess()
+    const gate = createDeferred()
+    const onRetired = vi.fn()
+    startFakeAgent(process, ['s1'], { onPrompt: () => gate.promise })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      callbacks: { onRetired }
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    const prompt = runtime.sendPrompt({ sessionId: 's1', text: 'hi' })
+
+    await runtime.requestRetirement()
+    expect(process.killed).toBe(false)
+    expect(onRetired).not.toHaveBeenCalled()
+    expect(runtime.getSnapshot().sessionIds).toEqual(['s1'])
+
+    gate.resolve()
+    await prompt
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(process.killed).toBe(true)
+    expect(runtime.getSnapshot().sessionIds).toEqual([])
+    expect(onRetired).toHaveBeenCalledOnce()
+  })
+
+  it('lets retirement supersede a deferred provider reconnect exactly once', async () => {
+    const process = new FakeAgentProcess()
+    const promptStarted = createDeferred()
+    const releasePrompt = createDeferred()
+    const onRetired = vi.fn()
+    const states: string[] = []
+    startFakeAgent(process, ['s1'], {
+      onPrompt: async () => {
+        promptStarted.resolve()
+        await releasePrompt.promise
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      callbacks: {
+        onRetired,
+        onStateChanged: (snapshot) => states.push(snapshot.status)
+      }
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    const prompt = runtime.sendPrompt({ sessionId: 's1', text: 'hi' })
+    await promptStarted.promise
+    states.length = 0
+
+    await runtime.requestProviderReconnect()
+    await runtime.requestRetirement()
+    expect(process.killed).toBe(false)
+    expect(onRetired).not.toHaveBeenCalled()
+
+    releasePrompt.resolve()
+    await prompt
+    await vi.waitFor(() => expect(onRetired).toHaveBeenCalledOnce())
+
+    expect(process.killed).toBe(true)
+    expect(states).not.toContain('idle')
+  })
+
+  it('does not retire while createSession is resolving its backend', async () => {
+    const process = new FakeAgentProcess()
+    const backendEntered = createDeferred()
+    const releaseBackend = createDeferred()
+    const onRetired = vi.fn()
+    startFakeAgent(process, ['s1'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      callbacks: { onRetired },
+      resolveBackend: async () => {
+        backendEntered.resolve()
+        await releaseBackend.promise
+        return {
+          framework: { ...claudeCodeFramework, spawn: () => asAgentProcess(process) },
+          executablePath: '/bin/agent',
+          env: {}
+        }
+      }
+    })
+
+    const creating = runtime.createSession({ cwd: '/workspace' })
+    await backendEntered.promise
+    await runtime.requestRetirement()
+
+    expect(process.killed).toBe(false)
+    expect(onRetired).not.toHaveBeenCalled()
+
+    releaseBackend.resolve()
+    await expect(creating).resolves.toMatchObject({ sessionId: 's1' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(process.killed).toBe(true)
+    expect(onRetired).toHaveBeenCalledOnce()
+  })
+
+  it('does not retire while a prompt checks whether disabled skills need force-loading', async () => {
+    const process = new FakeAgentProcess()
+    const skillCheckEntered = createDeferred()
+    const releaseSkillCheck = createDeferred()
+    const onRetired = vi.fn()
+    startFakeAgent(process, ['s1'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      callbacks: { onRetired },
+      skills: {
+        needForceLoad: async () => {
+          skillCheckEntered.resolve()
+          await releaseSkillCheck.promise
+          return []
+        },
+        namesForIds: async (ids) => ids
+      }
+    })
+    await runtime.createSession({ cwd: '/workspace' })
+
+    const prompting = runtime.sendPrompt({
+      sessionId: 's1',
+      text: 'use the selected skill',
+      forcedSkillIds: ['research']
+    })
+    await skillCheckEntered.promise
+    await runtime.requestRetirement()
+
+    expect(process.killed).toBe(false)
+    expect(onRetired).not.toHaveBeenCalled()
+
+    releaseSkillCheck.resolve()
+    await expect(prompting).resolves.toMatchObject({ stopReason: 'end_turn' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(process.killed).toBe(true)
+    expect(onRetired).toHaveBeenCalledOnce()
+  })
+
+  it('does not retire while deleteSession awaits the agent close request', async () => {
+    const process = new FakeAgentProcess()
+    const closeEntered = createDeferred()
+    const releaseClose = createDeferred()
+    const onRetired = vi.fn()
+    startFakeAgent(process, ['s1'], {
+      onClose: async () => {
+        closeEntered.resolve()
+        await releaseClose.promise
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      callbacks: { onRetired }
+    })
+    await runtime.createSession({ cwd: '/workspace' })
+
+    const deleting = runtime.deleteSession({ sessionId: 's1' })
+    await closeEntered.promise
+    await runtime.requestRetirement()
+
+    expect(process.killed).toBe(false)
+    expect(onRetired).not.toHaveBeenCalled()
+
+    releaseClose.resolve()
+    await deleting
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(process.killed).toBe(true)
+    expect(onRetired).toHaveBeenCalledOnce()
+  })
+
+  it('does not retire while setPermissionProfile awaits the agent mode request', async () => {
+    const process = new FakeAgentProcess()
+    const modeEntered = createDeferred()
+    const releaseMode = createDeferred()
+    const onRetired = vi.fn()
+    startFakeAgent(process, ['s1'], {
+      modes: createModes(['default', 'bypassPermissions']),
+      onSetMode: async () => {
+        modeEntered.resolve()
+        await releaseMode.promise
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      callbacks: { onRetired }
+    })
+    await runtime.createSession({ cwd: '/workspace', permissionProfile: 'ask' })
+
+    const changingProfile = runtime.setPermissionProfile({ sessionId: 's1', profile: 'full' })
+    await modeEntered.promise
+    await runtime.requestRetirement()
+
+    expect(process.killed).toBe(false)
+    expect(onRetired).not.toHaveBeenCalled()
+
+    releaseMode.resolve()
+    await changingProfile
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(process.killed).toBe(true)
+    expect(onRetired).toHaveBeenCalledOnce()
+  })
+
+  it('completes retirement after an unexpected connection close drains the active operation', async () => {
+    const process = new FakeAgentProcess()
+    const gate = createDeferred()
+    const onRetired = vi.fn()
+    startFakeAgent(process, ['s1'], { onPrompt: () => gate.promise })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      callbacks: { onRetired }
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    const prompt = runtime.sendPrompt({ sessionId: 's1', text: 'hi' })
+    await runtime.requestRetirement()
+
+    process.stdout.end()
+    gate.resolve()
+    await prompt.catch(() => undefined)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(runtime.getSnapshot().status).toBe('closed')
+    expect(onRetired).toHaveBeenCalledOnce()
+  })
+
+  it('keeps a reviewer session alive until it is disposed before retiring', async () => {
+    const process = new FakeAgentProcess()
+    const registerReviewerSession = vi.fn()
+    const unregisterReviewerSession = vi.fn(() => false)
+    const releaseBridge = vi.fn(async () => undefined)
+    startFakeAgent(process, ['reviewer-session-1'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent')
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...codexFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/codex-acp',
+        env: {},
+        providerConfiguration: {
+          providerId: 'custom-gateway',
+          apiType: 'openai',
+          baseUrl: 'http://127.0.0.1:1/v1',
+          headers: { authorization: 'Bearer bridge' }
+        },
+        responsesBridgeLease: {
+          selectSkills: vi.fn(async () => []),
+          registerReviewerSession,
+          unregisterReviewerSession,
+          release: releaseBridge
+        }
+      })
+    })
+
+    const { session } = await runtime.buildReviewerSession({
+      cwd: '/workspace',
+      mcpServers: [
+        {
+          type: 'http',
+          name: 'open-science-reviewer',
+          url: 'http://127.0.0.1:1/mcp',
+          headers: []
+        }
+      ]
+    })
+    expect(registerReviewerSession).toHaveBeenCalledWith('reviewer-session-1')
+
+    await runtime.requestRetirement()
+    expect(process.killed).toBe(false)
+    expect(releaseBridge).not.toHaveBeenCalled()
+
+    runtime.disposeReviewerSession(session)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(unregisterReviewerSession).toHaveBeenCalledWith('reviewer-session-1')
+    expect(errorLogSpy).toHaveBeenCalledWith('reviewer bridge request was never scoped', {
+      sessionId: 'reviewer-session-1'
+    })
+    expect(process.killed).toBe(true)
+    expect(releaseBridge).toHaveBeenCalledOnce()
+  })
+
+  it('completes reviewer cleanup before propagating a session disposal failure', async () => {
+    const process = new FakeAgentProcess()
+    const registerReviewerSession = vi.fn()
+    const unregisterReviewerSession = vi.fn(() => true)
+    const releaseBridge = vi.fn(async () => undefined)
+    const fakeAgent = startFakeAgent(process, ['reviewer-session-1'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...claudeCodeFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/claude',
+        env: {},
+        responsesBridgeLease: {
+          selectSkills: vi.fn(async () => []),
+          registerReviewerSession,
+          unregisterReviewerSession,
+          release: releaseBridge
+        }
+      })
+    })
+    const { session } = await runtime.buildReviewerSession({
+      cwd: '/workspace',
+      mcpServers: [
+        {
+          type: 'http',
+          name: 'open-science-reviewer',
+          url: 'http://127.0.0.1:1/mcp',
+          headers: []
+        }
+      ]
+    })
+    const reviewerCwd = fakeAgent.newSessions[0]!.cwd
+
+    await runtime.requestProviderReconnect()
+    expect(process.killed).toBe(false)
+
+    vi.spyOn(session, 'dispose').mockImplementationOnce(() => {
+      throw new Error('reviewer dispose failed')
+    })
+
+    expect(() => runtime.disposeReviewerSession(session)).toThrow('reviewer dispose failed')
+
+    expect(unregisterReviewerSession).toHaveBeenCalledWith('reviewer-session-1')
+    await expect(stat(reviewerCwd)).rejects.toMatchObject({ code: 'ENOENT' })
+    await vi.waitFor(() => expect(process.killed).toBe(true))
+    expect(releaseBridge).toHaveBeenCalledOnce()
+  })
+
+  it('finishes disconnect state cleanup when the responses bridge lease rejects release', async () => {
+    const process = new FakeAgentProcess()
+    const releaseBridge = vi.fn().mockRejectedValue(new Error('bridge close failed'))
+    startFakeAgent(process, ['s1'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...claudeCodeFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/agent',
+        env: {},
+        responsesBridgeLease: {
+          selectSkills: vi.fn(async () => []),
+          registerReviewerSession: vi.fn(),
+          unregisterReviewerSession: vi.fn(() => true),
+          release: releaseBridge
+        }
+      })
+    })
+    await runtime.createSession({ cwd: '/workspace' })
+
+    await expect(runtime.disconnect()).resolves.toMatchObject({ status: 'closed' })
+
+    expect(releaseBridge).toHaveBeenCalledOnce()
+    expect(runtime.getSnapshot().status).toBe('closed')
+    expect(errorLogSpy).toHaveBeenCalledWith(
+      'responses bridge lease release failed',
+      expect.objectContaining({ error: 'bridge close failed' })
+    )
+  })
+
+  it('keeps a retiring runtime alive across gaps in an activity workflow', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['s1'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process)
+    })
+    await runtime.createSession({ cwd: '/workspace' })
+    const activityStarted = createDeferred()
+    const releaseActivity = createDeferred()
+
+    const activity = runtime.withActivity({}, async () => {
+      activityStarted.resolve()
+      await releaseActivity.promise
+    })
+    await activityStarted.promise
+
+    await runtime.requestRetirement()
+    expect(process.killed).toBe(false)
+
+    releaseActivity.resolve()
+    await activity
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(process.killed).toBe(true)
+  })
+
+  it('keeps a retiring runtime alive until every nested withActivity lease is released', async () => {
+    // Nested withActivity calls stack the lease counter; retirement is gated on hasRetirementBlockingActivity
+    // which only returns false once every nested lease has run its finally. We probe the counter via the
+    // public observable: requestRetirement must not kill the agent process while any inner lease still
+    // holds, even after a sibling nest-mate returns.
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['s1'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process)
+    })
+    await runtime.createSession({ cwd: '/workspace' })
+
+    const innerStarted = createDeferred()
+    const releaseInner = createDeferred()
+    const outerStarted = createDeferred()
+    const releaseOuter = createDeferred()
+
+    const inner = runtime.withActivity({}, async () => {
+      innerStarted.resolve()
+      await releaseInner.promise
+    })
+    await innerStarted.promise
+
+    // Outer enters while inner is still in flight → lease counter is 2.
+    const outer = runtime.withActivity({}, async () => {
+      outerStarted.resolve()
+      await releaseOuter.promise
+    })
+    await outerStarted.promise
+
+    await runtime.requestRetirement()
+    expect(process.killed).toBe(false)
+
+    // Releasing the inner only drops the counter to 1; outer still owns a lease, so retirement must stay
+    // deferred. This is the edge the existing single-lease test does not cover.
+    releaseInner.resolve()
+    await inner
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    await runtime.requestRetirement()
+    expect(process.killed).toBe(false)
+
+    // Both leases released → finally chain on the outer finally drives the deferred retirement, and the
+    // agent process is reaped exactly once.
+    releaseOuter.resolve()
+    await outer
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(process.killed).toBe(true)
+  })
+
+  it('releases the withActivity lease through finally when the work function throws', async () => {
+    // The lease counter is decremented inside the same try/finally as the awaiting of `work`. A throw
+    // must take the finally branch — otherwise the activity would leak leases on every error path and
+    // retirement would never fire. We assert the public consequence: once the work promise rejects,
+    // requestRetirement can retire the generation immediately.
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['s1'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process)
+    })
+    await runtime.createSession({ cwd: '/workspace' })
+
+    const boom = new Error('workflow blew up')
+    const activityStarted = createDeferred()
+    const activity = runtime.withActivity({}, async () => {
+      activityStarted.resolve()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      throw boom
+    })
+
+    await activityStarted.promise
+    await expect(activity).rejects.toBe(boom)
+
+    // The lease must be back to 0 by now — the finally block ran before the rejection surfaced.
+    // Retirement therefore fires synchronously here; no second setTimeout is needed.
+    await runtime.requestRetirement()
     expect(process.killed).toBe(true)
   })
 
@@ -4221,6 +13010,261 @@ describe('ACP runtime session management', () => {
     // The second session must have landed on the new connection (second spawn).
     expect(result.sessionId).toBe('s2')
     expect(spawnCount).toBe(2)
+  })
+
+  it('resumeSession renews its stable identity after waiting for a pending provider reconnect', async () => {
+    const oldProcess = new FakeAgentProcess()
+    const newProcess = new FakeAgentProcess()
+    const gate = createDeferred()
+    const resumedSessionId = '123e4567-e89b-42d3-a456-426614174000'
+    startFakeAgent(oldProcess, ['s1'], { onPrompt: () => gate.promise })
+    const newAgent = startFakeAgent(newProcess, [])
+
+    let spawnCount = 0
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: async () => {
+        spawnCount += 1
+        return {
+          framework: {
+            ...claudeCodeFramework,
+            spawn: () => asAgentProcess(spawnCount === 1 ? oldProcess : newProcess)
+          },
+          executablePath: '/bin/agent',
+          env: {},
+          args: []
+        }
+      }
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    const prompt = runtime.sendPrompt({ sessionId: 's1', text: 'hi' })
+    await runtime.requestProviderReconnect()
+
+    const resumed = runtime.resumeSession({ sessionId: resumedSessionId, cwd: '/workspace' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(newAgent.resumedSessions).toEqual([])
+
+    gate.resolve()
+    await prompt
+
+    await expect(resumed).resolves.toMatchObject({ sessionId: resumedSessionId })
+    expect(newAgent.resumedSessions).toEqual([
+      expect.objectContaining({ sessionId: resumedSessionId })
+    ])
+    expect(spawnCount).toBe(2)
+  })
+
+  it('resetSessionContext renews its published app identity after a pending reconnect', async () => {
+    const oldProcess = new FakeAgentProcess()
+    const newProcess = new FakeAgentProcess()
+    const gate = createDeferred()
+    startFakeAgent(oldProcess, ['stable-app-session'], { onPrompt: () => gate.promise })
+    const newAgent = startFakeAgent(newProcess, ['replacement-provider-session'])
+
+    let spawnCount = 0
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: async () => {
+        spawnCount += 1
+        return {
+          framework: {
+            ...claudeCodeFramework,
+            spawn: () => asAgentProcess(spawnCount === 1 ? oldProcess : newProcess)
+          },
+          executablePath: '/bin/agent',
+          env: {},
+          args: []
+        }
+      }
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    const prompt = runtime.sendPrompt({ sessionId: 'stable-app-session', text: 'hi' })
+    await runtime.requestProviderReconnect()
+
+    const reset = runtime.resetSessionContext({
+      sessionId: 'stable-app-session',
+      cwd: '/workspace'
+    })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(newAgent.newSessions).toEqual([])
+
+    gate.resolve()
+    await prompt
+
+    await expect(reset).resolves.toMatchObject({
+      sessionId: 'stable-app-session',
+      contextReset: true
+    })
+    await runtime.sendPrompt({ sessionId: 'stable-app-session', text: 'replacement turn' })
+    expect(newAgent.prompts.at(-1)).toMatchObject({
+      sessionId: 'replacement-provider-session'
+    })
+    expect(spawnCount).toBe(2)
+  })
+
+  it.each([
+    {
+      operation: 'resume',
+      interruption: 'delete',
+      sessionId: '123e4567-e89b-42d3-a456-426614174000'
+    },
+    {
+      operation: 'context reset',
+      interruption: 'delete',
+      sessionId: 'stable-app-session'
+    },
+    {
+      operation: 'resume',
+      interruption: 'disconnect',
+      sessionId: '123e4567-e89b-42d3-a456-426614174000'
+    },
+    {
+      operation: 'context reset',
+      interruption: 'disconnect',
+      sessionId: 'stable-app-session'
+    }
+  ])(
+    'rejects a pending $operation after a second $interruption invalidation',
+    async ({ operation, interruption, sessionId }) => {
+      const oldProcess = new FakeAgentProcess()
+      const newProcess = new FakeAgentProcess()
+      const promptGate = createDeferred()
+      startFakeAgent(oldProcess, ['stable-app-session'], {
+        onPrompt: () => promptGate.promise
+      })
+      const newAgent = startFakeAgent(newProcess, ['unexpected-provider-session'])
+
+      let spawnCount = 0
+      const runtime = new AcpRuntime({
+        appVersion: '0.1.0',
+        defaultCwd: '/workspace',
+        resolveBackend: async () => {
+          spawnCount += 1
+          return {
+            framework: {
+              ...claudeCodeFramework,
+              spawn: () => asAgentProcess(spawnCount === 1 ? oldProcess : newProcess)
+            },
+            executablePath: '/bin/agent',
+            env: {},
+            args: []
+          }
+        }
+      })
+
+      await runtime.createSession({ cwd: '/workspace' })
+      const prompt = runtime.sendPrompt({ sessionId: 'stable-app-session', text: 'hi' })
+      await runtime.requestProviderReconnect()
+
+      const connectionReady = createDeferred()
+      const releaseEnsureConnected = createDeferred()
+      const internal = runtime as unknown as {
+        ensureConnected: (cwd: string) => Promise<unknown>
+      }
+      const ensureConnected = internal.ensureConnected.bind(runtime)
+      vi.spyOn(internal, 'ensureConnected').mockImplementationOnce(async (cwd) => {
+        const connection = await ensureConnected(cwd)
+        connectionReady.resolve()
+        await releaseEnsureConnected.promise
+        return connection
+      })
+
+      const pending =
+        operation === 'context reset'
+          ? runtime.resetSessionContext({ sessionId, cwd: '/workspace' })
+          : runtime.resumeSession({ sessionId, cwd: '/workspace' })
+
+      promptGate.resolve()
+      await prompt
+      await connectionReady.promise
+
+      if (interruption === 'delete') {
+        await runtime.deleteSession({ sessionId })
+        releaseEnsureConnected.resolve()
+      } else {
+        // Resolving the wrapper queues the startup continuation. disconnect() invalidates its
+        // generation and clears the just-returned connection synchronously before yielding.
+        releaseEnsureConnected.resolve()
+        await runtime.disconnect()
+      }
+
+      try {
+        await expect(pending).rejects.toThrow('ACP session startup was superseded.')
+        expect(newAgent.newSessions).toEqual([])
+        expect(newAgent.resumedSessions).toEqual([])
+        expect(runtime.getSnapshot().sessionIds).not.toContain(sessionId)
+      } finally {
+        promptGate.resolve()
+        releaseEnsureConnected.resolve()
+        await pending.catch(() => undefined)
+        await runtime.disconnect().catch(() => undefined)
+      }
+    }
+  )
+
+  it('blocks a same-id reset while deletion is in flight and allows retry after deletion fails', async () => {
+    const process = new FakeAgentProcess()
+    const closeStarted = createDeferred()
+    const releaseClose = createDeferred()
+    const deleteFailure = new Error('agent delete failed')
+    const fakeAgent = startFakeAgent(
+      process,
+      ['stable-app-session', 'replacement-provider-session'],
+      {
+        onClose: async () => {
+          closeStarted.resolve()
+          await releaseClose.promise
+          throw deleteFailure
+        }
+      }
+    )
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process)
+    })
+    await runtime.createSession({ cwd: '/workspace' })
+
+    const deleting = runtime.deleteSession({ sessionId: 'stable-app-session' })
+    await closeStarted.promise
+    const resetWhileDeleting = runtime.resetSessionContext({
+      sessionId: 'stable-app-session',
+      cwd: '/workspace'
+    })
+
+    try {
+      await expect(resetWhileDeleting).rejects.toThrow(
+        'Primary session id collision with deletion in progress: stable-app-session'
+      )
+      expect(fakeAgent.newSessions).toHaveLength(1)
+
+      releaseClose.resolve()
+      await expect(deleting).rejects.toMatchObject({
+        code: -32603,
+        data: { details: deleteFailure.message }
+      })
+
+      await expect(
+        runtime.resetSessionContext({
+          sessionId: 'stable-app-session',
+          cwd: '/workspace'
+        })
+      ).resolves.toMatchObject({
+        sessionId: 'stable-app-session',
+        contextReset: true
+      })
+      expect(fakeAgent.newSessions).toHaveLength(2)
+    } finally {
+      releaseClose.resolve()
+      await deleting.catch(() => undefined)
+      await resetWhileDeleting.catch(() => undefined)
+      await runtime.deleteSession({ sessionId: 'stable-app-session' }).catch(() => undefined)
+      await runtime.disconnect().catch(() => undefined)
+    }
   })
 
   it('createSession proceeds immediately when an unexpected connection close resolves the barrier', async () => {
@@ -4411,102 +13455,64 @@ describe('ACP runtime session management', () => {
   it('reconnects immediately when a provider switch happens with no prompt in flight', async () => {
     const process = new FakeAgentProcess()
     startFakeAgent(process, ['s1'])
+    const states: string[] = []
     const runtime = new AcpRuntime({
       appVersion: '0.1.0',
       defaultCwd: '/workspace',
-      spawnAgent: () => asAgentProcess(process)
+      spawnAgent: () => asAgentProcess(process),
+      callbacks: { onStateChanged: (snapshot) => states.push(snapshot.status) }
     })
 
     await runtime.createSession({ cwd: '/workspace' })
     await runtime.requestProviderReconnect()
 
     expect(process.killed).toBe(true)
+    expect(runtime.getSnapshot().status).toBe('idle')
+    expect(states).not.toContain('closed')
   })
 
-  it('reloads skills immediately when no prompt is in flight', async () => {
-    const process = new FakeAgentProcess()
-    startFakeAgent(process, ['s1'])
-    const runtime = new AcpRuntime({
-      appVersion: '0.1.0',
-      defaultCwd: '/workspace',
-      spawnAgent: () => asAgentProcess(process)
-    })
-
-    await runtime.createSession({ cwd: '/workspace' })
-    await runtime.requestSkillsReload()
-
-    expect(process.killed).toBe(true)
-  })
-
-  it('defers a skills reload until an in-flight prompt finishes', async () => {
-    const process = new FakeAgentProcess()
-    const gate = createDeferred()
-    startFakeAgent(process, ['s1'], { onPrompt: () => gate.promise })
-    const runtime = new AcpRuntime({
-      appVersion: '0.1.0',
-      defaultCwd: '/workspace',
-      spawnAgent: () => asAgentProcess(process)
-    })
-
-    await runtime.createSession({ cwd: '/workspace' })
-
-    const prompt = runtime.sendPrompt({ sessionId: 's1', text: 'hi' })
-
-    // A skill toggle mid-turn must NOT disconnect the running agent.
-    await runtime.requestSkillsReload()
-    expect(process.killed).toBe(false)
-
-    // Once the turn finishes, the deferred reload is applied (agent torn down for a fresh spawn).
-    gate.resolve()
-    await prompt
-    await new Promise((resolve) => setTimeout(resolve, 0))
-    expect(process.killed).toBe(true)
-  })
-
-  it('applies a provider reconnect and a skills reload deferred in the same turn with one disconnect', async () => {
+  it('does not let a stale planned reconnect overwrite a newer connection status', async () => {
     const oldProcess = new FakeAgentProcess()
     const newProcess = new FakeAgentProcess()
-    const gate = createDeferred()
-    startFakeAgent(oldProcess, ['s1'], { onPrompt: () => gate.promise })
+    startFakeAgent(oldProcess, ['s1'])
     startFakeAgent(newProcess, ['s2'])
-
+    const teardownStarted = createDeferred()
+    const releaseTeardown = createDeferred()
     let spawnCount = 0
     const runtime = new AcpRuntime({
       appVersion: '0.1.0',
       defaultCwd: '/workspace',
-      resolveBackend: async () => {
-        spawnCount += 1
-        return {
-          framework: {
-            ...claudeCodeFramework,
-            spawn: () => asAgentProcess(spawnCount === 1 ? oldProcess : newProcess)
-          },
-          executablePath: '/bin/agent',
-          env: {},
-          args: []
-        }
-      }
+      resolveBackend: () => ({
+        framework: {
+          ...claudeCodeFramework,
+          spawn: () => asAgentProcess(spawnCount++ === 0 ? oldProcess : newProcess)
+        },
+        executablePath: '/bin/agent',
+        env: {}
+      })
     })
 
     await runtime.createSession({ cwd: '/workspace' })
-    const prompt = runtime.sendPrompt({ sessionId: 's1', text: 'hi' })
+    vi.mocked(terminateProcessTree).mockImplementationOnce(async (child) => {
+      child?.kill()
+      teardownStarted.resolve()
+      await releaseTeardown.promise
+      return { reaped: true }
+    })
+    const reconnect = runtime.requestProviderReconnect()
+    await teardownStarted.promise
 
-    // Both a provider switch and a skill toggle arrive during the same in-flight prompt.
-    await runtime.requestProviderReconnect()
-    await runtime.requestSkillsReload()
-    expect(oldProcess.killed).toBe(false)
+    try {
+      await expect(runtime.createSession({ cwd: '/workspace' })).resolves.toMatchObject({
+        sessionId: 's2'
+      })
+      expect(runtime.getSnapshot().status).toBe('connected')
+    } finally {
+      releaseTeardown.resolve()
+      await reconnect
+    }
 
-    // Turn finishes → a SINGLE deferred disconnect satisfies both (spawnCount 1 → 2). A second,
-    // redundant disconnect would spawn a third process on the next createSession.
-    gate.resolve()
-    await prompt
-    await new Promise((resolve) => setTimeout(resolve, 0))
-    expect(oldProcess.killed).toBe(true)
-
-    // The next session lands on the second spawn — proof no extra reconnect churned the process.
-    const next = await runtime.createSession({ cwd: '/workspace' })
-    expect(next.sessionId).toBe('s2')
-    expect(spawnCount).toBe(2)
+    expect(runtime.getSnapshot().status).toBe('connected')
   })
 
   it('passes the artifact MCP server to new and resumed sessions', async () => {
@@ -4559,15 +13565,15 @@ describe('ACP runtime session management', () => {
         append: expect.stringContaining('write_artifact_file')
       }
     })
-    // The skill-privacy guardrail is appended to the system prompt on both create and resume.
+    // Skill contents are hidden by the UI projection; the agent prompt must not block native loading.
     expect(fakeAgent.newSessions[0]._meta).toMatchObject({
       systemPrompt: {
-        append: expect.stringContaining('open_science_skill_privacy_instructions')
+        append: expect.not.stringContaining('open_science_skill_privacy_instructions')
       }
     })
     expect(fakeAgent.resumedSessions[0]._meta).toMatchObject({
       systemPrompt: {
-        append: expect.stringContaining('open_science_skill_privacy_instructions')
+        append: expect.not.stringContaining('open_science_skill_privacy_instructions')
       }
     })
   })
@@ -4629,6 +13635,10 @@ describe('ACP runtime session management', () => {
     const process = new FakeAgentProcess()
     const fakeAgent = startFakeAgent(process, ['remote-session-1'])
     const aliases: Array<{ aliasSessionId: string; sessionId: string }> = []
+    const getRpcConnection = vi.fn(async () => ({
+      endpoint: 'http://127.0.0.1:4567',
+      token: 'secret-token'
+    }))
     const runtime = new AcpRuntime({
       appVersion: '0.1.0',
       defaultCwd: '/workspace',
@@ -4637,10 +13647,7 @@ describe('ACP runtime session management', () => {
         projectName: 'default-project',
         mcpEntryPath: '/app/out/main/index.js',
         mcpCommand: '/Applications/Open Science.app/Contents/MacOS/Open Science',
-        getRpcConnection: async () => ({
-          endpoint: 'http://127.0.0.1:4567',
-          token: 'secret-token'
-        }),
+        getRpcConnection,
         registerSessionAlias: (aliasSessionId, sessionId) => {
           aliases.push({ aliasSessionId, sessionId })
         }
@@ -4675,6 +13682,17 @@ describe('ACP runtime session management', () => {
         sessionId: 'remote-session-1'
       }
     ])
+    expect(getRpcConnection).toHaveBeenNthCalledWith(1, {
+      sessionId: getEnvValue(
+        fakeAgent.newSessions[0].mcpServers[0],
+        'OPEN_SCIENCE_NOTEBOOK_SESSION_ID'
+      ),
+      projectId: 'default-project'
+    })
+    expect(getRpcConnection).toHaveBeenNthCalledWith(2, {
+      sessionId: 'remote-session-2',
+      projectId: 'default-project'
+    })
     expect(fakeAgent.resumedSessions[0].mcpServers).toHaveLength(1)
     expect(
       getEnvValue(fakeAgent.resumedSessions[0].mcpServers[0], 'OPEN_SCIENCE_NOTEBOOK_SESSION_ID')
@@ -4696,6 +13714,76 @@ describe('ACP runtime session management', () => {
     const createdSessionMeta = JSON.stringify(fakeAgent.newSessions[0]._meta)
     expect(createdSessionMeta).toContain('mcp__open-science-notebook__notebook_execute')
     expect(createdSessionMeta).not.toContain('`notebook_execute`')
+  })
+
+  it('passes the conversation Skill import tool a session-scoped route', async () => {
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['remote-session-1'])
+    const aliases: Array<{ aliasSessionId: string; sessionId: string }> = []
+    const getRpcConnection = vi.fn(async () => ({
+      endpoint: 'http://127.0.0.1:4567',
+      token: 'secret-token'
+    }))
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      skillImport: {
+        mcpEntryPath: '/app/out/main/index.js',
+        mcpCommand: '/Applications/Open Science.app/Contents/MacOS/Open Science',
+        getRpcConnection,
+        registerSessionAlias: (aliasSessionId, sessionId) => {
+          aliases.push({ aliasSessionId, sessionId })
+        }
+      }
+    })
+
+    const createdSession = await runtime.createSession({ cwd: '/workspace' })
+
+    expect(fakeAgent.newSessions[0].mcpServers).toHaveLength(1)
+    expect(fakeAgent.newSessions[0].mcpServers[0]).toMatchObject({
+      name: 'open-science-skills',
+      command: '/Applications/Open Science.app/Contents/MacOS/Open Science',
+      args: ['/app/out/main/index.js', '--open-science-skill-import-mcp']
+    })
+    const aliasSessionId = getEnvValue(
+      fakeAgent.newSessions[0].mcpServers[0],
+      'OPEN_SCIENCE_SKILL_IMPORT_SESSION_ID'
+    )
+    expect(aliasSessionId).toMatch(/^skill-import-session-/)
+    expect(getRpcConnection).toHaveBeenCalledWith({ sessionId: aliasSessionId })
+    expect(aliases).toEqual([{ aliasSessionId, sessionId: createdSession.sessionId }])
+    expect(JSON.stringify(fakeAgent.newSessions[0]._meta)).toContain(
+      'mcp__open-science-skills__request_skill_import'
+    )
+  })
+
+  it('omits the conversation Skill import MCP and prompt guidance when disabled', async () => {
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['remote-session-1'])
+    const getRpcConnection = vi.fn(async () => ({
+      endpoint: 'http://127.0.0.1:4567',
+      token: 'secret-token'
+    }))
+    const registerSessionAlias = vi.fn()
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      skillImport: {
+        mcpEntryPath: '/app/out/main/index.js',
+        isEnabled: async () => false,
+        getRpcConnection,
+        registerSessionAlias
+      }
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+
+    expect(fakeAgent.newSessions[0].mcpServers).toEqual([])
+    expect(JSON.stringify(fakeAgent.newSessions[0]._meta)).not.toContain('request_skill_import')
+    expect(getRpcConnection).not.toHaveBeenCalled()
+    expect(registerSessionAlias).not.toHaveBeenCalled()
   })
 
   it('passes only the workspace as a static allowed import root, not the pre-start notebook alias', async () => {
@@ -4831,6 +13919,128 @@ describe('ACP runtime session management', () => {
     )
   })
 
+  it('retries transient Artifact claim preparation in the prompt failure cleanup', async () => {
+    const storageRoot = await createTemporaryRoot()
+    const repository = new ArtifactRepository(storageRoot)
+    const generatedArtifact = {
+      id: 'version-1',
+      artifactId: 'artifact-1',
+      versionId: 'version-1',
+      versionNumber: 1,
+      checksum: 'a'.repeat(64),
+      createdAt: '2026-08-02T00:00:00.000Z',
+      projectName: 'project-1',
+      sessionId: 'artifact-session-1',
+      runId: 'artifact-run-1',
+      name: 'result.txt',
+      path: '/managed/result.txt',
+      fileUrl: 'file:///managed/result.txt',
+      mimeType: 'text/plain',
+      size: 6,
+      mtimeMs: 1
+    }
+    let listAttempts = 0
+    const listRunVersions = vi.fn(async () => {
+      listAttempts += 1
+      if (listAttempts === 1) throw new Error('temporary Artifact list failure')
+      return [generatedArtifact]
+    })
+    const artifactEvents: AcpRuntimeEvent[] = []
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['remote-session-1'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      artifacts: {
+        configRoot: storageRoot,
+        dataRoot: storageRoot,
+        projectName: 'project-1',
+        mcpEntryPath: '/app/out/main/index.js',
+        repository,
+        provenance: {
+          listRunVersions,
+          writeAppGeneratedVersion: async () => generatedArtifact
+        }
+      },
+      callbacks: {
+        onEvent: (event) => {
+          if (event.kind === 'artifact') artifactEvents.push(event)
+        }
+      }
+    })
+    const session = await runtime.createSession({ cwd: '/workspace', projectName: 'project-1' })
+
+    await expect(
+      runtime.sendPrompt({ sessionId: session.sessionId, text: 'prepare an Artifact claim' })
+    ).rejects.toThrow('temporary Artifact list failure')
+
+    expect(listRunVersions).toHaveBeenCalledTimes(2)
+    expect(artifactEvents).toHaveLength(1)
+    const claim = resolveArtifactRunClaim(runtime, artifactEvents[0].artifactClaimId!)
+    expect(claim.artifactVersionIds).toEqual(['version-1'])
+    await expect(
+      repository.findRunFinalizationMarker('project-1', claim.runId)
+    ).resolves.toMatchObject({ artifactVersionIds: ['version-1'] })
+  })
+
+  it.each([
+    { outcome: 'success' as const, promptError: undefined },
+    { outcome: 'failure' as const, promptError: new Error('agent failed after opening the run') }
+  ])(
+    'exposes an active artifact run only while its current-run handoff is live after $outcome',
+    async ({ promptError }) => {
+      const storageRoot = await createTemporaryRoot()
+      const process = new FakeAgentProcess()
+      let currentRunFile = ''
+      let activeRunIds: string[] = []
+      let handoffRunId: string | undefined
+      const fakeAgent = startFakeAgent(process, ['remote-session-1'], {
+        onPrompt: async () => {
+          const handoff = JSON.parse(await readFile(currentRunFile, 'utf8')) as {
+            artifactRunId?: string
+          }
+          handoffRunId = handoff.artifactRunId
+          activeRunIds = runtime.getActiveArtifactRunIds()
+          if (promptError) throw promptError
+        }
+      })
+      const runtime = new AcpRuntime({
+        appVersion: '0.1.0',
+        defaultCwd: '/workspace',
+        spawnAgent: () => asAgentProcess(process),
+        artifacts: {
+          configRoot: storageRoot,
+          dataRoot: storageRoot,
+          projectName: 'default-project',
+          mcpEntryPath: '/app/out/main/index.js',
+          repository: new ArtifactRepository(storageRoot)
+        }
+      })
+
+      const session = await runtime.createSession({ cwd: '/workspace' })
+      currentRunFile = getEnvValue(
+        fakeAgent.newSessions[0].mcpServers[0],
+        'OPEN_SCIENCE_ARTIFACT_CURRENT_RUN_FILE'
+      )
+      const prompt = runtime.sendPrompt({ sessionId: session.sessionId, text: 'make a file' })
+
+      if (promptError) {
+        await expect(prompt).rejects.toMatchObject({
+          code: -32603,
+          data: { details: promptError.message }
+        })
+      } else {
+        await expect(prompt).resolves.toBeDefined()
+      }
+
+      expect(handoffRunId).toMatch(/^artifact-run-/)
+      expect(activeRunIds).toEqual([handoffRunId])
+      expect(runtime.getActiveArtifactRunIds()).toEqual([])
+      await expect(readFile(currentRunFile, 'utf8')).resolves.toBe(`${JSON.stringify({})}\n`)
+    }
+  )
+
   it('emits an artifact event with pending files before a prompt stops', async () => {
     const storageRoot = await createTemporaryRoot()
     const repository = new ArtifactRepository(storageRoot)
@@ -4839,13 +14049,19 @@ describe('ACP runtime session management', () => {
       kind: string
       sessionId?: string
       runId?: string
+      promptMessageId?: string
       artifactClaimId?: string
       artifactCount?: number
     }> = []
     let currentRunFile = ''
     const fakeAgent = startFakeAgent(process, ['remote-session-1'], {
       onPrompt: async ({ sessionId }) => {
-        const context = JSON.parse(await readFile(currentRunFile, 'utf8')) as { runId: string }
+        const context = JSON.parse(await readFile(currentRunFile, 'utf8')) as {
+          artifactRunId: string
+          agentName?: string
+        }
+
+        expect(context.agentName).toBeTruthy()
 
         await repository.writePendingFile({
           projectName: 'default-project',
@@ -4853,7 +14069,7 @@ describe('ACP runtime session management', () => {
             fakeAgent.newSessions[0].mcpServers[0],
             'OPEN_SCIENCE_ARTIFACT_SESSION_ID'
           ),
-          runId: context.runId,
+          runId: context.artifactRunId,
           filename: 'result.txt',
           source: { kind: 'inline', content: 'artifact content', encoding: 'utf8' }
         })
@@ -4879,6 +14095,7 @@ describe('ACP runtime session management', () => {
               kind: event.kind,
               sessionId: event.sessionId,
               runId: event.runId,
+              promptMessageId: event.promptMessageId,
               artifactClaimId: event.artifactClaimId,
               artifactCount: event.artifacts?.length
             })
@@ -4899,10 +14116,484 @@ describe('ACP runtime session management', () => {
         kind: 'artifact',
         sessionId: 'remote-session-1',
         runId: expect.stringMatching(/^artifact-run-/),
+        promptMessageId: expect.stringMatching(/^prompt-artifact-run-/),
         artifactClaimId: expect.stringMatching(/^artifact-claim-/),
         artifactCount: 1
       }
     ])
+    await expect(
+      repository.findRunFinalizationMarker('default-project', events[0].runId!)
+    ).resolves.toMatchObject({
+      sourceSessionId: getEnvValue(
+        fakeAgent.newSessions[0].mcpServers[0],
+        'OPEN_SCIENCE_ARTIFACT_SESSION_ID'
+      ),
+      sessionId: 'remote-session-1',
+      provenanceContext: {
+        promptMessageId: events[0].promptMessageId
+      }
+    })
+    await expect(
+      repository.findRunFinalizationMarker('default-project', events[0].runId!)
+    ).resolves.not.toHaveProperty('messageId')
+  })
+
+  it('drains an accepted app-side Artifact write before freezing the claim and marker', async () => {
+    const storageRoot = await createTemporaryRoot()
+    const client = createProjectDbClient(storageRoot)
+    temporaryDisconnections.push(() => client.$disconnect())
+    await ensureProjectSchema(client)
+    const repository = new ArtifactRepository(storageRoot)
+    const durableProvenance = new ArtifactProvenanceRepository({
+      storageRoot,
+      getClient: () => Promise.resolve(client),
+      compatibilityRepository: repository
+    })
+    const writeStarted = createDeferred()
+    const releaseWrite = createDeferred()
+    const closeStarted = createDeferred()
+    const listRunVersions = vi.fn((request) => durableProvenance.listRunVersions(request))
+    let appWrite: ReturnType<AcpRuntime['writeArtifactForCurrentRun']> | undefined
+    let artifactClaimId: string | undefined
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['remote-session-1'], {
+      onPrompt: async ({ sessionId }) => {
+        appWrite = runtime.writeArtifactForCurrentRun(sessionId, {
+          filename: 'late.txt',
+          content: 'accepted before stop',
+          mimeType: 'text/plain'
+        })
+        await writeStarted.promise
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      artifacts: {
+        configRoot: storageRoot,
+        dataRoot: storageRoot,
+        projectName: 'project-1',
+        mcpEntryPath: '/app/out/main/index.js',
+        repository,
+        provenance: {
+          listRunVersions,
+          writeAppGeneratedVersion: async (request) => {
+            writeStarted.resolve()
+            await releaseWrite.promise
+            return durableProvenance.writeAppGeneratedVersion(request)
+          }
+        },
+        issueRpcCapability: () => 'run-capability-1',
+        revokeRpcCapability: async () => {
+          closeStarted.resolve()
+        }
+      },
+      callbacks: {
+        onEvent: (event) => {
+          if (event.kind === 'artifact') artifactClaimId = event.artifactClaimId
+        }
+      }
+    })
+    const session = await runtime.createSession({ cwd: '/workspace', projectName: 'project-1' })
+    const prompt = runtime.sendPrompt({
+      sessionId: session.sessionId,
+      text: 'save late.txt',
+      provenanceContext: {
+        rootFrameId: 'root-frame-1',
+        agentFrameId: 'agent-frame-1',
+        messageBranchId: 'branch-1',
+        runtimeSegmentId: 'runtime-1',
+        promptMessageId: 'prompt-1'
+      }
+    })
+
+    await closeStarted.promise
+    expect(listRunVersions).not.toHaveBeenCalled()
+    expect(artifactClaimId).toBeUndefined()
+    await expect(
+      runtime.writeArtifactForCurrentRun(session.sessionId, {
+        filename: 'too-late.txt',
+        content: 'must be rejected'
+      })
+    ).rejects.toThrow(/No active assistant turn/i)
+
+    releaseWrite.resolve()
+    await appWrite
+    await prompt
+
+    expect(artifactClaimId).toBeTruthy()
+    const claim = resolveArtifactRunClaim(runtime, artifactClaimId!)
+    const version = await client.artifactVersion.findFirstOrThrow({
+      where: { artifactRunId: claim.runId }
+    })
+    expect(claim.artifactVersionIds).toEqual([version.id])
+    await expect(
+      repository.findRunFinalizationMarker('project-1', claim.runId)
+    ).resolves.toMatchObject({ artifactVersionIds: [version.id] })
+  })
+
+  it('drains an authorized Artifact RPC write before freezing the claim and marker', async () => {
+    const storageRoot = await createTemporaryRoot()
+    const client = createProjectDbClient(storageRoot)
+    temporaryDisconnections.push(() => client.$disconnect())
+    await ensureProjectSchema(client)
+    const repository = new ArtifactRepository(storageRoot)
+    const durableProvenance = new ArtifactProvenanceRepository({
+      storageRoot,
+      getClient: () => Promise.resolve(client),
+      compatibilityRepository: repository
+    })
+    const rpcWriteStarted = createDeferred()
+    const releaseRpcWrite = createDeferred()
+    const closeStarted = createDeferred()
+    const notebookService = new NotebookRuntimeService({
+      configRoot: storageRoot,
+      dataRoot: storageRoot,
+      projectName: 'project-1',
+      repository: new NotebookRunRepository(storageRoot)
+    })
+    const rpcServer = new NotebookLocalRpcServer(notebookService, {
+      artifactProvenance: {
+        createVersion: async (request) => {
+          rpcWriteStarted.resolve()
+          await releaseRpcWrite.promise
+          return durableProvenance.createVersion(request)
+        }
+      }
+    })
+    const rpcConnection = await rpcServer.ensureStarted()
+    const listRunVersions = vi.fn((request) => durableProvenance.listRunVersions(request))
+    let rpcWrite: Promise<Response> | undefined
+    let artifactClaimId: string | undefined
+    let currentRunFile = ''
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['remote-session-1'], {
+      onPrompt: async ({ sessionId }) => {
+        const context = JSON.parse(await readFile(currentRunFile, 'utf8')) as {
+          artifactRunId: string
+          appSessionId: string
+          rootFrameId: string
+          agentFrameId: string
+          messageBranchId: string
+          runtimeSegmentId: string
+          promptMessageId: string
+          rpcCapabilityToken: string
+        }
+        const artifactStorageSessionId = getEnvValue(
+          fakeAgent.newSessions[0].mcpServers[0],
+          'OPEN_SCIENCE_ARTIFACT_SESSION_ID'
+        )
+        await repository.writePendingFile({
+          projectName: 'project-1',
+          sessionId: artifactStorageSessionId,
+          runId: context.artifactRunId,
+          filename: 'rpc-late.txt',
+          source: { kind: 'inline', content: 'accepted RPC bytes', encoding: 'utf8' }
+        })
+        rpcWrite = fetch(rpcConnection.endpoint, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${context.rpcCapabilityToken}`,
+            'content-type': 'application/json'
+          },
+          body: JSON.stringify({
+            method: 'artifactCreateVersion',
+            params: {
+              projectId: 'project-1',
+              appSessionId: sessionId,
+              artifactStorageSessionId,
+              artifactRunId: context.artifactRunId,
+              writeOperationId: 'write-rpc-late',
+              writeRequestChecksum: 'c'.repeat(64),
+              rootFrameId: context.rootFrameId,
+              agentFrameId: context.agentFrameId,
+              messageBranchId: context.messageBranchId,
+              runtimeSegmentId: context.runtimeSegmentId,
+              promptMessageId: context.promptMessageId,
+              filename: 'rpc-late.txt',
+              contentType: 'text/plain'
+            }
+          })
+        })
+        await rpcWriteStarted.promise
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      artifacts: {
+        configRoot: storageRoot,
+        dataRoot: storageRoot,
+        projectName: 'project-1',
+        mcpEntryPath: '/app/out/main/index.js',
+        repository,
+        provenance: {
+          listRunVersions,
+          writeAppGeneratedVersion: (request) => durableProvenance.writeAppGeneratedVersion(request)
+        },
+        getRpcConnection: () => Promise.resolve(rpcConnection),
+        issueRpcCapability: (binding) => rpcServer.issueArtifactRunCapability(binding),
+        revokeRpcCapability: async (token) => {
+          closeStarted.resolve()
+          await rpcServer.revokeArtifactRunCapability(token)
+        }
+      },
+      callbacks: {
+        onEvent: (event) => {
+          if (event.kind === 'artifact') artifactClaimId = event.artifactClaimId
+        }
+      }
+    })
+
+    try {
+      const session = await runtime.createSession({ cwd: '/workspace', projectName: 'project-1' })
+      currentRunFile = getEnvValue(
+        fakeAgent.newSessions[0].mcpServers[0],
+        'OPEN_SCIENCE_ARTIFACT_CURRENT_RUN_FILE'
+      )
+      const prompt = runtime.sendPrompt({
+        sessionId: session.sessionId,
+        text: 'save through RPC',
+        provenanceContext: {
+          rootFrameId: 'root-frame-1',
+          agentFrameId: 'agent-frame-1',
+          messageBranchId: 'branch-1',
+          runtimeSegmentId: 'runtime-1',
+          promptMessageId: 'prompt-1'
+        }
+      })
+
+      await closeStarted.promise
+      expect(listRunVersions).not.toHaveBeenCalled()
+      expect(artifactClaimId).toBeUndefined()
+
+      releaseRpcWrite.resolve()
+      await expect(rpcWrite!.then((response) => response.status)).resolves.toBe(200)
+      await prompt
+
+      expect(artifactClaimId).toBeTruthy()
+      const claim = resolveArtifactRunClaim(runtime, artifactClaimId!)
+      const version = await client.artifactVersion.findFirstOrThrow({
+        where: { artifactRunId: claim.runId }
+      })
+      expect(claim.artifactVersionIds).toEqual([version.id])
+      await expect(
+        repository.findRunFinalizationMarker('project-1', claim.runId)
+      ).resolves.toMatchObject({ artifactVersionIds: [version.id] })
+    } finally {
+      releaseRpcWrite.resolve()
+      await rpcServer.close()
+    }
+  })
+
+  it('finalizes an Artifact after a restored branch supplies ancestor-only provenance context', async () => {
+    const storageRoot = await createTemporaryRoot()
+    const client = createProjectDbClient(storageRoot)
+    temporaryDisconnections.push(() => client.$disconnect())
+    await ensureProjectSchema(client)
+    const repository = new ArtifactRepository(storageRoot)
+    const durableSessionAuthority: { current?: PersistedChatSession } = {}
+    const provenance = new ArtifactProvenanceRepository({
+      storageRoot,
+      getClient: () => Promise.resolve(client),
+      compatibilityRepository: repository,
+      loadSession: async () => durableSessionAuthority.current
+    })
+    const process = new FakeAgentProcess()
+    let artifactClaimId: string | undefined
+    let writeError: unknown
+    startFakeAgent(process, ['remote-session-1'], {
+      onPrompt: async ({ sessionId }) => {
+        try {
+          await runtime.writeArtifactForCurrentRun(sessionId, {
+            filename: 'sin.txt',
+            content: 'restored-session-image',
+            mimeType: 'text/plain'
+          })
+        } catch (error) {
+          writeError = error
+        }
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      artifacts: {
+        configRoot: storageRoot,
+        dataRoot: storageRoot,
+        projectName: 'project-1',
+        mcpEntryPath: '/app/out/main/index.js',
+        repository,
+        provenance
+      },
+      callbacks: {
+        onEvent: (event) => {
+          if (event.kind === 'artifact') artifactClaimId = event.artifactClaimId
+        }
+      }
+    })
+    const session = await runtime.createSession({ cwd: '/workspace', projectName: 'project-1' })
+
+    await runtime.sendPrompt({
+      sessionId: session.sessionId,
+      text: 'draw sin again',
+      provenanceContext: {
+        rootFrameId: 'root-frame-1',
+        agentFrameId: 'agent-frame-1',
+        messageBranchId: 'branch-current',
+        // Restored conversation graphs describe ancestors separately from the active branch leaf.
+        messageBranchAncestry: ['branch-parent'],
+        messageAncestry: ['message-parent', 'prompt-current'],
+        runtimeSegmentId: 'runtime-segment-restored',
+        promptMessageId: 'prompt-current'
+      }
+    })
+
+    if (writeError) throw writeError
+    expect(artifactClaimId).toBeTruthy()
+    const claim = resolveArtifactRunClaim(runtime, artifactClaimId!)
+    const claimedVersion = await client.artifactVersion.findFirstOrThrow({
+      where: { artifactRunId: claim.runId }
+    })
+    expect(claim.artifactVersionIds).toEqual([claimedVersion.id])
+    const createdAt = Date.now()
+    const conversationGraph = {
+      schemaVersion: 1 as const,
+      rootFrameId: 'root-frame-1',
+      activeFrameId: 'agent-frame-1',
+      frames: [
+        {
+          id: 'root-frame-1',
+          originBindingState: 'root' as const,
+          kind: 'root' as const,
+          status: 'completed' as const,
+          activeBranchId: 'root-branch',
+          createdAt,
+          completedAt: createdAt
+        },
+        {
+          id: 'agent-frame-1',
+          parentFrameId: 'root-frame-1',
+          originMessageId: 'message-parent',
+          originBindingState: 'validated' as const,
+          kind: 'compatibility' as const,
+          status: 'completed' as const,
+          activeBranchId: 'branch-current',
+          createdAt,
+          completedAt: createdAt
+        }
+      ],
+      branches: [
+        {
+          id: 'root-branch',
+          agentFrameId: 'root-frame-1',
+          createdAt,
+          updatedAt: createdAt
+        },
+        {
+          id: 'branch-parent',
+          agentFrameId: 'agent-frame-1',
+          headMessageId: 'message-parent',
+          createdAt,
+          updatedAt: createdAt
+        },
+        {
+          id: 'branch-current',
+          agentFrameId: 'agent-frame-1',
+          parentBranchId: 'branch-parent',
+          forkMessageId: 'message-parent',
+          headMessageId: 'assistant-current',
+          createdAt,
+          updatedAt: createdAt
+        }
+      ],
+      messages: [
+        {
+          id: 'message-parent',
+          role: 'user' as const,
+          content: 'previous prompt',
+          status: 'complete' as const,
+          eventIds: [],
+          createdAt,
+          updatedAt: createdAt,
+          agentFrameId: 'agent-frame-1',
+          introducedOnBranchId: 'branch-parent',
+          revisionRootMessageId: 'message-parent',
+          runtimeSegmentId: 'runtime-segment-restored'
+        },
+        {
+          id: 'prompt-current',
+          role: 'user' as const,
+          content: 'draw sin again',
+          status: 'complete' as const,
+          eventIds: [],
+          createdAt: createdAt + 1,
+          updatedAt: createdAt + 1,
+          agentFrameId: 'agent-frame-1',
+          introducedOnBranchId: 'branch-current',
+          parentMessageId: 'message-parent',
+          revisionRootMessageId: 'prompt-current',
+          runtimeSegmentId: 'runtime-segment-restored'
+        },
+        {
+          id: 'assistant-current',
+          role: 'agent' as const,
+          content: 'saved sin.txt',
+          status: 'complete' as const,
+          eventIds: [],
+          createdAt: createdAt + 2,
+          updatedAt: createdAt + 2,
+          agentFrameId: 'agent-frame-1',
+          introducedOnBranchId: 'branch-current',
+          parentMessageId: 'prompt-current',
+          runtimeSegmentId: 'runtime-segment-restored'
+        }
+      ],
+      activities: [],
+      activityGroups: [],
+      runtimeSegments: [
+        {
+          id: 'runtime-segment-restored',
+          agentFrameId: 'agent-frame-1',
+          frameworkId: 'claude-code' as const,
+          startedAt: createdAt
+        }
+      ]
+    }
+    durableSessionAuthority.current = {
+      id: session.sessionId,
+      projectId: 'project-1',
+      title: 'Restored session',
+      cwd: '/workspace',
+      status: 'idle',
+      messages: conversationGraph.messages.map(projectConversationMessage),
+      conversationGraph,
+      createdAt,
+      updatedAt: createdAt + 2
+    }
+    const finalized = await provenance.finalizeRun({
+      projectId: claim.projectName,
+      appSessionId: claim.sessionId,
+      artifactRunId: claim.runId,
+      artifactVersionIds: claim.artifactVersionIds!,
+      rootFrameId: claim.rootFrameId!,
+      agentFrameId: claim.agentFrameId!,
+      messageBranchId: claim.messageBranchId!,
+      messageBranchAncestry: claim.messageBranchAncestry,
+      // The finalize IPC appends the now-known assistant message id to the prompt-time ancestry.
+      messageAncestry: [...(claim.messageAncestry ?? []), 'assistant-current'],
+      runtimeSegmentId: claim.runtimeSegmentId!,
+      promptMessageId: claim.promptMessageId!,
+      messageId: 'assistant-current'
+    })
+
+    expect(finalized).toEqual([expect.objectContaining({ name: 'sin.txt' })])
+    await expect(
+      client.artifactVersion.findFirstOrThrow({ where: { artifactRunId: claim.runId } })
+    ).resolves.toMatchObject({ state: 'finalized', messageId: 'assistant-current' })
   })
 
   it('emits an artifact event for pending files even when the prompt fails', async () => {
@@ -4913,13 +14604,16 @@ describe('ACP runtime session management', () => {
       kind: string
       sessionId?: string
       runId?: string
+      promptMessageId?: string
       artifactClaimId?: string
       artifactCount?: number
     }> = []
     let currentRunFile = ''
     const fakeAgent = startFakeAgent(process, ['remote-session-1'], {
       onPrompt: async () => {
-        const context = JSON.parse(await readFile(currentRunFile, 'utf8')) as { runId: string }
+        const context = JSON.parse(await readFile(currentRunFile, 'utf8')) as {
+          artifactRunId: string
+        }
 
         await repository.writePendingFile({
           projectName: 'default-project',
@@ -4927,7 +14621,7 @@ describe('ACP runtime session management', () => {
             fakeAgent.newSessions[0].mcpServers[0],
             'OPEN_SCIENCE_ARTIFACT_SESSION_ID'
           ),
-          runId: context.runId,
+          runId: context.artifactRunId,
           filename: 'result.txt',
           source: { kind: 'inline', content: 'artifact content', encoding: 'utf8' }
         })
@@ -4955,6 +14649,7 @@ describe('ACP runtime session management', () => {
               kind: event.kind,
               sessionId: event.sessionId,
               runId: event.runId,
+              promptMessageId: event.promptMessageId,
               artifactClaimId: event.artifactClaimId,
               artifactCount: event.artifacts?.length
             })
@@ -4977,6 +14672,7 @@ describe('ACP runtime session management', () => {
         kind: 'artifact',
         sessionId: 'remote-session-1',
         runId: expect.stringMatching(/^artifact-run-/),
+        promptMessageId: expect.stringMatching(/^prompt-artifact-run-/),
         artifactClaimId: expect.stringMatching(/^artifact-claim-/),
         artifactCount: 1
       }
@@ -4988,6 +14684,7 @@ describe('ACP runtime session management', () => {
     const blockedStorageRoot = join(storageRoot, 'storage-file')
     const process = new FakeAgentProcess()
     const events: Array<{ kind: string; text?: string }> = []
+    const revokedTokens: string[] = []
     const runtime = new AcpRuntime({
       appVersion: '0.1.0',
       defaultCwd: '/workspace',
@@ -4997,7 +14694,12 @@ describe('ACP runtime session management', () => {
         dataRoot: blockedStorageRoot,
         projectName: 'default-project',
         mcpEntryPath: '/app/out/main/index.js',
-        mcpCommand: '/usr/bin/electron'
+        mcpCommand: '/usr/bin/electron',
+        getRpcConnection: async () => ({ endpoint: 'http://127.0.0.1:4567', token: 'global' }),
+        issueRpcCapability: () => 'activation-capability',
+        revokeRpcCapability: (token) => {
+          revokedTokens.push(token)
+        }
       },
       callbacks: {
         onEvent: (event) => events.push({ kind: event.kind, text: event.text })
@@ -5012,6 +14714,7 @@ describe('ACP runtime session management', () => {
     ).rejects.toThrow()
 
     expect(runtime.getSnapshot().promptInFlightSessionIds).toEqual([])
+    expect(revokedTokens).toEqual(['activation-capability'])
     expect(events).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -5079,6 +14782,61 @@ describe('ACP runtime session management', () => {
     const errorEvent = events.find((event) => event.kind === 'error')
     expect(errorEvent).toBeDefined()
     expect(errorEvent?.recoverable).toBeUndefined()
+  })
+
+  it('tags a provider-relayed prompt failure with providerError so the renderer hides Report', async () => {
+    const process = new FakeAgentProcess()
+    const events: Array<{ kind: string; providerError?: boolean }> = []
+    startFakeAgent(process, ['remote-session-1'], {
+      onPrompt: () => {
+        // An upstream provider rejection the agent relays as an APIError — the user's to fix, not a bug.
+        throw acp.RequestError.internalError({ errorName: 'APIError' }, 'Invalid API key')
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      callbacks: {
+        onEvent: (event) => events.push({ kind: event.kind, providerError: event.providerError })
+      }
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    await expect(
+      runtime.sendPrompt({ sessionId: 'remote-session-1', text: 'hi' })
+    ).rejects.toThrow()
+
+    expect(events).toContainEqual({ kind: 'error', providerError: true })
+  })
+
+  it('does not tag an ACP-layer prompt failure as providerError (stays reportable)', async () => {
+    const process = new FakeAgentProcess()
+    const events: Array<{ kind: string; providerError?: boolean }> = []
+    startFakeAgent(process, ['remote-session-1'], {
+      onPrompt: () => {
+        // A protocol-level failure with no upstream provider signal is an app/ACP problem, not a
+        // provider one, so it must NOT be tagged (the renderer keeps the Report button).
+        throw acp.RequestError.internalError({ errorKind: 'invalid_request' }, 'malformed request')
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      callbacks: {
+        onEvent: (event) => events.push({ kind: event.kind, providerError: event.providerError })
+      }
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    await expect(
+      runtime.sendPrompt({ sessionId: 'remote-session-1', text: 'hi' })
+    ).rejects.toThrow()
+
+    const errorEvent = events.find((event) => event.kind === 'error')
+    expect(errorEvent).toBeDefined()
+    expect(errorEvent?.providerError).toBeFalsy()
   })
 
   it('logs the provider rejection reason (message/code/data) when a prompt fails', async () => {
@@ -5181,6 +14939,81 @@ describe('ACP runtime session management', () => {
     expect(fakeAgent.resumedSessions).toEqual([])
   })
 
+  it('keeps a pending permission available when prompt cancellation fails', async () => {
+    const process = new FakeAgentProcess()
+    const permissionResponses: acp.RequestPermissionResponse[] = []
+
+    acp
+      .agent({ name: 'failed-cancel-permission-agent' })
+      .onRequest(acp.methods.agent.initialize, () => ({
+        protocolVersion: acp.PROTOCOL_VERSION,
+        agentCapabilities: {
+          loadSession: false,
+          sessionCapabilities: { close: {} }
+        },
+        authMethods: []
+      }))
+      .onRequest(acp.methods.agent.session.new, () => ({ sessionId: 'remote-session-1' }))
+      .onRequest(acp.methods.agent.session.prompt, async (ctx) => {
+        permissionResponses.push(
+          await ctx.client.request(acp.methods.client.session.requestPermission, {
+            sessionId: ctx.params.sessionId,
+            toolCall: {
+              toolCallId: 'pending-command',
+              title: 'Run command',
+              kind: 'execute',
+              status: 'pending',
+              rawInput: { command: 'npm test' }
+            },
+            options: [
+              { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
+              { optionId: 'reject', name: 'Reject', kind: 'reject_once' }
+            ]
+          })
+        )
+        return { stopReason: 'end_turn' }
+      })
+      .onRequest(acp.methods.agent.session.close, () => ({}))
+      .connect(
+        acp.ndJsonStream(
+          Writable.toWeb(process.stdout) as WritableStream<Uint8Array>,
+          Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>
+        )
+      )
+
+    const permissionRequests: AcpPermissionRequest[] = []
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      callbacks: { onPermissionRequest: (request) => permissionRequests.push(request) }
+    })
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    const prompt = runtime.sendPrompt({ sessionId: session.sessionId, text: 'run tests' })
+
+    await vi.waitFor(() => expect(runtime.getSnapshot().pendingPermissions).toHaveLength(1))
+    const connection = (
+      runtime as unknown as {
+        connection: { agent: { notify: (method: unknown, params: unknown) => Promise<void> } }
+      }
+    ).connection
+    vi.spyOn(connection.agent, 'notify').mockRejectedValueOnce(new Error('cancel write failed'))
+
+    await expect(runtime.cancelPrompt({ sessionId: session.sessionId })).rejects.toThrow(
+      'cancel write failed'
+    )
+    expect(runtime.getSnapshot().pendingPermissions).toHaveLength(1)
+    expect(runtime.getSnapshot().promptInFlightSessionIds).toEqual([session.sessionId])
+
+    runtime.respondToPermission({
+      requestId: permissionRequests[0].requestId,
+      optionId: 'reject'
+    })
+    await prompt
+
+    expect(permissionResponses).toEqual([{ outcome: { outcome: 'selected', optionId: 'reject' } }])
+  })
+
   it('keeps a cancelling prompt in flight until the agent returns its stop response', async () => {
     const process = new FakeAgentProcess()
     const promptCanStop = createDeferred()
@@ -5210,7 +15043,15 @@ describe('ACP runtime session management', () => {
         if (prompts.length === 1) {
           promptStarted.resolve()
           await promptCanStop.promise
-          return { stopReason: 'cancelled' }
+          return {
+            stopReason: 'cancelled',
+            usage: {
+              totalTokens: 27,
+              inputTokens: 19,
+              cachedReadTokens: 5,
+              outputTokens: 3
+            }
+          }
         }
 
         return { stopReason: 'end_turn' }
@@ -5250,6 +15091,9 @@ describe('ACP runtime session management', () => {
 
     expect(runtime.getSnapshot().promptInFlightSessionIds).toEqual([])
     expect(prompts).toEqual(['first prompt'])
+    expect(runtime.getSnapshot().events.find((event) => event.kind === 'stop')).toMatchObject({
+      turnUsage: { inputTokens: 19, cacheTokens: 5, outputTokens: 3 }
+    })
   })
 })
 
@@ -5279,27 +15123,164 @@ describe('ACP runtime skill force-load + nudge', () => {
   // A stub of the settings-service skill hooks with per-call spies for assertions.
   const createSkillsHooks = (options: {
     needForceLoad: string[]
-    names: Record<string, string>
+    nudgeNames?: Record<string, string>
+    descriptors?: Record<string, { name: string; path: string }>
+    catalog?: Array<{ name: string; description: string; path: string }>
   }): {
     needForceLoad: ReturnType<typeof vi.fn<(ids: string[]) => Promise<string[]>>>
-    setTurnForced: ReturnType<typeof vi.fn<(ids: string[]) => void>>
-    clearTurnForced: ReturnType<typeof vi.fn<() => void>>
     namesForIds: ReturnType<typeof vi.fn<(ids: string[]) => Promise<string[]>>>
+    descriptorsForIds: ReturnType<
+      typeof vi.fn<
+        (ids: string[], codexHome: string | undefined) => Promise<{ name: string; path: string }[]>
+      >
+    >
+    catalogForCodexHome: ReturnType<
+      typeof vi.fn<
+        (
+          codexHome: string | undefined
+        ) => Promise<Array<{ name: string; description: string; path: string }>>
+      >
+    >
   } => ({
     needForceLoad: vi.fn<(ids: string[]) => Promise<string[]>>(async () => options.needForceLoad),
-    setTurnForced: vi.fn<(ids: string[]) => void>(),
-    clearTurnForced: vi.fn<() => void>(),
     namesForIds: vi.fn<(ids: string[]) => Promise<string[]>>(async (ids: string[]) =>
-      ids.map((id) => options.names[id]).filter((name): name is string => name !== undefined)
+      ids.map((id) => options.nudgeNames?.[id] ?? id)
+    ),
+    descriptorsForIds: vi.fn(async (ids: string[]) =>
+      ids.flatMap((id) => {
+        const descriptor = options.descriptors?.[id]
+        return descriptor ? [descriptor] : []
+      })
+    ),
+    catalogForCodexHome: vi.fn(async () => options.catalog ?? [])
+  })
+
+  it('does not let a delayed pre-start attempt overwrite a newer active turn', async () => {
+    const process = new FakeAgentProcess()
+    const skillCheckEntered = createDeferred()
+    const releaseSkillCheck = createDeferred()
+    const newerPromptEntered = createDeferred()
+    const releaseNewerPrompt = createDeferred()
+    const onPromptStarted = vi.fn()
+    const onPromptEnded = vi.fn()
+    startFakeAgent(process, ['remote-session-1'], {
+      onPrompt: async ({ text }) => {
+        if (text === 'newer prompt') {
+          newerPromptEntered.resolve()
+          await releaseNewerPrompt.promise
+        }
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      callbacks: { onPromptStarted, onPromptEnded },
+      skills: {
+        needForceLoad: async () => {
+          skillCheckEntered.resolve()
+          await releaseSkillCheck.promise
+          return ['research']
+        },
+        namesForIds: async (ids) => ids
+      }
+    })
+    const session = await runtime.createSession({ cwd: '/workspace' })
+
+    const delayedPrompt = runtime.sendPrompt({
+      sessionId: session.sessionId,
+      text: 'delayed prompt',
+      forcedSkillIds: ['research']
+    })
+    await skillCheckEntered.promise
+    await runtime.cancelPrompt({ sessionId: session.sessionId })
+
+    const newerPrompt = runtime.sendPrompt({
+      sessionId: session.sessionId,
+      text: 'newer prompt'
+    })
+    await newerPromptEntered.promise
+    releaseSkillCheck.resolve()
+
+    await expect(delayedPrompt).rejects.toThrow(/already running/)
+    expect(onPromptStarted).toHaveBeenCalledOnce()
+    expect(process.killed).toBe(false)
+
+    releaseNewerPrompt.resolve()
+    await expect(newerPrompt).resolves.toMatchObject({ stopReason: 'end_turn' })
+    expect(onPromptEnded).toHaveBeenCalledOnce()
+    expect(onPromptEnded).toHaveBeenCalledWith(session.sessionId, onPromptStarted.mock.calls[0][1])
+  })
+
+  it('passes turn-forced skill ids to backend resolution per runtime instance', async () => {
+    const firstSpawner = createFreshAgentSpawner()
+    const secondSpawner = createFreshAgentSpawner()
+    const firstContexts: Array<
+      { forcedSkillIds: string[]; systemPromptAppends?: string[] } | undefined
+    > = []
+    const secondContexts: Array<
+      { forcedSkillIds: string[]; systemPromptAppends?: string[] } | undefined
+    > = []
+    const createRuntime = (
+      spawner: ReturnType<typeof createFreshAgentSpawner>,
+      contexts: Array<{ forcedSkillIds: string[]; systemPromptAppends?: string[] } | undefined>
+    ): AcpRuntime =>
+      new AcpRuntime({
+        appVersion: '0.1.0',
+        defaultCwd: '/workspace',
+        resolveBackend: (context?: {
+          forcedSkillIds: string[]
+          systemPromptAppends?: string[]
+        }) => {
+          contexts.push(context)
+          return {
+            framework: { ...claudeCodeFramework, spawn: spawner.spawn },
+            executablePath: '/bin/agent',
+            env: {}
+          }
+        },
+        skills: {
+          needForceLoad: async (ids) => ids,
+          namesForIds: async (ids) => ids
+        }
+      })
+
+    const first = createRuntime(firstSpawner, firstContexts)
+    const second = createRuntime(secondSpawner, secondContexts)
+    await Promise.all([
+      first.createSession({ cwd: '/workspace' }),
+      second.createSession({ cwd: '/workspace' })
+    ])
+    await Promise.all([
+      first.sendPrompt({
+        sessionId: 'remote-session-1',
+        text: 'first',
+        forcedSkillIds: ['skill-a']
+      }),
+      second.sendPrompt({
+        sessionId: 'remote-session-1',
+        text: 'second',
+        forcedSkillIds: ['skill-b']
+      })
+    ])
+
+    expect(firstContexts).toEqual(
+      expect.arrayContaining([expect.objectContaining({ forcedSkillIds: ['skill-a'] })])
+    )
+    expect(secondContexts).toEqual(
+      expect.arrayContaining([expect.objectContaining({ forcedSkillIds: ['skill-b'] })])
+    )
+    expect(firstContexts).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ forcedSkillIds: ['skill-b'] })])
+    )
+    expect(secondContexts).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ forcedSkillIds: ['skill-a'] })])
     )
   })
 
   it('respawns and nudges when a picked skill is disabled, then restores after the turn', async () => {
     const spawner = createFreshAgentSpawner()
-    const hooks = createSkillsHooks({
-      needForceLoad: ['research'],
-      names: { research: 'Deep Research' }
-    })
+    const hooks = createSkillsHooks({ needForceLoad: ['research'] })
     const runtime = new AcpRuntime({
       appVersion: '0.1.0',
       defaultCwd: '/workspace',
@@ -5316,31 +15297,28 @@ describe('ACP runtime skill force-load + nudge', () => {
       forcedSkillIds: ['research']
     })
 
-    // The picked skill was marked forced and the agent respawned before the prompt (resume path).
-    expect(hooks.setTurnForced).toHaveBeenCalledWith(['research'])
+    // The picked skill was scoped to this runtime and the agent respawned before the prompt.
     expect(spawner.spawnCount()).toBe(2)
     expect(spawner.agents[1].resumedSessions).toHaveLength(1)
 
-    // The nudge is prepended to the text the agent receives (on the respawned agent).
+    // The nudge names the skill by its slug id (the identifier the agent's Skill tool resolves),
+    // NOT its human display name — a display name like "Deep Research" is unknown to the tool.
     expect(spawner.agents[1].prompts).toEqual([
       {
         sessionId: 'remote-session-1',
-        text: 'Use the following skill(s) for this task: Deep Research.\n\nsummarize the paper'
+        text: 'Use the following skill(s) for this task: research.\n\nsummarize the paper'
       }
     ])
 
-    // After the turn the force set is cleared and a restore reconnect is scheduled (agent torn down).
-    expect(hooks.clearTurnForced).toHaveBeenCalledTimes(1)
+    // After the turn the force set is cleared and a planned restore reconnect tears the agent down
+    // without advertising an abnormal closed connection to the renderer.
     await new Promise((resolve) => setTimeout(resolve, 0))
-    expect(runtime.getSnapshot().status).toBe('closed')
+    expect(runtime.getSnapshot().status).toBe('idle')
   })
 
   it('nudges without any reconnect when every picked skill is already enabled', async () => {
     const spawner = createFreshAgentSpawner()
-    const hooks = createSkillsHooks({
-      needForceLoad: [],
-      names: { research: 'Deep Research' }
-    })
+    const hooks = createSkillsHooks({ needForceLoad: [] })
     const runtime = new AcpRuntime({
       appVersion: '0.1.0',
       defaultCwd: '/workspace',
@@ -5356,23 +15334,326 @@ describe('ACP runtime skill force-load + nudge', () => {
     })
 
     // No disabled picks → no respawn and no force set toggling, but the nudge is still prepended.
-    expect(hooks.setTurnForced).not.toHaveBeenCalled()
-    expect(hooks.clearTurnForced).not.toHaveBeenCalled()
     expect(spawner.spawnCount()).toBe(1)
     expect(spawner.agents[0].prompts).toEqual([
       {
         sessionId: 'remote-session-1',
-        text: 'Use the following skill(s) for this task: Deep Research.\n\nsummarize the paper'
+        text: 'Use the following skill(s) for this task: research.\n\nsummarize the paper'
       }
     ])
   })
 
-  it('leaves the prompt untouched when no skills are picked', async () => {
+  it('nudges a personal skill by its agent-resolvable frontmatter name', async () => {
     const spawner = createFreshAgentSpawner()
     const hooks = createSkillsHooks({
-      needForceLoad: ['research'],
-      names: { research: 'Deep Research' }
+      needForceLoad: [],
+      nudgeNames: { 'personal-my-skill': 'My Skill' }
     })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: spawner.spawn,
+      skills: hooks
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    await runtime.sendPrompt({
+      sessionId: 'remote-session-1',
+      text: 'summarize the paper',
+      forcedSkillIds: ['personal-my-skill']
+    })
+
+    expect(spawner.agents[0].prompts).toEqual([
+      {
+        sessionId: 'remote-session-1',
+        text: 'Use the following skill(s) for this task: My Skill.\n\nsummarize the paper'
+      }
+    ])
+    expect(hooks.namesForIds).toHaveBeenCalledWith(['personal-my-skill'])
+  })
+
+  it('sends a picked Codex Skill as private native-input metadata without changing text', async () => {
+    const process = new FakeAgentProcess()
+    let receivedPrompt: ContentBlock[] = []
+    startFakeAgent(process, ['codex-session-1'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'read-only'),
+      onPrompt: ({ prompt }) => {
+        receivedPrompt = prompt
+      }
+    })
+    const skillPath = '/data/codex-subscription/skills/os-research/SKILL.md'
+    const hooks = createSkillsHooks({
+      needForceLoad: [],
+      descriptors: { research: { name: 'research', path: skillPath } }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: { ...codexFramework, buildSessionSetup: () => ({}) },
+      skills: hooks
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    await runtime.sendPrompt({
+      sessionId: 'codex-session-1',
+      text: 'summarize the paper',
+      forcedSkillIds: ['research']
+    })
+
+    expect(receivedPrompt).toEqual([
+      {
+        type: 'text',
+        text: 'summarize the paper',
+        _meta: {
+          'open-science/skill-inputs': [{ name: 'research', path: skillPath }]
+        }
+      }
+    ])
+    expect(hooks.namesForIds).not.toHaveBeenCalled()
+  })
+
+  it('selects a bridged Codex Skill from current user text and attaches native-input metadata', async () => {
+    const process = new FakeAgentProcess()
+    let receivedPrompt: ContentBlock[] = []
+    const events: AcpRuntimeEvent[] = []
+    startFakeAgent(process, ['codex-session-1'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'read-only'),
+      onPrompt: ({ prompt }) => {
+        receivedPrompt = prompt
+      }
+    })
+    const skillPath = '/data/codex/skills/os-mcp-pubmed/SKILL.md'
+    const catalog = [{ name: 'mcp-pubmed', description: 'Search PubMed.', path: skillPath }]
+    const hooks = createSkillsHooks({ needForceLoad: [], catalog })
+    const selectSkills = vi.fn(async () => [{ name: 'mcp-pubmed', path: skillPath }])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: {
+          ...codexFramework,
+          spawn: () => asAgentProcess(process),
+          buildSessionSetup: () => ({ promptPrefix: 'framework guidance' })
+        },
+        executablePath: '/bin/codex-acp',
+        env: { CODEX_HOME: '/data/codex' },
+        responsesBridgeLease: {
+          selectSkills,
+          registerReviewerSession: vi.fn(),
+          unregisterReviewerSession: vi.fn(() => false),
+          release: vi.fn(async () => undefined)
+        }
+      }),
+      callbacks: { onEvent: (event) => events.push(event) },
+      skills: hooks
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    await runtime.sendPrompt({
+      sessionId: 'codex-session-1',
+      text: '用 PubMed 搜索肿瘤免疫文章',
+      historyPreamble: 'earlier conversation'
+    })
+
+    expect(hooks.catalogForCodexHome).toHaveBeenCalledWith('/data/codex')
+    expect(selectSkills).toHaveBeenCalledWith(
+      '用 PubMed 搜索肿瘤免疫文章',
+      catalog,
+      expect.any(AbortSignal)
+    )
+    expect(receivedPrompt).toEqual([
+      {
+        type: 'text',
+        text: 'earlier conversation\n\nframework guidance\n\n用 PubMed 搜索肿瘤免疫文章',
+        _meta: {
+          'open-science/skill-inputs': [{ name: 'mcp-pubmed', path: skillPath }]
+        }
+      }
+    ])
+    const skillEvents = events.filter((event) => event.providerToolName === 'skill')
+    expect(skillEvents).toEqual([
+      expect.objectContaining({
+        kind: 'tool',
+        title: 'Loaded skill: mcp-pubmed',
+        status: 'in_progress'
+      }),
+      expect.objectContaining({
+        kind: 'tool',
+        title: 'Loaded skill: mcp-pubmed',
+        status: 'completed'
+      })
+    ])
+    expect(skillEvents[0]?.toolCallId).toBe(skillEvents[1]?.toolCallId)
+    expect(JSON.stringify(skillEvents)).not.toContain(skillPath)
+  })
+
+  it('bypasses bridged Codex Skill selection when the picker supplies an explicit Skill', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['codex-session-1'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'read-only')
+    })
+    const explicitPath = '/data/codex/skills/os-research/SKILL.md'
+    const hooks = createSkillsHooks({
+      needForceLoad: [],
+      descriptors: { research: { name: 'research', path: explicitPath } },
+      catalog: [{ name: 'automatic', description: 'Automatic.', path: '/automatic/SKILL.md' }]
+    })
+    const selectSkills = vi.fn(async () => [{ name: 'automatic', path: '/automatic/SKILL.md' }])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...codexFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/codex-acp',
+        env: { CODEX_HOME: '/data/codex' },
+        responsesBridgeLease: {
+          selectSkills,
+          registerReviewerSession: vi.fn(),
+          unregisterReviewerSession: vi.fn(() => false),
+          release: vi.fn(async () => undefined)
+        }
+      }),
+      skills: hooks
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    await runtime.sendPrompt({
+      sessionId: 'codex-session-1',
+      text: 'use my explicit choice',
+      forcedSkillIds: ['research']
+    })
+
+    expect(hooks.descriptorsForIds).toHaveBeenCalledWith(['research'], '/data/codex')
+    expect(hooks.catalogForCodexHome).not.toHaveBeenCalled()
+    expect(selectSkills).not.toHaveBeenCalled()
+  })
+
+  it('keeps native Codex discovery untouched when no responses bridge is active', async () => {
+    const process = new FakeAgentProcess()
+    const agent = startFakeAgent(process, ['codex-session-1'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'read-only')
+    })
+    const hooks = createSkillsHooks({
+      needForceLoad: [],
+      catalog: [{ name: 'research', description: 'Research.', path: '/research/SKILL.md' }]
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: { ...codexFramework, buildSessionSetup: () => ({}) },
+      skills: hooks
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    await runtime.sendPrompt({ sessionId: 'codex-session-1', text: 'plain native request' })
+
+    expect(hooks.catalogForCodexHome).not.toHaveBeenCalled()
+    expect(agent.prompts).toEqual([{ sessionId: 'codex-session-1', text: 'plain native request' }])
+  })
+
+  it('fails open to the ordinary Codex turn when automatic Skill selection rejects', async () => {
+    const process = new FakeAgentProcess()
+    const agent = startFakeAgent(process, ['codex-session-1'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'read-only')
+    })
+    const hooks = createSkillsHooks({
+      needForceLoad: [],
+      catalog: [{ name: 'research', description: 'Research.', path: '/research/SKILL.md' }]
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: {
+          ...codexFramework,
+          spawn: () => asAgentProcess(process),
+          buildSessionSetup: () => ({})
+        },
+        executablePath: '/bin/codex-acp',
+        env: { CODEX_HOME: '/data/codex' },
+        responsesBridgeLease: {
+          selectSkills: vi.fn(async () => Promise.reject(new Error('selector unavailable'))),
+          registerReviewerSession: vi.fn(),
+          unregisterReviewerSession: vi.fn(() => false),
+          release: vi.fn(async () => undefined)
+        }
+      }),
+      skills: hooks
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    await runtime.sendPrompt({ sessionId: 'codex-session-1', text: 'ordinary request' })
+
+    expect(agent.prompts).toEqual([{ sessionId: 'codex-session-1', text: 'ordinary request' }])
+    expect(warnLogSpy).toHaveBeenCalledWith('Codex Skill selection failed', {
+      reason: 'selector-error'
+    })
+  })
+
+  it('cancels bridged Codex Skill selection before submitting the agent prompt', async () => {
+    const process = new FakeAgentProcess()
+    const agent = startFakeAgent(process, ['codex-session-1'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'read-only')
+    })
+    const selectorStarted = createDeferred()
+    const releaseSelector = createDeferred()
+    let selectorWasAborted = false
+    const selectSkills = vi.fn(
+      async (
+        _text: string,
+        _catalog: Array<{ name: string; description: string; path: string }>,
+        signal?: AbortSignal
+      ) => {
+        selectorStarted.resolve()
+        await releaseSelector.promise
+        selectorWasAborted = signal?.aborted ?? false
+        return []
+      }
+    )
+    const hooks = createSkillsHooks({
+      needForceLoad: [],
+      catalog: [{ name: 'research', description: 'Research.', path: '/research/SKILL.md' }]
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: {
+          ...codexFramework,
+          spawn: () => asAgentProcess(process),
+          buildSessionSetup: () => ({})
+        },
+        executablePath: '/bin/codex-acp',
+        env: { CODEX_HOME: '/data/codex' },
+        responsesBridgeLease: {
+          selectSkills,
+          registerReviewerSession: vi.fn(),
+          unregisterReviewerSession: vi.fn(() => false),
+          release: vi.fn(async () => undefined)
+        }
+      }),
+      skills: hooks
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    const prompting = runtime.sendPrompt({
+      sessionId: 'codex-session-1',
+      text: 'select then run'
+    })
+    await selectorStarted.promise
+    await runtime.cancelPrompt({ sessionId: 'codex-session-1' })
+    releaseSelector.resolve()
+
+    await expect(prompting).resolves.toMatchObject({ stopReason: 'cancelled' })
+    expect(selectorWasAborted).toBe(true)
+    expect(agent.prompts).toEqual([])
+  })
+
+  it('leaves the prompt untouched when no skills are picked', async () => {
+    const spawner = createFreshAgentSpawner()
+    const hooks = createSkillsHooks({ needForceLoad: ['research'] })
     const runtime = new AcpRuntime({
       appVersion: '0.1.0',
       defaultCwd: '/workspace',
@@ -5385,12 +15666,114 @@ describe('ACP runtime skill force-load + nudge', () => {
 
     // With no forcedSkillIds, none of the skill hooks run and the text is unchanged.
     expect(hooks.needForceLoad).not.toHaveBeenCalled()
-    expect(hooks.namesForIds).not.toHaveBeenCalled()
-    expect(hooks.setTurnForced).not.toHaveBeenCalled()
     expect(spawner.spawnCount()).toBe(1)
     expect(spawner.agents[0].prompts).toEqual([
       { sessionId: 'remote-session-1', text: 'plain prompt' }
     ])
+  })
+
+  // End-to-end guard over the whole bundled set: for EVERY real bundled skill, the nudge the agent
+  // receives must name it by the exact id the agent's Skill tool resolves (its frontmatter name), and
+  // must NOT leak the human display name. This is the regression that "any / skill errors" reduces to.
+  it('nudges every bundled skill by its resolvable id, never its display name', async () => {
+    const bundled = await new SkillRegistry(
+      join(__dirname, '..', '..', '..', 'resources', 'skills')
+    ).list()
+    expect(bundled.length).toBeGreaterThan(0)
+
+    for (const skill of bundled) {
+      const spawner = createFreshAgentSpawner()
+      const hooks = createSkillsHooks({ needForceLoad: [] })
+      const runtime = new AcpRuntime({
+        appVersion: '0.1.0',
+        defaultCwd: '/workspace',
+        spawnAgent: spawner.spawn,
+        skills: hooks
+      })
+
+      await runtime.createSession({ cwd: '/workspace' })
+      await runtime.sendPrompt({
+        sessionId: 'remote-session-1',
+        text: 'do the task',
+        forcedSkillIds: [skill.id]
+      })
+
+      const prompt = spawner.agents[0].prompts[0]?.text ?? ''
+      expect(prompt, `nudge for "${skill.id}"`).toBe(
+        `Use the following skill(s) for this task: ${skill.id}.\n\ndo the task`
+      )
+      // A display name that differs from the id (16 of 18 bundled skills) must never reach the agent.
+      if (skill.name !== skill.id) {
+        expect(prompt, `display name for "${skill.id}"`).not.toContain(skill.name)
+      }
+    }
+  })
+})
+
+describe('ACP runtime Codex Skill activity projection', () => {
+  it('emits only the Skill name for a native Codex SKILL.md read lifecycle', () => {
+    const events: AcpRuntimeEvent[] = []
+    const codexHome = join('/data', 'codex-subscription')
+    const skillPath = join(codexHome, 'skills', 'mcp-pubmed', 'SKILL.md')
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      callbacks: { onEvent: (event) => events.push(event) }
+    })
+    const internal = runtime as unknown as {
+      applyResolvedBackend: (backend: {
+        framework: typeof codexFramework
+        backendId: string
+        executablePath: string
+        env: NodeJS.ProcessEnv
+      }) => void
+      handleSessionUpdate: (notification: SessionNotification) => void
+      activeSessionFor: (sessionId: string) => { sessionId: string } | undefined
+    }
+    internal.applyResolvedBackend({
+      framework: codexFramework,
+      backendId: 'codex:isolated',
+      executablePath: '/data/codex-acp',
+      env: { CODEX_HOME: codexHome }
+    })
+    vi.spyOn(internal, 'activeSessionFor').mockReturnValue({ sessionId: 'session-1' })
+
+    internal.handleSessionUpdate({
+      sessionId: 'session-1',
+      update: {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'read-skill-1',
+        kind: 'read',
+        title: `Read file '${skillPath}'`,
+        status: 'in_progress',
+        locations: [{ path: skillPath }]
+      }
+    })
+    internal.handleSessionUpdate({
+      sessionId: 'session-1',
+      update: {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'read-skill-1',
+        status: 'completed',
+        rawOutput: { formatted_output: 'FULL SKILL BODY', exit_code: 0 }
+      }
+    })
+    internal.handleSessionUpdate({
+      sessionId: 'session-1',
+      update: { sessionUpdate: 'usage_update', used: 100, size: 128000 }
+    })
+
+    expect(events).toHaveLength(2)
+    expect(events.map((event) => event.title)).toEqual([
+      'Loading skill: mcp-pubmed',
+      'Loaded skill: mcp-pubmed'
+    ])
+    expect(JSON.stringify(events)).not.toContain(skillPath)
+    expect(JSON.stringify(events)).not.toContain('FULL SKILL BODY')
+    const categories =
+      runtime.getSnapshot().contextUsageBySession['session-1']?.breakdown?.categories
+    expect(categories).toContainEqual(expect.objectContaining({ key: 'skills', estimated: true }))
+    expect(categories).not.toContainEqual(expect.objectContaining({ key: 'tools' }))
   })
 })
 
@@ -5450,7 +15833,7 @@ describe('ACP runtime — agent process lifecycle logging', () => {
     expect((call?.[1] as { signal: string }).signal).toBe('SIGKILL')
   })
 
-  it('logs an agent process error event with framework and pid', async () => {
+  it('logs an agent process error event with a safe category and lifecycle context', async () => {
     errorLogSpy.mockClear()
     const process = new FakeAgentProcess()
     process.pid = 9090
@@ -5462,15 +15845,23 @@ describe('ACP runtime — agent process lifecycle logging', () => {
     })
 
     await runtime.createSession({ cwd: '/workspace' })
-    process.emit('error', new Error('EPIPE'))
+    process.emit(
+      'error',
+      Object.assign(new Error('sensitive pipe failure'), {
+        code: 'EPIPE',
+        path: '/private/sensitive-socket'
+      })
+    )
 
     const call = errorLogSpy.mock.calls.find(([message]) => message === 'agent process error event')
     expect(call).toBeDefined()
-    const data = call?.[1] as { error: string; framework: string; pid: number; status: string }
-    expect(data.error).toBe('EPIPE')
-    expect(data.framework).toBe('claude-code')
-    expect(data.pid).toBe(9090)
-    expect(data.status).toBe('connected')
+    expect(call?.[1]).toEqual({
+      errorCategory: 'system',
+      framework: 'claude-code',
+      generation: 1,
+      status: 'connected'
+    })
+    expect(JSON.stringify(call?.[1])).not.toMatch(/sensitive pipe failure|sensitive-socket|9090/)
   })
 
   it('logs agent stderr with the framework the process was spawned under', async () => {
@@ -5522,7 +15913,7 @@ describe('ACP runtime — agent process lifecycle logging', () => {
 })
 
 describe('ACP runtime — connect failure logging', () => {
-  it('logs "agent connection failed" with error, cwd, and framework when spawn throws', async () => {
+  it('logs "agent connection failed" with a safe category and lifecycle context', async () => {
     errorLogSpy.mockClear()
     const runtime = new AcpRuntime({
       appVersion: '0.1.0',
@@ -5536,39 +15927,56 @@ describe('ACP runtime — connect failure logging', () => {
 
     const call = errorLogSpy.mock.calls.find(([message]) => message === 'agent connection failed')
     expect(call).toBeDefined()
-    const data = call?.[1] as { error: string; code: string; cwd: string; framework: string }
-    expect(data.error).toBe('spawn claude ENOENT')
-    expect(data.code).toBe('ENOENT')
-    expect(data.cwd).toBe(resolve('/workspace'))
-    expect(data.framework).toBe('claude-code')
+    expect(call?.[1]).toEqual({
+      errorCategory: 'not-found',
+      framework: 'claude-code',
+      generation: 1,
+      status: 'connecting'
+    })
   })
 
   it('logs "agent connection abandoned" (not failed) when the generation is superseded mid-spawn', async () => {
     warnLogSpy.mockClear()
     errorLogSpy.mockClear()
     const process = new FakeAgentProcess()
+    const { lease, release } = createBackendLeaseHarness()
     process.pid = 1212
     const runtime = new AcpRuntime({
       appVersion: '0.1.0',
       defaultCwd: '/workspace',
       // Bump the connection generation synchronously during spawn: the connect that captured the older
       // generation must detect the supersede after the child appears and abandon it.
-      spawnAgent: () => {
-        ;(runtime as unknown as { connectionGeneration: number }).connectionGeneration += 1
-        return asAgentProcess(process)
-      }
+      resolveBackend: () => ({
+        framework: {
+          ...claudeCodeFramework,
+          spawn: () => {
+            ;(
+              runtime as unknown as {
+                connectionResources: { supersede: () => number }
+              }
+            ).connectionResources.supersede()
+            return asAgentProcess(process)
+          }
+        },
+        executablePath: '/bin/agent',
+        env: {},
+        responsesBridgeLease: lease
+      })
     })
 
     await expect(runtime.createSession({ cwd: '/workspace' })).rejects.toThrow(/superseded/i)
+    expect(release).toHaveBeenCalledOnce()
 
     const abandoned = warnLogSpy.mock.calls.find(
       ([message]) => message === 'agent connection abandoned (superseded or shutting down)'
     )
     expect(abandoned).toBeDefined()
-    const data = abandoned?.[1] as { framework: string; agentProcessPid: number; cwd: string }
-    expect(data.framework).toBe('claude-code')
-    expect(data.agentProcessPid).toBe(1212)
-    expect(data.cwd).toBe(resolve('/workspace'))
+    expect(abandoned?.[1]).toEqual({
+      errorCategory: 'error',
+      framework: 'claude-code',
+      generation: 1,
+      status: 'connecting'
+    })
     // The supersede path must NOT also emit the error-level "failed" record.
     expect(errorLogSpy.mock.calls.some(([message]) => message === 'agent connection failed')).toBe(
       false
@@ -5577,6 +15985,7 @@ describe('ACP runtime — connect failure logging', () => {
 
   it('labels a real-backend spawn failure with the resolved (switched) framework, not the old one', async () => {
     errorLogSpy.mockClear()
+    const { lease, release } = createBackendLeaseHarness()
     // The runtime defaults to claude-code; this reconnect resolves a *different* backend whose real
     // framework.spawn() throws. spawnAgentProcess sets this.framework to opencode before spawning, so
     // the failure must be attributed to opencode — the backend actually launched — via the spawn tag,
@@ -5592,17 +16001,22 @@ describe('ACP runtime — connect failure logging', () => {
           }
         },
         executablePath: '/bin/opencode',
-        env: {}
+        env: {},
+        responsesBridgeLease: lease
       })
     })
 
     await expect(runtime.createSession({ cwd: '/workspace' })).rejects.toThrow(/opencode ENOENT/)
+    expect(release).toHaveBeenCalledOnce()
 
     const call = errorLogSpy.mock.calls.find(([message]) => message === 'agent connection failed')
     expect(call).toBeDefined()
-    const data = call?.[1] as { error: string; framework: string }
-    expect(data.error).toBe('spawn opencode ENOENT')
-    expect(data.framework).toBe('opencode')
+    expect(call?.[1]).toEqual({
+      errorCategory: 'error',
+      framework: 'opencode',
+      generation: 1,
+      status: 'connecting'
+    })
   })
 
   it('logs "agent connection abandoned" when a real async resolveBackend is superseded mid-resolution by a public disconnect()', async () => {
@@ -5647,16 +16061,18 @@ describe('ACP runtime — connect failure logging', () => {
     await expect(createPromise).rejects.toThrow(/superseded|shutting down/i)
 
     // The connect resumes, spawns the child, then detects the supersede and abandons it. Key guarantees:
-    // logged as *abandoned* (a warning) with the spawned child's pid + target cwd/framework, and NOT
-    // also raised as the error-level "failed" record.
+    // logged as *abandoned* (a warning) with safe lifecycle context, and NOT also raised as the
+    // error-level "failed" record.
     const abandoned = warnLogSpy.mock.calls.find(
       ([message]) => message === 'agent connection abandoned (superseded or shutting down)'
     )
     expect(abandoned).toBeDefined()
-    const data = abandoned?.[1] as { cwd: string; framework: string; agentProcessPid: number }
-    expect(data.cwd).toBe(resolve('/workspace'))
-    expect(data.framework).toBe('claude-code')
-    expect(data.agentProcessPid).toBe(3434)
+    expect(abandoned?.[1]).toEqual({
+      errorCategory: 'error',
+      framework: 'claude-code',
+      generation: 1,
+      status: 'closed'
+    })
     expect(errorLogSpy.mock.calls.some(([message]) => message === 'agent connection failed')).toBe(
       false
     )
@@ -5688,9 +16104,12 @@ describe('ACP runtime — connect failure logging', () => {
 
     const call = errorLogSpy.mock.calls.find(([message]) => message === 'agent connection failed')
     expect(call).toBeDefined()
-    const data = call?.[1] as { error: string; framework: string }
-    expect(data.error).toBe('raw string spawn failure')
-    expect(data.framework).toBe('opencode')
+    expect(call?.[1]).toEqual({
+      errorCategory: 'string',
+      framework: 'opencode',
+      generation: 1,
+      status: 'connecting'
+    })
   })
 
   it('does not mutate a frozen spawn Error, still labels the framework, and re-throws it verbatim', async () => {
@@ -5736,7 +16155,7 @@ describe('ACP runtime — session effort', () => {
 
   const createEffortRuntime = (
     process: FakeAgentProcess,
-    sessionEffort: ReasoningEffort | undefined,
+    sessionEffort: ModelReasoningEffort | undefined,
     sessionModel?: string
   ): AcpRuntime =>
     new AcpRuntime({
@@ -5778,7 +16197,7 @@ describe('ACP runtime — session effort', () => {
     expect(fakeAgent.configChanges).toEqual([])
   })
 
-  it('clamps the desired level to the closest advertised value', async () => {
+  it('does not reinterpret an unadvertised model-resolved effort', async () => {
     const process = new FakeAgentProcess()
     const fakeAgent = startFakeAgent(process, ['s-effort'], {
       configOptions: [thoughtLevelOption(['low', 'medium'])]
@@ -5787,10 +16206,8 @@ describe('ACP runtime — session effort', () => {
 
     await runtime.createSession({ cwd: '/workspace' })
 
-    // 'max' is not advertised; the model's top level takes its place instead of a no-op.
-    expect(fakeAgent.configChanges).toEqual([
-      { sessionId: 's-effort', configId: 'effort', value: 'medium' }
-    ])
+    // The Agent layer is only a transport. It must not replace max with medium.
+    expect(fakeAgent.configChanges).toEqual([])
   })
 
   it('resolves effort against the option set reported after a model switch', async () => {
@@ -5815,11 +16232,9 @@ describe('ACP runtime — session effort', () => {
 
     await runtime.createSession({ cwd: '/workspace' })
 
-    // Clamping against the pre-switch set would apply 'high' — invalid for model-b. The post-switch
-    // set yields 'medium' instead.
+    // Neither the stale nor the post-switch option set contains the model-resolved max value.
     expect(fakeAgent.configChanges).toEqual([
-      { sessionId: 's-effort', configId: 'model', value: 'model-b' },
-      { sessionId: 's-effort', configId: 'effort', value: 'medium' }
+      { sessionId: 's-effort', configId: 'model', value: 'model-b' }
     ])
   })
 
@@ -5854,9 +16269,9 @@ describe('ACP runtime — session effort', () => {
     await runtime.createSession({ cwd: '/workspace' })
     expect(fakeAgent.configChanges).toEqual([])
 
-    const applied = await runtime.applyReasoningEffortChange('max')
+    const applied = await runtime.applyReasoningEffortChange('high')
 
-    // The open session gets the closest advertised level over ACP, still on the original process.
+    // The open session gets the exact model-resolved level over ACP, still on the original process.
     expect(applied).toBe(true)
     expect(spawn).toHaveBeenCalledTimes(1)
     expect(fakeAgent.configChanges).toEqual([
@@ -5866,6 +16281,82 @@ describe('ACP runtime — session effort', () => {
     // Sessions created later in the same process inherit the new level.
     await runtime.createSession({ cwd: '/workspace' })
     expect(fakeAgent.configChanges[1]).toMatchObject({ configId: 'effort', value: 'high' })
+  })
+
+  it('updates only the runtime-owned Responses bridge with a live effort change', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['s-bridge-effort'], {
+      configOptions: [thoughtLevelOption(['default', 'high'])]
+    })
+    const setReasoningEffort = vi.fn()
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...claudeCodeFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/claude',
+        env: {},
+        responsesBridgeLease: {
+          selectSkills: vi.fn(async () => []),
+          registerReviewerSession: vi.fn(),
+          unregisterReviewerSession: vi.fn(() => false),
+          setReasoningEffort,
+          release: vi.fn(async () => undefined)
+        }
+      })
+    })
+    await runtime.createSession({ cwd: '/workspace' })
+
+    await runtime.applyReasoningEffortChange('high')
+    await runtime.applyReasoningEffortChange('default')
+
+    expect(setReasoningEffort).toHaveBeenNthCalledWith(1, 'high')
+    expect(setReasoningEffort).toHaveBeenNthCalledWith(2, undefined)
+  })
+
+  it('defers a new-model effort while the old provider is waiting to reconnect', async () => {
+    const process = new FakeAgentProcess()
+    const promptStarted = createDeferred()
+    const finishPrompt = createDeferred()
+    const fakeAgent = startFakeAgent(process, ['s-old-model'], {
+      configOptions: [thoughtLevelOption(['default', 'high', 'max'])],
+      onPrompt: async () => {
+        promptStarted.resolve()
+        await finishPrompt.promise
+        return { stopReason: 'end_turn' }
+      }
+    })
+    const setReasoningEffort = vi.fn()
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: {
+          ...claudeCodeFramework,
+          spawn: () => asAgentProcess(process)
+        },
+        executablePath: '/bin/claude',
+        env: {},
+        responsesBridgeLease: {
+          selectSkills: vi.fn(async () => []),
+          registerReviewerSession: vi.fn(),
+          unregisterReviewerSession: vi.fn(() => false),
+          setReasoningEffort,
+          release: vi.fn(async () => undefined)
+        }
+      })
+    })
+    await runtime.createSession({ cwd: '/workspace' })
+    const prompt = runtime.sendPrompt({ sessionId: 's-old-model', text: 'keep working' })
+    await promptStarted.promise
+    await runtime.requestProviderReconnect()
+
+    await expect(runtime.applyReasoningEffortChange('max')).resolves.toBe(false)
+    expect(fakeAgent.configChanges).toEqual([])
+    expect(setReasoningEffort).not.toHaveBeenCalled()
+
+    finishPrompt.resolve()
+    await prompt
   })
 
   it('hands control back to the agent default when the level is cleared live', async () => {
@@ -5883,7 +16374,7 @@ describe('ACP runtime — session effort', () => {
       })
     })
     await runtime.createSession({ cwd: '/workspace' })
-    await runtime.applyReasoningEffortChange('max')
+    await runtime.applyReasoningEffortChange('high')
 
     const applied = await runtime.applyReasoningEffortChange('default')
 
@@ -5928,11 +16419,9 @@ describe('ACP runtime — session effort', () => {
 
     const applied = await runtime.applyReasoningEffortChange('max')
 
-    // The post-switch set tops out at 'medium'; the stale session/new set would wrongly yield 'high'.
+    // The post-switch set does not expose max, so the transport must not substitute medium.
     expect(applied).toBe(true)
-    expect(fakeAgent.configChanges).toEqual([
-      { sessionId: 's-live', configId: 'effort', value: 'medium' }
-    ])
+    expect(fakeAgent.configChanges).toEqual([])
   })
 
   it('reports failure so the caller reconnects when a live apply is rejected', async () => {
@@ -6042,7 +16531,12 @@ describe('ACP runtime — session effort', () => {
     expect(fakeAgent.configChanges).toEqual([])
     const call = warnLogSpy.mock.calls.find(([message]) => message === 'set session effort failed')
     expect(call).toBeDefined()
-    expect((call?.[1] as { sessionId: string }).sessionId).toBe('s-effort')
+    expect(call?.[1]).toEqual({
+      errorCategory: 'request',
+      framework: 'opencode',
+      generation: 1,
+      status: 'connected'
+    })
   })
 })
 
@@ -6066,36 +16560,25 @@ describe('ACP runtime — session-creation and spawn diagnostics', () => {
     const payloadOf = (message: string): Record<string, unknown> | undefined =>
       infoLogSpy.mock.calls.find(([m]) => m === message)?.[1] as Record<string, unknown> | undefined
 
-    // Every stage of a successful createSession leaves a breadcrumb, and each carries the context that
-    // makes it useful for diagnosis — not just the message name.
-    expect(payloadOf('createSession: starting')).toMatchObject({
-      request: { cwd: '/workspace', projectName: 'my-project' }
-    })
-    expect(payloadOf('createSession: ensureConnected')).toMatchObject({
-      sessionCwd: resolve('/workspace'),
-      projectName: 'my-project'
-    })
-    const mcpBreadcrumb = payloadOf('createSession: createMcpServers')
-    expect(typeof mcpBreadcrumb?.artifactSessionId).toBe('string')
-    expect(typeof mcpBreadcrumb?.notebookSessionId).toBe('string')
-    expect(typeof (payloadOf('createSession: buildSession')?.mcpServersCount as number)).toBe(
-      'number'
-    )
-    expect(payloadOf('createSession: configurePermissionProfile')).toMatchObject({
-      sessionId: session.sessionId
-    })
-    expect(payloadOf('createSession: applySessionModel')).toMatchObject({
-      sessionId: session.sessionId
-    })
-    expect(payloadOf('createSession: completed successfully')).toMatchObject({
-      sessionId: session.sessionId
-    })
-    expect(payloadOf('ensureConnected: attempting connection')).toMatchObject({
-      cwd: resolve('/workspace')
-    })
-    expect(payloadOf('ensureConnected: connection established')).toMatchObject({
-      cwd: resolve('/workspace')
-    })
+    // Every stage leaves a breadcrumb, but its payload is a strict lifecycle whitelist.
+    for (const message of [
+      'createSession: starting',
+      'createSession: ensureConnected',
+      'createSession: createMcpServers',
+      'createSession: buildSession',
+      'createSession: configurePermissionProfile',
+      'createSession: applySessionModel',
+      'createSession: completed successfully',
+      'ensureConnected: attempting connection',
+      'ensureConnected: connection established'
+    ]) {
+      expect(payloadOf(message)).toEqual({
+        framework: 'claude-code',
+        generation: expect.any(Number),
+        status: expect.stringMatching(/^(?:idle|connecting|connected)$/)
+      })
+    }
+    expect(session.sessionId).toBe('staged-session')
   })
 
   it('logs "createSession: failed" and "ensureConnected: connect failed" when the connection fails', async () => {
@@ -6119,13 +16602,18 @@ describe('ACP runtime — session-creation and spawn diagnostics', () => {
     const createFailure = errorLogSpy.mock.calls.find(
       ([message]) => message === 'createSession: failed'
     )
-    expect((createFailure?.[1] as { error: string }).error).toBe('spawn boom')
+    expect(createFailure?.[1]).toEqual({
+      errorCategory: 'error',
+      framework: 'claude-code',
+      generation: 1,
+      status: 'error'
+    })
   })
 
-  it('logs "createSession: configurePermissionProfile failed" with the full error when the profile setup throws', async () => {
+  it('logs a safe category when permission-profile setup throws', async () => {
     errorLogSpy.mockClear()
     const process = new FakeAgentProcess()
-    startFakeAgent(process, ['perm-fail-session'])
+    startFakeAgent(process, ['perm-fail-session', 'perm-fail-session'])
     const runtime = new AcpRuntime({
       appVersion: '0.1.0',
       defaultCwd: '/workspace',
@@ -6139,17 +16627,90 @@ describe('ACP runtime — session-creation and spawn diagnostics', () => {
     ).mockRejectedValueOnce(boom)
 
     await expect(runtime.createSession({ cwd: '/workspace' })).rejects.toBe(boom)
-
     const call = errorLogSpy.mock.calls.find(
       ([message]) => message === 'createSession: configurePermissionProfile failed'
     )
     expect(call).toBeDefined()
-    const data = call?.[1] as { error: string; code: string }
-    expect(data.error).toBe('permission setup failed')
-    expect(data.code).toBe('EPERM')
+    expect(call?.[1]).toEqual({
+      errorCategory: 'permission',
+      framework: 'claude-code',
+      generation: 1,
+      status: 'connected'
+    })
+
+    const recovered = await runtime.createSession({ cwd: '/workspace' })
+    expect(recovered.sessionId).toBe('perm-fail-session')
+    await runtime.deleteSession({ sessionId: recovered.sessionId })
   })
 
-  it('logs the resolved backend (executable + env keys, values omitted) and the spawned pid', async () => {
+  it('releases the provisional notebook RPC capability when session creation fails', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['perm-fail-session'])
+    const releaseSessionCapabilities = vi.fn()
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({
+          endpoint: 'http://127.0.0.1:4567',
+          token: 'secret-token'
+        }),
+        releaseSessionCapabilities
+      }
+    })
+    const failure = new Error('permission setup failed')
+    vi.spyOn(
+      runtime as unknown as { configurePermissionProfile: () => Promise<void> },
+      'configurePermissionProfile'
+    ).mockRejectedValueOnce(failure)
+
+    await expect(runtime.createSession({ cwd: '/workspace' })).rejects.toBe(failure)
+
+    expect(releaseSessionCapabilities).toHaveBeenCalledOnce()
+    expect(releaseSessionCapabilities).toHaveBeenCalledWith(
+      expect.stringMatching(/^notebook-session-/)
+    )
+  })
+
+  it('releases owned session metadata after its exact provisional capability fails to publish', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['perm-fail-session'])
+    const release = vi.fn()
+    const releaseSessionCapabilities = vi.fn()
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({
+          endpoint: 'http://127.0.0.1:4567',
+          token: 'secret-token',
+          release
+        }),
+        releaseSessionCapabilities
+      }
+    })
+    const failure = new Error('permission setup failed')
+    vi.spyOn(
+      runtime as unknown as { configurePermissionProfile: () => Promise<void> },
+      'configurePermissionProfile'
+    ).mockRejectedValueOnce(failure)
+
+    await expect(runtime.createSession({ cwd: '/workspace' })).rejects.toBe(failure)
+
+    expect(release).toHaveBeenCalledOnce()
+    expect(releaseSessionCapabilities).toHaveBeenCalledOnce()
+    expect(releaseSessionCapabilities).toHaveBeenCalledWith(
+      expect.stringMatching(/^notebook-session-/)
+    )
+  })
+
+  it('logs backend and spawn success without executable, arguments, env, or pid', async () => {
     infoLogSpy.mockClear()
     const process = new FakeAgentProcess()
     process.pid = 7654
@@ -6159,9 +16720,9 @@ describe('ACP runtime — session-creation and spawn diagnostics', () => {
       defaultCwd: '/workspace',
       resolveBackend: () => ({
         framework: { ...claudeCodeFramework, spawn: () => asAgentProcess(process) },
-        executablePath: '/bin/agent',
+        executablePath: '/private/agent-secret/bin/agent',
         env: { ANTHROPIC_AUTH_TOKEN: 'secret-should-not-be-logged', REGION: 'us' },
-        args: ['--acp']
+        args: ['--token=argument-secret']
       })
     })
 
@@ -6169,19 +16730,22 @@ describe('ACP runtime — session-creation and spawn diagnostics', () => {
 
     const resolved = infoLogSpy.mock.calls.find(([message]) => message === 'agent backend resolved')
     expect(resolved).toBeDefined()
-    const resolvedData = resolved?.[1] as {
-      executablePath: string
-      envKeys: string[]
-      args: string[]
-    }
-    expect(resolvedData.executablePath).toBe('/bin/agent')
-    expect(resolvedData.envKeys).toEqual(['ANTHROPIC_AUTH_TOKEN', 'REGION'])
-    expect(resolvedData.args).toEqual(['--acp'])
-    // The env *values* must never be logged — only the keys.
-    expect(JSON.stringify(resolvedData)).not.toContain('secret-should-not-be-logged')
+    expect(resolved?.[1]).toEqual({
+      framework: 'claude-code',
+      generation: 1,
+      status: 'connecting'
+    })
+    expect(JSON.stringify(resolved?.[1])).not.toMatch(
+      /secret-should-not-be-logged|argument-secret|agent-secret|ANTHROPIC_AUTH_TOKEN/
+    )
 
     const spawned = infoLogSpy.mock.calls.find(([message]) => message === 'agent process spawned')
-    expect((spawned?.[1] as { pid: number }).pid).toBe(7654)
+    expect(spawned?.[1]).toEqual({
+      framework: 'claude-code',
+      generation: 1,
+      status: 'connecting'
+    })
+    expect(JSON.stringify(spawned?.[1])).not.toContain('7654')
   })
 
   it('logs "ensureConnected: connection is null after connect" when connect resolves without a connection', async () => {
@@ -6204,10 +16768,12 @@ describe('ACP runtime — session-creation and spawn diagnostics', () => {
       ([message]) => message === 'ensureConnected: connection is null after connect'
     )
     expect(call).toBeDefined()
-    // The branch carries the target cwd + current status, not just the message.
-    const data = call?.[1] as { cwd: string; status: string }
-    expect(data.cwd).toBe(resolve('/workspace'))
-    expect(typeof data.status).toBe('string')
+    expect(call?.[1]).toEqual({
+      errorCategory: 'connection-unavailable',
+      framework: 'claude-code',
+      generation: 0,
+      status: 'idle'
+    })
   })
 
   it('does not let a cleanup failure mask the original connection error', async () => {
@@ -6230,17 +16796,56 @@ describe('ACP runtime — session-creation and spawn diagnostics', () => {
     // The rejection is the ORIGINAL spawn failure, not the cleanup error.
     await expect(runtime.createSession({ cwd: '/workspace' })).rejects.toThrow(/spawn boom/)
 
-    // Both the original failure and the (non-masking) cleanup failure are recorded with context.
+    // Both failures are categorized without retaining their messages, and cleanup never masks the
+    // original rejection.
     const failed = errorLogSpy.mock.calls.find(([message]) => message === 'agent connection failed')
-    expect((failed?.[1] as { error: string }).error).toBe('spawn boom')
+    expect((failed?.[1] as { errorCategory: string }).errorCategory).toBe('error')
     const cleanup = errorLogSpy.mock.calls.find(
       ([message]) => message === 'agent connection cleanup failed'
     )
     expect(cleanup).toBeDefined()
-    const cleanupData = cleanup?.[1] as { error: string; framework: string; cwd: string }
-    expect(cleanupData.error).toBe('cleanup boom')
-    expect(cleanupData.framework).toBe('claude-code')
-    expect(cleanupData.cwd).toBe(resolve('/workspace'))
+    expect(cleanup?.[1]).toEqual({
+      errorCategory: 'error',
+      framework: 'claude-code',
+      generation: 1,
+      status: 'connecting'
+    })
+  })
+
+  it('does not let bridge release and logger failures mask the original spawn error', async () => {
+    const release = vi.fn().mockRejectedValue(new Error('bridge release failed'))
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: {
+          ...claudeCodeFramework,
+          spawn: () => {
+            throw new Error('primary spawn failed')
+          }
+        },
+        executablePath: '/bin/agent',
+        env: {},
+        responsesBridgeLease: {
+          selectSkills: vi.fn(async () => []),
+          registerReviewerSession: vi.fn(),
+          unregisterReviewerSession: vi.fn(() => true),
+          release
+        }
+      })
+    })
+
+    errorLogSpy.mockImplementation(() => {
+      throw new Error('cleanup logger failed')
+    })
+    try {
+      await expect(runtime.createSession({ cwd: '/workspace' })).rejects.toThrow(
+        'primary spawn failed'
+      )
+      expect(release).toHaveBeenCalledOnce()
+    } finally {
+      errorLogSpy.mockReset()
+    }
   })
 
   it('survives a hostile Error (throwing message getter) through the real connectFresh path', async () => {
@@ -6276,8 +16881,100 @@ describe('ACP runtime — session-creation and spawn diagnostics', () => {
     // error is a safe string — never a raw throwing value that would break the renderer broadcast.
     const failed = errorLogSpy.mock.calls.find(([message]) => message === 'agent connection failed')
     expect(failed).toBeDefined()
-    expect((failed?.[1] as { error: string; framework: string }).framework).toBe('claude-code')
+    expect((failed?.[1] as { errorCategory: string; framework: string }).framework).toBe(
+      'claude-code'
+    )
+    expect((failed?.[1] as { errorCategory: string }).errorCategory).toBe('error')
     expect(typeof runtime.getSnapshot().error).toBe('string')
+  })
+
+  it('does not log request or provider-error secrets during session creation', async () => {
+    infoLogSpy.mockClear()
+    warnLogSpy.mockClear()
+    errorLogSpy.mockClear()
+    const requestSecret = 'request-research-secret'
+    const providerSecret = 'provider-credential-secret'
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['unused-session'], {
+      newSessionError: acp.RequestError.internalError(
+        { credential: providerSecret, research: requestSecret },
+        `provider rejected ${providerSecret}`
+      )
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process)
+    })
+
+    await expect(
+      runtime.createSession({
+        cwd: `/private/${requestSecret}`,
+        projectName: requestSecret
+      })
+    ).rejects.toThrow()
+
+    const serializedLogs = JSON.stringify([
+      ...infoLogSpy.mock.calls,
+      ...warnLogSpy.mock.calls,
+      ...errorLogSpy.mock.calls
+    ])
+    expect(serializedLogs).not.toContain(requestSecret)
+    expect(serializedLogs).not.toContain(providerSecret)
+    const failure = errorLogSpy.mock.calls.find(([message]) => message === 'createSession: failed')
+    expect(failure?.[1]).toEqual({
+      errorCategory: 'request',
+      framework: 'claude-code',
+      generation: 1,
+      status: 'connected'
+    })
+  })
+
+  it('does not log spawn inputs or sensitive spawn-error fields', async () => {
+    infoLogSpy.mockClear()
+    warnLogSpy.mockClear()
+    errorLogSpy.mockClear()
+    const spawnSecret = 'spawn-provider-secret'
+    const spawnError = Object.assign(new Error(`spawn rejected ${spawnSecret}`), {
+      code: 'ENOENT',
+      data: { credential: spawnSecret },
+      path: `/private/${spawnSecret}`
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: {
+          ...opencodeFramework,
+          spawn: () => {
+            throw spawnError
+          }
+        },
+        executablePath: `/private/${spawnSecret}/agent`,
+        env: { PROVIDER_TOKEN: spawnSecret },
+        args: [`--credential=${spawnSecret}`]
+      })
+    })
+
+    await expect(runtime.createSession({ cwd: `/workspace/${spawnSecret}` })).rejects.toBe(
+      spawnError
+    )
+
+    const serializedLogs = JSON.stringify([
+      ...infoLogSpy.mock.calls,
+      ...warnLogSpy.mock.calls,
+      ...errorLogSpy.mock.calls
+    ])
+    expect(serializedLogs).not.toContain(spawnSecret)
+    const failure = errorLogSpy.mock.calls.find(
+      ([message]) => message === 'agent connection failed'
+    )
+    expect(failure?.[1]).toEqual({
+      errorCategory: 'not-found',
+      framework: 'opencode',
+      generation: 1,
+      status: 'connecting'
+    })
   })
 })
 
@@ -6358,6 +17055,42 @@ describe('ACP runtime — failure-path robustness (errorMessage coercion + sync-
 
     await expect(runtime.createSession({ cwd: '/workspace' })).rejects.toBe(spawnError)
   }
+
+  it('does not overwrite a reentrant failure-event disconnect with error status', async () => {
+    const spawnError = new Error('spawn failed before disconnect')
+    const statuses: string[] = []
+    let disconnect: Promise<unknown> | undefined
+    const callbacks: { disconnectRuntime?: () => Promise<unknown> } = {}
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      callbacks: {
+        onEvent: (event) => {
+          if (event.title === 'Connection failed') disconnect = callbacks.disconnectRuntime?.()
+        },
+        onStateChanged: (snapshot) => statuses.push(snapshot.status)
+      },
+      resolveBackend: () => ({
+        framework: {
+          ...claudeCodeFramework,
+          spawn: () => {
+            throw spawnError
+          }
+        },
+        executablePath: '/bin/agent',
+        env: {}
+      })
+    })
+    callbacks.disconnectRuntime = () => runtime.disconnect()
+
+    await expect(runtime.connect({ cwd: '/workspace' })).rejects.toBe(spawnError)
+    expect(disconnect).toBeDefined()
+    await disconnect
+
+    expect(runtime.getSnapshot().status).toBe('closed')
+    expect(statuses.at(-1)).toBe('closed')
+    expect(statuses).not.toContain('error')
+  })
 
   it('propagates the spawn cause even when onEvent throws synchronously', async () => {
     const spawnError = new Error('spawn failed A')
@@ -6481,7 +17214,11 @@ describe('ACP runtime — failure-path robustness (errorMessage coercion + sync-
       appVersion: '0.1.0',
       defaultCwd: '/workspace',
       spawnAgent: () => {
-        ;(runtime as unknown as { connectionGeneration: number }).connectionGeneration += 1
+        ;(
+          runtime as unknown as {
+            connectionResources: { supersede: () => number }
+          }
+        ).connectionResources.supersede()
         return asAgentProcess(process)
       }
     })
@@ -6530,6 +17267,363 @@ describe('prompt streaming after a context reset', () => {
     expect(assistantChunks[0]).toMatchObject({
       sessionId: session.sessionId,
       text: 'reply for remote-session-2'
+    })
+  })
+})
+
+describe('Specialist Skill scoping', () => {
+  const specialistSkillResolver = (
+    specialistId: string
+  ): Promise<{
+    kind: 'specialist'
+    skillIds: string[]
+    frameworkNames: string[]
+    missingSkillIds: string[]
+  }> =>
+    Promise.resolve(
+      specialistId === 'zero'
+        ? { kind: 'specialist' as const, skillIds: [], frameworkNames: [], missingSkillIds: [] }
+        : {
+            kind: 'specialist' as const,
+            skillIds: ['allowed'],
+            frameworkNames: ['Allowed Skill'],
+            missingSkillIds: []
+          }
+    )
+
+  it('sends Claude an exact whitelist and rejects an out-of-scope forced chip', async () => {
+    const process = new FakeAgentProcess()
+    const agent = startFakeAgent(process, ['specialist-session'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: claudeCodeFramework,
+      resolveSpecialistIdentity: async () => ({ append: 'Specialist identity', prefix: '' }),
+      resolveSpecialistSkills: async () => ({
+        kind: 'specialist',
+        skillIds: ['allowed'],
+        frameworkNames: ['Allowed Skill'],
+        missingSkillIds: []
+      })
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace', specialistId: 'sp-1' })
+    expect(agent.newSessions[0]?._meta).toMatchObject({
+      claudeCode: { options: { skills: ['Allowed Skill'] } }
+    })
+    await expect(
+      runtime.sendPrompt({
+        sessionId: session.sessionId,
+        text: 'bypass',
+        forcedSkillIds: ['blocked']
+      })
+    ).rejects.toThrow('not available to the active specialist')
+    expect(agent.prompts).toHaveLength(0)
+  })
+
+  it('invalidates a Specialist preflight when context reset replaces the provider session', async () => {
+    const process = new FakeAgentProcess()
+    const agent = startFakeAgent(process, ['specialist-session-1', 'specialist-session-2'])
+    const promptPreflightEntered = createDeferred()
+    const releasePromptPreflight = createDeferred()
+    let resolutionCount = 0
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: claudeCodeFramework,
+      resolveSpecialistIdentity: async () => ({ append: 'Specialist identity', prefix: '' }),
+      resolveSpecialistSkills: async () => {
+        resolutionCount += 1
+        if (resolutionCount === 2) {
+          promptPreflightEntered.resolve()
+          await releasePromptPreflight.promise
+        }
+        return {
+          kind: 'specialist' as const,
+          skillIds: ['allowed'],
+          frameworkNames: ['Allowed Skill'],
+          missingSkillIds: []
+        }
+      }
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace', specialistId: 'sp-1' })
+    const stalePrompt = runtime.sendPrompt({ sessionId: session.sessionId, text: 'stale prompt' })
+    void stalePrompt.catch(() => undefined)
+    await promptPreflightEntered.promise
+
+    await runtime.resetSessionContext({ sessionId: session.sessionId, cwd: '/workspace' })
+    releasePromptPreflight.resolve()
+
+    await expect(stalePrompt).rejects.toThrow(/superseded/)
+    expect(agent.prompts).toEqual([])
+
+    await runtime.sendPrompt({ sessionId: session.sessionId, text: 'replacement prompt' })
+    expect(agent.prompts).toEqual([
+      {
+        sessionId: 'specialist-session-2',
+        text: expect.stringContaining('replacement prompt')
+      }
+    ])
+  })
+
+  it('allows a forced mcp-* connector Skill when the active specialist grants that connector', async () => {
+    const process = new FakeAgentProcess()
+    const agent = startFakeAgent(process, ['specialist-connector-session'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: claudeCodeFramework,
+      resolveSpecialistIdentity: async () => ({ append: 'Specialist identity', prefix: '' }),
+      resolveSpecialistSkills: async () => ({
+        kind: 'specialist' as const,
+        skillIds: [],
+        frameworkNames: ['mcp-biomart'],
+        missingSkillIds: []
+      })
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace', specialistId: 'sp-1' })
+    await runtime.sendPrompt({
+      sessionId: session.sessionId,
+      text: 'continue with BioMart',
+      forcedSkillIds: ['mcp-biomart']
+    })
+
+    expect(agent.prompts).toHaveLength(1)
+  })
+
+  it('does not carry source forced Skills into a Claude handoff continuation', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['continuation-source-session'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: claudeCodeFramework,
+      skills: {
+        needForceLoad: vi.fn(async () => []),
+        namesForIds: vi.fn(async (ids: string[]) => ids)
+      }
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    await runtime.sendPrompt({
+      sessionId: session.sessionId,
+      text: 'switch to a specialist',
+      forcedSkillIds: ['customize']
+    })
+
+    const continuation = runtime.createClaudeCodeContinuationRequest({
+      sessionId: session.sessionId,
+      switchReadBack: {
+        status: 'approved',
+        operation: 'switch',
+        binding: {
+          sessionId: session.sessionId,
+          specialistId: 'target-specialist',
+          targetName: 'Target Specialist'
+        }
+      }
+    })
+
+    expect(continuation).not.toHaveProperty('forcedSkillIds')
+  })
+
+  it.each([codexFramework, opencodeFramework])(
+    'adds allowed-Skill guidance on every %s turn',
+    async (framework) => {
+      const process = new FakeAgentProcess()
+      const agent = startFakeAgent(process, ['guided-session'], {
+        modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent')
+      })
+      const runtime = new AcpRuntime({
+        appVersion: '0.1.0',
+        defaultCwd: '/workspace',
+        spawnAgent: () => asAgentProcess(process),
+        framework,
+        resolveSpecialistIdentity: async () => ({ append: '', prefix: 'Specialist identity' }),
+        resolveSpecialistSkills: specialistSkillResolver
+      })
+
+      const session = await runtime.createSession({ cwd: '/workspace', specialistId: 'sp-1' })
+      await runtime.sendPrompt({ sessionId: session.sessionId, text: 'work' })
+      await runtime.sendPrompt({ sessionId: session.sessionId, text: 'continue' })
+      expect(agent.prompts[0]?.text).toContain('Allowed Specialist Skills for this session')
+      expect(agent.prompts[0]?.text).toContain('Allowed Skill')
+      expect(agent.prompts[1]?.text).toContain('Allowed Specialist Skills for this session')
+    }
+  )
+
+  it('projects a switched OpenCode Specialist on an app-owned continuation without a second user event', async () => {
+    const process = new FakeAgentProcess()
+    const agent = startFakeAgent(process, ['opencode-handoff'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent')
+    })
+    const events: AcpRuntimeEvent[] = []
+    const notebookSpecialists: Array<string | undefined> = []
+    const startedTurnTokens: string[] = []
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: opencodeFramework,
+      callbacks: {
+        onEvent: (event) => events.push(event),
+        onPromptStarted: (_sessionId, turnToken) => startedTurnTokens.push(turnToken)
+      },
+      notebook: {
+        projectName: 'Artifacts',
+        mcpEntryPath: '/bin/mcp',
+        getRpcConnection: async () => ({ endpoint: 'http://127.0.0.1:4567', token: 'nb' }),
+        registerSessionSpecialist: (_sessionId, specialistId) => {
+          notebookSpecialists.push(specialistId)
+        }
+      },
+      resolveSpecialistIdentity: async (specialistId) => ({
+        append: '',
+        prefix: specialistId === 'new' ? 'New Specialist identity' : 'Old Specialist identity'
+      }),
+      resolveSpecialistSkills: async (specialistId) => ({
+        kind: 'specialist',
+        skillIds: [`${specialistId}-skill`],
+        frameworkNames: [`${specialistId} Skill`, `${specialistId} Connector`],
+        missingSkillIds: []
+      })
+    })
+    const session = await runtime.createSession({ cwd: '/workspace', specialistId: 'old' })
+    await runtime.sendPrompt({ sessionId: session.sessionId, text: 'analyse these samples' })
+
+    await runtime.switchSpecialist(session.sessionId, 'new')
+    events.length = 0
+    await runtime.sendPrompt({
+      sessionId: session.sessionId,
+      text: 'analyse these samples',
+      continuation: {
+        kind: 'specialist-handoff',
+        originatingTurnToken: startedTurnTokens[0],
+        targetName: 'New Specialist',
+        completion: { kind: 'returned', value: { switched: true, afterAwait: 'complete' } }
+      }
+    })
+
+    expect(agent.prompts[1]?.text).toContain('New Specialist identity')
+    expect(agent.prompts[1]?.text).toContain('new Skill')
+    expect(agent.prompts[1]?.text).toContain('new Connector')
+    expect(agent.prompts[1]?.text).toContain('Captured outer tool result')
+    expect(agent.prompts[1]?.text).toContain('"afterAwait":"complete"')
+    expect(events.some((event) => event.kind === 'message' && event.role === 'user')).toBe(false)
+    expect(notebookSpecialists.at(-1)).toBe('new')
+    expect(startedTurnTokens).toEqual([startedTurnTokens[0], startedTurnTokens[0]])
+  })
+
+  it('updates Codex native Skill selection to the switched specialist, including mcp-* connectors', async () => {
+    const process = new FakeAgentProcess()
+    let receivedPrompt: ContentBlock[] = []
+    startFakeAgent(process, ['codex-specialist-session'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent'),
+      onPrompt: ({ prompt }) => {
+        receivedPrompt = prompt
+      }
+    })
+    const oldConnector = {
+      name: 'mcp-old-connector',
+      description: 'Old specialist connector.',
+      path: '/data/codex/skills/mcp-old-connector/SKILL.md'
+    }
+    const newConnector = {
+      name: 'mcp-new-connector',
+      description: 'New specialist connector.',
+      path: '/data/codex/skills/mcp-new-connector/SKILL.md'
+    }
+    const catalog = [oldConnector, newConnector]
+    // Model a stale selector result that still contains the old connector. The runtime must offer
+    // only the new scope and must reject any result outside that offered catalog.
+    const selectSkills = vi.fn(async () => catalog)
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...codexFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/codex-acp',
+        env: { CODEX_HOME: '/data/codex' },
+        responsesBridgeLease: {
+          selectSkills,
+          registerReviewerSession: vi.fn(),
+          unregisterReviewerSession: vi.fn(() => false),
+          release: vi.fn(async () => undefined)
+        }
+      }),
+      skills: {
+        needForceLoad: vi.fn(async () => []),
+        namesForIds: vi.fn(async (ids: string[]) => ids),
+        descriptorsForIds: vi.fn(async () => []),
+        catalogForCodexHome: vi.fn(async () => catalog)
+      },
+      resolveSpecialistIdentity: async () => ({ append: '', prefix: '' }),
+      resolveSpecialistSkills: async (specialistId) => ({
+        kind: 'specialist' as const,
+        skillIds: [],
+        frameworkNames: specialistId === 'new' ? ['mcp-new-connector'] : ['mcp-old-connector'],
+        missingSkillIds: []
+      })
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace', specialistId: 'old' })
+    await runtime.switchSpecialist(session.sessionId, 'new')
+    await runtime.sendPrompt({ sessionId: session.sessionId, text: 'use the new connector' })
+
+    expect(selectSkills).toHaveBeenCalledWith(
+      'use the new connector',
+      [newConnector],
+      expect.any(AbortSignal)
+    )
+    expect(receivedPrompt).toEqual([
+      {
+        type: 'text',
+        text: expect.stringContaining('mcp-new-connector'),
+        _meta: {
+          'open-science/skill-inputs': [newConnector]
+        }
+      }
+    ])
+  })
+
+  it('sends the current whitelist on ACP resume, with empty Specialist distinct from Main', async () => {
+    const process = new FakeAgentProcess()
+    const agent = startFakeAgent(process, ['unused'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: claudeCodeFramework,
+      resolveSpecialistSkills: specialistSkillResolver
+    })
+    await runtime.resumeSession({ sessionId: 'restored', cwd: '/workspace', specialistId: 'zero' })
+    expect(agent.resumedSessions[0]?._meta).toMatchObject({
+      claudeCode: { options: { skills: [] } }
+    })
+  })
+
+  it('omits Claude skills only for unbound Main while a zero-Skill Specialist sends []', async () => {
+    const process = new FakeAgentProcess()
+    const agent = startFakeAgent(process, ['zero-session', 'main-session'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: claudeCodeFramework,
+      resolveSpecialistIdentity: async () => ({ append: '', prefix: '' }),
+      resolveSpecialistSkills: specialistSkillResolver
+    })
+    await runtime.createSession({ cwd: '/workspace', specialistId: 'zero' })
+    await runtime.createSession({ cwd: '/workspace' })
+    expect(agent.newSessions[0]?._meta).toMatchObject({ claudeCode: { options: { skills: [] } } })
+    expect(agent.newSessions[1]?._meta).not.toMatchObject({
+      claudeCode: { options: { skills: expect.anything() } }
     })
   })
 })

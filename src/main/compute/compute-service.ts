@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os'
 import type {
   ComputeCallError,
   ComputeHost,
+  ComputeJob,
   DetailsAuthor,
   ExecResult,
   JobResult,
@@ -39,6 +40,7 @@ import type { StagedInputEntry } from './job-dispatcher'
 import { getJobHarvestDir } from './harvest-engine'
 import { getNotebookSessionRoot } from '../notebook/repository'
 import type { ConcurrencyManager, SessionStatus } from './concurrency-manager'
+import { workspaceRelativePath } from './workspace-path'
 
 // Probe timeout for the full bundle — individual commands share one connection but each gets this
 // budget. Set generously so slow clusters don't abort, but short enough for a responsive UI (30s).
@@ -643,8 +645,8 @@ export class ComputeService {
   // Executes a short remote command on the SSH host, preceded by an approval gate (design.md §6).
   //
   // When sessionId and projectId are supplied, grant memory is checked and recorded:
-  //   - conversation: session in-memory grant (no card on repeat calls in the same session)
-  //   - project: persisted to settings JSON (no card for that project after first approval)
+  //   - conversation: durable logical Session grant (legacy wire name)
+  //   - project/global: durable Registry grants at the corresponding scope
   //   - once: no memory — card shown every time
   //
   // call_command does NOT count against the concurrent job limit (design.md §5).
@@ -687,7 +689,8 @@ export class ComputeService {
       ? await this.approvalBroker.requestWithContext(approvalInfo, {
           sessionId: context.sessionId,
           projectId: context.projectId,
-          operation: 'call_command'
+          operation: 'call_command',
+          ownerId: host.id
         })
       : await this.approvalBroker.request(approvalInfo)
 
@@ -854,7 +857,8 @@ export class ComputeService {
         ? await this.approvalBroker.requestWithContext(approvalInfo, {
             sessionId: context.sessionId,
             projectId: context.projectId,
-            operation: 'download'
+            operation: 'download',
+            ownerId: host.id
           })
         : await this.approvalBroker.request(approvalInfo)
 
@@ -1233,7 +1237,8 @@ export class ComputeService {
     const decision = await this.approvalBroker.requestWithContext(approvalInfo, {
       sessionId: context.sessionId,
       projectId: context.projectId,
-      operation: 'submit_job'
+      operation: 'submit_job',
+      ownerId: host.id
     })
 
     if (decision === 'deny') {
@@ -1296,7 +1301,7 @@ export class ComputeService {
         scpRunner: this.scpRunner,
         hostRepository: this.repository,
         jobRepository: this.jobRepository,
-        onJobUpdated: this.onJobUpdated
+        onJobUpdated: this.handleJobUpdated
       })
     }
 
@@ -1466,16 +1471,13 @@ export class ComputeService {
     return status
   }
 
-  // Internal callback wrapper: when a job transitions to a terminal state, notify ConcurrencyManager
-  // to trigger auto-dispatch of queued jobs. This is called by the JobPoller via onJobUpdated.
-  // Exposed as a method so the JobPoller (or IPC layer) can wire it in production.
-  notifyJobCompleted(job: import('../../shared/compute').ComputeJob): void {
-    const terminalStates = new Set(['success', 'failed', 'timeout', 'error'])
-    if (terminalStates.has(job.status) && this.concurrencyManager) {
-      // Fire-and-forget: ConcurrencyManager.onJobCompleted() is async but we don't await it here
-      // to keep the onJobUpdated callback synchronous (matches the existing pattern).
-      void this.concurrencyManager.onJobCompleted()
-    }
+  // Stable producer-facing sink for every persisted job update, regardless of whether the dispatcher
+  // or poller observed it. ConcurrencyManager owns the combined broadcast-and-drain policy when
+  // queueing is enabled; otherwise this preserves the observer-only behavior used by lightweight
+  // service configurations.
+  handleJobUpdated = (job: ComputeJob): void => {
+    if (this.concurrencyManager) this.concurrencyManager.handleJobUpdated(job)
+    else this.onJobUpdated?.(job)
   }
 }
 
@@ -1512,7 +1514,7 @@ async function collectFiles(
       await collectFiles(baseDir, fullPath, workspaceCwd, results)
     } else if (entry.isFile()) {
       // Use workspace-relative path so agent can open() directly (design §4).
-      results.push(relative(workspaceCwd, fullPath))
+      results.push(workspaceRelativePath(workspaceCwd, fullPath))
     }
   }
 }

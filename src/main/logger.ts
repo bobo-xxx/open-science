@@ -1,4 +1,5 @@
 import { appendFile, mkdir, rename, rm, stat } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
 import { extname, join } from 'node:path'
 
 // Lightweight structured file logger for the main process. Kept free of Electron imports so it stays
@@ -16,6 +17,7 @@ const LEVEL_ORDER: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, e
 
 export type LoggerConfig = {
   logDir: string
+  runId: string
   fileName: string
   minLevel: LogLevel
   mirrorToConsole: boolean
@@ -371,6 +373,66 @@ const bestEffortMessage = (error: unknown): string => {
   }
 }
 
+// Returns a coarse, fixed-vocabulary category for boundary diagnostics that must not retain provider
+// messages, request data, credentials, research content, stacks, or local paths. Raw numeric RPC codes
+// and identifier-shaped system codes are classified rather than copied, so a hostile `code` or `name`
+// property cannot smuggle arbitrary text into the log. Callers that explicitly own richer diagnostics
+// can continue to use errorLogFields instead.
+const diagnosticErrorFields = (error: unknown): { errorCategory: string } => {
+  try {
+    if (error === null) return { errorCategory: 'null' }
+
+    const type = typeof error
+    if (type !== 'object' && type !== 'function') return { errorCategory: type }
+
+    const code = safeRead(error as object, 'code')
+    if (typeof code === 'number' && Number.isFinite(code)) {
+      return { errorCategory: 'request' }
+    }
+    if (typeof code === 'string') {
+      if (code === 'ENOENT' || code === 'ENOTDIR') return { errorCategory: 'not-found' }
+      if (code === 'EACCES' || code === 'EPERM') return { errorCategory: 'permission' }
+      if (code === 'ETIMEDOUT' || code === 'ESOCKETTIMEDOUT') {
+        return { errorCategory: 'timeout' }
+      }
+      if (
+        code === 'ECONNREFUSED' ||
+        code === 'ECONNRESET' ||
+        code === 'ENETUNREACH' ||
+        code === 'EHOSTUNREACH' ||
+        code === 'EAI_AGAIN'
+      ) {
+        return { errorCategory: 'network' }
+      }
+      if (code.length <= 64 && /^(?:E[A-Z0-9_]+|ERR_[A-Z0-9_]+)$/.test(code)) {
+        return { errorCategory: 'system' }
+      }
+    }
+
+    const name = safeRead(error as object, 'name')
+    const categoriesByName: Record<string, string> = {
+      AbortError: 'aborted',
+      AggregateError: 'aggregate',
+      Error: 'error',
+      RangeError: 'range',
+      ReferenceError: 'reference',
+      RequestError: 'request',
+      SyntaxError: 'syntax',
+      SystemError: 'system',
+      TimeoutError: 'timeout',
+      TypeError: 'type',
+      URIError: 'uri'
+    }
+    if (typeof name === 'string' && Object.hasOwn(categoriesByName, name)) {
+      return { errorCategory: categoriesByName[name] }
+    }
+
+    return { errorCategory: 'object' }
+  } catch {
+    return { errorCategory: 'unknown' }
+  }
+}
+
 // Expands an unknown thrown value into a log-safe record for nesting inside a larger context object.
 // toSerializable only unwraps a *top-level* Error; an Error nested inside `{ error, ...ctx }` serializes
 // to `{}` because its fields are non-enumerable — losing the message, stack, and (worse) the code/data
@@ -470,7 +532,13 @@ const errorLogFields = (error: unknown): Record<string, unknown> => {
   }
 }
 
-const formatLine = (level: LogLevel, scope: string, message: string, data?: unknown): string => {
+const formatLine = (
+  level: LogLevel,
+  scope: string,
+  message: string,
+  data?: unknown,
+  runId?: string
+): string => {
   const record: Record<string, unknown> = {
     t: new Date().toISOString(),
     level,
@@ -478,13 +546,21 @@ const formatLine = (level: LogLevel, scope: string, message: string, data?: unkn
     msg: message
   }
 
+  if (runId !== undefined) record.runId = runId
   if (data !== undefined) record.data = toSerializable(data)
 
   try {
     return JSON.stringify(record)
   } catch {
     // Fall back to a best-effort line if the payload has circular refs.
-    return JSON.stringify({ t: record.t, level, scope, msg: message, data: '[unserializable]' })
+    return JSON.stringify({
+      t: record.t,
+      level,
+      ...(runId === undefined ? {} : { runId }),
+      scope,
+      msg: message,
+      data: '[unserializable]'
+    })
   }
 }
 
@@ -565,6 +641,7 @@ const appendLine = (line: string): void => {
 // Initializes the sink. Safe to call once at startup; later calls replace the config and re-seed size.
 const initLogger = (options: { logDir: string } & Partial<Omit<LoggerConfig, 'logDir'>>): void => {
   config = {
+    runId: randomUUID(),
     fileName: 'main.log',
     minLevel: 'debug',
     mirrorToConsole: true,
@@ -592,7 +669,7 @@ const emit = (level: LogLevel, scope: string, message: string, data?: unknown): 
 
   if (config && LEVEL_ORDER[level] < LEVEL_ORDER[config.minLevel]) return
 
-  appendLine(formatLine(level, scope, message, data))
+  appendLine(formatLine(level, scope, message, data, config?.runId))
 }
 
 export type Logger = {
@@ -610,4 +687,12 @@ const createLogger = (scope: string): Logger => ({
   error: (message, data) => emit('error', scope, message, data)
 })
 
-export { createLogger, errorLogFields, flushLogs, formatLine, getLogFilePath, initLogger }
+export {
+  createLogger,
+  diagnosticErrorFields,
+  errorLogFields,
+  flushLogs,
+  formatLine,
+  getLogFilePath,
+  initLogger
+}

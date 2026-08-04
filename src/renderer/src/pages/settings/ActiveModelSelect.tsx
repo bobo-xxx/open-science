@@ -26,17 +26,23 @@ const SEP = '␟'
 const ActiveModelSelect = (): React.JSX.Element | null => {
   const providers = useSettingsStore((state) => state.providers)
   const activeProviderId = useSettingsStore((state) => state.activeProviderId)
+  const claudeSubscriptionProviderId = useSettingsStore(
+    (state) => state.claudeSubscriptionProviderId
+  )
   const activeModel = useSettingsStore((state) => state.activeModel)
   const setActiveProvider = useSettingsStore((state) => state.setActiveProvider)
   const agentFrameworkId = useSettingsStore((state) => state.agentFrameworkId)
   const frameworkEndpoints = useSettingsStore(selectFrameworkApiEndpoints)
 
-  const options = selectProviderModelOptions(providers)
+  const options = selectProviderModelOptions(
+    providers,
+    activeProviderId,
+    claudeSubscriptionProviderId
+  )
 
   if (options.length === 0) return null
 
-  // A provider is selectable only when it can actually drive the current framework (endpoint + type;
-  // a Local Claude provider is Claude-only).
+  // A provider is selectable only when it can actually drive the current framework (endpoint + type).
   const isCompatible = (provider: (typeof providers)[number], model: string): boolean =>
     isProviderUsableByFramework(
       { apiEndpoints: provider.apiEndpoints, type: provider.type },
@@ -61,7 +67,7 @@ const ActiveModelSelect = (): React.JSX.Element | null => {
       value={current ? `${current.providerId}${SEP}${current.model}` : undefined}
       onValueChange={(value) => {
         const [providerId, model] = value.split(SEP)
-        void setActiveProvider(providerId, model)
+        void setActiveProvider(providerId, model).catch(() => undefined)
       }}
     >
       <SelectTrigger aria-label="Active model">

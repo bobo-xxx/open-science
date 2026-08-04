@@ -6,7 +6,8 @@ import {
   isMcpToolName,
   isWithinWorkspace,
   resolveAllowOptionId,
-  resolveAutomaticPermission
+  resolveAutomaticPermission,
+  resolveMcpProviderLeafIdentity
 } from './permission-policy'
 
 const createPermissionRequest = (
@@ -14,7 +15,9 @@ const createPermissionRequest = (
   locations?: Array<{ path: string }>,
   overrides?: {
     title?: string
+    providerToolName?: string
     options?: RequestPermissionRequest['options']
+    rawInput?: unknown
   }
 ): RequestPermissionRequest => ({
   sessionId: 'session-1',
@@ -22,7 +25,9 @@ const createPermissionRequest = (
     toolCallId: 'tool-1',
     title: overrides?.title ?? 'Tool call',
     kind,
-    locations
+    locations,
+    rawInput: overrides?.rawInput,
+    ...(overrides?.providerToolName ? { _meta: { toolName: overrides.providerToolName } } : {})
   },
   options: overrides?.options ?? [
     { optionId: 'allow', name: 'Allow once', kind: 'allow_once' },
@@ -90,12 +95,21 @@ describe('permission policy', () => {
   })
 
   it('recognizes MCP tool names across frameworks', () => {
-    const servers = ['open-science-artifacts', 'open-science-notebook']
+    const servers = [
+      'open-science-activity',
+      'open-science-artifacts',
+      'open-science-notebook',
+      'open-science-skills'
+    ]
 
     // Claude namespaces MCP tools mcp__<server>__<tool> — matched by prefix regardless of server list.
     expect(isMcpToolName('mcp__pencil__batch_get', [])).toBe(true)
     // opencode joins them <server>_<tool> — matched only against the session's known server names.
     expect(isMcpToolName('open-science-artifacts_write_artifact_file', servers)).toBe(true)
+    expect(isMcpToolName('open_science_activity_begin_activity_group', servers)).toBe(true)
+    expect(isMcpToolName('open_science_artifacts_write_artifact_file', servers)).toBe(true)
+    expect(isMcpToolName('open_science_notebook_notebook_execute', servers)).toBe(true)
+    expect(isMcpToolName('open_science_skills_request_skill_import', servers)).toBe(true)
     expect(isMcpToolName('open-science-notebook', servers)).toBe(true)
     // Codex uses mcp.<server>.<tool> — the generic mcp. prefix is not trusted without a known server.
     expect(isMcpToolName('mcp.open-science-notebook.notebook_execute', servers)).toBe(true)
@@ -110,6 +124,13 @@ describe('permission policy', () => {
     expect(isMcpToolName('execute', ['open-science-notebook'])).toBe(true)
     expect(isMcpToolName('write', ['open-science-artifacts'])).toBe(true)
     expect(isMcpToolName('execute', ['some-other-server'])).toBe(false)
+    expect(resolveMcpProviderLeafIdentity('execute', ['open-science-notebook'])).toBe(
+      'open-science-notebook/notebook_execute'
+    )
+    expect(resolveMcpProviderLeafIdentity('write', ['open-science-artifacts'])).toBe(
+      'open-science-artifacts/write_artifact_file'
+    )
+    expect(resolveMcpProviderLeafIdentity('execute', ['some-other-server'])).toBeUndefined()
   })
 
   it('never auto-approves opencode-named MCP tools (<server>_<tool>) reporting a low-risk kind', () => {
@@ -147,6 +168,103 @@ describe('permission policy', () => {
         autoReviewStrategy: 'conservative',
         cwd: '/workspace/project',
         mcpServerNames: ['open-science-artifacts', 'open-science-notebook']
+      })
+    ).toBeUndefined()
+  })
+
+  it('auto-approves the declaration-only activity group tool under Ask', () => {
+    const request = createPermissionRequest('other', undefined, {
+      title: 'mcp__open-science-activity__begin_activity_group'
+    })
+
+    expect(
+      resolveAutomaticPermission(request, {
+        profile: 'ask',
+        mcpServerNames: ['open-science-activity']
+      })
+    ).toBe('allow')
+    expect(isMcpToolName('begin_activity_group', ['open-science-activity'])).toBe(true)
+
+    expect(
+      resolveAutomaticPermission(
+        createPermissionRequest('other', undefined, { title: 'begin_activity_group' }),
+        { profile: 'ask', mcpServerNames: ['open-science-activity'] }
+      )
+    ).toBeUndefined()
+  })
+
+  it('auto-approves only the server-qualified Artifact save capability without prompting', () => {
+    for (const providerToolName of [
+      'mcp__open-science-artifacts__write_artifact_file',
+      'mcp__open_science_artifacts__write_artifact_file',
+      'mcp.open-science-artifacts.write_artifact_file',
+      'open-science-artifacts_write_artifact_file',
+      'open_science_artifacts_write_artifact_file',
+      'write'
+    ]) {
+      expect(
+        resolveAutomaticPermission(
+          createPermissionRequest('other', undefined, { providerToolName }),
+          {
+            profile: 'ask',
+            mcpServerNames: ['open-science-artifacts']
+          }
+        )
+      ).toBe('allow')
+    }
+
+    expect(
+      resolveAutomaticPermission(
+        createPermissionRequest('other', undefined, {
+          providerToolName: 'write_artifact_file'
+        }),
+        { profile: 'ask', mcpServerNames: ['open-science-artifacts'] }
+      )
+    ).toBeUndefined()
+
+    expect(
+      resolveAutomaticPermission(
+        createPermissionRequest('other', undefined, { title: 'write_artifact_file' }),
+        { profile: 'ask', mcpServerNames: ['open-science-artifacts'] }
+      )
+    ).toBeUndefined()
+
+    // Claude Code's qualified title is still presentation data in isolation. Runtime may only restore
+    // it as provider identity after binding it to a preceding MCP tool_call with the same call id.
+    expect(
+      resolveAutomaticPermission(
+        createPermissionRequest('other', undefined, {
+          title: 'mcp__open-science-artifacts__write_artifact_file'
+        }),
+        { profile: 'ask', mcpServerNames: ['open-science-artifacts'] }
+      )
+    ).toBeUndefined()
+
+    expect(
+      resolveAutomaticPermission(
+        createPermissionRequest('other', undefined, {
+          title: 'mcp__open-science-artifacts__write_artifact_file',
+          providerToolName: 'mcp__third-party__write_artifact_file'
+        }),
+        { profile: 'ask', mcpServerNames: ['open-science-artifacts'] }
+      )
+    ).toBeUndefined()
+  })
+
+  it('does not trust raw input to identify an activity group declaration', () => {
+    const spoofedBuiltIn = createPermissionRequest('execute', undefined, {
+      title: 'Bash',
+      rawInput: {
+        server: 'open-science-activity',
+        tool: 'begin_activity_group',
+        arguments: { title: 'Spoofed declaration' }
+      }
+    })
+
+    expect(
+      resolveAutomaticPermission(spoofedBuiltIn, {
+        profile: 'ask',
+        mcpServerNames: ['open-science-activity']
       })
     ).toBeUndefined()
   })
@@ -221,7 +339,7 @@ describe('permission policy', () => {
     ).toBe('allow')
   })
 
-  it('falls back to allow_always for Full access only when no one-shot option is offered', () => {
+  it('does not create Agent-owned memory when Full access lacks a one-shot option', () => {
     const onlyAlways = createPermissionRequest('execute', undefined, {
       options: [
         { optionId: 'always', name: 'Allow always', kind: 'allow_always' },
@@ -229,6 +347,23 @@ describe('permission policy', () => {
       ]
     })
 
-    expect(resolveAutomaticPermission(onlyAlways, { profile: 'full' })).toBe('always')
+    expect(resolveAutomaticPermission(onlyAlways, { profile: 'full' })).toBeUndefined()
+  })
+
+  it('does not use an activity declaration remember option as a Full access fallback', () => {
+    const onlyAlways = createPermissionRequest('other', undefined, {
+      title: 'mcp__open-science-activity__begin_activity_group',
+      options: [
+        { optionId: 'always', name: 'Allow always', kind: 'allow_always' },
+        { optionId: 'reject', name: 'Reject', kind: 'reject_once' }
+      ]
+    })
+
+    expect(
+      resolveAutomaticPermission(onlyAlways, {
+        profile: 'full',
+        mcpServerNames: ['open-science-activity']
+      })
+    ).toBeUndefined()
   })
 })

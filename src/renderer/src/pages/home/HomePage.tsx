@@ -20,10 +20,12 @@ import { useSessionStore } from '@/stores/session-store'
 import { useProjectStore } from '@/stores/project-store'
 import { useSettingsStore } from '@/stores/settings-store'
 import { GitHubStarBadge } from '@/components/GitHubStarBadge'
+import { ThemePreferenceMenu } from '@/components/ThemeControls'
 import { UpdateCapsule } from '@/components/UpdateCapsule'
 import { APP } from '../../../../shared/app-config'
 import type { Project } from '../../../../shared/projects'
 import type { EnvironmentCheckItem, EnvironmentCheckResult } from '../../../../shared/settings'
+import { getEnvironmentRepairPanel } from '../settings/settings-navigation'
 
 import { DeleteProjectDialog } from './DeleteProjectDialog'
 import { ProjectFormDialog } from './ProjectFormDialog'
@@ -37,6 +39,11 @@ type ProjectSummary = {
 }
 
 type ProjectFormState = { mode: 'create' } | { mode: 'edit'; projectId: string }
+
+type HomePageProps = {
+  canDeleteProjects: boolean
+  hasCompleteSessionCatalog: boolean
+}
 
 // Optional warnings (currently Python and reduced key protection) never create a Home alert. Only a
 // failed check that blocks the core flow asks an existing user to revisit environment setup.
@@ -57,10 +64,10 @@ const sectionHeadingClassName =
 const listCardClassName = 'rounded-2xl border border-border-200/70 bg-bg-000 p-1.5 shadow-card'
 
 const rowClassName =
-  'group flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-left transition-colors duration-150 ease-out hover:bg-bg-300'
+  'group flex w-full items-center gap-2 rounded-xl px-2.5 py-2.5 text-left transition-colors duration-150 ease-out hover:bg-bg-300 sm:px-3'
 
 const rowActionClassName =
-  'shrink-0 rounded p-0.5 text-text-300 opacity-0 transition-[opacity,color,background-color] duration-150 ease-out hover:bg-bg-400 hover:text-text-000 focus-visible:opacity-100 group-hover:opacity-100 data-[state=open]:opacity-100'
+  'shrink-0 rounded p-0.5 text-text-300 opacity-100 transition-[opacity,color,background-color] duration-150 ease-out hover:bg-bg-400 hover:text-text-000 focus-visible:opacity-100 sm:opacity-0 sm:group-hover:opacity-100 data-[state=open]:opacity-100'
 
 const menuContentClassName =
   'z-modal min-w-[9rem] rounded-xl border-[0.5px] border-border-200 bg-bg-000 p-1.5 shadow-menu'
@@ -69,10 +76,13 @@ const menuItemClassName =
   'flex w-full cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-left text-sm text-text-100 transition-colors duration-150 ease-out outline-none data-[highlighted]:bg-bg-200 data-[highlighted]:text-text-000'
 
 const menuDangerItemClassName =
-  'flex w-full cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-left text-sm text-danger-000 transition-colors duration-150 ease-out outline-none data-[highlighted]:bg-danger-900'
+  'flex w-full cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-left text-sm text-danger-000 transition-colors duration-150 ease-out outline-none data-[highlighted]:bg-danger-900 data-[disabled]:pointer-events-none data-[disabled]:opacity-50'
 
 // Landing screen: pick a project or jump back into a recent session.
-const HomePage = (): React.JSX.Element => {
+const HomePage = ({
+  canDeleteProjects,
+  hasCompleteSessionCatalog
+}: HomePageProps): React.JSX.Element => {
   const projects = useProjectStore((state) => state.projects)
   const loadError = useProjectStore((state) => state.loadError)
   const createProject = useProjectStore((state) => state.createProject)
@@ -83,8 +93,9 @@ const HomePage = (): React.JSX.Element => {
   const openSession = useNavigationStore((state) => state.openSession)
   const openSettings = useSettingsStore((state) => state.openSettings)
   const environmentCheck = useSettingsStore((state) => state.environmentCheck)
-  const openEnvironmentRepair = useSettingsStore((state) => state.openEnvironmentRepair)
+  const openSettingsToPanel = useSettingsStore((state) => state.openSettingsToPanel)
   const requiredEnvironmentFailures = getRequiredEnvironmentFailures(environmentCheck)
+  const environmentRepairPanel = getEnvironmentRepairPanel(requiredEnvironmentFailures)
 
   const [formState, setFormState] = useState<ProjectFormState | null>(null)
   const [nameDraft, setNameDraft] = useState('')
@@ -92,6 +103,8 @@ const HomePage = (): React.JSX.Element => {
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [formError, setFormError] = useState<string | undefined>(undefined)
   const [projectToDelete, setProjectToDelete] = useState<Project | undefined>(undefined)
+  const [isDeletingProject, setIsDeletingProject] = useState(false)
+  const [deleteProjectError, setDeleteProjectError] = useState<string | undefined>(undefined)
 
   // Non-pending sessions only; pending ones have no durable project yet.
   const persistedSessions = useMemo(
@@ -146,6 +159,20 @@ const HomePage = (): React.JSX.Element => {
     setFormError(undefined)
   }
 
+  const openDeleteDialog = (project: Project): void => {
+    if (!canDeleteProjects) return
+
+    setDeleteProjectError(undefined)
+    setProjectToDelete(project)
+  }
+
+  const closeDeleteDialog = (): void => {
+    if (isDeletingProject) return
+
+    setProjectToDelete(undefined)
+    setDeleteProjectError(undefined)
+  }
+
   const closeFormDialog = (): void => {
     if (isSubmitting) return
 
@@ -177,7 +204,7 @@ const HomePage = (): React.JSX.Element => {
 
         setFormState(null)
 
-        if (isCreate) openProject(project.id)
+        if (isCreate) openProject(project.id, 'user')
       })
       .catch((error: unknown) => {
         setFormError(error instanceof Error ? error.message : 'Could not save project.')
@@ -189,18 +216,31 @@ const HomePage = (): React.JSX.Element => {
 
   // Main coordinates durable project/session/index cleanup; renderer state changes only after it succeeds.
   const confirmDeleteProject = (): void => {
-    if (!projectToDelete) return
+    if (!canDeleteProjects || !projectToDelete || isDeletingProject) return
 
     const projectId = projectToDelete.id
 
-    setProjectToDelete(undefined)
+    // Deletion is an explicit user takeover even though it does not immediately navigate. Advance
+    // the navigation revision before the async mutation so deferred startup intents cannot reopen a
+    // conversation after the post-delete view has settled.
+    useNavigationStore.getState().recordUserNavigation()
+    setIsDeletingProject(true)
+    setDeleteProjectError(undefined)
 
     void deleteProject(projectId)
       .then(() => {
         useSessionStore.getState().removeSessionsForProject(projectId)
+        setProjectToDelete(undefined)
       })
-      .catch(() => {
-        // Durable deletion failed; leave the project and in-memory sessions untouched.
+      .catch((error: unknown) => {
+        // Durable deletion failed; keep the target and in-memory sessions visible so the user can
+        // inspect the failure and retry or cancel explicitly.
+        setDeleteProjectError(
+          error instanceof Error ? error.message : 'Could not delete the project. Please try again.'
+        )
+      })
+      .finally(() => {
+        setIsDeletingProject(false)
       })
   }
 
@@ -213,8 +253,8 @@ const HomePage = (): React.JSX.Element => {
 
   return (
     <main className="min-h-svh bg-bg-10 text-text-000">
-      <div className="mx-auto max-w-[1080px] px-8 py-7 pb-16">
-        <header className="flex items-center justify-between">
+      <div className="mx-auto max-w-[1080px] px-4 py-5 pb-12 sm:px-8 sm:py-7 sm:pb-16">
+        <header className="flex items-start justify-between gap-3">
           <div>
             <a
               href={APP.links.website}
@@ -224,26 +264,30 @@ const HomePage = (): React.JSX.Element => {
             >
               Open Science
             </a>
-            <div className="mt-1 text-[11px] text-text-100">Beta</div>
+            <div className="mt-1 text-[11px] text-muted-foreground">Beta</div>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center justify-end gap-1 sm:gap-2">
             <UpdateCapsule />
-            {requiredEnvironmentFailures.length > 0 ? (
+            {requiredEnvironmentFailures.length > 0 && environmentRepairPanel ? (
               <button
                 type="button"
-                onClick={openEnvironmentRepair}
+                onClick={() => openSettingsToPanel(environmentRepairPanel)}
                 className="inline-flex h-8 items-center gap-1.5 rounded-md border border-danger-000/35 bg-danger-900 px-2.5 text-xs font-medium text-danger-000 transition-colors duration-150 ease-out hover:border-danger-000/55 hover:bg-danger-900/80"
                 aria-label="Open environment repair"
               >
                 <CircleAlert className="size-3.5" strokeWidth={2} aria-hidden="true" />
-                <span>
+                <span className="hidden sm:inline">
                   {requiredEnvironmentFailures.length === 1
                     ? `${requiredEnvironmentFailures[0].label} needs attention`
                     : `${requiredEnvironmentFailures.length} environment items need attention`}
                 </span>
+                <span className="sm:hidden">Environment</span>
               </button>
             ) : null}
-            <GitHubStarBadge />
+            <span className="hidden sm:inline-flex">
+              <GitHubStarBadge />
+            </span>
+            <ThemePreferenceMenu />
             <button
               type="button"
               aria-label="Model settings"
@@ -260,13 +304,13 @@ const HomePage = (): React.JSX.Element => {
               onClick={openCreateDialog}
             >
               <Plus className="size-3.5" strokeWidth={2} aria-hidden="true" />
-              New project
+              <span className="hidden sm:inline">New project</span>
             </Button>
           </div>
         </header>
 
-        <div className="mt-10 grid grid-cols-1 gap-8 lg:grid-cols-2">
-          <section aria-label="Projects">
+        <div className="mt-8 grid grid-cols-1 gap-7 sm:mt-10 sm:gap-8 lg:grid-cols-2">
+          <section className="min-w-0" aria-label="Projects">
             <h2 className={sectionHeadingClassName}>
               <Archive className="size-4 text-text-100" strokeWidth={2} aria-hidden="true" />
               Projects
@@ -279,7 +323,7 @@ const HomePage = (): React.JSX.Element => {
                 Could not load projects: {loadError}
               </div>
             ) : projectSummaries.length === 0 ? (
-              <div className="rounded-2xl border border-dashed border-border-200/70 px-4 py-10 text-center text-sm text-text-100">
+              <div className="rounded-2xl border border-dashed border-border-200/70 px-4 py-10 text-center text-sm text-muted-foreground">
                 No projects yet. Create one to get started.
               </div>
             ) : (
@@ -293,7 +337,7 @@ const HomePage = (): React.JSX.Element => {
                     <button
                       type="button"
                       className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
-                      onClick={() => openProject(project.id)}
+                      onClick={() => openProject(project.id, 'user')}
                     >
                       <span className="truncate font-semibold text-text-000">{project.name}</span>
                       {project.isExample ? (
@@ -303,9 +347,11 @@ const HomePage = (): React.JSX.Element => {
                       ) : null}
                     </button>
                     <span className="shrink-0 text-xs text-text-100">
-                      {sessionCount} {sessionCount === 1 ? 'session' : 'sessions'}
+                      {hasCompleteSessionCatalog
+                        ? `${sessionCount} ${sessionCount === 1 ? 'session' : 'sessions'}`
+                        : 'Session count unavailable'}
                     </span>
-                    <span className="w-8 shrink-0 text-right text-xs text-text-300">
+                    <span className="hidden w-8 shrink-0 text-right text-xs text-text-300 sm:inline">
                       {formatRelativeTime(lastActivityAt)}
                     </span>
                     <DropdownMenu.Root>
@@ -335,7 +381,8 @@ const HomePage = (): React.JSX.Element => {
                           <DropdownMenu.Separator className="mx-1 my-1 h-px bg-border-300" />
                           <DropdownMenu.Item
                             className={menuDangerItemClassName}
-                            onSelect={() => setProjectToDelete(project)}
+                            disabled={!canDeleteProjects}
+                            onSelect={() => openDeleteDialog(project)}
                           >
                             <Trash2 className="size-4" strokeWidth={2} aria-hidden="true" />
                             Delete
@@ -349,13 +396,13 @@ const HomePage = (): React.JSX.Element => {
             )}
           </section>
 
-          <section aria-label="Recent sessions">
+          <section className="min-w-0" aria-label="Recent sessions">
             <h2 className={sectionHeadingClassName}>
               <Clock className="size-4 text-text-100" strokeWidth={2} aria-hidden="true" />
               Recent sessions
             </h2>
             {recentSessions.length === 0 ? (
-              <div className="rounded-2xl border border-dashed border-border-200/70 px-4 py-10 text-center text-sm text-text-100">
+              <div className="rounded-2xl border border-dashed border-border-200/70 px-4 py-10 text-center text-sm text-muted-foreground">
                 Sessions you start will appear here.
               </div>
             ) : (
@@ -368,7 +415,7 @@ const HomePage = (): React.JSX.Element => {
                       key={session.id}
                       type="button"
                       className={cn(rowClassName, 'cursor-pointer items-start')}
-                      onClick={() => openSession(session.projectId, session.id)}
+                      onClick={() => openSession(session.projectId, session.id, 'user')}
                       title={session.title}
                     >
                       <span
@@ -415,7 +462,11 @@ const HomePage = (): React.JSX.Element => {
       <DeleteProjectDialog
         project={projectToDelete}
         sessionCount={deleteTargetSessionCount}
-        onCancel={() => setProjectToDelete(undefined)}
+        hasCompleteSessionCatalog={hasCompleteSessionCatalog}
+        canDelete={canDeleteProjects}
+        isDeleting={isDeletingProject}
+        error={deleteProjectError}
+        onCancel={closeDeleteDialog}
         onConfirmDelete={confirmDeleteProject}
       />
     </main>

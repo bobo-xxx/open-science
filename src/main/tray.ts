@@ -1,19 +1,56 @@
 import { Menu, Tray, nativeImage, screen, type NativeImage } from 'electron'
 
+import { DEFAULT_APP_ICON_VARIANT, type AppIconVariant } from '../shared/settings'
 import { createLogger } from './logger'
 
 const logger = createLogger('tray')
 
+// Builds a NativeImage for one app-icon variant, or undefined when the asset is missing/unreadable,
+// so callers fall back instead of blanking the tray.
+const createVariantIcon = (
+  variantPaths: Partial<Record<AppIconVariant, string>>,
+  variant: AppIconVariant
+): NativeImage | undefined => {
+  const path = variantPaths[variant]
+  if (!path) return undefined
+  try {
+    const image = nativeImage.createFromPath(path)
+    return image.isEmpty() ? undefined : image
+  } catch (error) {
+    logger.error('failed to load tray icon variant asset', { variant, error })
+    return undefined
+  }
+}
+
+// Re-points a live tray at the given app-icon variant. Called when the user switches the app icon in
+// settings so the tray glyph matches the window icon. Guards a destroyed tray (the settings IPC can
+// outlive it during teardown) and keeps the current image when the variant asset is unreadable.
+const setTrayIconVariant = (
+  tray: Tray,
+  variantPaths: Partial<Record<AppIconVariant, string>>,
+  variant: AppIconVariant
+): void => {
+  if (tray.isDestroyed()) return
+  const image = createVariantIcon(variantPaths, variant)
+  if (image) tray.setImage(image)
+}
+
 // macOS menu-bar icons should be monochrome "template" images: black pixels on a transparent background
-// that the system tints to match the light/dark menu bar. The app icon is a light ring-of-dots glyph on
-// a dark rounded-square container, so we keep the dots (mapping their brightness to alpha) and drop the
-// dark container, then paint everything black and flag it as a template. Returns undefined on any
-// failure so the caller can fall back to the full-color icon.
+// that the system tints to match the light/dark menu bar. A prepared 16px/32px source is used directly;
+// the legacy full-color conversion remains as a fallback when no dedicated asset is supplied.
 const TEMPLATE_ICON_SIZE = 18
-const createMacTemplateIcon = (iconPath: string): NativeImage | undefined => {
+const createMacTemplateIcon = (
+  iconPath: string,
+  preparedTemplate: boolean
+): NativeImage | undefined => {
   try {
     const source = nativeImage.createFromPath(iconPath)
     if (source.isEmpty()) return undefined
+
+    if (preparedTemplate) {
+      source.setTemplateImage(true)
+      return source
+    }
 
     const { width, height } = source.getSize()
     if (!width || !height) return undefined
@@ -24,7 +61,11 @@ const createMacTemplateIcon = (iconPath: string): NativeImage | undefined => {
     const bitmap = source.toBitmap()
     for (let i = 0; i < bitmap.length; i += 4) {
       const luminance = 0.299 * bitmap[i + 2] + 0.587 * bitmap[i + 1] + 0.114 * bitmap[i]
-      const alpha = Math.max(0, Math.min(255, Math.round(((luminance - 90) / (232 - 90)) * 255)))
+      const luminanceAlpha = Math.max(
+        0,
+        Math.min(255, Math.round(((luminance - 90) / (232 - 90)) * 255))
+      )
+      const alpha = Math.round((luminanceAlpha * bitmap[i + 3]) / 255)
       bitmap[i] = 0
       bitmap[i + 1] = 0
       bitmap[i + 2] = 0
@@ -47,6 +88,13 @@ const createMacTemplateIcon = (iconPath: string): NativeImage | undefined => {
 // host (e.g. Linux without a StatusNotifier/AppIndicator), letting the app fall back to quit-on-close.
 const createAppTray = (opts: {
   iconPath: string
+  templateIconPath?: string
+  // Windows-only: per-variant tray tiles so the tray glyph follows the app icon chosen in settings
+  // (light tile for the light variant, dark tile for the dark one). Switched live via
+  // setTrayIconVariant when the user changes the setting.
+  variantIconPaths?: Partial<Record<AppIconVariant, string>>
+  // The persisted variant to start with; defaults to the shared default when unset.
+  initialVariant?: AppIconVariant
   onShow: () => void
   onHide: () => void
   onQuit: () => void
@@ -59,8 +107,16 @@ const createAppTray = (opts: {
     // the full-color icon. An empty image is tolerated so the tray still appears with a blank glyph.
     const icon =
       process.platform === 'darwin'
-        ? (createMacTemplateIcon(opts.iconPath) ?? nativeImage.createFromPath(opts.iconPath))
-        : nativeImage.createFromPath(opts.iconPath)
+        ? (createMacTemplateIcon(
+            opts.templateIconPath ?? opts.iconPath,
+            Boolean(opts.templateIconPath)
+          ) ?? nativeImage.createFromPath(opts.iconPath))
+        : ((opts.variantIconPaths &&
+            createVariantIcon(
+              opts.variantIconPaths,
+              opts.initialVariant ?? DEFAULT_APP_ICON_VARIANT
+            )) ??
+          nativeImage.createFromPath(opts.iconPath))
     const tray = new Tray(icon)
 
     const headlessWeb = opts.headless && opts.onOpenWeb && opts.onCopyWebUrl
@@ -111,4 +167,4 @@ const createAppTray = (opts: {
   }
 }
 
-export { createAppTray }
+export { createAppTray, setTrayIconVariant }

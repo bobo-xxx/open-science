@@ -4,9 +4,10 @@ import type { ToolActivity } from '@/stores/session-store'
 
 import {
   buildToolActivityDetails,
+  getLoadedSkillName,
   getToolDisplayName,
   isEditActivity,
-  isNotebookExecuteActivity
+  isSkillActivity
 } from './workspace-tool-activity-details'
 
 const createActivity = (overrides: Partial<ToolActivity>): ToolActivity => ({
@@ -28,6 +29,33 @@ describe('workspace tool activity details', () => {
     ).toBe('Bash')
     expect(getToolDisplayName(createActivity({ toolKind: 'execute' }))).toBe('Terminal')
     expect(getToolDisplayName(createActivity({ toolKind: undefined }))).toBe('Tool')
+  })
+
+  it('keeps native Skill instruction documents out of expandable activity details', () => {
+    const activity = createActivity({
+      title: 'Loaded skill: mcp-pubmed',
+      rawInput: { name: 'mcp-pubmed' },
+      toolContent: [
+        {
+          type: 'content',
+          content: { type: 'text', text: '<skill_content>Internal instructions</skill_content>' }
+        }
+      ]
+    })
+
+    expect(isSkillActivity(activity)).toBe(true)
+    expect(buildToolActivityDetails(activity)).toBeUndefined()
+  })
+
+  it('recognizes an in-progress projected Codex Skill activity and extracts its name', () => {
+    const activity = createActivity({
+      title: 'Loading skill: mcp-pubmed',
+      status: 'in_progress'
+    })
+
+    expect(isSkillActivity(activity)).toBe(true)
+    expect(getLoadedSkillName(activity)).toBe('mcp-pubmed')
+    expect(buildToolActivityDetails(activity)).toBeUndefined()
   })
 
   it('builds command and output code sections for execute tools', () => {
@@ -163,20 +191,6 @@ describe('workspace tool activity details', () => {
     expect(details?.sections[1]).toMatchObject({ label: 'Output', text: '5 rows returned' })
   })
 
-  it('detects the notebook execute tool so its row can default to expanded', () => {
-    expect(
-      isNotebookExecuteActivity(
-        createActivity({ providerToolName: 'mcp__open-science-notebook__notebook_execute' })
-      )
-    ).toBe(true)
-    expect(
-      isNotebookExecuteActivity(
-        createActivity({ providerToolName: 'mcp__open-science-notebook__notebook_state' })
-      )
-    ).toBe(false)
-    expect(isNotebookExecuteActivity(createActivity({ providerToolName: 'Bash' }))).toBe(false)
-  })
-
   it('renders a notebook cell as Python code plus output, not the raw run summary', () => {
     const runSummary = {
       runId: 'notebook-run-1',
@@ -212,6 +226,76 @@ describe('workspace tool activity details', () => {
     expect((details?.sections[0] as { collapsible?: boolean }).collapsible).toBeFalsy()
   })
 
+  it('renders a Codex notebook activity from its dotted title and MCP arguments envelope', () => {
+    const runSummary = {
+      status: 'completed',
+      text: { stdout: '42\n', stderr: '', traceback: '' },
+      outputs: []
+    }
+    const activity = createActivity({
+      title: 'mcp.open-science-notebook.notebook_execute',
+      toolKind: 'execute',
+      rawInput: {
+        server: 'open-science-notebook',
+        tool: 'notebook_execute',
+        arguments: { kernelKind: 'python', code: 'print(42)' }
+      },
+      toolContent: [
+        { type: 'content', content: { type: 'text', text: JSON.stringify(runSummary) } }
+      ]
+    })
+    const details = buildToolActivityDetails(activity)
+
+    expect(details?.displayName).toBe('Notebook cell')
+    expect(details?.sections[0]).toMatchObject({
+      kind: 'code',
+      label: 'Code',
+      language: 'python',
+      text: 'print(42)'
+    })
+    expect(details?.sections[1]).toMatchObject({ kind: 'code', label: 'Output', text: '42' })
+  })
+
+  it('renders an opencode single-underscore notebook tool as code, not raw JSON', () => {
+    // opencode names the tool <server>_<tool> (no mcp__ prefix); the activity must still render as
+    // a notebook cell rather than falling back to the run-summary envelope.
+    const activity = createActivity({
+      providerToolName: 'open-science-notebook_notebook_execute',
+      toolKind: 'execute',
+      rawInput: { code: 'print(1)' },
+      toolContent: []
+    })
+    const details = buildToolActivityDetails(activity)
+
+    expect(details?.displayName).toBe('Notebook cell')
+    expect(details?.sections[0]).toMatchObject({
+      kind: 'code',
+      language: 'python',
+      text: 'print(1)'
+    })
+  })
+
+  it('labels a notebook cell with its clean kernel name, never the raw tool id', () => {
+    const runSummary = {
+      status: 'completed',
+      script: 'x = 1',
+      text: { stdout: '', stderr: '', traceback: '', plain: [] },
+      outputs: []
+    }
+    const activity = createActivity({
+      // The runtime may backfill an untitled call with the raw tool id; the row label ignores it.
+      title: 'mcp__open-science-notebook__notebook_execute',
+      providerToolName: 'mcp__open-science-notebook__notebook_execute',
+      rawInput: { code: 'x = 1' },
+      toolContent: [
+        { type: 'content', content: { type: 'text', text: JSON.stringify(runSummary) } }
+      ]
+    })
+    const details = buildToolActivityDetails(activity)
+
+    expect(details?.displayName).toBe('Notebook cell')
+  })
+
   it('falls back to the run summary script when notebook input code is unavailable', () => {
     const runSummary = {
       status: 'failed',
@@ -236,6 +320,32 @@ describe('workspace tool activity details', () => {
     expect(details?.sections[1]?.kind === 'code' && details.sections[1].text).toContain(
       'ValueError: boom'
     )
+  })
+
+  it('uses the run summary kernel when notebook raw input is unavailable', () => {
+    const runSummary = {
+      status: 'completed',
+      kernelKind: 'r',
+      // Deliberately ambiguous: the code heuristic defaults this to Python without summary metadata.
+      script: 'print("from R")',
+      text: { stdout: '[1] "from R"\n', stderr: '', traceback: '', plain: [] }
+    }
+    const activity = createActivity({
+      providerToolName: 'mcp__open-science-notebook__notebook_execute',
+      toolKind: 'other',
+      toolContent: [
+        { type: 'content', content: { type: 'text', text: JSON.stringify(runSummary) } }
+      ]
+    })
+
+    const details = buildToolActivityDetails(activity)
+
+    expect(details?.displayName).toBe('Notebook cell')
+    expect(details?.sections[0]).toMatchObject({
+      label: 'Code',
+      language: 'r',
+      text: 'print("from R")'
+    })
   })
 
   it('renders a repl_execute run as Agent SDK JavaScript code plus its echoed result', () => {
@@ -384,6 +494,53 @@ describe('workspace tool activity details', () => {
     expect(details?.metaLabel).toBe('conda · restart needed')
   })
 
+  it('shows verified requested-package version changes from manage_packages', () => {
+    const activity = createActivity({
+      providerToolName: 'mcp__open-science-notebook__manage_packages',
+      toolKind: 'other',
+      rawInput: { language: 'python', packages: ['numpy', 'pandas'] },
+      toolContent: [
+        {
+          type: 'content',
+          content: {
+            type: 'text',
+            text: JSON.stringify({
+              ok: true,
+              needsRestart: false,
+              method: 'conda',
+              packageChanges: [
+                {
+                  name: 'numpy',
+                  change: 'updated',
+                  beforeVersion: '2.1.0',
+                  afterVersion: '2.2.0'
+                },
+                {
+                  name: 'pandas',
+                  change: 'unchanged',
+                  beforeVersion: '2.2.3',
+                  afterVersion: '2.2.3'
+                }
+              ]
+            })
+          }
+        }
+      ]
+    })
+
+    const details = buildToolActivityDetails(activity)
+    const packagesSection = details?.sections.find(
+      (section) => section.kind === 'code' && section.label === 'Packages'
+    )
+
+    expect(packagesSection?.kind === 'code' && packagesSection.text).toContain(
+      'numpy: 2.1.0 → 2.2.0'
+    )
+    expect(packagesSection?.kind === 'code' && packagesSection.text).toContain(
+      'pandas: unchanged at 2.2.3'
+    )
+  })
+
   it('renders an image artifact-write result as an inline preview section', () => {
     const activity = createActivity({
       providerToolName: 'write_artifact_file',
@@ -486,6 +643,63 @@ describe('workspace tool activity details', () => {
     expect(details?.displayName).toBe('Write file')
     expect(details?.subtitle).toBe('data.csv')
     expect(details?.sections[0]?.kind === 'code' && details.sections[0].text).not.toContain('a,b')
+  })
+
+  it('does not classify artifact-file lookalikes as managed writes', () => {
+    const activity = createActivity({
+      providerToolName: 'delete_artifact_file',
+      toolKind: 'other',
+      title: 'Delete artifact file',
+      rawInput: { filename: 'obsolete.csv' },
+      rawOutput: { deleted: true }
+    })
+
+    const details = buildToolActivityDetails(activity)
+
+    expect(details?.displayName).toBe('delete_artifact_file')
+    expect(details?.sections.map((section) => section.label)).toEqual(['Input', 'Output'])
+    expect(details?.sections[1]?.kind === 'code' && details.sections[1].text).toContain('deleted')
+  })
+
+  it('summarizes a Codex artifact receipt envelope when the MCP identity is only in the title', () => {
+    const artifactReceipt = {
+      artifact: {
+        artifact_id: 'bfa741b1-2088-42b0-b075-812a640e1ec6',
+        version_id: 'de3cfa20-2cea-4f8a-87cd-7b482410e0ed',
+        version_number: 1,
+        filename: 'sin.png',
+        content_type: 'image/png',
+        size_bytes: 41671,
+        checksum: '75e5991b3bac5025d01ae83eb0d85fab922153411edb8d19859f728528f20a68',
+        producer_run_id: 'notebook-run-1785397616378-1',
+        environment: 'default-python'
+      }
+    }
+    const activity = createActivity({
+      toolKind: 'execute',
+      title: 'mcp.open-science-artifacts.write_artifact_file',
+      rawOutput: {
+        result: {
+          content: [{ type: 'text', text: JSON.stringify(artifactReceipt) }],
+          structuredContent: null,
+          _meta: null
+        },
+        error: null
+      }
+    })
+    const details = buildToolActivityDetails(activity)
+
+    expect(details?.displayName).toBe('Write file')
+    expect(details?.subtitle).toBe('sin.png')
+    expect(details?.metaLabel).toBe('41 KB')
+    expect(details?.sections.map((section) => section.label)).toEqual(['File'])
+    expect(details?.sections[0]?.kind === 'code' && details.sections[0].text).toContain('sin.png')
+    expect(details?.sections[0]?.kind === 'code' && details.sections[0].text).not.toContain(
+      'artifact_id'
+    )
+    expect(details?.sections[0]?.kind === 'code' && details.sections[0].text).not.toContain(
+      'structuredContent'
+    )
   })
 
   it('renders a WebFetch with its URL, prompt, and fetched result', () => {

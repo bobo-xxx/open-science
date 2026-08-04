@@ -1,0 +1,271 @@
+{
+  "schemaVersion": 1,
+  "alwaysLanes": ["policy"],
+  "laneOrder": [
+    "policy",
+    "docs",
+    "format",
+    "lint",
+    "typecheck_node",
+    "typecheck_web",
+    "interface_contracts",
+    "cli_sdk",
+    "unit_linux",
+    "coverage_macos",
+    "windows_runtime",
+    "windows_path",
+    "unit_renderer",
+    "build",
+    "e2e_functional_macos",
+    "e2e_functional_windows",
+    "e2e_workspace_macos",
+    "e2e_workspace_windows",
+    "e2e_accessibility_macos",
+    "e2e_accessibility_windows",
+    "e2e_visual_macos"
+  ],
+  "bundleOrder": [
+    "policy",
+    "static",
+    "unit",
+    "coverage_macos",
+    "windows_core",
+    "macos_e2e",
+    "windows_e2e"
+  ],
+  "laneBundles": {
+    "policy": "policy",
+    "docs": "static",
+    "format": "static",
+    "lint": "static",
+    "typecheck_node": "static",
+    "typecheck_web": "static",
+    "interface_contracts": "static",
+    "cli_sdk": "static",
+    "unit_linux": "unit",
+    "coverage_macos": "coverage_macos",
+    "windows_runtime": "windows_core",
+    "windows_path": "windows_core",
+    "unit_renderer": "unit",
+    "build": "macos_e2e",
+    "e2e_functional_macos": "macos_e2e",
+    "e2e_functional_windows": "windows_e2e",
+    "e2e_workspace_macos": "macos_e2e",
+    "e2e_workspace_windows": "windows_e2e",
+    "e2e_accessibility_macos": "macos_e2e",
+    "e2e_accessibility_windows": "windows_e2e",
+    "e2e_visual_macos": "macos_e2e"
+  },
+  "rules": [
+    {
+      "id": "global_gate_input",
+      "role": "global",
+      "paths": [
+        "package*.json",
+        ".nvmrc",
+        "tsconfig*.json",
+        "vitest.config.*",
+        "electron.vite.config.*",
+        "vite.web.config.*",
+        "playwright.config.*",
+        "electron-builder.yml",
+        "scripts/ci/**",
+        ".github/workflows/pr-gate.yml"
+      ],
+      "mode": "full",
+      "capabilities": []
+    },
+    {
+      "id": "ci_integrity_surface",
+      "role": "owner",
+      "paths": [
+        ".github/workflows/**",
+        ".github/actions/**",
+        ".github/dependabot.yml",
+        ".github/CODEOWNERS",
+        "CODEOWNERS"
+      ],
+      "capabilities": ["ci_integrity_surface"]
+    },
+    {
+      "id": "documentation",
+      "role": "owner",
+      "paths": ["**/*.md", "docs/**", "LICENSE", ".gitignore"],
+      "capabilities": ["documentation"]
+    },
+    {
+      "id": "shared_contract",
+      "role": "owner",
+      "fallbackOwner": true,
+      "paths": ["src/shared/**"],
+      "capabilities": ["shared_contract"]
+    },
+    {
+      "id": "preload_contract",
+      "role": "owner",
+      "paths": ["src/preload/**"],
+      "capabilities": ["preload_contract"]
+    },
+    {
+      "id": "main_runtime",
+      "role": "owner",
+      "fallbackOwner": true,
+      "paths": ["src/main/**"],
+      "capabilities": ["main_runtime"]
+    },
+    {
+      "id": "windows_sensitive",
+      "role": "overlay",
+      "paths": [
+        "src/main/**/*windows*.ts",
+        "src/main/**/*powershell*.ts",
+        "src/main/**/*path*.ts",
+        "src/main/**/*acl*.ts",
+        "src/main/storage/**",
+        "src/main/session-persistence/**",
+        "src/main/file-save.ts",
+        "src/main/specialist/repository.ts",
+        "src/main/settings/notebook-runtime-settings.ts",
+        "src/main/settings/preferences.ts",
+        "src/preload/**/*windows*.ts",
+        "src/preload/**/*powershell*.ts",
+        "src/preload/**/*path*.ts",
+        "src/preload/**/*acl*.ts"
+      ],
+      "capabilities": ["windows_sensitive"]
+    },
+    {
+      "id": "renderer_view",
+      "role": "owner",
+      "fallbackOwner": true,
+      "paths": ["src/renderer/**"],
+      "capabilities": ["renderer_view"]
+    },
+    {
+      "id": "renderer_state",
+      "role": "overlay",
+      "paths": [
+        "src/renderer/src/stores/**",
+        "src/renderer/src/hooks/**",
+        "src/renderer/src/navigation/**",
+        "src/renderer/src/pages/workspace/**"
+      ],
+      "capabilities": ["renderer_state"]
+    },
+    {
+      "id": "cli_sdk",
+      "role": "owner",
+      "paths": ["cli/**", "packages/open-science/**"],
+      "capabilities": ["cli_sdk"]
+    },
+    {
+      "id": "settings_ipc",
+      "role": "overlay",
+      "paths": ["src/main/settings/ipc.ts"],
+      "capabilities": ["settings_ipc"]
+    }
+  ],
+  "capabilities": {
+    "ci_integrity_surface": {
+      "consumers": [],
+      "lanes": []
+    },
+    "documentation": {
+      "consumers": [],
+      "lanes": ["docs"]
+    },
+    "shared_contract": {
+      "consumers": ["preload_adapter"],
+      "lanes": [
+        "format",
+        "lint",
+        "typecheck_node",
+        "typecheck_web",
+        "interface_contracts",
+        "unit_linux",
+        "coverage_macos",
+        "windows_runtime",
+        "windows_path"
+      ]
+    },
+    "preload_contract": {
+      "consumers": [],
+      "lanes": [
+        "format",
+        "lint",
+        "typecheck_node",
+        "typecheck_web",
+        "interface_contracts",
+        "coverage_macos",
+        "build"
+      ]
+    },
+    "main_runtime": {
+      "consumers": ["renderer_runtime"],
+      "lanes": [
+        "format",
+        "lint",
+        "typecheck_node",
+        "interface_contracts",
+        "unit_linux",
+        "coverage_macos"
+      ]
+    },
+    "renderer_runtime": {
+      "consumers": ["e2e_functional", "e2e_workspace"],
+      "lanes": ["typecheck_web", "unit_renderer", "build"]
+    },
+    "windows_sensitive": {
+      "consumers": [],
+      "lanes": ["windows_runtime", "windows_path"]
+    },
+    "renderer_view": {
+      "consumers": ["e2e_functional", "e2e_accessibility", "e2e_visual"],
+      "lanes": [
+        "format",
+        "lint",
+        "typecheck_web",
+        "unit_linux",
+        "coverage_macos",
+        "unit_renderer",
+        "build"
+      ]
+    },
+    "renderer_state": {
+      "consumers": ["e2e_workspace"],
+      "lanes": []
+    },
+    "cli_sdk": {
+      "consumers": [],
+      "lanes": ["format", "lint", "cli_sdk"]
+    },
+    "settings_ipc": {
+      "consumers": ["preload_adapter"],
+      "lanes": ["typecheck_node", "interface_contracts"]
+    },
+    "preload_adapter": {
+      "consumers": ["renderer_settings"],
+      "lanes": ["typecheck_web", "build"]
+    },
+    "renderer_settings": {
+      "consumers": ["e2e_functional", "e2e_workspace", "e2e_accessibility", "e2e_visual"],
+      "lanes": ["unit_renderer"]
+    },
+    "e2e_functional": {
+      "consumers": [],
+      "lanes": ["e2e_functional_macos", "e2e_functional_windows"]
+    },
+    "e2e_workspace": {
+      "consumers": [],
+      "lanes": ["e2e_workspace_macos", "e2e_workspace_windows"]
+    },
+    "e2e_accessibility": {
+      "consumers": [],
+      "lanes": ["e2e_accessibility_macos", "e2e_accessibility_windows"]
+    },
+    "e2e_visual": {
+      "consumers": [],
+      "lanes": ["e2e_visual_macos"]
+    }
+  }
+}

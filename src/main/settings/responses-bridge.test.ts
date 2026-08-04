@@ -11,8 +11,10 @@ import {
   toolsToChat,
   upstreamErrorMessage
 } from './responses-bridge'
+import { selectExplicitConnectorSkills } from './skill-selector-routing'
 
 describe('Responses-compatible bridge conversion', () => {
+  const legacyReviewerMarker = '<open_science_reviewer_session>'
   it('maps instructions, messages, function calls, and tool results to Chat Completions', () => {
     const request = responsesToChatRequest({
       model: 'model-a',
@@ -258,7 +260,13 @@ describe('Responses-compatible bridge conversion', () => {
             }
           }
         ],
-        usage: { total_tokens: 4 }
+        usage: {
+          prompt_tokens: 3,
+          prompt_tokens_details: { cached_tokens: 1 },
+          completion_tokens: 2,
+          completion_tokens_details: { reasoning_tokens: 1 },
+          total_tokens: 5
+        }
       })
     ).toMatchObject({
       id: 'chat-1',
@@ -267,7 +275,13 @@ describe('Responses-compatible bridge conversion', () => {
         { type: 'message', content: [{ type: 'output_text', text: 'done' }] },
         { type: 'function_call', call_id: 'call-1', name: 'lookup', arguments: '{"id":1}' }
       ],
-      usage: { total_tokens: 4 }
+      usage: {
+        input_tokens: 3,
+        input_tokens_details: { cached_tokens: 1 },
+        output_tokens: 2,
+        output_tokens_details: { reasoning_tokens: 1 },
+        total_tokens: 5
+      }
     })
   })
 
@@ -471,6 +485,12 @@ describe('Responses-compatible bridge conversion', () => {
       responsesToChatRequest({ input: 'hello', reasoning: { effort: 'turbo' } })
     ).toThrow(/reasoning effort/)
     expect(() =>
+      responsesToChatRequest({ input: 'hello', reasoning: { effort: 'max' } })
+    ).not.toThrow()
+    expect(() =>
+      responsesToChatRequest({ input: 'hello', reasoning: { effort: 'ultra' } })
+    ).not.toThrow()
+    expect(() =>
       responsesToChatRequest({ input: 'hello', reasoning: { summary: 'verbose' } })
     ).toThrow(/reasoning summary/)
     expect(() =>
@@ -508,56 +528,101 @@ describe('Responses-compatible bridge conversion', () => {
     ).toMatchObject({ model: 'deepseek-v4-flash' })
   })
 
-  it('translates the reasoning effort into the Chat Completions parameter when explicitly chosen', () => {
+  it('uses the model-resolved effort override instead of Codex\u2019s request value', () => {
     expect(
       responsesToChatRequest(
         { model: 'model-a', input: 'hi', reasoning: { effort: 'high' } },
         undefined,
         undefined,
         [],
-        { forwardReasoningEffort: true }
+        { reasoningEffortOverride: 'max' }
       )
-    ).toMatchObject({ reasoning_effort: 'high' })
-    expect(
-      responsesToChatRequest(
-        { model: 'model-a', input: 'hi', reasoning: { effort: 'low' } },
-        undefined,
-        undefined,
-        [],
-        { forwardReasoningEffort: true }
-      )
-    ).toMatchObject({ reasoning_effort: 'low' })
+    ).toMatchObject({ reasoning_effort: 'max' })
   })
 
-  it('clamps the Codex-only xhigh effort to high for Chat Completions', () => {
-    expect(
-      responsesToChatRequest(
-        { model: 'model-a', input: 'hi', reasoning: { effort: 'xhigh' } },
-        undefined,
-        undefined,
-        [],
-        { forwardReasoningEffort: true }
-      )
-    ).toMatchObject({ reasoning_effort: 'high' })
-  })
+  it.each(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const)(
+    'transports the model-resolved %s effort without protocol-level clamping',
+    (effort) => {
+      expect(
+        responsesToChatRequest(
+          { model: 'model-a', input: 'hi', reasoning: { effort: 'high' } },
+          undefined,
+          undefined,
+          [],
+          { reasoningEffortOverride: effort }
+        )
+      ).toMatchObject({ reasoning_effort: effort })
+    }
+  )
 
-  it('omits the reasoning effort when there is nothing portable to send', () => {
-    // 'none' has no Chat Completions equivalent — the upstream default stands. No reasoning block
-    // means nothing is sent either.
+  it('uses provider-native Chat controls when none is not a reasoning_effort literal', () => {
     expect(
-      responsesToChatRequest(
-        { model: 'model-a', input: 'hi', reasoning: { effort: 'none' } },
-        undefined,
-        undefined,
-        [],
-        { forwardReasoningEffort: true }
-      )
-    ).not.toHaveProperty('reasoning_effort')
+      responsesToChatRequest({ model: 'catalog', input: 'hi' }, 'deepseek-v4-pro', undefined, [], {
+        reasoningEffortOverride: 'none',
+        vendorId: 'deepseek'
+      })
+    ).toMatchObject({ thinking: { type: 'disabled' } })
     expect(
-      responsesToChatRequest({ model: 'model-a', input: 'hi' }, undefined, undefined, [], {
-        forwardReasoningEffort: true
+      responsesToChatRequest({ model: 'catalog', input: 'hi' }, 'deepseek-v4-pro', undefined, [], {
+        reasoningEffortOverride: 'none',
+        vendorId: 'deepseek'
       })
     ).not.toHaveProperty('reasoning_effort')
+
+    expect(
+      responsesToChatRequest({ model: 'catalog', input: 'hi' }, 'mimo-v2.5-pro', undefined, [], {
+        reasoningEffortOverride: 'high',
+        vendorId: 'xiaomimimo'
+      })
+    ).toMatchObject({ thinking: { type: 'enabled' } })
+
+    expect(
+      responsesToChatRequest({ model: 'catalog', input: 'hi' }, 'qwen/qwen3.7-max', undefined, [], {
+        reasoningEffortOverride: 'none',
+        vendorId: 'openrouter'
+      })
+    ).toMatchObject({ reasoning: { enabled: false } })
+  })
+
+  it('uses the selected native transport for a custom gateway', () => {
+    const request = responsesToChatRequest(
+      { model: 'catalog', input: 'hi' },
+      'private-model',
+      undefined,
+      [],
+      {
+        reasoningEffortOverride: 'none',
+        reasoningEffortTransport: 'minimax'
+      }
+    )
+
+    expect(request).toMatchObject({ thinking: { type: 'disabled' } })
+    expect(request).not.toHaveProperty('reasoning_effort')
+  })
+
+  it('does not infer the built-in OpenRouter Qwen toggle for a custom gateway', () => {
+    expect(
+      responsesToChatRequest({ model: 'catalog', input: 'hi' }, 'qwen/qwen3.7-max', undefined, [], {
+        reasoningEffortOverride: 'high',
+        reasoningEffortTransport: 'openrouter'
+      })
+    ).toMatchObject({ reasoning: { effort: 'high' } })
+  })
+
+  it('uses OpenRouter reasoning objects and keeps GLM none as a literal effort', () => {
+    expect(
+      responsesToChatRequest({ model: 'catalog', input: 'hi' }, 'openai/gpt-5.5', undefined, [], {
+        reasoningEffortOverride: 'xhigh',
+        vendorId: 'openrouter'
+      })
+    ).toMatchObject({ reasoning: { effort: 'xhigh' } })
+
+    expect(
+      responsesToChatRequest({ model: 'catalog', input: 'hi' }, 'glm-5.2', undefined, [], {
+        reasoningEffortOverride: 'none',
+        vendorId: 'zhipu'
+      })
+    ).toMatchObject({ reasoning_effort: 'none' })
   })
 
   it('strips the reasoning effort unless the user explicitly chose a level', () => {
@@ -566,6 +631,17 @@ describe('Responses-compatible bridge conversion', () => {
     expect(
       responsesToChatRequest({ model: 'model-a', input: 'hi', reasoning: { effort: 'high' } })
     ).not.toHaveProperty('reasoning_effort')
+  })
+
+  it('requests streaming usage without forwarding Responses-only stream options', () => {
+    expect(
+      responsesToChatRequest({
+        model: 'model-a',
+        input: 'hi',
+        stream: true,
+        stream_options: { include_obfuscation: true }
+      })
+    ).toMatchObject({ stream_options: { include_usage: true } })
   })
 
   it('surfaces a nested upstream error instead of hiding it behind HTTP status', () => {
@@ -587,6 +663,20 @@ describe('Responses-compatible bridge conversion', () => {
                 id: 'chat-1',
                 model: 'model-a',
                 choices: [{ index: 0, delta: { role: 'assistant', content: 'bridge-ok' } }]
+              }),
+            '',
+            'data: ' +
+              JSON.stringify({
+                id: 'chat-1',
+                model: 'model-a',
+                choices: [],
+                usage: {
+                  prompt_tokens: 3,
+                  prompt_tokens_details: { cached_tokens: 1 },
+                  completion_tokens: 2,
+                  completion_tokens_details: { reasoning_tokens: 1 },
+                  total_tokens: 5
+                }
               }),
             '',
             'data: [DONE]',
@@ -629,6 +719,7 @@ describe('Responses-compatible bridge conversion', () => {
       expect(upstreamRequest).toMatchObject({
         model: 'model-a',
         stream: true,
+        stream_options: { include_usage: true },
         messages: [
           { role: 'system', content: 'Be brief.' },
           { role: 'user', content: [{ type: 'text', text: 'hi' }] }
@@ -637,12 +728,26 @@ describe('Responses-compatible bridge conversion', () => {
       expect(output).toContain('response.output_text.delta')
       expect(output).toContain('bridge-ok')
       expect(output).toContain('response.completed')
+      const completed = output
+        .split('\n')
+        .filter((line) => line.startsWith('data: '))
+        .map((line) => JSON.parse(line.slice(6)) as Record<string, unknown>)
+        .find((event) => event.type === 'response.completed') as {
+        response: { usage: Record<string, unknown> }
+      }
+      expect(completed.response.usage).toEqual({
+        input_tokens: 3,
+        input_tokens_details: { cached_tokens: 1 },
+        output_tokens: 2,
+        output_tokens_details: { reasoning_tokens: 1 },
+        total_tokens: 5
+      })
     } finally {
       await bridge.close()
     }
   })
 
-  it('forwards the reasoning effort to the upstream gateway when explicitly chosen', async () => {
+  it('overrides Codex\u2019s effort with the model-resolved value at the upstream gateway', async () => {
     let upstreamRequest: Record<string, unknown> | undefined
     const upstreamFetch = vi.fn(
       async (_url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
@@ -664,7 +769,7 @@ describe('Responses-compatible bridge conversion', () => {
       }
     )
     const bridge = new ResponsesBridge(
-      { baseUrl: 'https://vendor.example/v1', key: 'upstream-key', forwardReasoningEffort: true },
+      { baseUrl: 'https://vendor.example/v1', key: 'upstream-key', reasoningEffort: 'max' },
       upstreamFetch
     )
     const connection = await bridge.start()
@@ -685,9 +790,8 @@ describe('Responses-compatible bridge conversion', () => {
       })
       await response.text()
 
-      // The Codex-only 'xhigh' reaches the gateway as 'high', not dropped.
       expect(response.status).toBe(200)
-      expect(upstreamRequest).toMatchObject({ reasoning_effort: 'high' })
+      expect(upstreamRequest).toMatchObject({ reasoning_effort: 'max' })
     } finally {
       await bridge.close()
     }
@@ -714,8 +818,8 @@ describe('Responses-compatible bridge conversion', () => {
         )
       }
     )
-    // No forwardReasoningEffort: Codex's own default effort must not change what existing bridged
-    // users send upstream.
+    // No resolved override: Codex's own default effort must not change what existing bridged users
+    // send upstream.
     const bridge = new ResponsesBridge(
       { baseUrl: 'https://vendor.example/v1', key: 'upstream-key' },
       upstreamFetch
@@ -790,13 +894,14 @@ describe('Responses-compatible bridge conversion', () => {
       await post()
       expect(upstreamRequest).not.toHaveProperty('reasoning_effort')
 
-      // The user picks a level (Codex applies it live over ACP — the bridge never reconnects).
-      bridge.setForwardReasoningEffort(true)
+      // The model profile resolves a concrete level (Codex applies it live over ACP — the bridge
+      // never reconnects).
+      bridge.setReasoningEffort('max')
       await post()
-      expect(upstreamRequest).toMatchObject({ reasoning_effort: 'high' })
+      expect(upstreamRequest).toMatchObject({ reasoning_effort: 'max' })
 
       // Back to default: stripping restored on the same live bridge.
-      bridge.setForwardReasoningEffort(false)
+      bridge.setReasoningEffort(undefined)
       await post()
       expect(upstreamRequest).not.toHaveProperty('reasoning_effort')
     } finally {
@@ -905,14 +1010,6 @@ describe('Responses-compatible bridge conversion', () => {
               required: ['code']
             }
           }
-        ],
-        connectorInstructions: [
-          {
-            id: 'pubmed',
-            aliases: ['PubMed'],
-            content:
-              'Reach this service ONLY via host.mcp. Example: host.mcp("pubmed", "search_articles", {"query": "cancer"})'
-          }
         ]
       },
       upstreamFetch
@@ -962,14 +1059,6 @@ describe('Responses-compatible bridge conversion', () => {
         'exec_command',
         'mcp__open_science_notebook__notebook_execute'
       ])
-      expect(upstreamRequest?.messages).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            role: 'system',
-            content: expect.stringContaining('host.mcp("pubmed", "search_articles"')
-          })
-        ])
-      )
       expect(output).toContain('"type":"function_call"')
       expect(output).toContain('"namespace":"mcp__open_science_notebook"')
       expect(output).toContain('"name":"notebook_execute"')
@@ -980,30 +1069,55 @@ describe('Responses-compatible bridge conversion', () => {
     }
   })
 
-  it('selects connector guidance from the latest user turn instead of stale history', async () => {
-    const upstreamFetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-      const request = JSON.parse(String(init?.body))
-      expect(request.messages[0].content).toContain('GENES_GUIDANCE')
-      expect(request.messages[0].content).not.toContain('PUBMED_GUIDANCE')
-      return Response.json({
-        id: 'c-latest',
-        model: 'm',
-        choices: [{ message: { role: 'assistant', content: 'ok' } }]
-      })
-    })
+  it('advertises reviewer MCP functions only for a trusted registered session key', async () => {
+    const upstreamRequests: Array<Record<string, unknown>> = []
+    const upstreamFetch = vi.fn(
+      async (_url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        upstreamRequests.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+        return new Response(
+          [
+            `data: ${JSON.stringify({
+              id: 'chat-reviewer-scope',
+              model: 'model-a',
+              choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+            })}`,
+            '',
+            'data: [DONE]',
+            ''
+          ].join('\n'),
+          { headers: { 'content-type': 'text/event-stream' } }
+        )
+      }
+    )
     const bridge = new ResponsesBridge(
       {
         baseUrl: 'https://vendor.example/v1',
-        connectorInstructions: [
-          { id: 'pubmed', aliases: ['PubMed'], content: 'PUBMED_GUIDANCE' },
-          { id: 'genes', aliases: ['mygene.info'], content: 'GENES_GUIDANCE' }
-        ]
+        namespacedTools: [
+          {
+            namespace: 'mcp__open_science_notebook',
+            name: 'notebook_execute',
+            parameters: { type: 'object' }
+          }
+        ],
+        reviewerScope: {
+          namespacedTools: [
+            {
+              namespace: 'mcp__open_science_reviewer',
+              name: 'read_turn',
+              parameters: { type: 'object' }
+            },
+            {
+              namespace: 'mcp__open_science_reviewer',
+              name: 'submit_findings',
+              parameters: { type: 'object' }
+            }
+          ]
+        }
       },
       upstreamFetch
     )
     const connection = await bridge.start()
-
-    try {
+    const post = async (input: string, promptCacheKey: string): Promise<void> => {
       const response = await fetch(`${connection.baseUrl}/responses`, {
         method: 'POST',
         headers: {
@@ -1011,16 +1125,45 @@ describe('Responses-compatible bridge conversion', () => {
           'content-type': 'application/json'
         },
         body: JSON.stringify({
-          model: 'm',
-          stream: false,
-          input: [
-            { type: 'message', role: 'user', content: 'Use PubMed for cancer papers' },
-            { type: 'message', role: 'assistant', content: 'done' },
-            { type: 'message', role: 'user', content: 'Use mygene.info for TP53' }
-          ]
+          model: 'model-a',
+          input,
+          prompt_cache_key: promptCacheKey,
+          stream: true,
+          tools: [
+            { type: 'function', name: 'exec_command', parameters: { type: 'object' } },
+            { type: 'local_shell' },
+            { type: 'tool_search' }
+          ],
+          tool_choice: { type: 'function', name: 'exec_command' }
         })
       })
-      expect(response.status).toBe(200)
+      await response.text()
+    }
+
+    try {
+      bridge.registerReviewerSession('never-observed-reviewer-session')
+      expect(bridge.unregisterReviewerSession('never-observed-reviewer-session')).toBe(false)
+
+      await post(`${legacyReviewerMarker} normal user content`, 'normal-session')
+      bridge.registerReviewerSession('reviewer-session')
+      await post('review this turn without a model-visible routing marker', 'reviewer-session')
+      expect(bridge.unregisterReviewerSession('reviewer-session')).toBe(true)
+
+      const toolNames = upstreamRequests.map((request) =>
+        ((request.tools ?? []) as Array<{ function?: { name?: string } }>).map(
+          (tool) => tool.function?.name
+        )
+      )
+      expect(toolNames[0]).toEqual(['exec_command', 'mcp__open_science_notebook__notebook_execute'])
+      expect(toolNames[1]).toEqual([
+        'mcp__open_science_reviewer__read_turn',
+        'mcp__open_science_reviewer__submit_findings'
+      ])
+      expect(upstreamRequests[0]?.tool_choice).toEqual({
+        type: 'function',
+        function: { name: 'exec_command' }
+      })
+      expect(upstreamRequests[1]?.tool_choice).toBe('auto')
     } finally {
       await bridge.close()
     }
@@ -1458,5 +1601,300 @@ describe('Responses-compatible bridge conversion', () => {
     // Real provider switch: cache is cleared so stale reasoning can't leak across providers.
     bridge.setTarget({ baseUrl: 'https://b.example/v1', model: 'm2', key: 'k2' })
     expect(cache.size).toBe(0)
+  })
+})
+
+describe('Responses bridge Skill selector', () => {
+  const catalog = [
+    {
+      name: 'mcp-pubmed',
+      description: 'Search biomedical literature.',
+      path: '/private/pubmed/SKILL.md',
+      source: 'connector' as const
+    },
+    {
+      name: 'literature-review',
+      description: 'Plan a systematic review.',
+      path: '/private/review/SKILL.md'
+    },
+    { name: 'statistics', description: 'Analyze numerical data.', path: '/private/stats/SKILL.md' },
+    { name: 'writing', description: 'Improve prose.', path: '/private/writing/SKILL.md' }
+  ]
+
+  it('sends only current text plus names and descriptions and returns canonical bounded results', async () => {
+    let upstreamUrl = ''
+    let upstreamHeaders: HeadersInit | undefined
+    let upstreamBody: Record<string, unknown> = {}
+    const upstreamFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      upstreamUrl = String(input)
+      upstreamHeaders = init?.headers
+      upstreamBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                tool_calls: [
+                  {
+                    function: {
+                      name: 'select_skills',
+                      arguments: JSON.stringify({
+                        skill_names: [
+                          'mcp-pubmed',
+                          'unknown',
+                          'mcp-pubmed',
+                          'literature-review',
+                          'statistics',
+                          'writing'
+                        ]
+                      })
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }),
+        { headers: { 'content-type': 'application/json' } }
+      )
+    })
+    const bridge = new ResponsesBridge(
+      { baseUrl: 'https://vendor.example/v1', key: 'secret-key', model: 'deepseek-v4-flash' },
+      upstreamFetch
+    )
+
+    const selected = await bridge.selectSkills('查找肿瘤免疫相关的生物医学文献', catalog)
+
+    expect(selected).toEqual(catalog.slice(0, 3).map(({ name, path }) => ({ name, path })))
+    expect(upstreamUrl).toBe('https://vendor.example/v1/chat/completions')
+    expect(upstreamHeaders).toMatchObject({ authorization: 'Bearer secret-key' })
+    expect(upstreamBody).toMatchObject({
+      model: 'deepseek-v4-flash',
+      stream: false,
+      temperature: 0,
+      max_tokens: 512,
+      messages: [
+        expect.objectContaining({ role: 'system' }),
+        { role: 'user', content: '查找肿瘤免疫相关的生物医学文献' }
+      ],
+      tools: [
+        {
+          type: 'function',
+          function: expect.objectContaining({
+            name: 'select_skills',
+            parameters: expect.objectContaining({
+              properties: expect.objectContaining({
+                skill_names: expect.objectContaining({ maxItems: 3 })
+              })
+            })
+          })
+        }
+      ]
+    })
+    expect(upstreamBody).not.toHaveProperty('tool_choice')
+    const serialized = JSON.stringify(upstreamBody)
+    expect(serialized).toContain('Search biomedical literature.')
+    expect(serialized.match(/mcp-pubmed/g)).toHaveLength(1)
+    expect(serialized).not.toContain('/private/')
+    expect(serialized).not.toContain('secret-key')
+  })
+
+  it('selects an explicitly named connector Skill locally without an upstream request', async () => {
+    const upstreamFetch = vi.fn<typeof fetch>()
+    const bridge = new ResponsesBridge(
+      { baseUrl: 'https://vendor.example/v1', model: 'deepseek-v4-flash' },
+      upstreamFetch
+    )
+
+    await expect(bridge.selectSkills('用 PubMed 搜索肿瘤免疫文章', catalog)).resolves.toEqual([
+      { name: 'mcp-pubmed', path: '/private/pubmed/SKILL.md' }
+    ])
+    expect(upstreamFetch).not.toHaveBeenCalled()
+  })
+
+  it('does not treat an ordinary Skill name in natural text as an explicit local selection', async () => {
+    const upstreamFetch = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  tool_calls: [
+                    {
+                      function: {
+                        name: 'select_skills',
+                        arguments: JSON.stringify({ skill_names: ['research'] })
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          })
+        )
+    )
+    const bridge = new ResponsesBridge(
+      { baseUrl: 'https://vendor.example/v1', model: 'model-a' },
+      upstreamFetch
+    )
+    const mixedCatalog = [
+      ...catalog,
+      { name: 'research', description: 'Research a topic.', path: '/skills/research/SKILL.md' }
+    ]
+
+    await expect(bridge.selectSkills('research cancer treatments', mixedCatalog)).resolves.toEqual([
+      { name: 'research', path: '/skills/research/SKILL.md' }
+    ])
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+  })
+
+  it('does not infer connector provenance from a user-controlled mcp-* name', () => {
+    expect(
+      selectExplicitConnectorSkills('use personal for this task', [
+        {
+          name: 'mcp-personal',
+          description: 'A user-authored Skill.',
+          path: '/skills/personal/SKILL.md'
+        }
+      ])
+    ).toEqual([])
+  })
+
+  it('finds an explicitly named connector before bounding the inference catalog', async () => {
+    const upstreamFetch = vi.fn<typeof fetch>()
+    const bridge = new ResponsesBridge(
+      { baseUrl: 'https://vendor.example/v1', model: 'model-a' },
+      upstreamFetch
+    )
+    const largeCatalog = [
+      ...Array.from({ length: 140 }, (_, index) => ({
+        name: `skill-${index}`,
+        description: `Description ${index}`,
+        path: `/skills/${index}/SKILL.md`
+      })),
+      {
+        name: 'mcp-pubmed',
+        description: 'Search PubMed.',
+        path: '/skills/pubmed/SKILL.md',
+        source: 'connector' as const
+      }
+    ]
+
+    await expect(bridge.selectSkills('用 PubMed 搜索文章', largeCatalog)).resolves.toEqual([
+      { name: 'mcp-pubmed', path: '/skills/pubmed/SKILL.md' }
+    ])
+    expect(upstreamFetch).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['an upstream error', new Response('provider unavailable', { status: 503 })],
+    ['a malformed function result', new Response(JSON.stringify({ choices: [{ message: {} }] }))]
+  ])('fails open for %s', async (_label, response) => {
+    const bridge = new ResponsesBridge(
+      { baseUrl: 'https://vendor.example/v1', model: 'model-a' },
+      vi.fn(async () => response.clone())
+    )
+
+    await expect(bridge.selectSkills('hello', catalog)).resolves.toEqual([])
+  })
+
+  it('bounds candidate fields, catalog count, and the complete serialized request', async () => {
+    let upstreamBody = ''
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      upstreamBody = String(init?.body)
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                tool_calls: [
+                  {
+                    function: {
+                      name: 'select_skills',
+                      arguments: JSON.stringify({ skill_names: [] })
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        })
+      )
+    })
+    const oversizedCatalog = [
+      { name: 'oversized', description: 'x'.repeat(1_000_000), path: '/oversized/SKILL.md' },
+      ...Array.from({ length: 300 }, (_, index) => ({
+        name: `skill-${index}`,
+        description: `Description ${index}`,
+        path: `/skills/${index}/SKILL.md`
+      }))
+    ]
+    const bridge = new ResponsesBridge(
+      { baseUrl: 'https://vendor.example/v1', model: 'model-a' },
+      upstreamFetch
+    )
+
+    await expect(bridge.selectSkills('hello', oversizedCatalog)).resolves.toEqual([])
+
+    const request = JSON.parse(upstreamBody) as {
+      messages: Array<{ content: string }>
+      tools: Array<{
+        function: {
+          parameters: { properties: { skill_names: { items: Record<string, unknown> } } }
+        }
+      }>
+    }
+    const catalogJson = request.messages[0].content.split('Skill catalog:\n')[1]
+    const names = (JSON.parse(catalogJson) as Array<{ name: string }>).map(({ name }) => name)
+    expect(names).toHaveLength(128)
+    expect(names).not.toContain('oversized')
+    expect(request.tools[0].function.parameters.properties.skill_names.items).toEqual({
+      type: 'string'
+    })
+    expect(request.messages[0].content).not.toContain('x'.repeat(10_000))
+    expect(Buffer.byteLength(upstreamBody, 'utf8')).toBeLessThan(300 * 1024)
+  })
+
+  it('fails open when the selection deadline expires', async () => {
+    const upstreamFetch = vi.fn(
+      async (_input: string | URL | Request, init?: RequestInit): Promise<Response> =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true })
+        })
+    )
+    const bridge = new ResponsesBridge(
+      { baseUrl: 'https://vendor.example/v1', model: 'model-a' },
+      upstreamFetch,
+      { skillSelectorTimeoutMs: 5 }
+    )
+
+    await expect(bridge.selectSkills('hello', catalog)).resolves.toEqual([])
+  })
+
+  it('aborts the upstream selection when the caller cancels the turn', async () => {
+    let markStarted!: () => void
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve
+    })
+    const upstreamFetch = vi.fn(
+      async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+        markStarted()
+        return new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true })
+        })
+      }
+    )
+    const bridge = new ResponsesBridge(
+      { baseUrl: 'https://vendor.example/v1', model: 'model-a' },
+      upstreamFetch
+    )
+    const controller = new AbortController()
+
+    const selecting = bridge.selectSkills('hello', catalog, controller.signal)
+    await started
+    controller.abort()
+
+    await expect(selecting).resolves.toEqual([])
   })
 })

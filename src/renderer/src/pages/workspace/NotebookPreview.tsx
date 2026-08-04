@@ -17,6 +17,7 @@ import { shouldProvisionR } from './lazy-r'
 import { notebookGated } from './provisioning-view'
 import { NotebookCodeBlock } from './notebook-code'
 import { NotebookRunOutputs } from './NotebookRunOutputs'
+import { NotebookInputDataStrip } from './NotebookInputDataStrip'
 import {
   resolveRunErrorLine,
   environmentLabel,
@@ -122,7 +123,15 @@ const NotebookRunCell = ({
           </span>
         ) : null}
       </div>
-      <NotebookCodeBlock code={run.script} highlightLine={errorLine} />
+      <NotebookInputDataStrip
+        inputFiles={run.inputFiles ?? []}
+        className="mb-2 rounded-md border border-border-100 bg-bg-100 px-2 py-1.5"
+      />
+      <NotebookCodeBlock
+        code={run.script}
+        language={kind === 'repl' ? 'javascript' : kind}
+        highlightLine={errorLine}
+      />
       <NotebookRunOutputs run={run} />
     </div>
   )

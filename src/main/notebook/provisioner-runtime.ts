@@ -1,6 +1,7 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { createReadStream } from 'node:fs'
+import { createReadStream, realpathSync } from 'node:fs'
+import { basename, resolve, sep, win32 } from 'node:path'
 import { promisify } from 'node:util'
 
 import { condaActivatedPath } from './runtime-paths'
@@ -13,6 +14,39 @@ const execFileAsync = promisify(execFile)
 export const CHILD_UNCONFIRMED = 'RUNTIME_CHILD_UNCONFIRMED'
 export const isChildUnconfirmedError = (error: unknown): boolean =>
   error instanceof Error && error.message.includes(CHILD_UNCONFIRMED)
+
+// Structured payload attached to a runMicromamba failure (exit / timeout). The user-facing
+// `Error.message` carries only a short excerpt; the full stdout/stderr tails live here so machine
+// consumers (cache-corruption / MAX_PATH recovery parsers, startup-gate logging) keep the complete
+// diagnostics the message no longer holds.
+export type MicromambaErrorData = {
+  argv: string[]
+  exitCode?: number | null
+  stderrTail?: string
+  stdoutTail?: string
+}
+
+const hasMicromambaErrorData = (error: unknown): error is { data: MicromambaErrorData } =>
+  error instanceof Error &&
+  typeof (error as { data?: unknown }).data === 'object' &&
+  (error as { data?: unknown }).data !== null
+
+// The FULL micromamba diagnostic text for machine parsing (not for the UI). Prefers the untruncated
+// stdout+stderr tails on `error.data`; falls back to `error.message` for errors raised without the
+// structured payload (e.g. captureMicromamba, spawn-failure). Recovery heuristics regex-match this, so
+// it must reconstruct what the pre-excerpt `Error.message` used to contain.
+export const micromambaDiagnosticText = (error: unknown): string => {
+  const message = error instanceof Error ? error.message : String(error)
+  if (!hasMicromambaErrorData(error)) return message
+  const { stdoutTail, stderrTail } = error.data
+  return [
+    message,
+    stdoutTail && `stdout tail:\n${stdoutTail}`,
+    stderrTail && `stderr tail:\n${stderrTail}`
+  ]
+    .filter(Boolean)
+    .join('\n')
+}
 
 // Kills a child and resolves ONLY once it has actually exited, escalating SIGTERM -> SIGKILL. Resolves
 // true when exit is confirmed, false when it can't be confirmed within the deadline (SIGTERM can be
@@ -71,6 +105,67 @@ const executableEnv = ({
   return { ...merged, PATH: condaActivatedPath(prefix, merged.PATH, platform) }
 }
 
+const R_RUNTIME_PATH_PROBE = [
+  'normalize <- function(path) normalizePath(path, winslash="/", mustWork=FALSE)',
+  'cat("OPEN_SCIENCE_R_HOME=", normalize(R.home()), "\\n", sep="")',
+  'cat("OPEN_SCIENCE_R_BASE_LIBRARY=", normalize(R.home("library")), "\\n", sep="")',
+  'for (path in .libPaths()) cat("OPEN_SCIENCE_R_LIBRARY=", normalize(path), "\\n", sep="")'
+].join('; ')
+
+const canonicalPath = (path: string): string => {
+  try {
+    return realpathSync(path)
+  } catch {
+    return resolve(path)
+  }
+}
+
+const pathIsWithin = (
+  candidate: string,
+  root: string,
+  platform: NodeJS.Platform = process.platform
+): boolean => {
+  const normalizeCase = (value: string): string =>
+    platform === 'win32' ? value.toLowerCase() : value
+  const normalizePath = (value: string): string =>
+    platform === 'win32' ? win32.resolve(value) : canonicalPath(value)
+  const normalizedCandidate = normalizeCase(normalizePath(candidate))
+  const normalizedRoot = normalizeCase(normalizePath(root))
+  const separator = platform === 'win32' ? win32.sep : sep
+  return (
+    normalizedCandidate === normalizedRoot ||
+    normalizedCandidate.startsWith(`${normalizedRoot}${separator}`)
+  )
+}
+
+const assertRRuntimePaths = (
+  stdout: string,
+  prefix: string,
+  platform: NodeJS.Platform = process.platform
+): void => {
+  const values = (marker: string): string[] =>
+    stdout
+      .split(/\r?\n/u)
+      .filter((line) => line.startsWith(marker))
+      .map((line) => line.slice(marker.length).trim())
+      .filter(Boolean)
+  const homes = values('OPEN_SCIENCE_R_HOME=')
+  const baseLibraries = values('OPEN_SCIENCE_R_BASE_LIBRARY=')
+  const libraries = values('OPEN_SCIENCE_R_LIBRARY=')
+  if (
+    homes.length !== 1 ||
+    baseLibraries.length !== 1 ||
+    !pathIsWithin(homes[0], prefix, platform) ||
+    !pathIsWithin(baseLibraries[0], prefix, platform) ||
+    !libraries.some((library) => pathIsWithin(library, prefix, platform))
+  ) {
+    throw new Error(
+      `R runtime paths resolve outside the expected prefix ${prefix}; the environment may have been ` +
+        'copied or relocated without being rebuilt.'
+    )
+  }
+}
+
 // Verifies a materialized interpreter actually runs `<bin> --version` (spec §5 step 4 — the arm64 /
 // ad-hoc signature verification point). Rejects with the captured stderr on failure.
 export const verifyExecutable = async (
@@ -78,11 +173,21 @@ export const verifyExecutable = async (
   options: VerifyExecutableOptions = {}
 ): Promise<void> => {
   try {
-    await execFileAsync(bin, ['--version'], {
-      timeout: 15_000,
-      windowsHide: true,
-      env: executableEnv(options)
-    })
+    const isR = ['r', 'r.exe'].includes(basename(bin).toLowerCase())
+    const { stdout } = await execFileAsync(
+      bin,
+      isR ? ['--vanilla', '--slave', '-e', R_RUNTIME_PATH_PROBE] : ['--version'],
+      {
+        timeout: 15_000,
+        windowsHide: true,
+        env: executableEnv(options),
+        encoding: 'utf8'
+      }
+    )
+    if (isR) {
+      if (!options.prefix) throw new Error('an expected prefix is required to verify R')
+      assertRRuntimePaths(stdout, options.prefix, options.platform)
+    }
   } catch (error) {
     throw new Error(`interpreter not executable: ${bin} (${(error as Error).message})`)
   }
@@ -134,11 +239,15 @@ export const runMicromamba = (
     })
 
     const maxTail = 16 * 1024
+    // Cap the excerpt embedded in the user-facing error message; full tails still reach the logs via
+    // the error's structured `data`.
+    const MESSAGE_TAIL_LIMIT = 500
     let stdout = ''
     let stderr = ''
     let timedOut = false
     let cancelled = false
     let settled = false
+    const startedAt = Date.now()
     const appendTail = (current: string, chunk: unknown): string =>
       `${current}${String(chunk)}`.slice(-maxTail)
     child.stdout.on('data', (chunk) => {
@@ -162,10 +271,16 @@ export const runMicromamba = (
       clearTimeout(timeout)
       signal?.removeEventListener('abort', onAbort)
     }
-    const output = (): string =>
-      [stdout && `stdout tail:\n${stdout}`, stderr && `stderr tail:\n${stderr}`]
-        .filter(Boolean)
-        .join('\n')
+    // Full tails go into the error's structured `data` for the logs; the user-facing message gets only
+    // this short excerpt. micromamba writes its package plan (thousands of pinned specs) to stdout, so
+    // embedding the raw tails in the message floods the provisioning banner — prefer the stderr reason,
+    // capped, and fall back to stdout only when stderr is empty.
+    const briefTail = (): string => {
+      const source = stderr.trim() || stdout.trim()
+      return source.length > MESSAGE_TAIL_LIMIT
+        ? `…${source.slice(-MESSAGE_TAIL_LIMIT).trimStart()}`
+        : source
+    }
 
     // Record the spawned PID for crash-recovery supervision. If recording FAILS, fail closed: kill the
     // child and only settle once it is CONFIRMED gone — the close handler then rejects with
@@ -215,13 +330,27 @@ export const runMicromamba = (
         reject(new Error('Runtime setup cancelled.'))
         return
       }
-      const tails = output()
+      const excerpt = briefTail()
       if (timedOut) {
-        reject(
+        const timeoutError = Object.assign(
           new Error(
-            `micromamba timed out after ${timeoutMs}ms (${argv.join(' ')})${tails ? `:\n${tails}` : ''}`
-          )
+            `micromamba timed out after ${timeoutMs}ms (${argv.join(' ')})${excerpt ? `:\n${excerpt}` : ''}`
+          ),
+          {
+            code: 'MICROMAMBA_TIMEOUT',
+            data: {
+              argv,
+              cachePath: env?.CONDA_PKGS_DIRS,
+              durationMs: Date.now() - startedAt,
+              offline: argv.includes('--offline'),
+              pid: child.pid,
+              stderrTail: stderr,
+              stdoutTail: stdout,
+              timeoutMs
+            }
+          }
         )
+        reject(timeoutError)
         return
       }
       if (code === 0) {
@@ -229,8 +358,17 @@ export const runMicromamba = (
         return
       }
       const status = code === null ? `signal ${closeSignal ?? 'unknown'}` : `exit ${code}`
+      // Short message for the UI banner; full tails attached to `data` for the logs (see briefTail).
       reject(
-        new Error(`micromamba failed (${status}; ${argv.join(' ')})${tails ? `:\n${tails}` : ''}`)
+        Object.assign(
+          new Error(
+            `micromamba failed (${status}; ${argv.join(' ')})${excerpt ? `:\n${excerpt}` : ''}`
+          ),
+          {
+            code: 'MICROMAMBA_EXIT',
+            data: { argv, exitCode: code, stderrTail: stderr, stdoutTail: stdout }
+          }
+        )
       )
     })
   })

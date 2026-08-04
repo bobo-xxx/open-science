@@ -9,10 +9,10 @@ import {
   usePreviewWorkbenchStore,
   createSessionReviewerPreviewItem
 } from '@/stores/preview-workbench-store'
-import { useReviewStore } from '@/stores/review-store'
+import { selectProjectSessionReviews, useReviewStore } from '@/stores/review-store'
 import { useSettingsStore } from '@/stores/settings-store'
-import type { ChatSession } from '@/stores/session-store'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useSessionStore, type ChatSession } from '@/stores/session-store'
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from 'react'
 
 import { shouldShowAgentLoadingMessage } from './agent-loading-message'
 import {
@@ -20,6 +20,7 @@ import {
   createPreviewFileItemFromMention,
   createPreviewFileItemFromUpload
 } from './preview-file-item'
+import { createPreviewRequestScope } from './previews/preview-file-reader'
 import type { JobSummary } from '../../../../shared/compute'
 import { CompletedJobCard } from '@/components/CompletedJobCard'
 import { JobDetailModal } from '@/components/JobDetailModal'
@@ -30,19 +31,26 @@ import { WorkspaceActivityGroup } from './WorkspaceActivityGroup'
 import { WorkspaceAgentLoadingRow } from './WorkspaceAgentLoadingRow'
 import { WorkspaceMessageItem } from './WorkspaceMessageItem'
 import type { ArtifactMentionPart } from './WorkspaceMessageItem'
+import { useWorkspaceMessageEditState } from './workspace-message-edit-state-context'
 import { createConversationItems } from './workspace-conversation-items'
 import { groupConversationItems } from './workspace-tool-activity-groups'
 import type { ActivityExpansionOverrides } from './workspace-tool-activity-groups'
 import { useSessionJobStore } from '@/stores/session-job-store'
 import type { GoToTranscriptIntent, ReviewWithChecks } from '../../../../shared/reviewer'
 import type { ComposerDoc } from './composer/composer-doc'
+import type {
+  HandoffLifecycleEventSource,
+  HandoffRetryRequest
+} from '../../../../shared/handoff-lifecycle'
+import { HandoffLifecycleStatus } from './HandoffLifecycleStatus'
+import { useHandoffLifecycleEvents } from './useHandoffLifecycleEvents'
 
 type WorkspaceMessageScrollerProps = {
   activeSession: ChatSession | undefined
-  // Gates inline editing of sent user prompts; the handler truncates at the edited message and
-  // resends the adjusted doc as a fresh turn.
-  canEditMessage: boolean
   onSendEditedMessage: (messageId: string, doc: ComposerDoc) => void
+  // Events are read-only projections; retry sends an intent that main validates against its state.
+  handoffLifecycleSource?: HandoffLifecycleEventSource
+  onRetryHandoff?: (request: HandoffRetryRequest) => Promise<void>
 }
 
 type SessionScopedActivityGroupState = {
@@ -69,26 +77,48 @@ const getMessageArtifacts = (
   if (!message.artifactIds || !session.artifacts) return []
 
   const artifactsById = new Map(session.artifacts.map((artifact) => [artifact.id, artifact]))
+  const artifactsByLogicalId = new Map<string, MessageArtifact>()
 
-  return message.artifactIds
-    .map((artifactId) => artifactsById.get(artifactId))
-    .filter((artifact): artifact is MessageArtifact => Boolean(artifact))
+  for (const artifactId of message.artifactIds) {
+    const artifact = artifactsById.get(artifactId)
+    if (!artifact) continue
+
+    const logicalId = artifact.versionId
+      ? `version:${artifact.versionId}`
+      : `artifact:${artifact.id}`
+    const current = artifactsByLogicalId.get(logicalId)
+    const isNativeVersion = Boolean(artifact.versionId && artifact.id === artifact.versionId)
+    const currentIsNativeVersion = Boolean(current?.versionId && current.id === current.versionId)
+    if (!current || (isNativeVersion && !currentIsNativeVersion)) {
+      artifactsByLogicalId.set(logicalId, artifact)
+    }
+  }
+
+  return Array.from(artifactsByLogicalId.values())
 }
 
 // Sends an app-managed generated file to the preview workbench instead of opening it locally.
-const previewArtifact = (artifact: MessageArtifact, sessionId: string): void => {
-  const previewItem = createPreviewFileItemFromArtifact(artifact, sessionId)
+const previewArtifact = (
+  artifact: MessageArtifact,
+  sessionId: string,
+  projectId?: string
+): void => {
+  const previewItem = createPreviewFileItemFromArtifact(artifact, sessionId, projectId)
 
   // Generated files keep their artifact id so repeated clicks refresh the existing preview tab.
   if (previewItem) usePreviewWorkbenchStore.getState().upsertAndActivateItem(previewItem)
 }
 
 // Sends an app-managed uploaded file to the preview workbench.
-const previewUploadAttachment = (attachment: MessageUploadAttachment, sessionId: string): void => {
+const previewUploadAttachment = (
+  attachment: MessageUploadAttachment,
+  sessionId: string,
+  projectId?: string
+): void => {
   // Upload ids are namespaced away from artifact ids while preserving one tab per uploaded file.
   usePreviewWorkbenchStore
     .getState()
-    .upsertAndActivateItem(createPreviewFileItemFromUpload(attachment, sessionId))
+    .upsertAndActivateItem(createPreviewFileItemFromUpload(attachment, sessionId, projectId))
 }
 
 // Opens the Session reviewer panel in the preview workbench, positioned at the finding's locator.
@@ -103,14 +133,70 @@ const openSessionReviewer = (sessionId: string, intent: GoToTranscriptIntent): v
   )
 }
 
+type WorkspaceMessageReviewProps = {
+  projectId: string | undefined
+  sessionId: string
+  turnMessageId: string
+  onGoToTranscript: (intent: GoToTranscriptIntent) => void
+  onRerun: (review: ReviewWithChecks) => Promise<boolean>
+}
+
+// Keep reviewer updates local to their card. Subscribing the transcript parent to the whole Session
+// review array made every reviewer push rebuild every rich Markdown message in large conversations.
+const WorkspaceMessageReview = ({
+  projectId,
+  sessionId,
+  turnMessageId,
+  onGoToTranscript,
+  onRerun
+}: WorkspaceMessageReviewProps): React.JSX.Element | null => {
+  const review = useReviewStore((state) =>
+    selectProjectSessionReviews(state.reviewsBySession, projectId, sessionId).find(
+      (candidate) => candidate.turnMessageId === turnMessageId
+    )
+  )
+
+  if (!review) return null
+  return (
+    <div className="px-4 pb-1 md:px-6">
+      <div className="mx-auto w-full max-w-[56rem]">
+        {/* Only "Go to transcript" navigates to the reviewer page; the card itself does not. */}
+        <ReviewerCard review={review} onGoToTranscript={onGoToTranscript} onRerun={onRerun} />
+      </div>
+    </div>
+  )
+}
+
+type EditableWorkspaceMessageItemProps = Omit<
+  ComponentProps<typeof WorkspaceMessageItem>,
+  'canEditMessage'
+>
+
+// Only user-message edit controls subscribe to review-sensitive edit availability. Agent rows remain
+// outside this context subscription, so a reviewer lifecycle transition cannot rebuild rich output.
+const EditableWorkspaceMessageItem = (
+  props: EditableWorkspaceMessageItemProps
+): React.JSX.Element => {
+  const canEditMessage = useWorkspaceMessageEditState()
+  return <WorkspaceMessageItem {...props} canEditMessage={canEditMessage} />
+}
+
 // Owns transcript scrolling and session-scoped expansion state for activity groups.
-const WorkspaceMessageScroller = ({
+const WorkspaceMessageScrollerImpl = ({
   activeSession,
-  canEditMessage,
-  onSendEditedMessage
+  onSendEditedMessage,
+  handoffLifecycleSource,
+  onRetryHandoff
 }: WorkspaceMessageScrollerProps): React.JSX.Element => {
   const currentSessionId = activeSession?.id
-  const getReviewForTurn = useReviewStore((state) => state.getReviewForTurn)
+  const currentProjectId = activeSession?.projectId
+  const handoffEvents = useHandoffLifecycleEvents(handoffLifecycleSource, currentSessionId)
+  // The whole-window find bar is an Electron overlay owned by main; the Workspace only needs to tell
+  // main it is mounted and searchable so Cmd/Ctrl+F is intercepted (and re-arm UNREADY on unmount).
+  useEffect(() => {
+    const stop = window.api?.window?.announceWindowFindReady?.()
+    return () => stop?.()
+  }, [])
   const loadReviewsForSession = useReviewStore((state) => state.loadReviewsForSession)
 
   // Job store for binding and CompletedJobCard rendering
@@ -141,9 +227,9 @@ const WorkspaceMessageScroller = ({
   // Load persisted reviews whenever the active session changes.
   useEffect(() => {
     if (currentSessionId) {
-      void loadReviewsForSession(currentSessionId)
+      void loadReviewsForSession(currentSessionId, currentProjectId)
     }
-  }, [currentSessionId, loadReviewsForSession])
+  }, [currentProjectId, currentSessionId, loadReviewsForSession])
 
   // Reload (which recomputes staleness against current artifact bytes) when the window regains focus.
   // An artifact edited outside the app while this session stays open would otherwise keep showing its
@@ -153,11 +239,11 @@ const WorkspaceMessageScroller = ({
     if (!currentSessionId) return
 
     const onFocus = (): void => {
-      void loadReviewsForSession(currentSessionId)
+      void loadReviewsForSession(currentSessionId, currentProjectId)
     }
     window.addEventListener('focus', onFocus)
     return () => window.removeEventListener('focus', onFocus)
-  }, [currentSessionId, loadReviewsForSession])
+  }, [currentProjectId, currentSessionId, loadReviewsForSession])
 
   // Group expansion is keyed by session so switching conversations never reuses stale UI state.
   const [collapsedActivityGroupState, setCollapsedActivityGroupState] =
@@ -179,8 +265,42 @@ const WorkspaceMessageScroller = ({
     activityExpansionOverrideState.sessionId === currentSessionId
       ? activityExpansionOverrideState.overrides
       : {}
-  const conversationItems = groupConversationItems(createConversationItems(activeSession))
+  const conversationItems = useMemo(
+    () =>
+      groupConversationItems(
+        createConversationItems(activeSession, handoffEvents),
+        activeSession?.activityGroups
+      ),
+    [activeSession, handoffEvents]
+  )
+  // Assistant text can be split into several messages around tool calls. All fragments share the
+  // prompt they respond to, but only the last visible fragment in that turn owns whole-turn metadata.
+  // Legacy unlinked messages remain independent so older transcripts do not lose their timestamps.
+  const assistantFooterMessageIds = useMemo(() => {
+    const footerIds = new Set<string>()
+    const footerIdByPromptMessageId = new Map<string, string>()
+
+    for (const item of conversationItems) {
+      if (item.type !== 'message' || item.message.role !== 'agent') continue
+
+      const promptMessageId = item.message.responseToMessageId
+      if (!promptMessageId) {
+        footerIds.add(item.message.id)
+        continue
+      }
+
+      const previousFooterId = footerIdByPromptMessageId.get(promptMessageId)
+      if (previousFooterId) footerIds.delete(previousFooterId)
+      footerIdByPromptMessageId.set(promptMessageId, item.message.id)
+      footerIds.add(item.message.id)
+    }
+
+    return footerIds
+  }, [conversationItems])
   const showAgentLoadingMessage = shouldShowAgentLoadingMessage(activeSession)
+  const messageCreatedAtById = new Map(
+    activeSession?.messages.map((message) => [message.id, message.createdAt]) ?? []
+  )
 
   // Counts the user turns after each message; the destructive-resend warning keys off turns, not
   // raw message count, so a single follow-up turn stays warning-free.
@@ -288,23 +408,39 @@ const WorkspaceMessageScroller = ({
 
   // Routes a generated-file click to the preview workbench, scoped to the active session.
   const onPreviewArtifact = (artifact: MessageArtifact): void => {
-    if (currentSessionId) previewArtifact(artifact, currentSessionId)
+    if (currentSessionId) previewArtifact(artifact, currentSessionId, currentProjectId)
   }
 
   // Routes a sent-message upload click to the preview workbench for the active session.
   const onPreviewUploadAttachment = (attachment: MessageUploadAttachment): void => {
-    if (currentSessionId) previewUploadAttachment(attachment, currentSessionId)
+    if (currentSessionId) {
+      previewUploadAttachment(attachment, currentSessionId, activeSession?.projectId)
+    }
   }
 
   // Opens an artifact mention in the preview panel, probing existence first so a stale link warns.
   const onPreviewMentionArtifact = async (part: ArtifactMentionPart): Promise<void> => {
     if (!currentSessionId) return
+    if (part.source === 'linked-folder') {
+      showMentionNotice('Linked-folder files are not available until the folder is connected.')
+      return
+    }
 
     const read =
       part.source === 'upload' ? window.api.uploads.readPreview : window.api.artifacts.readPreview
 
     try {
-      await read({ path: part.path, maxBytes: 1, encoding: 'utf8' })
+      await read({
+        ...createPreviewRequestScope({
+          projectId: currentProjectId,
+          sessionId: currentSessionId,
+          source: part.source,
+          path: part.path
+        }),
+        path: part.path,
+        maxBytes: 1,
+        encoding: 'utf8'
+      })
     } catch {
       showMentionNotice(`"${part.name}" is no longer available.`)
       return
@@ -312,7 +448,9 @@ const WorkspaceMessageScroller = ({
 
     usePreviewWorkbenchStore
       .getState()
-      .upsertAndActivateItem(createPreviewFileItemFromMention(part, currentSessionId))
+      .upsertAndActivateItem(
+        createPreviewFileItemFromMention(part, currentSessionId, currentProjectId)
+      )
   }
 
   // Opens Settings on a skill mention's detail, warning instead when the skill no longer exists.
@@ -417,14 +555,84 @@ const WorkspaceMessageScroller = ({
                       activeSession && item.message.role !== 'user'
                         ? getMessageArtifacts(activeSession, item.message)
                         : []
-                    // Look up any review for this agent message (its id is the turnMessageId).
-                    const review =
-                      currentSessionId && item.message.role === 'agent'
-                        ? getReviewForTurn(currentSessionId, item.message.id)
-                        : undefined
-
                     // Jobs pre-assigned to this slot: each job appears in exactly one slot.
                     const jobsBeforeMessage = jobSlotsByItemIndex.get(itemIndex) ?? []
+                    const graph = activeSession?.conversationGraph
+                    const messageNode = graph?.messages.find(
+                      (message) => message.id === item.message.id
+                    )
+                    const runtimeSegment = messageNode?.runtimeSegmentId
+                      ? graph?.runtimeSegments.find(
+                          (segment) => segment.id === messageNode.runtimeSegmentId
+                        )
+                      : undefined
+                    // Legacy sessions synthesize this segment with a fallback framework. Keep only
+                    // the session-level values that were actually persisted.
+                    const synthesizedLegacyRuntime =
+                      runtimeSegment?.id === `runtime-segment-${activeSession?.id}` &&
+                      !activeSession?.agentFrameworkId
+                    const runtimeIdentity = synthesizedLegacyRuntime
+                      ? activeSession?.agentBackendId || activeSession?.agentModel
+                        ? {
+                            backendId: activeSession.agentBackendId,
+                            model: activeSession.agentModel
+                          }
+                        : undefined
+                      : runtimeSegment
+                    const revisionRootMessageId = messageNode?.revisionRootMessageId
+                    const revisions = revisionRootMessageId
+                      ? (graph?.messages
+                          .filter(
+                            (message) =>
+                              message.role === 'user' &&
+                              message.revisionRootMessageId === revisionRootMessageId
+                          )
+                          .sort(
+                            (left, right) =>
+                              left.createdAt - right.createdAt || left.id.localeCompare(right.id)
+                          ) ?? [])
+                      : []
+                    const revisionIndex = revisions.findIndex(
+                      (message) => message.id === item.message.id
+                    )
+                    const activateRevision = (index: number): (() => void) | undefined => {
+                      const revision = revisions[index]
+                      return revision && activeSession
+                        ? () =>
+                            useSessionStore
+                              .getState()
+                              .activateMessageBranch(
+                                activeSession.id,
+                                revision.introducedOnBranchId
+                              )
+                        : undefined
+                    }
+                    const messageItemProps: EditableWorkspaceMessageItemProps = {
+                      message: item.message,
+                      onPreviewArtifact,
+                      onPreviewUploadAttachment,
+                      onOpenSkillMention,
+                      onPreviewMentionArtifact,
+                      onSendEditedMessage,
+                      turnStartedAt: item.message.responseToMessageId
+                        ? messageCreatedAtById.get(item.message.responseToMessageId)
+                        : undefined,
+                      runtimeIdentity,
+                      showAssistantFooter:
+                        item.message.role !== 'agent' ||
+                        assistantFooterMessageIds.has(item.message.id),
+                      subsequentTurns: subsequentTurnCountByMessageId.get(item.message.id) ?? 0,
+                      revisionNavigation:
+                        revisionIndex >= 0 && revisions.length > 1
+                          ? {
+                              index: revisionIndex,
+                              total: revisions.length,
+                              onPrevious: activateRevision(revisionIndex - 1),
+                              onNext: activateRevision(revisionIndex + 1)
+                            }
+                          : undefined,
+                      artifacts
+                    }
 
                     return (
                       <div key={item.id}>
@@ -442,30 +650,44 @@ const WorkspaceMessageScroller = ({
                             </div>
                           </MessageScrollerItem>
                         ))}
-                        <WorkspaceMessageItem
-                          message={item.message}
-                          onPreviewArtifact={onPreviewArtifact}
-                          onPreviewUploadAttachment={onPreviewUploadAttachment}
-                          onOpenSkillMention={onOpenSkillMention}
-                          onPreviewMentionArtifact={onPreviewMentionArtifact}
-                          canEditMessage={canEditMessage}
-                          onSendEditedMessage={onSendEditedMessage}
-                          subsequentTurns={subsequentTurnCountByMessageId.get(item.message.id) ?? 0}
-                          artifacts={artifacts}
-                        />
-                        {review ? (
-                          <div className="px-4 pb-1 md:px-6">
-                            <div className="mx-auto w-full max-w-[56rem]">
-                              {/* Only "Go to transcript" navigates to the reviewer page; the card itself does not. */}
-                              <ReviewerCard
-                                review={review}
-                                onGoToTranscript={handleGoToTranscript}
-                                onRerun={handleRerunReview}
-                              />
-                            </div>
-                          </div>
+                        {item.message.role === 'user' ? (
+                          <EditableWorkspaceMessageItem {...messageItemProps} />
+                        ) : (
+                          <WorkspaceMessageItem {...messageItemProps} canEditMessage={false} />
+                        )}
+                        {currentSessionId && item.message.role === 'agent' ? (
+                          <WorkspaceMessageReview
+                            projectId={currentProjectId}
+                            sessionId={currentSessionId}
+                            turnMessageId={item.message.id}
+                            onGoToTranscript={handleGoToTranscript}
+                            onRerun={handleRerunReview}
+                          />
                         ) : null}
                       </div>
+                    )
+                  }
+
+                  if (item.type === 'handoff') {
+                    return (
+                      <MessageScrollerItem key={item.id} messageId={item.id} className="min-w-0">
+                        <div className="px-4 pb-1 pt-3 md:px-6">
+                          <div className="mx-auto w-full max-w-[56rem]">
+                            <HandoffLifecycleStatus
+                              handoff={item}
+                              onRetry={
+                                item.phase === 'failed' && onRetryHandoff
+                                  ? async () =>
+                                      onRetryHandoff({
+                                        sessionId: item.sessionId,
+                                        originatingTurnId: item.originatingTurnId
+                                      })
+                                  : undefined
+                              }
+                            />
+                          </div>
+                        </div>
+                      </MessageScrollerItem>
                     )
                   }
 
@@ -533,5 +755,42 @@ const WorkspaceMessageScroller = ({
     </>
   )
 }
+
+// Composer controls above the transcript react to reviewer lifecycle changes. Keep those parent
+// renders from rebuilding an unchanged transcript; review cards maintain their own scoped subscription.
+const areSessionsEqualForTranscript = (
+  previous: ChatSession | undefined,
+  next: ChatSession | undefined
+): boolean => {
+  if (Object.is(previous, next)) return true
+  if (!previous || !next) return false
+
+  // WorkspacePage mirrors reviewer activity into this transient operation gate. It changes the
+  // ChatSession object identity but is not rendered by the transcript, so compare every other field.
+  const previousKeys = Object.keys(previous).filter(
+    (key) => key !== 'branchSwitchBlocked'
+  ) as Array<keyof ChatSession>
+  const nextKeys = Object.keys(next).filter((key) => key !== 'branchSwitchBlocked') as Array<
+    keyof ChatSession
+  >
+
+  return (
+    previousKeys.length === nextKeys.length &&
+    previousKeys.every((key) => Object.is(previous[key], next[key]))
+  )
+}
+
+const areWorkspaceMessageScrollerPropsEqual = (
+  previous: WorkspaceMessageScrollerProps,
+  next: WorkspaceMessageScrollerProps
+): boolean =>
+  previous.onSendEditedMessage === next.onSendEditedMessage &&
+  areSessionsEqualForTranscript(previous.activeSession, next.activeSession)
+
+const WorkspaceMessageScroller = memo(
+  WorkspaceMessageScrollerImpl,
+  areWorkspaceMessageScrollerPropsEqual
+)
+WorkspaceMessageScroller.displayName = 'WorkspaceMessageScroller'
 
 export { WorkspaceMessageScroller }

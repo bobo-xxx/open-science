@@ -3,6 +3,18 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 
 import { createLogger } from '../logger'
 import { appendChatCompletions } from './base-url'
+import { resolveChatReasoningTransport } from './reasoning-transport'
+import type { OfficialVendorId } from '../../shared/provider-registry'
+import type {
+  CustomReasoningEffortTransport,
+  ModelReasoningEffort
+} from '../../shared/reasoning-effort'
+import {
+  boundedSkillSelectorCatalog,
+  renderSkillSelectorCatalog,
+  resolveSelectedSkills,
+  selectExplicitConnectorSkills
+} from './skill-selector-routing'
 
 // The bridge deliberately keeps protocol payloads open-ended; validation rejects unsupported shapes
 // at the boundary before values reach the upstream request.
@@ -18,16 +30,18 @@ const log = createLogger('acp-bridge')
 export type ResponsesBridgeTarget = {
   baseUrl: string
   key?: string
+  vendorId?: OfficialVendorId
+  reasoningEffortTransport?: CustomReasoningEffortTransport
   // Codex uses a catalog model for its local metadata; bridge providers may need a different
   // upstream model id (for example, DeepSeek's model name).
   model?: string
   namespacedTools?: ResponsesBridgeNamespacedTool[]
-  connectorInstructions?: ResponsesBridgeConnectorInstruction[]
-  // Forward reasoning.effort upstream as reasoning_effort ONLY when the user explicitly picked a
-  // level. Codex emits its own default effort even when the app never configured one, so
-  // unconditional forwarding would change what existing bridged users send to their gateway —
-  // and gateways fronting non-OpenAI models often reject unknown parameters.
-  forwardReasoningEffort?: boolean
+  // The active model's resolved API value. This explicitly overrides Codex's transport-model effort,
+  // which may use a smaller vocabulary or emit its own default. Undefined strips the field.
+  reasoningEffort?: ModelReasoningEffort
+  reviewerScope?: {
+    namespacedTools: ResponsesBridgeNamespacedTool[]
+  }
 }
 
 export type ResponsesBridgeNamespacedTool = {
@@ -38,15 +52,25 @@ export type ResponsesBridgeNamespacedTool = {
   strict?: boolean
 }
 
-export type ResponsesBridgeConnectorInstruction = {
-  id: string
-  aliases: string[]
-  content: string
-}
-
 export type ResponsesBridgeConnection = {
   baseUrl: string
   token: string
+  // Absent is the legacy Chat Completions bridge. Native Responses compatibility stays on the
+  // Responses wire protocol and opts in explicitly so framework config can preserve its model.
+  kind?: 'responses-compatibility'
+}
+
+export type ResponsesBridgeSkillCandidate = {
+  name: string
+  description: string
+  path: string
+  source?: 'connector'
+}
+
+export type ResponsesBridgeSkillInput = Pick<ResponsesBridgeSkillCandidate, 'name' | 'path'>
+
+type ResponsesBridgeOptions = {
+  skillSelectorTimeoutMs?: number
 }
 
 type BridgeFetch = typeof fetch
@@ -64,7 +88,16 @@ class BridgeHttpError extends Error {
 
 const ALLOWED_INCLUDE_VALUES = new Set(['reasoning.encrypted_content'])
 const ALLOWED_REASONING_KEYS = new Set(['effort', 'summary'])
-const ALLOWED_REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh'])
+const ALLOWED_REASONING_EFFORTS = new Set([
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+  'ultra'
+])
 const ALLOWED_REASONING_SUMMARIES = new Set(['auto', 'concise', 'detailed'])
 const ALLOWED_IMAGE_DETAILS = new Set(['auto', 'low', 'high'])
 const UPSTREAM_IMAGE_TYPES = new Set(['image', 'image_url', 'input_image', 'output_image'])
@@ -283,65 +316,6 @@ const hasUpstreamImageField = (value: JsonObject): boolean =>
   value.image !== undefined ||
   value.image_url !== undefined ||
   value.output_image !== undefined
-
-const plainTextFromContent = (content: unknown): string => {
-  if (typeof content === 'string') return content
-  if (!Array.isArray(content)) return ''
-  return content
-    .filter((part): part is JsonObject => part && typeof part === 'object')
-    .filter((part) => ['input_text', 'output_text', 'text'].includes(String(part.type)))
-    .map((part) => String(part.text ?? ''))
-    .join('\n')
-}
-
-const connectorMentioned = (text: string, alias: string): boolean => {
-  const normalizedAlias = alias.trim().toLowerCase()
-  if (!normalizedAlias) return false
-  const escaped = normalizedAlias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  return new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`, 'i').test(text)
-}
-
-const selectConnectorInstructions = (
-  body: JsonObject,
-  connectors: readonly ResponsesBridgeConnectorInstruction[]
-): ResponsesBridgeConnectorInstruction[] => {
-  const input =
-    typeof body.input === 'string' ? [{ role: 'user', content: body.input }] : body.input
-  if (!Array.isArray(input)) return []
-  // Route from the latest user turn only. Looking across the whole Responses history makes an old
-  // connector mention contaminate a later, unrelated request.
-  const latestUser = input.findLast(
-    (item) => item && typeof item === 'object' && item.role === 'user'
-  )
-  const userText = latestUser ? plainTextFromContent(latestUser.content).toLowerCase() : ''
-  if (!userText) return []
-
-  return connectors.filter((connector) =>
-    [connector.id, ...connector.aliases].some((alias) => connectorMentioned(userText, alias))
-  )
-}
-
-const withConnectorInstructions = (
-  body: JsonObject,
-  connectors: readonly ResponsesBridgeConnectorInstruction[]
-): { body: JsonObject; selectedIds: string[] } => {
-  const selected = selectConnectorInstructions(body, connectors)
-  if (selected.length === 0) return { body, selectedIds: [] }
-  const connectorText = [
-    '<open_science_connector_instructions>',
-    'The following connector instructions are mandatory for this turn.',
-    ...selected.map((connector) => connector.content),
-    '</open_science_connector_instructions>'
-  ].join('\n\n')
-  const instructions =
-    typeof body.instructions === 'string' && body.instructions.length > 0
-      ? `${body.instructions}\n\n${connectorText}`
-      : connectorText
-  return {
-    body: { ...body, instructions },
-    selectedIds: selected.map((connector) => connector.id)
-  }
-}
 
 const namespacedToolAlias = (
   tool: Pick<ResponsesBridgeNamespacedTool, 'namespace' | 'name'>
@@ -578,7 +552,11 @@ export const responsesToChatRequest = (
   upstreamModel?: string,
   reasoningByCallId?: Map<string, string>,
   namespacedTools: readonly ResponsesBridgeNamespacedTool[] = [],
-  options?: { forwardReasoningEffort?: boolean }
+  options?: {
+    reasoningEffortOverride?: ModelReasoningEffort
+    vendorId?: OfficialVendorId
+    reasoningEffortTransport?: CustomReasoningEffortTransport
+  }
 ): JsonObject => {
   for (const field of UNSUPPORTED_FIELDS) {
     if (body[field] !== undefined && body[field] !== null) {
@@ -649,27 +627,18 @@ export const responsesToChatRequest = (
   const toolChoice = hasTools ? requestedToolChoice : undefined
   const stream = body.stream !== false
 
-  // Translate the Responses reasoning effort into the Chat Completions equivalent (validated above),
-  // but only when the app's user explicitly picked a level: Codex also emits its own default effort,
-  // and forwarding that would change what existing bridged users send upstream. OpenAI-shaped
-  // gateways take `reasoning_effort`; the Codex-only 'xhigh' clamps to 'high', and 'none' is
-  // omitted — Chat Completions has no "reasoning off" switch, so the upstream default stands.
-  const requestedEffort =
-    options?.forwardReasoningEffort &&
-    body.reasoning &&
-    typeof body.reasoning === 'object' &&
-    !Array.isArray(body.reasoning)
-      ? (body.reasoning as JsonObject).effort
-      : undefined
-  const chatReasoningEffort =
-    requestedEffort === 'xhigh'
-      ? 'high'
-      : requestedEffort === 'minimal' ||
-          requestedEffort === 'low' ||
-          requestedEffort === 'medium' ||
-          requestedEffort === 'high'
-        ? requestedEffort
-        : undefined
+  // The model profile already chose the upstream API value. Never derive it from Codex's request:
+  // Codex runs a catalog transport model and may omit, default, or clamp values that the real model
+  // supports. Undefined intentionally strips Codex's own effort from the Chat request.
+  const chatReasoningEffort = options?.reasoningEffortOverride
+  const reasoningTransport = chatReasoningEffort
+    ? resolveChatReasoningTransport(
+        options?.vendorId,
+        upstreamModel,
+        chatReasoningEffort,
+        options?.reasoningEffortTransport
+      )
+    : undefined
 
   return {
     model: upstreamModel ?? body.model,
@@ -684,9 +653,15 @@ export const responsesToChatRequest = (
     ...(body.max_output_tokens === undefined || body.max_output_tokens === null
       ? {}
       : { max_tokens: body.max_output_tokens }),
-    ...(chatReasoningEffort ? { reasoning_effort: chatReasoningEffort } : {}),
+    ...(reasoningTransport?.reasoningEffort
+      ? { reasoning_effort: reasoningTransport.reasoningEffort }
+      : {}),
+    ...(reasoningTransport?.thinking ? { thinking: reasoningTransport.thinking } : {}),
+    ...(reasoningTransport?.reasoning ? { reasoning: reasoningTransport.reasoning } : {}),
     stream,
-    ...(stream ? { stream_options: body.stream_options ?? { include_usage: true } } : {})
+    // Responses stream options are not Chat Completions options. Request final usage explicitly and
+    // do not forward fields such as include_obfuscation that a Chat-compatible gateway may reject.
+    ...(stream ? { stream_options: { include_usage: true } } : {})
   }
 }
 
@@ -722,6 +697,32 @@ const responseEnvelope = (
   user: null,
   metadata: {}
 })
+
+// Chat Completions and Responses use different usage field names. Codex validates the Responses
+// shape before publishing its ACP token-usage update, so passing Chat fields through makes usage
+// silently disappear even though the upstream reported it.
+const chatUsageToResponsesUsage = (usage: unknown): JsonObject | undefined => {
+  if (typeof usage !== 'object' || usage === null || Array.isArray(usage)) return undefined
+
+  const chatUsage = usage as JsonObject
+  const tokenCount = (value: unknown): number | undefined =>
+    typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
+  const inputTokens = tokenCount(chatUsage.prompt_tokens)
+  const outputTokens = tokenCount(chatUsage.completion_tokens)
+
+  if (inputTokens === undefined || outputTokens === undefined) return undefined
+
+  const cachedTokens = tokenCount(chatUsage.prompt_tokens_details?.cached_tokens) ?? 0
+  const reasoningTokens = tokenCount(chatUsage.completion_tokens_details?.reasoning_tokens) ?? 0
+
+  return {
+    input_tokens: inputTokens,
+    input_tokens_details: { cached_tokens: cachedTokens },
+    output_tokens: outputTokens,
+    output_tokens_details: { reasoning_tokens: reasoningTokens },
+    total_tokens: tokenCount(chatUsage.total_tokens) ?? inputTokens + outputTokens
+  }
+}
 
 const completionToResponse = (
   completion: JsonObject,
@@ -763,7 +764,7 @@ const completionToResponse = (
     completion.id ?? `resp_${randomBytes(6).toString('hex')}`,
     completion.model,
     output,
-    completion.usage
+    chatUsageToResponsesUsage(completion.usage)
   )
 }
 
@@ -797,6 +798,7 @@ const streamChatToResponses = async (
   let textItem: JsonObject | undefined
   // Accumulated so the caller can cache it against this turn's tool-call ids (see inputToMessages).
   let reasoning = ''
+  let usage: JsonObject | undefined
   let sequence = 0
   writeEvent(response, 'response.created', sequence++, {
     response: responseEnvelope(responseId, model, [])
@@ -836,6 +838,7 @@ const streamChatToResponses = async (
     return item
   }
   const consume = (chunk: JsonObject): void => {
+    usage = chatUsageToResponsesUsage(chunk.usage) ?? usage
     const finishReason = chunk.choices?.[0]?.finish_reason
     if (typeof finishReason === 'string' && finishReason.length > 0) {
       terminalFinishReason = finishReason
@@ -982,7 +985,7 @@ const streamChatToResponses = async (
     })
   } else if (terminalFinishReason === 'stop' || terminalFinishReason === 'tool_calls') {
     writeEvent(response, 'response.completed', sequence++, {
-      response: responseEnvelope(responseId, model, output)
+      response: responseEnvelope(responseId, model, output, usage)
     })
   } else if (streamError) {
     log.warn('bridge stream error', {
@@ -990,7 +993,7 @@ const streamChatToResponses = async (
       error: streamError instanceof Error ? streamError.message : String(streamError)
     })
     writeEvent(response, 'response.failed', sequence++, {
-      response: responseEnvelope(responseId, model, output, undefined, 'failed', {
+      response: responseEnvelope(responseId, model, output, usage, 'failed', {
         type: 'upstream_error',
         message: 'Upstream stream ended before completion'
       })
@@ -1001,19 +1004,19 @@ const streamChatToResponses = async (
     log.warn('bridge stream incomplete', { model, finishReason: terminalFinishReason })
     writeEvent(response, 'response.incomplete', sequence++, {
       response: {
-        ...responseEnvelope(responseId, model, output, undefined, 'incomplete'),
+        ...responseEnvelope(responseId, model, output, usage, 'incomplete'),
         incomplete_details: { reason: terminalFinishReason }
       }
     })
   } else if (sawDone) {
     writeEvent(response, 'response.completed', sequence++, {
-      response: responseEnvelope(responseId, model, output)
+      response: responseEnvelope(responseId, model, output, usage)
     })
   } else {
     // No finish_reason and no [DONE]: the upstream ended mid-stream without a terminal signal.
     log.warn('bridge stream truncated (no terminal finish_reason)', { model })
     writeEvent(response, 'response.failed', sequence++, {
-      response: responseEnvelope(responseId, model, output, undefined, 'failed', {
+      response: responseEnvelope(responseId, model, output, usage, 'failed', {
         type: 'upstream_incomplete',
         message: 'Upstream stream ended without a terminal finish_reason'
       })
@@ -1040,12 +1043,124 @@ export class ResponsesBridge {
   // it back to thinking-mode providers that require it. Grows within a session; cleared on close (a
   // provider switch / disconnect). Keyed by call_id, which Codex round-trips, so lookups stay stable.
   private readonly reasoningByCallId = new Map<string, string>()
+  private readonly reviewerSessionKeys = new Set<string>()
+  private readonly scopedReviewerSessionKeys = new Set<string>()
 
   constructor(
     target: ResponsesBridgeTarget,
-    private readonly fetchImpl: BridgeFetch = fetch
+    private readonly fetchImpl: BridgeFetch = fetch,
+    private readonly options: ResponsesBridgeOptions = {}
   ) {
     this.target = target
+  }
+
+  async selectSkills(
+    text: string,
+    catalog: ResponsesBridgeSkillCandidate[],
+    signal?: AbortSignal
+  ): Promise<ResponsesBridgeSkillInput[]> {
+    if (!text.trim() || catalog.length === 0 || signal?.aborted) return []
+    const explicit = selectExplicitConnectorSkills(text, catalog)
+    if (explicit.length > 0) return explicit
+    const selectorCatalog = boundedSkillSelectorCatalog(catalog)
+    if (selectorCatalog.length === 0) return []
+
+    const timeout = new AbortController()
+    let timedOut = false
+    const abortFromCaller = (): void => timeout.abort(signal?.reason)
+    signal?.addEventListener('abort', abortFromCaller, { once: true })
+    const timer = setTimeout(() => {
+      timedOut = true
+      timeout.abort()
+    }, this.options.skillSelectorTimeoutMs ?? 15_000)
+    timer.unref?.()
+    try {
+      const response = await this.fetchImpl(chatUrl(this.target.baseUrl), {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(this.target.key ? { authorization: `Bearer ${this.target.key}` } : {})
+        },
+        body: JSON.stringify({
+          model: this.target.model,
+          stream: false,
+          temperature: 0,
+          max_tokens: 512,
+          messages: [
+            {
+              role: 'system',
+              content:
+                'You are a Skill routing classifier. Select only the Skills needed to execute the current user request. Do not perform the task. Call select_skills exactly once. Use only catalog names. Return an empty list when no Skill applies.\n\nSkill catalog:\n' +
+                renderSkillSelectorCatalog(selectorCatalog)
+            },
+            { role: 'user', content: text }
+          ],
+          tools: [
+            {
+              type: 'function',
+              function: {
+                name: 'select_skills',
+                description: 'Select zero to three applicable Skills from the provided catalog.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    skill_names: {
+                      type: 'array',
+                      maxItems: 3,
+                      items: { type: 'string' }
+                    }
+                  },
+                  required: ['skill_names'],
+                  additionalProperties: false
+                }
+              }
+            }
+          ]
+        }),
+        signal: timeout.signal
+      })
+      if (!response.ok) {
+        log.warn('bridge skill selection failed', {
+          model: this.target.model,
+          reason: 'upstream-http',
+          status: response.status
+        })
+        return []
+      }
+
+      const completion = (await response.json()) as JsonObject
+      const calls = completion.choices?.[0]?.message?.tool_calls
+      const call = Array.isArray(calls)
+        ? calls.find((candidate) => candidate?.function?.name === 'select_skills')
+        : undefined
+      if (typeof call?.function?.arguments !== 'string') {
+        log.warn('bridge skill selection failed', {
+          model: this.target.model,
+          reason: 'missing-function-call'
+        })
+        return []
+      }
+
+      const args = JSON.parse(call.function.arguments) as JsonObject
+      const requested = Array.isArray(args.skill_names) ? args.skill_names : []
+      const selected = resolveSelectedSkills(requested, selectorCatalog)
+      log.info('bridge skill selection completed', {
+        model: this.target.model,
+        catalogCount: catalog.length,
+        routedCatalogCount: selectorCatalog.length,
+        selectedNames: selected.map(({ name }) => name)
+      })
+      return selected
+    } catch {
+      log.warn('bridge skill selection failed', {
+        model: this.target.model,
+        reason: timedOut ? 'timeout' : signal?.aborted ? 'cancelled' : 'invalid-response'
+      })
+      return []
+    } finally {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', abortFromCaller)
+    }
   }
 
   setTarget(target: ResponsesBridgeTarget): void {
@@ -1056,16 +1171,27 @@ export class ResponsesBridge {
     const changed =
       this.target.baseUrl !== target.baseUrl ||
       this.target.model !== target.model ||
+      this.target.vendorId !== target.vendorId ||
+      this.target.reasoningEffortTransport !== target.reasoningEffortTransport ||
       this.target.key !== target.key
     this.target = target
     if (changed) this.reasoningByCallId.clear()
   }
 
-  // Updates only the effort-forwarding policy on the live target, for when the user's reasoning-effort
-  // setting changes without a reconnect (Codex applies level changes live over ACP). Deliberately not
-  // a setTarget: the upstream provider is unchanged, so the reasoning cache must be preserved.
-  setForwardReasoningEffort(forward: boolean): void {
-    this.target = { ...this.target, forwardReasoningEffort: forward }
+  // Updates only the resolved upstream effort on the live target. Deliberately not a setTarget: the
+  // provider is unchanged, so the reasoning cache must be preserved.
+  setReasoningEffort(effort?: ModelReasoningEffort): void {
+    this.target = { ...this.target, reasoningEffort: effort }
+  }
+
+  registerReviewerSession(promptCacheKey: string): void {
+    this.reviewerSessionKeys.add(promptCacheKey)
+    this.scopedReviewerSessionKeys.delete(promptCacheKey)
+  }
+
+  unregisterReviewerSession(promptCacheKey: string): boolean {
+    this.reviewerSessionKeys.delete(promptCacheKey)
+    return this.scopedReviewerSessionKeys.delete(promptCacheKey)
   }
 
   async start(): Promise<ResponsesBridgeConnection> {
@@ -1087,17 +1213,23 @@ export class ResponsesBridge {
         }
       })
     })
-    await new Promise<void>((resolve, reject) => {
-      server.once('error', reject)
-      server.listen(0, '127.0.0.1', resolve)
-    })
-    server.unref()
-    const address = server.address()
-    if (!address || typeof address === 'string')
-      throw new Error('Responses bridge did not bind a port')
+    // Own the server before listen resolves so every partial-start failure remains closeable.
     this.server = server
-    this.connection = { baseUrl: `http://127.0.0.1:${address.port}/v1`, token }
-    return this.connection
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once('error', reject)
+        server.listen(0, '127.0.0.1', resolve)
+      })
+      server.unref()
+      const address = server.address()
+      if (!address || typeof address === 'string')
+        throw new Error('Responses bridge did not bind a port')
+      this.connection = { baseUrl: `http://127.0.0.1:${address.port}/v1`, token }
+      return this.connection
+    } catch (error) {
+      await this.close().catch(() => undefined)
+      throw error
+    }
   }
 
   async close(): Promise<void> {
@@ -1105,6 +1237,8 @@ export class ResponsesBridge {
     this.server = undefined
     this.connection = undefined
     this.reasoningByCallId.clear()
+    this.reviewerSessionKeys.clear()
+    this.scopedReviewerSessionKeys.clear()
     if (!server) return
     const closing = new Promise<void>((resolve, reject) =>
       server.close((error) => (error ? reject(error) : resolve()))
@@ -1143,17 +1277,28 @@ export class ResponsesBridge {
 
     try {
       const body = await readBody(request)
-      const namespacedTools = this.target.namespacedTools ?? []
-      const connectorSelection = withConnectorInstructions(
-        body,
-        this.target.connectorInstructions ?? []
-      )
+      const promptCacheKey =
+        typeof body.prompt_cache_key === 'string' ? body.prompt_cache_key : undefined
+      const reviewerScoped =
+        promptCacheKey !== undefined && this.reviewerSessionKeys.has(promptCacheKey)
+      if (reviewerScoped) this.scopedReviewerSessionKeys.add(promptCacheKey)
+      const namespacedTools = reviewerScoped
+        ? (this.target.reviewerScope?.namespacedTools ?? [])
+        : (this.target.namespacedTools ?? [])
+      // codex-acp ignores disableBuiltInTools metadata and still advertises shell/filesystem tools.
+      // For reviewer turns, replace the entire declaration set at the protocol boundary so the model
+      // can call only the scope-bounded reviewer HTTP MCP functions.
+      const scopedBody = reviewerScoped ? { ...body, tools: [], tool_choice: 'auto' } : body
       const chatRequest = responsesToChatRequest(
-        connectorSelection.body,
+        scopedBody,
         this.target.model,
         this.reasoningByCallId,
         namespacedTools,
-        { forwardReasoningEffort: this.target.forwardReasoningEffort }
+        {
+          reasoningEffortOverride: this.target.reasoningEffort,
+          vendorId: this.target.vendorId,
+          reasoningEffortTransport: this.target.reasoningEffortTransport
+        }
       )
 
       // Reveals which real model actually serves the turn (Codex only ever sees the internal catalog
@@ -1175,7 +1320,7 @@ export class ResponsesBridge {
         ],
         incomingToolCount: incomingTools.length,
         outgoingToolNames,
-        selectedConnectors: connectorSelection.selectedIds,
+        reviewerScoped,
         toolChoice: chatRequest.tool_choice ?? null
       })
 

@@ -1,7 +1,10 @@
 import { randomUUID } from 'node:crypto'
+import type { BigIntStats } from 'node:fs'
 import { open, stat } from 'node:fs/promises'
+import type { FileHandle } from 'node:fs/promises'
 import { basename, extname } from 'node:path'
 
+import type { OfficePreviewAdmissionError } from '../shared/office-preview'
 import type {
   AcquireManagedPreviewRequest,
   ManagedPreviewRangeResult,
@@ -12,10 +15,17 @@ import type {
 } from '../shared/preview-resources'
 
 const MAX_PREVIEW_RANGE_BYTES = 1024 * 1024
+const MAX_RELEASED_RESOURCE_TOMBSTONES = 1024
 const PREVIEW_SCHEME = 'open-science-preview'
 const MANAGED_PREVIEW_SCHEME = {
   scheme: PREVIEW_SCHEME,
-  privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true }
+  privileges: {
+    standard: true,
+    secure: true,
+    supportFetchAPI: true,
+    corsEnabled: true,
+    stream: true
+  }
 } as const
 
 const MIME_TYPES_BY_EXTENSION: Record<string, string> = {
@@ -29,6 +39,8 @@ const MIME_TYPES_BY_EXTENSION: Record<string, string> = {
   '.pdf': 'application/pdf',
   '.png': 'image/png',
   '.svg': 'image/svg+xml',
+  '.tif': 'image/tiff',
+  '.tiff': 'image/tiff',
   '.webp': 'image/webp'
 }
 
@@ -46,16 +58,45 @@ const inferMimeType = (filePath: string, fallback?: string): string =>
   'application/octet-stream'
 
 type ManagedPreviewResourcesOptions = {
-  resolvePath: (source: ManagedPreviewSource, request: { path: string }) => Promise<string>
+  resolvePath: (
+    source: ManagedPreviewSource,
+    request: AcquireManagedPreviewRequest
+  ) => Promise<string>
   createId?: () => string
+}
+
+type ManagedPreviewResourceSnapshot = {
+  size: number
+  version: number
+  dev: bigint
+  ino: bigint
+  mtimeNs: bigint
+}
+
+type AcquireManagedPreviewOptions = {
+  snapshot: ManagedPreviewResourceSnapshot
+  maxBytes: number
 }
 
 type ResourceEntry = ManagedPreviewResource & {
   ownerId: number
   filePath: string
+  strictSnapshot?: {
+    dev: bigint
+    ino: bigint
+    mtimeNs: bigint
+    maxBytes: number
+  }
 }
 
-type PreviewProtocolResource = Pick<ResourceEntry, 'filePath' | 'mimeType'>
+type PreviewProtocolResource =
+  | Pick<ResourceEntry, 'filePath' | 'mimeType'>
+  | {
+      fileHandle: FileHandle
+      mimeType: string
+      size: number
+      verifyUnchanged: () => Promise<void>
+    }
 
 type RangeReader = {
   read: (
@@ -64,6 +105,20 @@ type RangeReader = {
     length: number,
     position: number
   ) => Promise<{ bytesRead: number }>
+}
+
+const snapshotFileStat = (fileStat: BigIntStats): ManagedPreviewResourceSnapshot => {
+  if (fileStat.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error('Managed preview file size cannot be represented safely.')
+  }
+
+  return {
+    size: Number(fileStat.size),
+    version: Number(fileStat.mtimeNs) / 1_000_000,
+    dev: fileStat.dev,
+    ino: fileStat.ino,
+    mtimeNs: fileStat.mtimeNs
+  }
 }
 
 const readExactRange = async (
@@ -89,34 +144,81 @@ const readExactRange = async (
 // Stores capability metadata only; file bytes remain on disk until a protocol or range read occurs.
 class ManagedPreviewResources {
   private readonly resources = new Map<string, ResourceEntry>()
+  private readonly releasedOwners = new Map<string, number>()
   private readonly createId: () => string
 
   constructor(private readonly options: ManagedPreviewResourcesOptions) {
     this.createId = options.createId ?? randomUUID
   }
 
+  async inspect(request: AcquireManagedPreviewRequest): Promise<ManagedPreviewResourceSnapshot> {
+    // Resolve through the managed repository so metadata checks never accept an arbitrary path.
+    const filePath = await this.options.resolvePath(request.source, request)
+    const fileStat = await stat(filePath, { bigint: true })
+    if (!fileStat.isFile()) throw new Error('Managed preview path is not a file.')
+
+    return snapshotFileStat(fileStat)
+  }
+
   async acquire(
     ownerId: number,
-    request: AcquireManagedPreviewRequest
+    request: AcquireManagedPreviewRequest,
+    options?: AcquireManagedPreviewOptions
   ): Promise<ManagedPreviewResource> {
     // Resolve through the managed repository before minting an owner-scoped capability URL.
-    const filePath = await this.options.resolvePath(request.source, { path: request.path })
-    const fileStat = await stat(filePath)
+    const filePath = await this.options.resolvePath(request.source, request)
+    const fileStat = await stat(filePath, { bigint: true })
 
     if (!fileStat.isFile()) {
       throw new Error('Managed preview path is not a file.')
+    }
+    const fileSnapshot = snapshotFileStat(fileStat)
+    if (options && fileSnapshot.size > options.maxBytes) {
+      const error: OfficePreviewAdmissionError = Object.assign(
+        new Error('Managed preview file is too large.'),
+        {
+          code: 'FILE_TOO_LARGE' as const,
+          size: fileSnapshot.size,
+          limit: options.maxBytes
+        }
+      )
+      throw error
+    }
+    if (
+      options &&
+      (fileSnapshot.size !== options.snapshot.size ||
+        fileSnapshot.mtimeNs !== options.snapshot.mtimeNs ||
+        fileSnapshot.dev !== options.snapshot.dev ||
+        fileSnapshot.ino !== options.snapshot.ino)
+    ) {
+      throw new Error('Managed preview file changed after admission.')
     }
 
     const id = this.createId()
     const resource: ManagedPreviewResource = {
       id,
       url: `${PREVIEW_SCHEME}://${id}/${encodeURIComponent(basename(filePath))}`,
-      size: fileStat.size,
+      size: fileSnapshot.size,
       mimeType: inferMimeType(filePath, request.mimeType),
-      version: fileStat.mtimeMs
+      version: fileSnapshot.version
     }
 
-    this.resources.set(id, { ...resource, ownerId, filePath })
+    this.releasedOwners.delete(id)
+    this.resources.set(id, {
+      ...resource,
+      ownerId,
+      filePath,
+      ...(options
+        ? {
+            strictSnapshot: {
+              dev: options.snapshot.dev,
+              ino: options.snapshot.ino,
+              mtimeNs: options.snapshot.mtimeNs,
+              maxBytes: options.maxBytes
+            }
+          }
+        : {})
+    })
     return resource
   }
 
@@ -156,18 +258,28 @@ class ManagedPreviewResources {
   }
 
   release(ownerId: number, request: ReleaseManagedPreviewRequest): void {
-    this.getOwnedResource(ownerId, request.resourceId)
-    this.resources.delete(request.resourceId)
+    const resource = this.resources.get(request.resourceId)
+    if (!resource) {
+      if (this.releasedOwners.get(request.resourceId) === ownerId) return
+      throw new Error('Managed preview resource is not available.')
+    }
+    if (resource.ownerId !== ownerId) {
+      throw new Error('Managed preview resource is not available.')
+    }
+    this.revokeResource(request.resourceId, resource.ownerId)
   }
 
   releaseOwner(ownerId: number): void {
     // Renderer teardown is the final backstop for resources not released by React cleanup.
     for (const [resourceId, resource] of this.resources) {
-      if (resource.ownerId === ownerId) this.resources.delete(resourceId)
+      if (resource.ownerId === ownerId) this.revokeResource(resourceId, ownerId)
+    }
+    for (const [resourceId, releasedOwnerId] of this.releasedOwners) {
+      if (releasedOwnerId === ownerId) this.releasedOwners.delete(resourceId)
     }
   }
 
-  resolveProtocolResource(resourceId: string): PreviewProtocolResource {
+  async resolveProtocolResource(resourceId: string): Promise<PreviewProtocolResource> {
     // Protocol access uses the unguessable resource id and never accepts a renderer-supplied path.
     const resource = this.resources.get(resourceId)
 
@@ -175,7 +287,62 @@ class ManagedPreviewResources {
       throw new Error('Managed preview resource is not available.')
     }
 
-    return { filePath: resource.filePath, mimeType: resource.mimeType }
+    if (!resource.strictSnapshot) {
+      return { filePath: resource.filePath, mimeType: resource.mimeType }
+    }
+
+    // Open first and fstat the same handle that will be streamed. Holding the handle pins the
+    // admitted inode while the protocol caps the response to the approved byte count.
+    const fileHandle = await open(resource.filePath, 'r')
+    try {
+      const fileStat = await fileHandle.stat({ bigint: true })
+      if (
+        !fileStat.isFile() ||
+        fileStat.size !== BigInt(resource.size) ||
+        fileStat.size > BigInt(resource.strictSnapshot.maxBytes) ||
+        fileStat.mtimeNs !== resource.strictSnapshot.mtimeNs ||
+        fileStat.dev !== resource.strictSnapshot.dev ||
+        fileStat.ino !== resource.strictSnapshot.ino
+      ) {
+        this.revokeResource(resourceId, resource.ownerId)
+        throw new Error('Managed preview file changed after capability creation.')
+      }
+
+      const verifyUnchanged = async (): Promise<void> => {
+        const finalStat = await fileHandle.stat({ bigint: true })
+        if (
+          !finalStat.isFile() ||
+          finalStat.size !== BigInt(resource.size) ||
+          finalStat.size > BigInt(resource.strictSnapshot!.maxBytes) ||
+          finalStat.mtimeNs !== resource.strictSnapshot!.mtimeNs ||
+          finalStat.dev !== resource.strictSnapshot!.dev ||
+          finalStat.ino !== resource.strictSnapshot!.ino
+        ) {
+          this.revokeResource(resourceId, resource.ownerId)
+          throw new Error('Managed preview file changed during protocol streaming.')
+        }
+      }
+
+      return {
+        fileHandle,
+        mimeType: resource.mimeType,
+        size: resource.size,
+        verifyUnchanged
+      }
+    } catch (error) {
+      await fileHandle.close()
+      throw error
+    }
+  }
+
+  private revokeResource(resourceId: string, ownerId: number): void {
+    this.resources.delete(resourceId)
+    this.releasedOwners.set(resourceId, ownerId)
+    while (this.releasedOwners.size > MAX_RELEASED_RESOURCE_TOMBSTONES) {
+      const oldestResourceId = this.releasedOwners.keys().next().value
+      if (oldestResourceId === undefined) break
+      this.releasedOwners.delete(oldestResourceId)
+    }
   }
 
   private getOwnedResource(ownerId: number, resourceId: string): ResourceEntry {
@@ -196,4 +363,9 @@ export {
   PREVIEW_SCHEME,
   readExactRange
 }
-export type { ManagedPreviewResourcesOptions, PreviewProtocolResource }
+export type {
+  AcquireManagedPreviewOptions,
+  ManagedPreviewResourceSnapshot,
+  ManagedPreviewResourcesOptions,
+  PreviewProtocolResource
+}

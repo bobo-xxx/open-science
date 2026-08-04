@@ -73,6 +73,35 @@ const TEXT_LIKE_EXTENSIONS = new Set([
 // Column-oriented formats, so the reading hint can name rows/columns rather than generic ranges.
 const TABULAR_EXTENSIONS = new Set(['csv', 'tsv', 'tab', 'psv'])
 
+// Structured data formats that are best inspected with a dataframe/database tool. Text members of
+// this set still take the bounded-preview path; binary members use an on-disk notice plus link.
+const DATASET_EXTENSIONS = new Set([
+  ...TABULAR_EXTENSIONS,
+  'xls',
+  'xlsx',
+  'xlsb',
+  'ods',
+  'parquet',
+  'arrow',
+  'feather',
+  'h5',
+  'hdf',
+  'hdf5',
+  'nc',
+  'netcdf',
+  'sav',
+  'dta',
+  'sas7bdat'
+])
+
+const DATASET_MIME_TYPES = new Set([
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.oasis.opendocument.spreadsheet',
+  'application/vnd.apache.arrow.file',
+  'application/vnd.apache.parquet'
+])
+
 // Lower-cased extension after the final dot, or '' when the name has none.
 const fileExtension = (name: string): string => {
   const dot = name.lastIndexOf('.')
@@ -87,7 +116,7 @@ const GENERIC_MIME_TYPES = new Set(['application/octet-stream', 'binary/octet-st
 // The lower-cased MIME essence (type/subtype) with any parameters and casing stripped, or undefined when
 // none was given. A real MIME arrives as `Text/CSV` or `application/json; charset=utf-8`, so every
 // comparison must run against this — not the raw string — or a valid text MIME reads as a concrete binary.
-const mimeEssence = (mimeType?: string): string | undefined => {
+export const mimeEssence = (mimeType?: string): string | undefined => {
   const essence = mimeType?.split(';', 1)[0]?.trim().toLowerCase()
 
   return essence ? essence : undefined
@@ -126,6 +155,14 @@ export const isTabularAttachment = (name: string, mimeType?: string): boolean =>
   if (essence === 'text/csv' || essence === 'text/tab-separated-values') return true
 
   return TABULAR_EXTENSIONS.has(fileExtension(name))
+}
+
+export const isDatasetAttachment = (name: string, mimeType?: string): boolean => {
+  const essence = mimeEssence(mimeType)
+  return (
+    DATASET_EXTENSIONS.has(fileExtension(name)) ||
+    (essence ? DATASET_MIME_TYPES.has(essence) : false)
+  )
 }
 
 // Raster image extensions that vision-capable agents can read as pixels, mapped to the MIME type to
@@ -172,7 +209,7 @@ export const formatBytes = (bytes: number): string => {
   return `${value.toFixed(1)} ${units[unit]}`
 }
 
-// Builds the text block that accompanies an oversized file's resource_link: it states why the file is
+// Builds the notice that accompanies an oversized file's local descriptor: it states why the file is
 // not inlined, tells the agent to read only what it needs, and shows a bounded preview of the start.
 export const buildOversizedAttachmentNotice = (input: {
   name: string
@@ -188,7 +225,7 @@ export const buildOversizedAttachmentNotice = (input: {
   const trailer = truncated ? '\n\n… file continues beyond this preview.' : ''
 
   return [
-    `[Attached file "${name}" (${formatBytes(size)}) is too large to include in full and is available on disk via the linked resource below.`,
+    `[Attached file "${name}" (${formatBytes(size)}) is too large to include in full and is available on disk via the local file reference below.`,
     `Do not load the whole file — read ${readHint}. For analysis over the full file, compute in the notebook rather than reading it into the conversation.`,
     'Preview of the start of the file:',
     '',
@@ -196,3 +233,18 @@ export const buildOversizedAttachmentNotice = (input: {
     trailer
   ].join('\n')
 }
+
+// Binary spreadsheets and scientific containers cannot provide a useful UTF-8 preview. Give the
+// agent an explicit analysis contract alongside a local file reference instead of a provider file.
+export const buildDatasetAttachmentNotice = (input: { name: string; size: number }): string =>
+  [
+    `[Attached dataset "${input.name}" (${formatBytes(input.size)}) is available on disk via the local file reference below.`,
+    'Do not load the whole file into the conversation. Inspect its schema and a small sample first, then use the notebook or a streaming/query tool to compute over the full dataset.]'
+  ].join('\n')
+
+export const buildDeferredMediaNotice = (input: {
+  name: string
+  size: number
+  kind: 'image' | 'PDF'
+}): string =>
+  `[Attached ${input.kind} "${input.name}" (${formatBytes(input.size)}) is too large for automatic in-memory processing and is available on disk via the linked resource below.]`

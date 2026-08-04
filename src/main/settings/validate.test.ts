@@ -19,7 +19,7 @@ const chatSseResponse = (body: string = toolCallSse): Response =>
   new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
 
 describe('validate: request construction', () => {
-  it('builds a bearer /v1/messages probe with anthropic-version and a 1-token body', () => {
+  it('builds a bearer /v1/messages probe with anthropic-version and a small reasoning budget', () => {
     const request = buildValidationRequest({
       type: 'custom',
       baseUrl: 'https://api.anthropic.com',
@@ -30,7 +30,7 @@ describe('validate: request construction', () => {
     expect(request.url).toBe('https://api.anthropic.com/v1/messages')
     expect(request.headers.authorization).toBe('Bearer test-token')
     expect(request.headers['anthropic-version']).toBe('2023-06-01')
-    expect(JSON.parse(request.body)).toMatchObject({ model: 'claude-sonnet-4-5', max_tokens: 1 })
+    expect(JSON.parse(request.body)).toMatchObject({ model: 'claude-sonnet-4-5', max_tokens: 16 })
   })
 
   it('normalizes a base URL that already carries /v1 so the probe never doubles it', () => {
@@ -177,7 +177,8 @@ describe('validate: classification', () => {
     expect(classifyStatus(403)).toBe('auth')
     expect(classifyStatus(404)).toBe('model-not-found')
     expect(classifyStatus(400)).toBe('unknown')
-    expect(classifyStatus(500)).toBe('unknown')
+    expect(classifyStatus(500)).toBe('server-error')
+    expect(classifyStatus(503)).toBe('server-error')
   })
 
   it('maps thrown errors to categories', () => {
@@ -252,8 +253,18 @@ describe('validate: error-body extraction', () => {
 })
 
 describe('validate: provider dispatch', () => {
-  it('returns ok for a 200 custom response', async () => {
-    const fetchImpl = vi.fn().mockResolvedValue({ status: 200 } as Response)
+  it('returns ok for a valid 200 Anthropic message', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'o' }],
+          usage: { input_tokens: 1, output_tokens: 1 }
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    )
 
     const result = await validateProvider(
       { type: 'custom', baseUrl: 'https://g/v1', key: 'k', model: 'm' },
@@ -261,6 +272,51 @@ describe('validate: provider dispatch', () => {
     )
 
     expect(result).toMatchObject({ ok: true, category: 'ok', status: 200 })
+  })
+
+  it('gives reasoning Anthropic providers enough output budget to return a message envelope', async () => {
+    const fetchImpl = vi.fn((_url: string | URL | Request, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)) as { max_tokens: number }
+      const message =
+        request.max_tokens >= 16
+          ? {
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'thinking', thinking: '...' }],
+              usage: { input_tokens: 1, output_tokens: request.max_tokens }
+            }
+          : {
+              type: '',
+              role: '',
+              content: [{ type: 'text', text: '' }],
+              usage: { input_tokens: 1, output_tokens: request.max_tokens }
+            }
+
+      return Promise.resolve(new Response(JSON.stringify(message), { status: 200 }))
+    })
+
+    const result = await validateProvider(
+      { type: 'custom', baseUrl: 'https://api.kimi.com/coding', key: 'k', model: 'kimi-k3' },
+      { fetchImpl: fetchImpl as unknown as typeof fetch, frameworkEndpoints: ['anthropic'] }
+    )
+
+    expect(result).toMatchObject({ ok: true, category: 'ok', status: 200 })
+  })
+
+  it('rejects an empty 200 Anthropic response instead of recording a false validation success', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response('{}', { status: 200 }))
+
+    const result = await validateProvider(
+      { type: 'custom', baseUrl: 'https://g/v1', key: 'k', model: 'm' },
+      { fetchImpl: fetchImpl as unknown as typeof fetch }
+    )
+
+    expect(result).toMatchObject({
+      ok: false,
+      category: 'unknown',
+      status: 200,
+      message: expect.stringContaining('valid Anthropic message')
+    })
   })
 
   it('requires an actual function call from a Chat Completions bridge provider', async () => {
@@ -372,6 +428,26 @@ describe('validate: provider dispatch', () => {
     expect(result).toMatchObject({ ok: false, category: 'model-not-found', status: 400 })
   })
 
+  it('surfaces a 5xx error message from a bridge validation', async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(
+        new Response('{"error":{"message":"Gateway timeout"}}', { status: 502 })
+      )
+
+    const result = await validateProvider(
+      { type: 'custom', apiEndpoints: ['openai'], baseUrl: 'https://g/v1', key: 'k', model: 'm' },
+      { fetchImpl: fetchImpl as unknown as typeof fetch, requireBridgeToolCall: true }
+    )
+
+    expect(result).toMatchObject({
+      ok: false,
+      category: 'server-error',
+      status: 502,
+      message: 'Gateway timeout'
+    })
+  })
+
   it('keeps a text-only Chat Completions provider unverified', async () => {
     const fetchImpl = vi
       .fn()
@@ -390,6 +466,37 @@ describe('validate: provider dispatch', () => {
       ok: false,
       category: 'unknown',
       message: expect.stringContaining('required streaming function tool call')
+    })
+  })
+
+  it('keeps a text-only native Responses compatibility provider unverified', async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(
+          'data: {"type":"response.output_text.delta","delta":"ok"}\n\ndata: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}}\n\n',
+          { status: 200, headers: { 'content-type': 'text/event-stream' } }
+        )
+      )
+
+    const result = await validateProvider(
+      {
+        type: 'custom',
+        apiEndpoints: ['responses'],
+        baseUrl: 'https://api.x.ai/v1',
+        key: 'k',
+        model: 'm'
+      },
+      {
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        requireNativeResponsesCompatibility: true
+      }
+    )
+
+    expect(result).toMatchObject({
+      ok: false,
+      category: 'unknown',
+      message: expect.stringContaining('namespace function tool call')
     })
   })
 
@@ -443,7 +550,7 @@ describe('validate: provider dispatch', () => {
 
     expect(result).toMatchObject({
       ok: false,
-      category: 'unknown',
+      category: 'server-error',
       status: 503,
       message: 'Service temporarily unavailable'
     })
@@ -460,7 +567,7 @@ describe('validate: provider dispatch', () => {
       { fetchImpl: fetchImpl as unknown as typeof fetch }
     )
 
-    expect(result).toMatchObject({ ok: false, category: 'unknown', status: 500 })
+    expect(result).toMatchObject({ ok: false, category: 'server-error', status: 500 })
     expect(result.message).toBeUndefined()
   })
 
@@ -487,26 +594,24 @@ describe('validate: provider dispatch', () => {
     expect(fetchImpl).not.toHaveBeenCalled()
   })
 
-  it('runs the claude probe for claude-default providers', async () => {
-    const okResult = await validateProvider(
-      { type: 'claude-default' },
-      { runClaudeProbe: () => Promise.resolve({ ok: true }) }
-    )
-    const failResult = await validateProvider(
-      { type: 'claude-default' },
-      { runClaudeProbe: () => Promise.resolve({ ok: false }) }
-    )
+  it('reports bad-url before starting native Responses compatibility validation', async () => {
+    const fetchImpl = vi.fn()
 
-    expect(okResult).toMatchObject({ ok: true, category: 'ok' })
-    expect(failResult).toMatchObject({ ok: false, category: 'auth' })
-  })
-
-  it('classifies a claude-default probe timeout as timeout, not auth', async () => {
     const result = await validateProvider(
-      { type: 'claude-default' },
-      { runClaudeProbe: () => Promise.resolve({ ok: false, timedOut: true }) }
+      {
+        type: 'custom',
+        apiEndpoints: ['responses'],
+        baseUrl: 'nonsense',
+        key: 'k',
+        model: 'm'
+      },
+      {
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        requireNativeResponsesCompatibility: true
+      }
     )
 
-    expect(result).toMatchObject({ ok: false, category: 'timeout' })
+    expect(result.category).toBe('bad-url')
+    expect(fetchImpl).not.toHaveBeenCalled()
   })
 })

@@ -145,6 +145,11 @@ The light theme uses a warm off-white page background, white cards, and a deep-g
   --accent: oklch(0.87 0.115 82);
   --accent-foreground: oklch(0.2 0.03 62);
   --destructive: oklch(0.58 0.22 25);
+  --chart-1: rgb(109 167 236);
+  --chart-2: rgb(88 176 133);
+  --chart-3: rgb(210 157 56);
+  --chart-4: rgb(178 132 229);
+  --chart-5: rgb(225 113 91);
   --border: #dededa;
   --input: #dededa;
   --ring: oklch(0.58 0.11 184);
@@ -242,18 +247,18 @@ Workspace tokens share the same visual intent as several shadcn tokens. Workspac
 
 Workspace-only tokens without a shadcn counterpart, plus shadow tokens. For shared surface colors, see **Workspace ↔ shadcn Equivalence** above.
 
-| Token                               | Tailwind class                     | Light value                                                       | Usage                                             |
-| ----------------------------------- | ---------------------------------- | ----------------------------------------------------------------- | ------------------------------------------------- |
-| `--bg-400`                          | `bg-bg-400`                        | `hsl(45 10% 88%)`                                                 | Sidebar row action hover                          |
-| `--text-300`                        | `text-text-300`                    | `hsl(43 3% 57%)`                                                  | Footer/action icon default color and loading dots |
-| `--rail-card-bg`                    | `bg-rail-card-bg`                  | `hsl(0 0% 100%)`                                                  | Sidebar rail card                                 |
-| `--danger-000` / `--danger-900`     | `text-danger-000`, `bg-danger-900` | `hsl(0 45% 38%)`, `hsl(0 55% 95%)`                                | Destructive session menu and dialog actions       |
-| `--action-panel-toggle`             | `text-action-panel-toggle`         | `hsl(0 0% 42%)`                                                   | Collapsed preview toggle                          |
-| `--surface-control-hover`           | `hover:bg-surface-control-hover`   | `hsl(38 20% 90%)`                                                 | Header icon control hover                         |
-| `--message-user-text`               | `text-message-user-text`           | `hsl(0 0% 12%)`                                                   | User message bubble text                          |
-| `--shadow-card`                     | `shadow-card`                      | `0 0 0 1px rgb(10 10 10 / 0.06), 0 4px 24px rgb(10 10 10 / 0.04)` | Sidebar rail card and composer dock               |
-| `--shadow-card-opaque`              | `shadow-card-opaque`               | `0 0 0 1px rgb(10 10 10 / 0.08), 0 8px 28px rgb(10 10 10 / 0.1)`  | Composer form                                     |
-| `--shadow-menu` / `--shadow-dialog` | `shadow-menu`, `shadow-dialog`     | `0 2px 8px rgb(0 0 0 / 0.08)`, `0 8px 32px rgb(10 10 10 / 12%)`   | Menus and modal dialogs                           |
+| Token                               | Tailwind class                     | Light value                                                       | Usage                                       |
+| ----------------------------------- | ---------------------------------- | ----------------------------------------------------------------- | ------------------------------------------- |
+| `--bg-400`                          | `bg-bg-400`                        | `hsl(45 10% 88%)`                                                 | Sidebar row action hover                    |
+| `--text-300`                        | `text-text-300`                    | `hsl(43 3% 57%)`                                                  | Action icon default color and loading dots  |
+| `--rail-card-bg`                    | `bg-rail-card-bg`                  | `hsl(0 0% 100%)`                                                  | Sidebar rail card                           |
+| `--danger-000` / `--danger-900`     | `text-danger-000`, `bg-danger-900` | `hsl(0 45% 38%)`, `hsl(0 55% 95%)`                                | Destructive session menu and dialog actions |
+| `--action-panel-toggle`             | `text-action-panel-toggle`         | `hsl(0 0% 42%)`                                                   | Collapsed preview toggle                    |
+| `--surface-control-hover`           | `hover:bg-surface-control-hover`   | `hsl(38 20% 90%)`                                                 | Header icon control hover                   |
+| `--message-user-text`               | `text-message-user-text`           | `hsl(0 0% 12%)`                                                   | User message bubble text                    |
+| `--shadow-card`                     | `shadow-card`                      | `0 0 0 1px rgb(10 10 10 / 0.06), 0 4px 24px rgb(10 10 10 / 0.04)` | Sidebar rail card and composer dock         |
+| `--shadow-card-opaque`              | `shadow-card-opaque`               | `0 0 0 1px rgb(10 10 10 / 0.08), 0 8px 28px rgb(10 10 10 / 0.1)`  | Composer form                               |
+| `--shadow-menu` / `--shadow-dialog` | `shadow-menu`, `shadow-dialog`     | `0 2px 8px rgb(0 0 0 / 0.08)`, `0 8px 32px rgb(10 10 10 / 12%)`   | Menus and modal dialogs                     |
 
 ### Border Opacity
 
@@ -394,6 +399,7 @@ Workspace-only tokens without a shadcn counterpart, plus shadow tokens. For shar
 - Overlay: `fixed inset-0 bg-black/50`, using Radix state animations for open and close; compact workspace dialogs use `bg-black/25 backdrop-blur-[2px]`.
 - Delete confirmation copy must include the session name and state that session artifacts remain in the project.
 - Rename dialog input uses `h-9 rounded-lg border-border-200 bg-bg-000 text-sm text-text-000 placeholder:text-text-100` and a subtle `ring-border-200/25` focus ring.
+- Session Artifact download dialog: use a scrollable `Dialog` up to `640px` wide and `80svh` high, with a compact header, an artifact checklist, and a persistent footer. Repair an incomplete Project Files index before treating the list as authoritative. Select every Artifact by default; show the selected/total count, file type, and size; disable download when none are selected; and keep failed items selected after a partial batch download.
 
 ### DropdownMenu / Popover / Select
 
@@ -405,7 +411,8 @@ Workspace-only tokens without a shadcn counterpart, plus shadow tokens. For shar
 - Session action menu content: `z-modal min-w-[9rem] rounded-xl border-[0.5px] border-border-200 bg-bg-000 p-1.5 shadow-menu`.
 - Session action trigger uses `MoreVertical`, opacity reveal on row hover/focus/menu-open, and an `aria-label` that includes the session title.
 - Session action items: `flex w-full cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-left text-sm text-text-100 data-[highlighted]:bg-bg-200 data-[highlighted]:text-text-000`.
-- Destructive session item: `text-danger-000 data-[highlighted]:bg-danger-900`; the menu includes only `Rename…` and `Delete`.
+- Destructive session item: `text-danger-000 data-[highlighted]:bg-danger-900`.
+- Group the Session action menu as: `Pin`/`Unpin` and `Rename…`; separator; `Download all artifacts` and `View notebook`; separator; destructive `Delete`.
 - Select trigger: `h-8 rounded-lg border border-border bg-card px-2.5`; hover and `data-state=open` use `bg-muted`, and keyboard focus uses the shared 3px ring.
 - Select content uses the same overscroll containment, surface, border, radius, and shadow as DropdownMenu. Options are `min-h-8 rounded-lg`; keyboard highlight uses `bg-muted text-foreground`.
 - Menus do not use a page scrim.
@@ -422,7 +429,7 @@ Workspace-only tokens without a shadcn counterpart, plus shadow tokens. For shar
 ### Sidebar
 
 - Sidebar root: `bg-sidebar text-sidebar-foreground`.
-- Expanded width should follow content density; the settings dialog left navigation is approximately `208px`.
+- Expanded width should follow content density; the settings dialog left navigation is approximately `192px`.
 - Collapsed state keeps a `size-8` icon rail and provides `Tooltip` for every icon item.
 - Item: `h-8 rounded-lg px-2 text-sm text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground`.
 - Active item: `bg-sidebar-accent text-sidebar-accent-foreground font-medium`.
@@ -453,7 +460,9 @@ Workspace-only tokens without a shadcn counterpart, plus shadow tokens. For shar
 - Message content is centered in `mx-auto w-full max-w-4xl pb-[56px]`.
 - User bubble: `ml-auto max-w-[90%] md:max-w-[min(85%,56rem)] rounded-2xl bg-bg-300 px-3.5 py-2 md:px-4 md:py-2.5 text-sm md:text-[15px] text-message-user-text`.
 - Assistant wrapper: `w-full max-w-[56rem] text-sm md:text-[15px] leading-relaxed text-text-000`.
-- Agent loading surface uses `rounded-2xl bg-bg-200`; animated dots use `bg-text-300`.
+- Message metadata uses `text-[11px] text-text-000/70 tabular-nums` below the content so timestamps and elapsed status meet WCAG contrast on workspace surfaces. The visible timestamp format is fixed to English `MMM D, h:mm AM/PM`: User Messages show `Sent ...`, completed Agent Messages show `Completed ...`, and failed Agent Messages show `Failed ...`. Terminal timestamps are persisted separately from mutable record update times. Agent footers keep terminal time, elapsed time, and `Usage` on one line without a separator (`Completed ... Elapsed 2m 5s Usage`). `Usage` uses a dashed underline and reveals a compact Context-window-style popover on pointer hover or keyboard focus. The popover has a proportional color bar above its token rows and a divided `Total` row below them. When an adapter reports a reliable agentic model-turn count, show `1 turn` or `N turns` as smaller muted text aligned to the right of the popover title; omit it rather than estimating when unavailable. Show Input, Cache, and Output when only aggregate cache data is available; split Cache into Cache read and Cache write, with distinct colors and bar segments, only when the agent reports both categories. The displayed categories are mutually exclusive and `Total` is their sum.
+- User Message copy and edit actions sit immediately left of the bubble and use the standard inline-action opacity transition on row hover or keyboard focus. When editing creates multiple Branches, keep the Branch navigation persistently visible at the right end of the metadata footer below the bubble, after the sent time, with previous/next controls around a Branch icon and the current/total count. Let the footer wrap on narrow surfaces so the navigation remains the final bottom row without colliding with the sent time.
+- Agent loading surface uses `rounded-2xl bg-bg-200`; elapsed and status text use `text-text-000/70`, while animated dots use `bg-text-300`.
 - Tool row: `h-8 rounded-lg px-2 text-[13px] hover:bg-foreground/[0.04]`.
 - Tool row metadata: `text-[12.5px] text-muted-foreground tabular-nums`.
 - Link: `text-primary underline-offset-4 hover:underline`.
@@ -493,9 +502,9 @@ Workspace-only tokens without a shadcn counterpart, plus shadow tokens. For shar
 - Image / document preview area: `flex-1 min-h-0 overflow-auto bg-card`.
 - Empty preview panel shell and scroll body use `bg-bg-10`.
 - File library search: `Input` or `CommandInput`, with focus using `ring-ring`.
-- File library view switch: `ToggleGroup type="single"`.
-- File row: `h-9 rounded-md px-2 hover:bg-accent hover:text-accent-foreground`.
-- File card: `rounded-lg border bg-card p-2 shadow-sm hover:bg-accent/50`.
+- File library view switch: `ToggleGroup type="single"`; inactive hover uses `bg-muted`, and the selected item uses `bg-bg-400 text-text-000`. Keep these states neutral rather than using `accent`.
+- File row: `h-9 rounded-md px-2 hover:bg-bg-200`; keep the text color unchanged on hover.
+- File card: `rounded-lg border bg-card p-2 shadow-sm hover:border-border-200 hover:bg-bg-100`.
 
 ## Page Guidelines
 
@@ -541,7 +550,7 @@ Workspace-only tokens without a shadcn counterpart, plus shadow tokens. For shar
 
 #### Composer skill selector
 
-- The composer input is a `contenteditable` editor (`role="textbox" aria-multiline`), not a textarea, so it can hold inline non-editable mention chips. Placeholder via `empty:before:content-[attr(data-placeholder)]` in a muted `text-text-300`: `Ask anything — / for skills`. Only `/` skills is wired; `@`/`#`/`⌘K` are reserved for later and are not advertised in the placeholder.
+- The composer input is a `contenteditable` editor (`role="textbox" aria-multiline`), not a textarea, so it can hold inline non-editable mention chips. Its muted `text-text-300` placeholder is `Ask anything — / for skills, @ for files, ⌘K to search` on macOS and uses `Ctrl+K` on Windows/Linux. `/` skills, `@` artifact files, and the platform search shortcut are wired; `#` is reserved for later and is not advertised.
 - Typing `/` at a word boundary opens a **skill popup** above the input: `absolute bottom-full mb-1 z-50 bg-bg-000 border-0.5 border-border-200 rounded-xl shadow p-1.5 min-w-[320px] max-w-[440px] max-h-[min(45vh,18rem)]`. It is a `role="listbox"` of `role="option"` rows — name (`font-medium text-sm truncate`) + source badge (`text-[10px] px-1.5 py-0.5 rounded bg-accent text-accent-foreground`) + 2-line description (`text-xs text-text-300 line-clamp-2`); active row `bg-bg-200 !text-text-000`. A footer hint bar shows `↑↓ navigate · Enter select · Esc close`.
 - Selecting inserts an inline **skill chip**: `inline-flex items-center px-1.5 py-0.5 mx-0.5 bg-accent text-accent-foreground rounded text-sm font-medium select-all`, `contenteditable="false"`, label `/<Name>`, carrying `data-mention-type="skill" data-skill-id`. Backspace deletes the whole chip; chips are atomic to caret motion.
 - On send, chips serialize to `/<Name>` inline in the visible message, and their skill ids are carried as `forcedSkillIds`: the agent prompt is prefixed with a steering nudge naming the skills, and any picked skill toggled off in Settings is force-loaded for that turn only (the message text the user sees is unchanged).
@@ -550,7 +559,7 @@ Workspace-only tokens without a shadcn counterpart, plus shadow tokens. For shar
 
 - Use a large `Dialog`; the restored panel is `h-[min(688px,calc(100vh-2rem))] w-[min(960px,calc(100vw-2rem))] rounded-xl border border-border bg-card shadow-dialog`. Maximize uses `inset-4`, filling the viewport with a stable 16px margin and never shrinking the restored panel.
 - Settings consumes the global semantic palette: background `#FAFAF8`, card/popover `#FFFFFF`, muted/secondary `#ECECEA`, border/input `#DEDEDA`, foreground `#202321`, and muted foreground `#646762`. Do not scope token overrides to the dialog or use `body:has(...)`; Radix portals inherit these root tokens directly.
-- Left navigation: `w-52 shrink-0 border-r border-border bg-background p-3`, organized into labeled groups (for example Capabilities and Workspace). Each group has a `text-xs font-medium text-muted-foreground` heading over its rows.
+- Left navigation: `w-48 shrink-0 border-r border-border bg-background p-3`, organized into labeled groups (for example Capabilities and Workspace). Each group has a `text-xs font-medium text-muted-foreground` heading over its rows.
 - Nav item: `h-8 w-full rounded-lg px-2 text-sm gap-2 hover:bg-muted`, with a `size-4` leading icon (`text-muted-foreground`) and a truncating label.
 - Active: `bg-muted text-foreground font-medium`; the neutral selection keeps deep green reserved for primary actions, focus, links, enabled switches, and success.
 - Content header: `h-12 border-b border-border px-3`, a space-between row. Left cluster: back / forward `size-7` icon buttons (`ArrowLeft` / `ArrowRight`, `disabled:opacity-40`), a `h-4 w-px bg-border` divider, then either a breadcrumb or a plain `h2 text-sm font-semibold` title. Right cluster: a maximize / restore `size-7` toggle (`Maximize2` / `Minimize2`) and a `size-7` close (`X`); both use `hover:bg-muted hover:text-foreground`.
@@ -572,6 +581,7 @@ Workspace-only tokens without a shadcn counterpart, plus shadow tokens. For shar
 - Skill detail page: header row pairs a `size-6` scroll icon (`ScrollText`, `text-primary`) + `text-base font-semibold` name + a rounded source badge (`bg-muted text-xs text-muted-foreground`, e.g. Featured) against the same enable switch, with a `text-xs text-muted-foreground` "Updated N days ago" line and a `[text-wrap:pretty]` description below. A **Files** section (`border-t border-border pt-4`) renders the `SKILL.md` body via `AgentMarkdown`; a **Details** section lists frontmatter Author / License / Third-party as stacked `text-xs` label + `text-sm` value rows, shown only when present.
 - Editor (create / edit) is sectioned Identity + Content + References: Content offers a Write / Upload toggle where pasting a `SKILL.md` auto-fills the frontmatter; References is a dropzone writing into the skill's `references/`.
 - Import from GitHub is Preview-first: no standalone import action initially, only a **Preview** button that scans the repo. Scanned candidates list with per-row checkboxes plus a **Select all** checkbox and an **Invert** text button; already-imported skills (matched by exact source URL or by the same folder name) show a muted `Imported` pill and are not pre-selected. The batch action, "Import selected (N)", is a neutral button (`border border-border bg-card hover:bg-muted`), never primary green.
+- A conversation-requested GitHub import uses the same preview-first semantics in an application modal: the app scans the resolved repo URL, pins candidates to the resolved commit so preview and import share one immutable snapshot, lists every discovered Skill, pre-selects candidates that are not already imported, loads a candidate's full preview only when requested, and writes only the user's confirmed selection. The agent never installs GitHub content directly into its own runtime Skill directory.
 - Upload is a full-page dropzone (`Drag and drop or click to upload`) accepting a `.md` file or a `.zip` / `.skill` bundle, with a centered "Write from scratch instead" fallback. A dropped file is **parsed first, not imported**: on success it advances to a "Confirm import" page (parsed name, description, and — for a bundle — the file list), with a neutral **Import** button and a **Choose a different file** escape. Nothing is written until Import is confirmed.
 - Duplicate detection on the confirm page uses two signals: an **exact re-upload** (the bundle's sha256 content signature already matches an import) and a **same-name skill** already in the catalog (any source; also covers `.md` uploads). Either one shows an "Already uploaded" pill on the name and an `Info`-icon reminder below the button row (`text-xs text-muted-foreground`) — "…already imported — re-importing is a no-op." for an exact match, or `A skill named "X" already exists.` for a name match. The reminder never blocks import.
 - When a file fails to parse into a valid skill (not a ZIP, no `SKILL.md`, or a `SKILL.md` with no `name`), the failure shows in a danger banner directly under the dropzone: `flex items-start gap-2 rounded-lg border border-danger-000/30 bg-danger-000/10 px-3 py-2 text-xs text-danger-000` with a leading `size-3.5` `AlertTriangle`. This is the reusable inline-error style for the settings pages.
@@ -579,44 +589,44 @@ Workspace-only tokens without a shadcn counterpart, plus shadow tokens. For shar
 
 ## Clickable Area Guidelines
 
-| Area              | Clickable part                       | shadcn pattern                                                                           |
-| ----------------- | ------------------------------------ | ---------------------------------------------------------------------------------------- |
-| Home              | Account menu                         | `Button ghost icon` + `DropdownMenu`                                                     |
-| Home              | Main create button                   | `Button default` or `Button outline size=sm`                                             |
-| Home              | List row                             | `button` / `Link` + `hover:bg-accent`                                                    |
-| Home              | Row actions                          | `Button ghost icon` + opacity reveal                                                     |
-| Dialog            | Close                                | `DialogClose` or `Button ghost icon`                                                     |
-| Dialog            | Cancel / confirm                     | `DialogFooter` + `Button secondary/default`                                              |
-| Settings          | Left navigation                      | `Button ghost` or `TabsTrigger`; active uses `bg-muted`                                  |
-| Settings          | Back / forward                       | `size-7` icon `button` (`ArrowLeft` / `ArrowRight`), `disabled:opacity-40`               |
-| Settings          | Breadcrumb root                      | Text `button` (`text-muted-foreground hover:text-foreground`)                            |
-| Settings          | Maximize / restore                   | `size-7` icon `button` (`Maximize2` / `Minimize2`)                                       |
-| Settings          | Close                                | `size-7` icon `button` (`X`)                                                             |
-| Settings          | Select field                         | `Select`                                                                                 |
-| Skills            | Add skill                            | Neutral `DropdownMenu` trigger (`border border-border bg-card`) + `Plus` / `ChevronDown` |
-| Skills            | Group header                         | Full-width collapse `button` + rotating `ChevronDown`                                    |
-| Skills            | Skill row                            | Flex-1 `button` → detail; hover reveals no extra chrome                                  |
-| Skills            | Edit / delete                        | `SettingsIconAction` (`Button ghost icon-sm` + `Tooltip`)                                |
-| Skills            | Enable toggle                        | Shared shadcn `Switch`                                                                   |
-| Skills            | Import selected                      | Neutral `button` (`border border-border bg-card`), not primary                           |
-| Sidebar           | Back / collapse                      | `Sidebar` + `Button ghost icon`                                                          |
-| Sidebar           | Navigation row                       | `SidebarMenuButton`                                                                      |
-| Workspace sidebar | New conversation                     | `button` + `hover:bg-bg-300 cursor-pointer`                                              |
-| Workspace sidebar | Session row                          | Nested `button`; wrapper owns hover/active only                                          |
-| Workspace sidebar | Session actions                      | Icon `button` + opacity reveal + `DropdownMenu`                                          |
-| Workspace sidebar | Settings                             | Icon `button` + `hover:bg-bg-300 cursor-pointer`                                         |
-| Activity stream   | Tool row                             | `Button ghost`-style row, hover `bg-foreground/[0.04]`                                   |
-| Activity stream   | Link / reference                     | `text-primary hover:underline`                                                           |
-| Activity stream   | Output card                          | `Card` or button card                                                                    |
-| Composer          | Add / options / send                 | `Button ghost icon`                                                                      |
-| Composer          | Text field                           | `Textarea` or contenteditable shell, preserving shadcn focus ring                        |
-| Session menu      | Rename / delete                      | `DropdownMenu.Item`; destructive delete uses `text-danger-000`                           |
-| Workspace dialogs | Rename / delete confirm              | `RenameSessionDialog` uses `bg-text-000`; `DeleteSessionDialog` uses `bg-danger-000`     |
-| Viewer            | Tab                                  | `TabsTrigger`                                                                            |
-| Viewer            | More / fullscreen / download / close | `Button ghost icon` + `Tooltip`                                                          |
-| File library      | Search                               | `Input` / `CommandInput`                                                                 |
-| File library      | Grid/list switch                     | `ToggleGroup type="single"`                                                              |
-| File library      | File card / file row                 | `Card` / button row + hover `bg-accent`                                                  |
+| Area              | Clickable part                                       | shadcn pattern                                                                           |
+| ----------------- | ---------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| Home              | Account menu                                         | `Button ghost icon` + `DropdownMenu`                                                     |
+| Home              | Main create button                                   | `Button default` or `Button outline size=sm`                                             |
+| Home              | List row                                             | `button` / `Link` + `hover:bg-accent`                                                    |
+| Home              | Row actions                                          | `Button ghost icon` + opacity reveal                                                     |
+| Dialog            | Close                                                | `DialogClose` or `Button ghost icon`                                                     |
+| Dialog            | Cancel / confirm                                     | `DialogFooter` + `Button secondary/default`                                              |
+| Settings          | Left navigation                                      | `Button ghost` or `TabsTrigger`; active uses `bg-muted`                                  |
+| Settings          | Back / forward                                       | `size-7` icon `button` (`ArrowLeft` / `ArrowRight`), `disabled:opacity-40`               |
+| Settings          | Breadcrumb root                                      | Text `button` (`text-muted-foreground hover:text-foreground`)                            |
+| Settings          | Maximize / restore                                   | `size-7` icon `button` (`Maximize2` / `Minimize2`)                                       |
+| Settings          | Close                                                | `size-7` icon `button` (`X`)                                                             |
+| Settings          | Select field                                         | `Select`                                                                                 |
+| Skills            | Add skill                                            | Neutral `DropdownMenu` trigger (`border border-border bg-card`) + `Plus` / `ChevronDown` |
+| Skills            | Group header                                         | Full-width collapse `button` + rotating `ChevronDown`                                    |
+| Skills            | Skill row                                            | Flex-1 `button` → detail; hover reveals no extra chrome                                  |
+| Skills            | Edit / delete                                        | `SettingsIconAction` (`Button ghost icon-sm` + `Tooltip`)                                |
+| Skills            | Enable toggle                                        | Shared shadcn `Switch`                                                                   |
+| Skills            | Import selected                                      | Neutral `button` (`border border-border bg-card`), not primary                           |
+| Sidebar           | Back / collapse                                      | `Sidebar` + `Button ghost icon`                                                          |
+| Sidebar           | Navigation row                                       | `SidebarMenuButton`                                                                      |
+| Workspace sidebar | New conversation                                     | `button` + `hover:bg-bg-300 cursor-pointer`                                              |
+| Workspace sidebar | Session row                                          | Nested `button`; wrapper owns hover/active only                                          |
+| Workspace sidebar | Session actions                                      | Icon `button` + opacity reveal + `DropdownMenu`                                          |
+| Workspace sidebar | Settings                                             | Icon `button` + `hover:bg-bg-300 cursor-pointer`                                         |
+| Activity stream   | Tool row                                             | `Button ghost`-style row, hover `bg-foreground/[0.04]`                                   |
+| Activity stream   | Link / reference                                     | `text-primary hover:underline`                                                           |
+| Activity stream   | Output card                                          | `Card` or button card                                                                    |
+| Composer          | Add / options / send                                 | `Button ghost icon`                                                                      |
+| Composer          | Text field                                           | `Textarea` or contenteditable shell, preserving shadcn focus ring                        |
+| Session menu      | Pin / rename / Artifact download / notebook / delete | `DropdownMenu.Item`; destructive delete uses `text-danger-000`                           |
+| Workspace dialogs | Rename / delete / Artifact download                  | Compact dialog chrome; download uses a scrollable checklist and persistent footer        |
+| Viewer            | Tab                                                  | `TabsTrigger`                                                                            |
+| Viewer            | More / fullscreen / download / close                 | `Button ghost icon` + `Tooltip`                                                          |
+| File library      | Search                                               | `Input` / `CommandInput`                                                                 |
+| File library      | Grid/list switch                                     | `ToggleGroup type="single"`; hover `bg-muted`, selected `bg-bg-400`                      |
+| File library      | File card / file row                                 | `Card` / button row + neutral hover `bg-bg-100` / `bg-bg-200`                            |
 
 ## Language Guidelines
 

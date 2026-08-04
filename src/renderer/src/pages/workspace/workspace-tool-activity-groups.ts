@@ -1,11 +1,12 @@
+import type { PersistedActivityGroup } from '../../../../shared/session-persistence'
 import type { ToolActivity } from '@/stores/session-store'
 
 import {
-  NOTEBOOK_PROVIDER_TOOL_PREFIX,
+  getNotebookToolSuffix,
   isActivityActive,
   type ConversationItem
 } from './workspace-conversation-items'
-import { isEditActivity } from './workspace-tool-activity-details'
+import { isEditActivity, isSkillActivity } from './workspace-tool-activity-details'
 import { hasWebSearchContentEvidence } from './workspace-web-search-details'
 
 type ConversationActivityGroupItem = {
@@ -14,10 +15,12 @@ type ConversationActivityGroupItem = {
   createdAt: number
   sortIndex: number
   activities: ToolActivity[]
+  activityGroupId?: string
+  title?: string
 }
 
 type GroupedConversationItem =
-  Extract<ConversationItem, { type: 'message' }> | ConversationActivityGroupItem
+  Extract<ConversationItem, { type: 'message' | 'handoff' }> | ConversationActivityGroupItem
 type ActivityExpansionOverrides = Record<string, boolean>
 type RenderableActivityEntry = {
   activity: ToolActivity
@@ -27,28 +30,43 @@ type RenderableActivityEntry = {
 const WEB_SEARCH_PROVIDER_TOOL_NAME = 'websearch'
 
 // Collapses consecutive activity items into one transcript group between chat messages.
-const groupConversationItems = (items: ConversationItem[]): GroupedConversationItem[] => {
+const groupConversationItems = (
+  items: ConversationItem[],
+  activityGroups: PersistedActivityGroup[] = []
+): GroupedConversationItem[] => {
   const groupedItems: GroupedConversationItem[] = []
+  const groupsById = new Map(activityGroups.map((group) => [group.id, group]))
 
   for (const item of items) {
-    if (item.type === 'message') {
+    // Handoff lifecycle rows are transcript annotations, not tool activities. Keep their timeline
+    // position and prevent them from merging into an adjacent tool group.
+    if (item.type === 'message' || item.type === 'handoff') {
       groupedItems.push(item)
       continue
     }
 
     const previousItem = groupedItems[groupedItems.length - 1]
+    const activityGroupId = item.activity.activityGroupId
+    const declaredGroup = activityGroupId ? groupsById.get(activityGroupId) : undefined
 
-    if (previousItem?.type === 'activity-group') {
+    if (
+      previousItem?.type === 'activity-group' &&
+      previousItem.activityGroupId === activityGroupId
+    ) {
       previousItem.activities.push(item.activity)
       continue
     }
 
     groupedItems.push({
-      id: `activity-group-${item.activity.id}`,
+      id: activityGroupId
+        ? `activity-group-${activityGroupId}`
+        : `activity-group-${item.activity.id}`,
       type: 'activity-group',
       createdAt: item.createdAt,
       sortIndex: item.sortIndex,
-      activities: [item.activity]
+      activities: [item.activity],
+      activityGroupId,
+      title: declaredGroup?.title
     })
   }
 
@@ -168,8 +186,8 @@ const categorizeActivity = (
   const providerName = getNormalizedProviderName(activity)
 
   // A notebook_execute call is one cell run; summarize it as such instead of a generic tool.
-  if (providerName === `${NOTEBOOK_PROVIDER_TOOL_PREFIX}notebook_execute`) return 'notebook'
-  if (providerName === 'skill') return 'skill'
+  if (getNotebookToolSuffix(providerName) === 'notebook_execute') return 'notebook'
+  if (isSkillActivity(activity)) return 'skill'
   if (providerName === 'save_artifacts' || providerName.includes('artifact')) return 'artifact'
   if (providerName === 'manage_packages' || providerName.includes('package')) return 'environment'
   if (providerName === 'request_network_access' || providerName.startsWith('request_network')) {
@@ -220,7 +238,10 @@ const capitalizeFirst = (value: string): string =>
   value.length > 0 ? `${value.charAt(0).toUpperCase()}${value.slice(1)}` : value
 
 // Summarizes a group as "Ran 2 commands, loaded a skill, made a call" style category clauses.
-const formatActivityGroupTitle = (activities: ToolActivity[]): string => {
+const formatActivityGroupTitle = (activities: ToolActivity[], declaredTitle?: string): string => {
+  const groupTitle = declaredTitle?.trim()
+  if (groupTitle) return groupTitle
+
   const hasSearchActivities = countSearchActivities(activities) > 0
   const categoryCounts = new Map<ActivityCategory, number>()
 

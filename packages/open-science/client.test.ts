@@ -4,6 +4,7 @@ import { join } from 'node:path'
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { PUBLIC_TERMINAL_FIXTURE } from '../../test/fixtures/renderer-contract-certification'
 import { connectToOpenScience, OpenScienceClient } from './index.mjs'
 
 const response = (status: number, payload: unknown): Response =>
@@ -19,6 +20,27 @@ afterEach(async () => {
 })
 
 describe('OpenScienceClient', () => {
+  it('pins the SDK method inventory without exposing management capabilities', () => {
+    expect(Object.getOwnPropertyNames(OpenScienceClient.prototype).sort()).toEqual(
+      [
+        'constructor',
+        'health',
+        'listProjects',
+        'createProject',
+        'listSessions',
+        'getSession',
+        'startRun',
+        'getRun',
+        'waitForRun',
+        'listArtifacts',
+        'downloadArtifact',
+        'events',
+        'request',
+        'throwResponseError'
+      ].sort()
+    )
+  })
+
   it('starts and waits for a run through the authenticated versioned API', async () => {
     const fetch = vi
       .fn()
@@ -67,7 +89,12 @@ describe('OpenScienceClient', () => {
       sleep: vi.fn().mockResolvedValue(undefined)
     })
 
-    const started = await client.startRun({ project: 'project-1', prompt: 'Research this.' })
+    const started = await client.startRun({
+      project: 'project-1',
+      prompt: 'Research this.',
+      permissionProfile: 'auto',
+      skillIds: ['literature-review']
+    })
     const completed = await client.waitForRun(started.id)
 
     expect(completed).toMatchObject({ status: 'completed', output: 'Done' })
@@ -76,7 +103,13 @@ describe('OpenScienceClient', () => {
       'http://127.0.0.1:44100/api/v1/runs',
       expect.objectContaining({
         method: 'POST',
-        headers: expect.objectContaining({ authorization: 'Bearer secret-token' })
+        headers: expect.objectContaining({ authorization: 'Bearer secret-token' }),
+        body: JSON.stringify({
+          project: 'project-1',
+          prompt: 'Research this.',
+          permissionProfile: 'auto',
+          skillIds: ['literature-review']
+        })
       })
     )
     expect(fetch).toHaveBeenCalledTimes(3)
@@ -121,6 +154,30 @@ describe('OpenScienceClient', () => {
     }
   })
 
+  it('honors caller cancellation before polling without exposing a run-cancel operation', async () => {
+    const fetch = vi.fn()
+    const client = new OpenScienceClient({
+      baseUrl: 'http://127.0.0.1:44100',
+      token: 'secret-token',
+      fetch
+    })
+    const abortController = new AbortController()
+    const cancellation = new Error('caller cancelled the wait')
+    abortController.abort(cancellation)
+
+    await expect(client.waitForRun('run-1', { signal: abortController.signal })).rejects.toBe(
+      cancellation
+    )
+    expect(fetch).not.toHaveBeenCalled()
+    expect(client).not.toHaveProperty('cancelRun')
+    expect(client).not.toHaveProperty('permissions')
+    expect(client).not.toHaveProperty('specialists')
+    expect(client).not.toHaveProperty('compute')
+    expect(client).not.toHaveProperty('notebook')
+    expect(client).not.toHaveProperty('notebookEnv')
+    expect(client).not.toHaveProperty('runtime')
+  })
+
   it('surfaces stable API errors without including the authentication token', async () => {
     const fetch = vi.fn().mockResolvedValue(
       response(404, {
@@ -149,13 +206,13 @@ describe('OpenScienceClient', () => {
       }
       if (path === '/api/v1/projects') return response(200, { data: [] })
       if (path === '/api/v1/sessions') return response(200, { data: [] })
-      if (path === '/api/v1/sessions/session-1') {
+      if (path === '/api/v1/sessions/session%2F1') {
         return response(200, { data: { id: 'session-1', status: 'idle' } })
       }
-      if (path === '/api/v1/sessions/session-1/artifacts') {
+      if (path === '/api/v1/sessions/session%2F1/artifacts') {
         return response(200, { data: [{ id: 'artifact-1' }] })
       }
-      if (path === '/api/v1/artifacts/artifact-1/content') return new Response('file bytes')
+      if (path === '/api/v1/artifacts/artifact%2F1/content') return new Response('file bytes')
       throw new Error(`Unexpected path: ${path}`)
     })
     const client = new OpenScienceClient({
@@ -166,14 +223,24 @@ describe('OpenScienceClient', () => {
 
     await client.listProjects()
     await client.createProject({ name: 'Created' })
-    await client.listSessions('project-1')
-    await client.getSession('session-1')
-    await client.listArtifacts('session-1')
-    expect(await (await client.downloadArtifact('artifact-1')).text()).toBe('file bytes')
+    await client.listSessions('Research / Lab')
+    await client.getSession('session/1')
+    await client.listArtifacts('session/1')
+    expect(await (await client.downloadArtifact('artifact/1')).text()).toBe('file bytes')
 
     for (const call of fetch.mock.calls) {
       expect(call[1]?.headers).toMatchObject({ authorization: 'Bearer token-1' })
     }
+    expect(
+      fetch.mock.calls.map(([input]) => new URL(input).pathname + new URL(input).search)
+    ).toEqual([
+      '/api/v1/projects',
+      '/api/v1/projects',
+      '/api/v1/sessions?project=Research%20%2F%20Lab',
+      '/api/v1/sessions/session%2F1',
+      '/api/v1/sessions/session%2F1/artifacts',
+      '/api/v1/artifacts/artifact%2F1/content'
+    ])
   })
 
   it('yields normalized public events and closes the WebSocket iterator', async () => {
@@ -206,15 +273,32 @@ describe('OpenScienceClient', () => {
     })
     const events = client.events({ WebSocket: FakeWebSocket as never })[Symbol.asyncIterator]()
     FakeWebSocket.instance.emit('open')
-    const next = events.next()
+    const first = events.next()
     FakeWebSocket.instance.emit('message', {
-      data: JSON.stringify({ type: 'run.event', data: { sessionId: 'session-1' } })
+      data: JSON.stringify(PUBLIC_TERMINAL_FIXTURE)
+    })
+    const second = events.next()
+    FakeWebSocket.instance.emit('message', {
+      data: JSON.stringify({
+        type: 'permission.requested',
+        data: { sessionId: 'session-1', requestId: 'permission-1' }
+      })
     })
 
-    await expect(next).resolves.toEqual({
-      value: { type: 'run.event', data: { sessionId: 'session-1' } },
+    await expect(first).resolves.toEqual({
+      value: PUBLIC_TERMINAL_FIXTURE,
       done: false
     })
+    await expect(second).resolves.toEqual({
+      value: {
+        type: 'permission.requested',
+        data: { sessionId: 'session-1', requestId: 'permission-1' }
+      },
+      done: false
+    })
+    expect(FakeWebSocket.instance.url.pathname).toBe('/api/v1/events')
+    expect(FakeWebSocket.instance.url.searchParams.get('token')).toBe('token-1')
+    expect(FakeWebSocket.instance.url.searchParams.get('client')).toMatch(/^sdk-/)
     await events.return?.()
     expect(FakeWebSocket.instance.closed).toBe(true)
   })

@@ -1,9 +1,12 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { isAbsolute, join, normalize, parse } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 
 import type {
   AgentFrameworkId,
+  AppIconVariant,
   ChatApiEndpoint,
+  ClaudeSubscriptionProviderId,
   ClaudeInfo,
   ProviderType,
   ProviderValidationFailure,
@@ -11,17 +14,29 @@ import type {
   ValidationCategory
 } from '../../shared/settings'
 import {
+  CLAUDE_ISOLATED_PROVIDER_ID,
+  CLAUDE_SHARED_PROVIDER_ID,
   CODEX_SUBSCRIPTION_PROVIDER_ID,
   SETTINGS_FILE_VERSION,
+  claudeIsolatedProviderIdentity,
   codexSubscriptionProviderIdentity,
+  isAppIconVariant,
+  isClaudeSubscriptionProvider,
+  isClaudeSubscriptionProviderId,
   isCodexSubscriptionProvider,
   isCodexSubscriptionProviderId,
   isReasoningEffort
 } from '../../shared/settings'
 import { isOfficialVendorId } from '../../shared/provider-registry'
+import {
+  isCustomReasoningEffortTransport,
+  isReasoningEffortPresetSetting
+} from '../../shared/reasoning-effort'
 import type { PackageMirror } from '../../shared/mirror'
 import type { NotebookLanguage } from '../../shared/notebook'
 import type { RuntimeEnablement, RuntimeSelection } from '../../shared/notebook-runtime'
+import type { CloseActionPreference } from '../../shared/window-controls'
+import { createLogger } from '../logger'
 import {
   createEmptySettings,
   type StoredComputeGrant,
@@ -34,9 +49,12 @@ import {
 
 const SETTINGS_FILE = 'settings.json'
 
+const log = createLogger('settings.repository')
+
 const PROVIDER_TYPES = new Set<ProviderType>([
   'custom',
-  'claude-default',
+  'claude-shared',
+  'claude-isolated',
   'official',
   'codex-shared',
   'codex-isolated'
@@ -50,6 +68,7 @@ const VALIDATION_CATEGORIES = new Set<ValidationCategory>([
   'bad-url',
   'timeout',
   'incompatible',
+  'server-error',
   'unknown'
 ])
 
@@ -151,6 +170,8 @@ const sanitizeValidationFailure = (value: unknown): ProviderValidationFailure | 
 }
 
 // Rebuilds one provider record, dropping unknown fields and records missing required identity.
+// An unknown `type` is dropped at load time and logged at WARN — usually a stale provider kind from a
+// prior version (e.g. the removed 'claude-default'). A bad value must never reach the active snapshot.
 const sanitizeProvider = (value: unknown): StoredProvider | undefined => {
   if (!isRecord(value)) return undefined
 
@@ -158,7 +179,13 @@ const sanitizeProvider = (value: unknown): StoredProvider | undefined => {
   const type = asString(value.type) as ProviderType | undefined
   const name = asString(value.name)
 
-  if (!id || !type || !PROVIDER_TYPES.has(type) || name === undefined) return undefined
+  if (!id || !type || name === undefined) return undefined
+
+  if (!PROVIDER_TYPES.has(type)) {
+    log.warn('dropping stored provider with unknown type', { id, type })
+
+    return undefined
+  }
 
   // An official provider without a recognizable vendor is unusable (no base URL/catalog to resolve),
   // so drop the corrupt record rather than keep a provider that can never spawn or validate.
@@ -169,12 +196,26 @@ const sanitizeProvider = (value: unknown): StoredProvider | undefined => {
   const provider: StoredProvider = { id, type, name }
   const baseUrl = asString(value.baseUrl)
   const model = asString(value.model)
+  const rawContextWindow = asNumber(value.contextWindow)
+  const contextWindow =
+    rawContextWindow !== undefined && Number.isSafeInteger(rawContextWindow) && rawContextWindow > 0
+      ? rawContextWindow
+      : undefined
   const supportsImageInput = asBoolean(value.supportsImageInput)
+  const reasoningEffortPreset = isReasoningEffortPresetSetting(value.reasoningEffortPreset)
+    ? value.reasoningEffortPreset
+    : undefined
+  const reasoningEffortTransport = isCustomReasoningEffortTransport(value.reasoningEffortTransport)
+    ? value.reasoningEffortTransport
+    : undefined
   const region = asString(value.region)
   const keyRef = asString(value.keyRef)
   const keyMask = asString(value.keyMask)
   const lastValidatedAt = asNumber(value.lastValidatedAt)
   const lastValidationFailure = sanitizeValidationFailure(value.lastValidationFailure)
+  const expiresAt = asNumber(value.expiresAt)
+  const disconnectedAt = asNumber(value.disconnectedAt)
+  const codexAuthMode = asString(value.codexAuthMode)
   // Keep only a clean list of non-empty string model ids.
   const fetchedModels = Array.isArray(value.fetchedModels)
     ? value.fetchedModels.filter(
@@ -203,7 +244,14 @@ const sanitizeProvider = (value: unknown): StoredProvider | undefined => {
 
   if (baseUrl) provider.baseUrl = baseUrl
   if (model) provider.model = model
+  if (contextWindow !== undefined) provider.contextWindow = contextWindow
   if (supportsImageInput !== undefined) provider.supportsImageInput = supportsImageInput
+  if (reasoningEffortPreset !== undefined && type === 'custom') {
+    provider.reasoningEffortPreset = reasoningEffortPreset
+  }
+  if (reasoningEffortTransport !== undefined && type === 'custom') {
+    provider.reasoningEffortTransport = reasoningEffortTransport
+  }
   if (apiEndpoints.length > 0) provider.apiEndpoints = apiEndpoints
   if (vendorId) provider.vendorId = vendorId
   if (region) provider.region = region
@@ -212,6 +260,16 @@ const sanitizeProvider = (value: unknown): StoredProvider | undefined => {
   if (keyMask) provider.keyMask = keyMask
   if (lastValidatedAt !== undefined) provider.lastValidatedAt = lastValidatedAt
   if (lastValidationFailure) provider.lastValidationFailure = lastValidationFailure
+  if (expiresAt !== undefined) provider.expiresAt = expiresAt
+  if (disconnectedAt !== undefined && type === 'claude-shared') {
+    provider.disconnectedAt = disconnectedAt
+  }
+  if (
+    isCodexSubscriptionProvider(type) &&
+    (codexAuthMode === 'imported' || codexAuthMode === 'isolated')
+  ) {
+    provider.codexAuthMode = codexAuthMode
+  }
 
   return provider
 }
@@ -338,21 +396,49 @@ const sanitizeSettings = (value: unknown): StoredSettings => {
     (provider) => provider.id === legacyActiveProviderId
   )
   const selectedCodexProvider = activeCodexProvider ?? codexProviders[0]
+  const migratedCodexProvider = selectedCodexProvider
+    ? {
+        ...selectedCodexProvider,
+        id: CODEX_SUBSCRIPTION_PROVIDER_ID,
+        // `codex-shared` is legacy setup input only. Runtime always uses the app-owned
+        // subscription home, so sanitized/newly persisted state has one isolated form.
+        type: 'codex-isolated' as const,
+        // Releases before codexAuthMode normalized both setup choices to the subscription id, so
+        // that shape is ambiguous. Prefer isolated to preserve the established runtime behavior;
+        // legacy shared users can explicitly re-import into the new app-owned profile.
+        codexAuthMode: selectedCodexProvider.codexAuthMode ?? 'isolated',
+        name: codexSubscriptionProviderIdentity().name
+      }
+    : undefined
+
+  // A legacy shared provider's validation describes credentials in the user's global Codex home,
+  // not the isolated home selected above. Do not present that stale state as an app-owned login;
+  // the Settings card will offer a fresh sign-in instead.
+  if (selectedCodexProvider?.type === 'codex-shared' && migratedCodexProvider) {
+    delete migratedCodexProvider.lastValidatedAt
+    delete migratedCodexProvider.lastValidationFailure
+    delete migratedCodexProvider.expiresAt
+  }
+
   const providers = [
     ...sanitizedProviders.filter((provider) => !isCodexSubscriptionProvider(provider.type)),
-    ...(selectedCodexProvider
-      ? [
-          {
-            ...selectedCodexProvider,
-            id: CODEX_SUBSCRIPTION_PROVIDER_ID,
-            name: codexSubscriptionProviderIdentity().name
-          }
-        ]
-      : [])
+    ...(migratedCodexProvider ? [migratedCodexProvider] : [])
   ]
   const settings: StoredSettings = {
     version: SETTINGS_FILE_VERSION,
     providers
+  }
+  const claudeSubscriptionProviderId = asString(value.claudeSubscriptionProviderId)
+
+  if (
+    claudeSubscriptionProviderId &&
+    isClaudeSubscriptionProviderId(claudeSubscriptionProviderId) &&
+    providers.some(
+      (provider) =>
+        provider.id === claudeSubscriptionProviderId && isClaudeSubscriptionProvider(provider.type)
+    )
+  ) {
+    settings.claudeSubscriptionProviderId = claudeSubscriptionProviderId
   }
   const claude = sanitizeClaudeInfo(value.claude)
   const codex = sanitizeCodexInfo(value.codex)
@@ -453,6 +539,26 @@ const sanitizeSettings = (value: unknown): StoredSettings => {
 
   if (notificationsEnabled !== undefined) {
     settings.notificationsEnabled = notificationsEnabled
+  }
+
+  // Conversation Skill import preference; only a real boolean survives.
+  const conversationSkillImportEnabled = asBoolean(value.conversationSkillImportEnabled)
+
+  if (conversationSkillImportEnabled !== undefined) {
+    settings.conversationSkillImportEnabled = conversationSkillImportEnabled
+  }
+
+  const closePreference = asString(value.closePreference)
+
+  if (closePreference === 'minimize' || closePreference === 'quit') {
+    settings.closePreference = closePreference
+  }
+
+  // App-icon look; only a known variant survives so a bad value can't leak through.
+  const appIconVariant = value.appIconVariant
+
+  if (isAppIconVariant(appIconVariant)) {
+    settings.appIconVariant = appIconVariant
   }
 
   const opencodePath = asString(value.opencodePath)
@@ -617,19 +723,165 @@ class SettingsRepository {
       if (index >= 0) providers[index] = provider
       else providers.push(provider)
 
-      return { ...settings, providers }
+      return {
+        ...settings,
+        providers,
+        ...(isClaudeSubscriptionProvider(provider.type) &&
+        isClaudeSubscriptionProviderId(provider.id)
+          ? { claudeSubscriptionProviderId: provider.id }
+          : {})
+      }
     })
   }
 
+  // Updates the single claude-isolated provider record (id is fixed at builtin-claude-isolated).
+  // The patch carries only the key-bearing fields the controller writes — model/lastValidatedAt/etc
+  // stay on whatever the renderer/service previously set, so a paste does not stomp the validated-at
+  // timestamp the validation flow recorded. When the record does not exist yet (a fresh install's
+  // first paste) it is created with the fixed id/name, mirroring codex's single subscription record.
+  async upsertClaudeIsolatedProvider(
+    patch: Partial<
+      Pick<StoredProvider, 'keyRef' | 'keyMask' | 'lastValidatedAt' | 'lastValidationFailure'>
+    >
+  ): Promise<StoredSettings> {
+    const identity = claudeIsolatedProviderIdentity()
+
+    return this.mutate((settings) => {
+      const index = settings.providers.findIndex(
+        (existing) => existing.id === CLAUDE_ISOLATED_PROVIDER_ID
+      )
+
+      if (index >= 0) {
+        const providers = [...settings.providers]
+
+        providers[index] = { ...providers[index], ...patch }
+        return { ...settings, providers }
+      }
+
+      const created: StoredProvider = {
+        id: identity.id,
+        type: 'claude-isolated',
+        name: identity.name
+      }
+
+      return { ...settings, providers: [...settings.providers, { ...created, ...patch }] }
+    })
+  }
+
+  async updateClaudeIsolatedCredentialsIfExists(
+    patch: Pick<StoredProvider, 'keyRef' | 'keyMask'>
+  ): Promise<boolean> {
+    let applied = false
+
+    await this.mutate((settings) => {
+      const index = settings.providers.findIndex(
+        (provider) => provider.id === CLAUDE_ISOLATED_PROVIDER_ID
+      )
+      if (index < 0) return settings
+
+      const providers = [...settings.providers]
+      providers[index] = { ...providers[index], ...patch }
+      applied = true
+
+      return { ...settings, providers }
+    })
+
+    return applied
+  }
+
+  // Records a probe result only while the credential that was probed is still current. Login probes
+  // run a subprocess and can overlap logout, deletion, edits, or a second paste; comparing inside the
+  // serialized mutation prevents a stale result from restoring an old provider snapshot or marking a
+  // replacement token as verified.
+  async updateClaudeIsolatedValidationIfKeyMatches(
+    expectedKeyRef: string | undefined,
+    patch: Pick<StoredProvider, 'expiresAt' | 'lastValidatedAt' | 'lastValidationFailure'>
+  ): Promise<boolean> {
+    let applied = false
+
+    await this.mutate((settings) => {
+      const index = settings.providers.findIndex(
+        (provider) => provider.id === CLAUDE_ISOLATED_PROVIDER_ID
+      )
+      if (index < 0 || settings.providers[index].keyRef !== expectedKeyRef) return settings
+
+      const providers = [...settings.providers]
+      providers[index] = { ...providers[index], ...patch }
+      applied = true
+
+      return { ...settings, providers }
+    })
+
+    return applied
+  }
+
+  async updateClaudeSharedValidationIfUnchanged(
+    expectedProvider: StoredProvider,
+    expectedPreferredMode: ClaudeSubscriptionProviderId | undefined,
+    expectedResolvedModel: string | undefined,
+    patch: Pick<StoredProvider, 'disconnectedAt' | 'lastValidatedAt' | 'lastValidationFailure'>
+  ): Promise<boolean> {
+    let applied = false
+
+    await this.mutate((settings) => {
+      const index = settings.providers.findIndex(
+        (provider) => provider.id === CLAUDE_SHARED_PROVIDER_ID
+      )
+      if (index < 0) return settings
+
+      const currentProvider = settings.providers[index]
+      // Only the effective shared-Claude target belongs in this CAS. Models selected on unrelated
+      // active providers do not change what the completed shared probe actually verified.
+      const currentResolvedModel =
+        settings.activeProviderId === CLAUDE_SHARED_PROVIDER_ID
+          ? (settings.activeModel ?? currentProvider?.model)
+          : currentProvider?.model
+      if (
+        settings.claudeSubscriptionProviderId !== expectedPreferredMode ||
+        currentResolvedModel !== expectedResolvedModel ||
+        !isDeepStrictEqual(currentProvider, expectedProvider)
+      ) {
+        return settings
+      }
+
+      const providers = [...settings.providers]
+      providers[index] = { ...providers[index], ...patch }
+      applied = true
+
+      return { ...settings, providers }
+    })
+
+    return applied
+  }
+
   // Removes a provider and clears the active pointer (and model) when it referenced the removed one.
+  // Claude's two fixed records are one collapsed provider in the UI, so deleting either id removes
+  // the whole subscription group atomically, including its persisted display preference.
   async deleteProvider(id: string): Promise<StoredSettings> {
     return this.mutate((settings) => {
-      const providers = settings.providers.filter((provider) => provider.id !== id)
-      const clearedActive = settings.activeProviderId === id
+      const deletingClaudeSubscription = isClaudeSubscriptionProviderId(id)
+      const removedIds = new Set(
+        settings.providers
+          .filter(
+            (provider) =>
+              provider.id === id ||
+              (deletingClaudeSubscription && isClaudeSubscriptionProvider(provider.type))
+          )
+          .map((provider) => provider.id)
+      )
+      const providers = settings.providers.filter((provider) => !removedIds.has(provider.id))
+      const clearedActive =
+        settings.activeProviderId !== undefined && removedIds.has(settings.activeProviderId)
       const activeProviderId = clearedActive ? undefined : settings.activeProviderId
       const activeModel = clearedActive ? undefined : settings.activeModel
 
-      return { ...settings, providers, activeProviderId, activeModel }
+      return {
+        ...settings,
+        providers,
+        activeProviderId,
+        activeModel,
+        ...(deletingClaudeSubscription ? { claudeSubscriptionProviderId: undefined } : {})
+      }
     })
   }
 
@@ -644,7 +896,10 @@ class SettingsRepository {
       return {
         ...settings,
         activeProviderId: id,
-        activeModel: id === undefined ? undefined : model
+        activeModel: id === undefined ? undefined : model,
+        ...(id !== undefined && isClaudeSubscriptionProviderId(id)
+          ? { claudeSubscriptionProviderId: id }
+          : {})
       }
     })
   }
@@ -675,6 +930,21 @@ class SettingsRepository {
   // immediately, without a restart.
   async setNotificationsEnabled(enabled: boolean): Promise<StoredSettings> {
     return this.mutate((settings) => ({ ...settings, notificationsEnabled: enabled }))
+  }
+
+  // Persists whether subsequent conversations receive the Skill import MCP and its instructions.
+  async setConversationSkillImportEnabled(enabled: boolean): Promise<StoredSettings> {
+    return this.mutate((settings) => ({ ...settings, conversationSkillImportEnabled: enabled }))
+  }
+
+  // Persists the Windows titlebar-close behavior; undefined restores the confirmation dialog.
+  async setClosePreference(preference: CloseActionPreference | undefined): Promise<StoredSettings> {
+    return this.mutate((settings) => ({ ...settings, closePreference: preference }))
+  }
+
+  // Persists the selected app-icon look; applied live to the window and dock/taskbar by the caller.
+  async setAppIconVariant(variant: AppIconVariant): Promise<StoredSettings> {
+    return this.mutate((settings) => ({ ...settings, appIconVariant: variant }))
   }
 
   // Records the detected opencode executable path + version for later spawns + the settings status card.
@@ -910,16 +1180,23 @@ class SettingsRepository {
     })
   }
 
-  // Removes a custom MCP server by id (and any stale per-tool blocks under its name).
+  // Removes a custom MCP server by id and every policy alias owned by its immutable id/editable name.
   async removeCustomServer(id: string): Promise<StoredSettings> {
     return this.mutateConnectors((connectors) => {
       const removed = (connectors.customMcpServers ?? []).find((s) => s.id === id)
       connectors.customMcpServers = (connectors.customMcpServers ?? []).filter((s) => s.id !== id)
-      if (removed && connectors.blockedToolIds) {
-        const prefix = `${removed.name}/`
-        const kept = connectors.blockedToolIds.filter((t) => !t.startsWith(prefix))
-        connectors.blockedToolIds = kept.length > 0 ? kept : undefined
+      if (!removed) return
+
+      const aliases = new Set([removed.id, removed.name])
+      connectors.autoAllowIds = connectors.autoAllowIds.filter((entry) => !aliases.has(entry))
+      const withoutToolAliases = (entries: string[] | undefined): string[] | undefined => {
+        const kept = (entries ?? []).filter(
+          (entry) => !Array.from(aliases).some((alias) => entry.startsWith(`${alias}/`))
+        )
+        return kept.length > 0 ? kept : undefined
       }
+      connectors.blockedToolIds = withoutToolAliases(connectors.blockedToolIds)
+      connectors.askToolIds = withoutToolAliases(connectors.askToolIds)
     })
   }
 
@@ -991,6 +1268,18 @@ class SettingsRepository {
         g.operation === grant.operation &&
         g.providerId === grant.providerId
     )
+  }
+
+  async listComputeGrants(): Promise<StoredComputeGrant[]> {
+    return [...((await this.getSettings()).computeGrants ?? [])]
+  }
+
+  async clearComputeGrants(): Promise<void> {
+    await this.mutate((settings) => {
+      const next = { ...settings }
+      delete next.computeGrants
+      return next
+    })
   }
 
   // Serializes a read-modify-write cycle so concurrent callers cannot clobber each other.

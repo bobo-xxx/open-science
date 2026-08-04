@@ -3,7 +3,7 @@ import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { ProviderView } from '../../../../shared/settings'
+import type { ClaudeSubscriptionProviderId, ProviderView } from '../../../../shared/settings'
 import { ProviderList } from './ProviderList'
 
 let container: HTMLDivElement
@@ -45,7 +45,18 @@ const renderList = (
     onCancel?: () => void
     onLogin?: () => void
     onLogout?: () => void
+    onReimport?: (provider: ProviderView) => void
     isCodexLoginPending?: boolean
+    isClaudeSharedLoginPending?: boolean
+    onLoginSharedClaude?: () => void
+    onCancelSharedClaudeLogin?: () => void
+    onLogoutSharedClaude?: () => void
+    isClaudeIsolatedLoginPending?: boolean
+    onLoginIsolatedClaude?: () => void
+    onCancelIsolatedClaudeLogin?: () => void
+    onLoginIsolatedClaudePaste?: () => void
+    onLogoutIsolatedClaude?: () => void
+    claudeSubscriptionProviderId?: ClaudeSubscriptionProviderId
   } = {}
 ): void => {
   act(() => {
@@ -61,6 +72,17 @@ const renderList = (
         onCancelCodexLogin={callbacks.onCancel}
         onLoginIsolatedCodex={callbacks.onLogin}
         onLogoutIsolatedCodex={callbacks.onLogout}
+        onReimportCodexAuthentication={callbacks.onReimport}
+        isClaudeSharedLoginPending={callbacks.isClaudeSharedLoginPending}
+        onLoginSharedClaude={callbacks.onLoginSharedClaude}
+        onCancelSharedClaudeLogin={callbacks.onCancelSharedClaudeLogin}
+        onLogoutSharedClaude={callbacks.onLogoutSharedClaude}
+        isClaudeIsolatedLoginPending={callbacks.isClaudeIsolatedLoginPending}
+        onLoginIsolatedClaude={callbacks.onLoginIsolatedClaude}
+        onCancelIsolatedClaudeLogin={callbacks.onCancelIsolatedClaudeLogin}
+        onLoginIsolatedClaudePaste={callbacks.onLoginIsolatedClaudePaste}
+        onLogoutIsolatedClaude={callbacks.onLogoutIsolatedClaude}
+        claudeSubscriptionProviderId={callbacks.claudeSubscriptionProviderId}
       />
     )
   })
@@ -156,21 +178,21 @@ describe('ProviderList', () => {
     expect(container.textContent).toContain('authentication rejected')
   })
 
-  it('shows the Local Claude probe message instead of referring to an API key', () => {
+  it('flags a provider whose last test failed with a server error', () => {
     renderList([
       provider({
-        type: 'claude-default',
-        name: 'Local Claude',
+        lastValidatedAt: 1,
         lastValidationFailure: {
           at: 2,
-          category: 'auth',
-          message: 'Local Claude could not authenticate. Run `claude` in a terminal and log in.'
+          category: 'server-error',
+          status: 503,
+          message: 'Service temporarily unavailable'
         }
       })
     ])
 
-    expect(container.textContent).toContain('Run `claude` in a terminal')
-    expect(container.textContent).not.toContain('check the API key')
+    expect(container.textContent).toContain('Service temporarily unavailable')
+    expect(container.textContent).toContain('HTTP 503')
   })
 
   it('does not flag a provider whose latest validation succeeded', () => {
@@ -196,39 +218,7 @@ describe('ProviderList', () => {
     expect(container.querySelector('[aria-label="Connection verified"]')).toBeNull()
   })
 
-  it('shows only the model for a local Claude provider and never a key row', () => {
-    renderList([
-      provider({
-        type: 'claude-default',
-        name: 'Local Claude',
-        baseUrl: undefined,
-        model: 'claude-opus',
-        maskedKey: undefined,
-        hasKey: false
-      })
-    ])
-
-    expect(container.textContent).toContain('Model: claude-opus')
-    expect(container.textContent).not.toContain('Key:')
-  })
-
-  it('labels an empty local-Claude model as the default', () => {
-    renderList([
-      provider({
-        type: 'claude-default',
-        name: 'Local Claude',
-        baseUrl: undefined,
-        model: undefined,
-        maskedKey: undefined,
-        hasKey: false
-      })
-    ])
-
-    expect(container.textContent).toContain('Model: default')
-    expect(container.textContent).not.toContain('Key:')
-  })
-
-  it('keeps shared Codex account management under Codex CLI', () => {
+  it('describes legacy shared Codex data as imported authentication', () => {
     renderList([
       provider({
         id: 'builtin-codex-shared',
@@ -241,11 +231,39 @@ describe('ProviderList', () => {
       })
     ])
 
-    expect(container.textContent).toContain('Managed by Codex CLI')
+    expect(container.textContent).toContain('Authentication imported into Open Science')
     expect(buttonByLabel('Check Codex login')).toBeDefined()
     expect(buttonByLabel('Edit')).toBeDefined()
     expect(buttonByLabel('Delete')).toBeDefined()
     expect(buttonByLabel('Sign out')).toBeUndefined()
+  })
+
+  it('renders a normalized imported Codex provider with imported copy and actions', () => {
+    const onReimport = vi.fn()
+    const imported = provider({
+      id: 'builtin-codex-subscription',
+      type: 'codex-isolated',
+      codexAuthMode: 'imported',
+      name: 'Codex subscription',
+      models: [],
+      model: undefined,
+      maskedKey: undefined,
+      hasKey: false
+    })
+    renderList([imported], undefined, undefined, { onReimport })
+
+    expect(container.textContent).toContain('Authentication imported into Open Science')
+    expect(buttonByLabel('Check Codex login')).toBeDefined()
+    act(() => buttonByLabel('Re-import Codex login')?.click())
+    expect(onReimport).toHaveBeenCalledWith(imported)
+    expect(buttonByLabel('Sign in')).toBeUndefined()
+    expect(buttonByLabel('Sign out')).toBeUndefined()
+
+    const onCancel = vi.fn()
+    renderList([imported], undefined, undefined, { onCancel, isCodexLoginPending: true })
+    act(() => buttonByLabel('Cancel sign-in')?.click())
+    expect(onCancel).toHaveBeenCalledOnce()
+    expect(buttonByLabel('Check Codex login')).toBeUndefined()
   })
 
   it('renders shared and isolated Codex modes as one subscription card', () => {
@@ -301,6 +319,118 @@ describe('ProviderList', () => {
     expect(buttonByLabel('Sign in')).toBeUndefined()
     expect(buttonByLabel('Edit')).toBeDefined()
     expect(buttonByLabel('Delete')).toBeDefined()
+  })
+
+  it('offers browser + setup-token sign-in for claude-isolated, cancel while pending, sign out after', () => {
+    const onLoginIsolatedClaude = vi.fn()
+    const onLoginIsolatedClaudePaste = vi.fn()
+    const onCancelIsolatedClaudeLogin = vi.fn()
+    const onLogoutIsolatedClaude = vi.fn()
+    const isolated = provider({
+      id: 'builtin-claude-isolated',
+      type: 'claude-isolated',
+      name: 'Claude subscription',
+      models: [],
+      model: undefined,
+      maskedKey: undefined,
+      hasKey: false,
+      lastValidatedAt: undefined
+    })
+
+    // Not signed in: the browser sign-in is primary and a setup-token fallback sits beside it.
+    renderList([isolated], undefined, undefined, {
+      onLoginIsolatedClaude,
+      onLoginIsolatedClaudePaste
+    })
+    act(() => buttonByLabel('Sign in with browser')?.click())
+    expect(onLoginIsolatedClaude).toHaveBeenCalledOnce()
+    act(() => buttonByLabel('Use setup token')?.click())
+    expect(onLoginIsolatedClaudePaste).toHaveBeenCalledOnce()
+
+    // While the browser sign-in is open: cancel is offered and the sign-in actions + test go away.
+    renderList([isolated], undefined, undefined, {
+      isClaudeIsolatedLoginPending: true,
+      onCancelIsolatedClaudeLogin
+    })
+    act(() => buttonByLabel('Cancel sign-in')?.click())
+    expect(onCancelIsolatedClaudeLogin).toHaveBeenCalledOnce()
+    expect(buttonByLabel('Sign in with browser')).toBeUndefined()
+    expect(buttonByLabel('Use setup token')).toBeUndefined()
+    expect(buttonByLabel('Test connection')).toBeUndefined()
+    // The pending row guides the user to the setup-token fallback in case the browser never opened.
+    expect(container.textContent).toContain("Didn't open? Cancel and use a setup token")
+
+    // Signed in (verified): sign-in actions go away, sign out is offered.
+    renderList([{ ...isolated, lastValidatedAt: 1 }], undefined, undefined, {
+      onLogoutIsolatedClaude
+    })
+    act(() => buttonByLabel('Sign out')?.click())
+    expect(onLogoutIsolatedClaude).toHaveBeenCalledOnce()
+    expect(buttonByLabel('Sign in with browser')).toBeUndefined()
+  })
+
+  it('swaps the claude-shared sign-in for a cancel action while the browser login is pending', () => {
+    const onLoginSharedClaude = vi.fn()
+    const onCancelSharedClaudeLogin = vi.fn()
+    const onLogoutSharedClaude = vi.fn()
+    const shared = provider({
+      id: 'builtin-claude-shared',
+      type: 'claude-shared',
+      name: 'Claude subscription',
+      models: [],
+      model: undefined,
+      maskedKey: undefined,
+      hasKey: false,
+      lastValidatedAt: undefined
+    })
+
+    // Not signed in: the browser sign-in is offered.
+    renderList([shared], undefined, undefined, { onLoginSharedClaude })
+    act(() => buttonByLabel('Sign in with browser')?.click())
+    expect(onLoginSharedClaude).toHaveBeenCalledOnce()
+
+    // While the browser sign-in is open: sign-in + test go away, cancel takes over (like OpenAI).
+    renderList([shared], undefined, undefined, {
+      isClaudeSharedLoginPending: true,
+      onCancelSharedClaudeLogin
+    })
+    expect(buttonByLabel('Sign in with browser')).toBeUndefined()
+    expect(buttonByLabel('Test connection')).toBeUndefined()
+    act(() => buttonByLabel('Cancel sign-in')?.click())
+    expect(onCancelSharedClaudeLogin).toHaveBeenCalledOnce()
+
+    // Signed in (verified): sign-in actions go away, app-local disconnect is offered.
+    renderList([{ ...shared, lastValidatedAt: 1 }], undefined, undefined, { onLogoutSharedClaude })
+    act(() => buttonByLabel('Disconnect from Open Science')?.click())
+    expect(onLogoutSharedClaude).toHaveBeenCalledOnce()
+    expect(buttonByLabel('Sign in with browser')).toBeUndefined()
+  })
+
+  it('keeps the preferred Claude mode visible while a custom provider is active', () => {
+    const shared = provider({
+      id: 'builtin-claude-shared',
+      type: 'claude-shared',
+      name: 'Claude subscription',
+      models: [],
+      model: undefined,
+      hasKey: false,
+      lastValidatedAt: undefined
+    })
+    const isolated = provider({
+      id: 'builtin-claude-isolated',
+      type: 'claude-isolated',
+      name: 'Claude subscription',
+      models: [],
+      model: undefined,
+      hasKey: false,
+      lastValidatedAt: undefined
+    })
+
+    renderList([shared, isolated, provider()], 'p1', undefined, {
+      claudeSubscriptionProviderId: 'builtin-claude-isolated'
+    })
+
+    expect(buttonByLabel('Use setup token')).toBeDefined()
   })
 
   it('renders an empty state with no providers', () => {

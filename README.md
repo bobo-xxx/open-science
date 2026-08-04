@@ -3,30 +3,24 @@
 [![Download](https://img.shields.io/badge/Download-Latest%20Release-2f9e44?style=for-the-badge&logo=github)](https://github.com/aipoch/open-science/releases/latest)
 [![Version](https://img.shields.io/github/v/release/aipoch/open-science?label=Version&style=for-the-badge&color=4dabf7)](https://github.com/aipoch/open-science/releases/latest)
 [![License](https://img.shields.io/badge/License-Apache--2.0-4dabf7?style=for-the-badge)](LICENSE)
-![Status](https://img.shields.io/badge/Status-Actively%20Developed-ff9f43?style=for-the-badge)
-[![Discussions](https://img.shields.io/badge/Discussions-Welcome-9775fa?style=for-the-badge)](https://github.com/aipoch/open-science/discussions)
-[![Discord](https://img.shields.io/badge/Discord-Join%20the%20Community-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/85dKfuGM9)
-[![YouTube](https://img.shields.io/badge/YouTube-AIPOCH_AI-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](https://www.youtube.com/@AIPOCH_AI)
-[![Follow on X](https://img.shields.io/badge/Follow%20on%20X-%40aipoch__ai-212529?style=for-the-badge&logo=x&logoColor=white)](https://x.com/aipoch_ai)
-[![LinkedIn](https://img.shields.io/badge/LinkedIn-AIPOCH-0A66C2?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/company/pochai)
+[![Website](https://img.shields.io/badge/Website-aipoch.com-2f9e44?style=for-the-badge)](https://aipoch.com/)
+[![Discord](https://img.shields.io/badge/Discord-Join%20the%20Community-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/zxQAYjReRv)
 
-**An open-source, model-agnostic AI workbench for scientific discovery.** Open Science is a local desktop application for researchers. Create a project, describe a task in plain language, and let the agent read files, run code, search the web, call scientific data connectors, and return reports, tables, figures, and an inspectable activity history in one workspace.
+**Open Science is an open-source, local-first, model-agnostic AI research workbench for scientific discovery.** Built for researchers, it runs as a self-hosted application on your own computer (macOS, Windows, Linux). Create a project, describe a task in plain language, and let the AI agent read files, run Python and R code, search the web, call scientific data connectors, and return reproducible reports, tables, and figures linked to an inspectable activity history in one workspace.
 
 > ⭐ **Star the repo:** If this project has been helpful, we'd greatly appreciate a star on GitHub. Starring the repository encourages continued development. It only takes a second, but it has a meaningful impact on the project.
 
-> 💡 **The application is available now.** Installers for macOS, Windows, and Linux are published on the [latest release](https://github.com/aipoch/open-science/releases/latest) page. Open Science supports the complete `plan → execute → produce → preview` workflow; use the release notes and the installed app for version-specific details.
+> 💡 **[Open Science v0.10.0 released](https://github.com/aipoch/open-science/releases/latest)** _(last updated August 2026)_. This release adds a project-scoped command palette, code syntax highlighting in previews and notebook cells, read-only package inventories per runtime environment, conversational skill imports from GitHub URLs, direct file preview beside the session, and Bailian (Alibaba Cloud) as a built-in model provider — while hardening session persistence, Windows update feedback, cross-platform path handling, and the renderer transport contract. See the [latest release notes](https://github.com/aipoch/open-science/releases/latest) for full details.
 
 <p align="center">
- <img width="1920" height="1140" alt="img_v3_0213r_31a1e21f-0ec2-4957-a150-62811a9899dg" src="https://github.com/user-attachments/assets/df59db19-98d7-4071-81f2-c682fbecdf86" />
+ <img width="1920" height="1140" alt="Open Science open-source AI research workbench desktop app workspace showing an agent session with generated artifacts" src="https://github.com/user-attachments/assets/df59db19-98d7-4071-81f2-c682fbecdf86" />
 </p>
 
 ## Table of Contents
 
 - [Quick Start](#-quick-start)
 - [Product Tour](#product-tour)
-- [Frequently Asked Questions](#frequently-asked-questions)
 - [Why Open Science](#why-open-science)
-- [Vision](#vision)
 - [Design Principles](#design-principles)
 - [Core Capabilities](#core-capabilities)
 - [Model Providers](#model-providers)
@@ -37,6 +31,7 @@
 - [Roadmap](#roadmap)
 - [Relationship to the aipoch Ecosystem](#relationship-to-the-aipoch-ecosystem)
 - [What This Is Not](#what-this-is-not)
+- [Frequently Asked Questions](#frequently-asked-questions)
 - [Get Involved](#get-involved)
 - [License](#license)
 - [Star History](#star-history)
@@ -60,10 +55,13 @@ Review the assets and verification information published on the release page. Se
 
 ### 2. Complete first-time setup
 
-The first launch has two guided steps:
+The first launch has five guided steps:
 
-1. **Prepare environment** checks compatibility, app storage, secure credential storage, network access, the Claude runtime, and optional Python Notebook support. If the runtime is missing, Open Science can install an app-managed copy without requiring Node.js, npm, or an administrator password.
-2. **Model provider** connects and tests the model you want to use. Choose a built-in provider, an Anthropic-compatible custom gateway, or reuse an existing subscription login without entering an API Key — `Local Claude` for a Claude Code login, or a ChatGPT/Codex subscription login on the Codex backend.
+1. **Environment** checks compatibility, app storage, secure credential storage, and network access.
+2. **Agent runtime** selects and prepares Claude Code, OpenCode, or Codex. App-managed runtimes can be installed without requiring Node.js, npm, or an administrator password.
+3. **Model provider** connects and tests the model you want to use. Choose a built-in provider, a custom gateway, or an existing Claude or Codex subscription login.
+4. **Notebook runtime** optionally prepares app-managed Python and R environments or enables detected and manually registered interpreters for either language.
+5. **Data location** chooses where large artifacts, notebooks, uploads, and environments are stored.
 
 <table>
   <tr>
@@ -71,12 +69,12 @@ The first launch has two guided steps:
     <td width="50%"><img src="docs/images/readme/onboarding-model-provider.jpg" alt="First-run model provider configuration in Open Science"></td>
   </tr>
   <tr>
-    <td align="center"><sub>Automatic environment detection and managed runtime setup</sub></td>
+    <td align="center"><sub>Host compatibility, storage, and network checks</sub></td>
     <td align="center"><sub>Provider, API Key, endpoint, and model validation</sub></td>
   </tr>
 </table>
 
-Python is optional unless you want the built-in Notebook kernel. Every required environment row must pass before `Continue` becomes available, and the model connection must pass before setup finishes.
+Notebook execution is optional. Every required environment and agent-runtime check must pass before `Continue` becomes available, and the model connection must pass before setup finishes. Notebook and data-location settings can keep their defaults and be changed later in Settings.
 
 ### 3. Start a research project
 
@@ -84,7 +82,9 @@ Python is optional unless you want the built-in Notebook kernel. Every required 
 2. Open a session and describe the goal, input data, constraints, desired outputs, and how the result should be checked.
 3. Attach source files, select a verified model, and choose an approval mode.
 4. Send the task. Inspect the agent's tool activity, approve sensitive actions, and open generated artifacts in the preview panel.
-5. Continue the work in later sessions. Use `@` to reference an existing project file and `/` to explicitly select an enabled skill.
+5. To explore a different direction, edit an earlier user message and resend it on a new branch; use the message revision controls to return to either path.
+6. Open an artifact's **Provenance** view to inspect its versions and the available evidence behind the selected result.
+7. Continue the work in later sessions. Use `@` to reference an existing project file and `/` to explicitly select an enabled skill.
 
 Want to develop the app instead? Skip to [Building From Source](#building-from-source).
 
@@ -92,9 +92,11 @@ Want to develop the app instead? Skip to [Building From Source](#building-from-s
 
 ## Product Tour
 
-### One workspace from task to artifacts
+Open Science organizes research into projects and sessions so that every result can stay connected to the evidence that produced it. The sections below walk through the workspace, artifact provenance, previews, scientific skills, and data connectors.
 
-Projects keep related sessions, uploads, generated files, and preview state together. The conversation records the agent's answer and the commands, file reads, edits, searches, and connector calls that produced it. Generated reports, figures, and tables remain attached to the session and are also collected in the project file library.
+### One workspace from task to traceable artifacts
+
+Projects keep related sessions, uploads, generated files, and preview state together. The conversation records the agent's answer and the commands, file reads, edits, searches, and connector calls that produced it. Each generated artifact is stored as an immutable, checksummed version. Its **Provenance** view exposes the evidence Open Science could verify at creation time: producer code and execution history, referenced inputs, an observed environment inventory, the producing conversation branch, and any version-scoped reviewer findings. Missing evidence is shown as unavailable instead of being guessed.
 
 <table>
   <tr>
@@ -107,13 +109,17 @@ Projects keep related sessions, uploads, generated files, and preview state toge
   </tr>
 </table>
 
-Open Science previews common scientific data, documents, images, source code, molecular structures and reactions, and Notebook history. Preview limits do not truncate the underlying file—the full artifact stays available to the agent and external tools.
+Generated reports, figures, and tables remain attached to the session and are also collected in the project file library. Preview tabs keep the active result visible as the panel changes size, and long names preserve their identifying suffix and extension. Open Science previews common scientific data, PDFs, Office documents (DOCX, XLSX, PPTX), images (with zoom and pan), source code with syntax highlighting, molecular structures and reactions, and Notebook history. Preview limits do not truncate the underlying file—the full artifact stays available to the agent and external tools. Use `Cmd/Ctrl+F` to search transcripts, Notebook output, and rendered pages across the workspace, or `Cmd/Ctrl+K` to open the project-scoped command palette. A dark mode rounds out the workspace: toggle the theme in **Settings → General** and the whole shell, transcript, and renderer palette switch without a flash.
+
+### Branch a conversation without losing the original
+
+Edit a completed user message to resend a revised prompt from that point. Open Science creates a new message branch instead of deleting the turns that followed, and revision controls let you move between the original and alternative paths. Branch selection, tool activity, attachments, and generated artifacts persist across project switches and restarts. Provenance remains tied to the exact branch that produced each artifact version, so exploring a different hypothesis does not blur the record of the earlier result.
 
 ### Scientific skills and data connectors
 
-Open Science includes a growing catalog of featured, file-based research skills. You can create personal skills, upload `SKILL.md`/ZIP/`.skill` packages, or preview and import compatible skills from GitHub. Enabled skills can be selected directly in the composer with `/`.
+Open Science includes a growing catalog of **18 featured**, file-based research skills: AlphaFold2, Boltz, Borzoi, Chai-1, DiffDock, Environment & Packages, ESM-2, ESMFold2, Evo 2, Indication Dossier, LigandMPNN, Literature Review, OpenFold3, ProteinMPNN, scGPT, scvi-tools, SolubleMPNN, and **Remote Compute (SSH)** for submitting and harvesting long-running jobs on remote HPC clusters. You can create personal skills, upload `SKILL.md`/ZIP/`.skill` packages, preview and import compatible skills from GitHub, or import skills already installed in your global agent directories. The agent can also request a package import from a session attachment or a public GitHub URL, with an app-owned preview and confirmation step before anything is written. Enabled skills can be selected directly in the composer with `/`.
 
-It also includes life-science connectors across literature, genes and proteins, genomics, variants, structures, clinical research, expression, chemistry, drug regulation, and related resources. Built-in and custom connectors remain behind the permission system, with per-tool `Always allow`, `Ask each time`, and `Block` controls. The installed app shows the current skill, connector, and tool catalogs.
+It also includes **24 built-in** research connectors: Literature Graph, PubMed, bioRxiv, Genes & Ontologies, Genomes, BioMart, Variants, Human Genetics, Clinical Genomics, Structures & Interactions, Protein Annotation, Expression, Omics Archives, CellGuide, Regulation, RNA, Chemistry, ChEMBL, ZINC, Molecule Viewer, Clinical Trials, Drug Regulatory, Cancer Models, and Research Resources. Built-in and custom connectors remain behind the permission system, with per-tool `Always allow`, `Ask each time`, and `Block` controls. The installed app shows the current skill, connector, and tool catalogs.
 
 <table>
   <tr>
@@ -134,21 +140,15 @@ Open Science brings those pieces into one inspectable desktop workspace:
 
 - **Work that persists.** Projects, sessions, drafts, files, previews, and run history survive application restarts.
 - **Execution, not just suggestions.** The agent can run commands, Python, and R, edit files, search, call connectors, and generate artifacts with the user's approval.
-- **Multiple model choices.** Use a built-in cloud provider, a compatible custom gateway, or a local Claude login.
+- **Alternative paths without lost work.** Revise an earlier prompt on a new message branch and switch between the resulting research directions.
+- **Traceable results.** Immutable artifact versions retain the production evidence Open Science can verify, and explicitly mark evidence it cannot.
+- **Multiple model choices.** Use a built-in cloud provider, a compatible custom gateway, or a Claude or Codex subscription; choose the model and its reasoning effort together in the composer.
 - **Local-first ownership.** The application and project state run on your computer; external calls happen through services you explicitly configure or approve.
-- **Inspectability.** The source code, skills, connector definitions, tool activity, and generated files are available for review.
+- **Inspectability.** The source code, skills, connector definitions, tool activity, generated files, and artifact provenance are available for review.
 - **Extensibility.** Add skills and MCP connectors instead of waiting for a closed plugin roadmap.
 - **No seat license.** Open Science is Apache-2.0 software. You pay only for the model or infrastructure you choose to use.
 
 Open Science is an independent product built from scratch. It is not a proxy, unofficial client, or reskin of another AI research application.
-
-## Vision
-
-<img width="1920" height="1140" alt="img_v3_0213r_d24336b6-c484-4e8e-be32-30f8b705772g" src="https://github.com/user-attachments/assets/5e3eea29-61b2-49b8-ac16-e4d9b43a4693" />
-
-Our goal is to make the AI research workbench a piece of open infrastructure rather than a rented product surface. A student with a laptop, a lab using a regional model provider, and an institution running its own gateway should be able to use the same research workspace while keeping control of their models, tools, and data boundaries.
-
-The long-term destination is a traceable loop connecting literature, data, computation, artifacts, review, and reusable scientific skills. The released desktop app is the working foundation for that direction, not a placeholder for a future concept.
 
 ## Design Principles
 
@@ -156,7 +156,7 @@ The long-term destination is a traceable loop connecting literature, data, compu
 - **Multi-provider with explicit compatibility.** The app validates provider configuration and makes endpoint requirements visible instead of treating every API protocol as interchangeable.
 - **Local-first and data-aware.** Keep project state local, surface external data flows, and make autonomy opt-in.
 - **Human-in-the-loop.** File edits, commands, network access, and connector calls are governed by explicit approval profiles.
-- **Durable research records.** Sessions, tool activity, files, and Notebook history should remain reviewable after the run ends.
+- **Durable research records.** Sessions, tool activity, Notebook history, and immutable artifact versions should remain reviewable after the run ends, with unavailable evidence stated plainly.
 - **Composable capabilities.** Skills, connectors, models, previews, and future compute backends should be replaceable parts rather than one black box.
 - **Honest scientific boundaries.** Generated output does not replace expert judgment, statistical review, or validation against primary evidence.
 
@@ -164,38 +164,45 @@ The long-term destination is a traceable loop connecting literature, data, compu
 
 This section describes durable product capabilities rather than a version-specific inventory. The installed app and [latest release notes](https://github.com/aipoch/open-science/releases/latest) are the source of truth for changing catalogs, packaging details, and newly added options.
 
-| Area                         | Core capability                                                                                                                                                                                                                                                             |
-| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Projects and sessions**    | Create, rename, and delete projects; maintain multiple sessions; restore recent work, drafts, conversation history, and preview state.                                                                                                                                      |
-| **Agent workflow**           | Natural-language tasks, streamed responses, typed tool-activity cards, stop controls, approval pauses, a confirmation step before closing or quitting during a running task, desktop notifications on task completion and failure, and recovery of sessions interrupted by an application restart.                                |
-| **Models**                   | Built-in cloud providers, custom compatible gateways, Local Claude, connection validation, per-model multimodal image input, per-model reasoning-effort control, and model selection per session.                                                                                                               |
-| **Agent backend**            | A selectable agent-framework backend so the same workspace can run on more than one underlying agent implementation, with provider and model choices validated against the selected backend, and app-managed backends installable, switchable, and removable from Settings. |
-| **Execution**                | Persistent notebook kernels (Python, R, and a REPL control plane) with durable code/output history, app-managed environments with offline provisioning and bring-your-own interpreters, remote SSH compute hosts as additional execution targets, and a user terminal shared with the agent.                          |
-| **Inputs and artifacts**     | File attachments, a project-level file library with indexed pagination and session grouping for large projects, generated artifact cards, \`@\` references to existing uploads/outputs, read-only multi-tab previews, file download/export from the library, and session export as `.ipynb` (per-tab or download-all). |
-| **Preview formats**          | Common scientific data, documents, images, source code, molecular structures and reactions, and Notebook history, viewable inline or full-screen.                                                                                                                           |
-| **Local data management**    | Local project and application data, configurable storage location, and guided migration.                                                                                                                                                                                    |
-| **Skills**                   | Featured and personal skills, package upload, GitHub preview/import, enable/disable controls, and explicit `/` selection in a session.                                                                                                                                      |
-| **Connectors**               | Built-in life-science connectors, custom local/remote MCP connectors, contact metadata, and connector/tool-level permissions.                                                                                                                                               |
-| **Safety controls**          | `Ask for approval`, `Auto-approve edits`, and `Full access` conversation profiles, plus per-connector and per-tool policies.                                                                                                                                                |
-| **Review and verification**  | An opt-in reviewer that audits a completed turn against its own transcript, execution log, and artifacts, reports pass/warn/fail findings, and can run a bounded fix loop to correct them.                                                                                  |
-| **Distribution and support** | Installers for macOS, Windows, and Linux, plus update guidance, local diagnostics, and community links.                                                                                                                                                                     |
+| Area                         | Core capability                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Projects and sessions**    | Create, rename, and delete projects; maintain multiple sessions with pinning; edit completed prompts into persistent, selectable message branches without deleting the original downstream path; restore recent work, drafts, conversation history, and preview state.                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| **Agent workflow**           | Natural-language tasks, streamed responses, typed tool-activity cards grouped under declared purpose titles, a live context-usage indicator with category-level estimates, on-demand context compaction, and persistence across restarts, stop controls, approval pauses, a confirmation step (with a remembered preference) before closing or quitting during a running task, desktop notifications plus durable unread conversation badges and native attention on blocking approvals, message timing metadata with elapsed-time and usage popovers, completed-turn agent framework and model identification, a project-scoped command palette, and recovery of sessions interrupted by an application restart. |
+| **Models**                   | Built-in cloud providers, custom compatible gateways, Claude and Codex subscription logins, connection validation, per-model multimodal image input, and a combined composer picker for model and model-supported reasoning effort. Available providers and API formats are validated against the selected agent backend.                                                                                                                                                                                                                                                                                                                                                                                         |
+| **Agent backend**            | A selectable agent-framework backend so the same workspace can run on more than one underlying agent implementation, with provider and model choices validated against the selected backend, and app-managed backends installable, switchable, and removable from Settings.                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| **Execution**                | Persistent Python, R, and REPL control-plane kernels with durable code/output history, plus stateless shell commands recorded in the same run history; app-managed environments with offline provisioning; bring-your-own Python and R interpreters; remote SSH compute hosts as additional execution targets; a user terminal shared with the agent; and a read-only installed-package inventory per runtime environment. Package management for external R runtimes remains manual.                                                                                                                                                                                                                             |
+| **Inputs and files**         | File attachments (up to 10 GB per file with streaming upload), a project-level library with indexed pagination, session grouping, source-scoped filename search, grid and list views, a large expand modal for large projects, split-view file preview beside the session, generated artifact cards, `@` references to existing uploads/outputs, file download/export, and session export as `.ipynb` (per-tab or download-all).                                                                                                                                                                                                                                                                                  |
+| **Artifacts and provenance** | Immutable, session-scoped artifact versions with checksummed content and available producer code, execution history, exact input references, environment inventory, producing message-branch context, and version-scoped reviewer evidence, with version navigation and direct links between related evidence.                                                                                                                                                                                                                                                                                                                                                                                                    |
+| **Preview formats**          | Responsive multi-tab previews for common scientific data, PDFs, Office documents (DOCX, XLSX, PPTX), images (with zoom and pan), source code with syntax highlighting, molecular structures and reactions, and Notebook history, viewable inline or full-screen.                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| **Local data management**    | Local project and application data, configurable storage location, and guided migration.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| **Skills**                   | **18 featured** built-in skills; personal skills, package upload, GitHub preview/import, import of installed global skills with candidate preview, agent-requested package imports from session attachments or GitHub URLs, enable/disable controls, and explicit `/` selection in a session.                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| **Connectors**               | **24 built-in** research connectors, custom local/remote MCP connectors, contact metadata, and connector/tool-level permissions.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| **Safety controls**          | `Ask for approval`, `Auto-approve edits`, and `Full access` conversation profiles; approval dialogs with code previews and call/conversation decisions; durable global, project, and session-scoped allow grants with filtering, per-row and family revoke, and Undo; plus per-connector and per-tool policies.                                                                                                                                                                                                                                                                                                                                                                                                   |
+| **Review and verification**  | An opt-in reviewer that audits a completed turn against its own transcript, execution log, and artifacts, reports pass/warn/fail findings, and can run a bounded fix loop to correct them.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| **Distribution and support** | Installers for macOS, Windows, and Linux, plus update guidance, local diagnostics, and community links.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 
 ## Model Providers
 
-| Provider mode                | How it works                                                                                      |
-| ---------------------------- | ------------------------------------------------------------------------------------------------- |
-| **Built-in cloud providers** | Choose from the provider list shown by the installed app and authenticate with the requested key. |
-| **Custom Gateway**           | Supply a compatible Base URL, API Key, and exact model ID.                                        |
-| **Local Claude**             | Reuse the computer's Claude Code login without entering an API Key in Open Science.               |
-| **Codex Subscription**       | Select the Codex agent framework first, then you can select Codex subscription in provider type   |
+Open Science is model-agnostic at the product level: connect it to major cloud LLM providers, a custom gateway, or reuse an existing Claude or Codex subscription. Provider availability currently depends on the selected agent backend and the API protocols it supports. There are four ways to connect a model:
 
-Built-in cloud vendors currently include OpenAI, Anthropic, DeepSeek, Zhipu AI (GLM) with a dedicated GLM Coding Plan endpoint, Kimi (Moonshot), MiniMax, StepFun, Xiaomi MIMO, SenseNova, Volcengine Ark, and the OpenRouter aggregation gateway, among others; some are region-specific.
+| Provider mode                | How it works                                                                                                                                                                                                                                                                                                                     |
+| ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Built-in cloud providers** | Choose from the provider list shown by the installed app and authenticate with the requested key.                                                                                                                                                                                                                                |
+| **Custom Gateway**           | Supply a compatible Base URL, API Key, and exact model ID. The default API format (Messages, Chat Completions, or Responses) is derived from the active agent framework, so a new custom gateway is compatible out of the box.                                                                                                   |
+| **Codex Subscription**       | Select the Codex agent framework first, then you can select Codex subscription in provider type                                                                                                                                                                                                                                  |
+| **Claude Subscription**      | Sign in with a Claude subscription in two modes: **shared** (a browser login that stores credentials in your default `~/.claude` profile) or **isolated** (an app-managed `claude setup-token` run under an app-owned `CLAUDE_CONFIG_DIR`, fully isolated from `~/.claude/`, with a browser flow plus a paste-a-token fallback). |
 
-Provider vendors, available models, and regional endpoints can evolve independently of this README. Treat the provider picker and connection test in the installed app as the source of truth. Unless the app states otherwise, a Custom Gateway must expose an Anthropic-compatible messages endpoint.
+The legacy **Local Claude** provider has been removed. Previously stored Local Claude entries are
+dropped during upgrade; add **Claude Subscription** and authenticate with shared browser login or
+the isolated `claude setup-token` flow instead.
+
+Built-in cloud vendors currently include OpenAI, Anthropic, Grok (xAI), DeepSeek, Zhipu AI (GLM) with a dedicated GLM Coding Plan endpoint, Kimi (Moonshot), MiniMax, StepFun with a dedicated Step Plan subscription endpoint, Xiaomi MIMO, SenseNova, Volcengine Ark, Bailian (Alibaba Cloud) with a dedicated Bailian for Plan subscription endpoint, and the OpenRouter aggregation gateway, among others; some are region-specific.
+
+Provider vendors, available models, and regional endpoints can evolve independently of this README. Treat the provider picker and connection test in the installed app as the source of truth.
 
 ## Data, Permissions, and Trust
 
-Open Science stores project data and settings on the local computer. API Keys are kept locally and use the operating system's secure credential storage when it is available. Logs are local and are not uploaded automatically.
+Open Science stores project data, settings, artifact versions, and provenance evidence on the local computer. API Keys are kept locally and use the operating system's secure credential storage when it is available. Logs are local and are not uploaded automatically.
 
 External data flow is still possible and should be reviewed:
 
@@ -216,7 +223,7 @@ Review connector parameters and tool activity before approving them. Never inclu
 
 ## Project Status
 
-Open Science is available as a released desktop application and is actively developed.
+Open Science is available as a released desktop application and is actively developed. v0.8.0 established immutable artifact versioning and inspectable provenance as shipped foundations, v0.9.0 added personal specialist agents with scoped capabilities, scoped permission management, conversation and artifact export, TIFF previews, collapsible side panels, and per-turn token usage, v0.9.1 added mobile remote access through Remote.It, conversational specialist customization, and message timing metadata, v0.9.2 added immediate specialist handoff, completed-turn agent and model identification, context-usage persistence across restarts, and Windows renderer crash recovery, and v0.10.0 adds a project-scoped command palette, code syntax highlighting in previews and notebook cells, read-only package inventories per runtime environment, conversational skill imports from GitHub URLs, direct file preview beside the session, and Bailian as a built-in model provider, while keeping deterministic reconstruction, portable environment restoration, and full-fidelity session replay on the roadmap.
 
 For version-specific features, provider and catalog changes, platform packaging, and recent fixes, use the [latest release notes](https://github.com/aipoch/open-science/releases/latest) and the installed app. For a maintained shipped/partial/planned breakdown, see the [Capability Map](ROADMAP.md#capability-map).
 
@@ -274,6 +281,13 @@ backend, tray, agent runtime, and localhost web service without opening an Elect
 Set `OPEN_SCIENCE_WEB_PORT` to choose a port (default `44100`). Explicitly quitting the
 application still shuts down agent and Notebook processes normally.
 
+### Mobile remote access
+
+The same localhost web UI can be reached from a phone or tablet through Remote.It pairing. Pair
+a browser with a six-digit Open Science code, approve it once on the desktop, and the workspace
+stays reachable without exposing the loopback server directly. Browser trust is revocable, and
+mode changes or service shutdown immediately invalidate active remote sessions.
+
 ### Headless CLI and SDK
 
 The headless CLI and zero-dependency Node.js SDK use the same local daemon, projects, sessions,
@@ -306,17 +320,15 @@ If Windows shows an unknown-publisher warning, verify the downloaded asset and c
 
 ## Roadmap
 
-<img width="1920" height="1140" alt="img_v3_0213r_7f01ae14-1e00-4fdc-b380-e415296405fg" src="https://github.com/user-attachments/assets/476c1b07-cb8e-4da0-80e3-46413710407b" />
-
 The product roadmap and capability status are maintained in [ROADMAP.md](ROADMAP.md). This README intentionally does not duplicate the moving list of priorities or release targets.
 
 ## Relationship to the aipoch Ecosystem
 
-<img width="1920" height="1140" alt="img_v3_0213r_9ff330e9-4036-4254-9f1a-8ce66656615g" src="https://github.com/user-attachments/assets/0ab847b1-1b7d-43f4-8c11-480a578e6c7d" />
+<img width="1920" height="1140" alt="How Open Science fits the aipoch ecosystem as the desktop orchestration layer for open scientific AI workflows" src="https://github.com/user-attachments/assets/0ab847b1-1b7d-43f4-8c11-480a578e6c7d" />
 
-Open Science is developed by [aipoch](https://github.com/aipoch) as the desktop orchestration layer for open scientific AI workflows.
+Open Science is developed by [AIPOCH](https://aipoch.com/open-science) ([GitHub org](https://github.com/aipoch)) as the desktop orchestration layer for open scientific AI workflows.
 
-- [aipoch/medical-research-skills](https://github.com/aipoch/medical-research-skills) is a broader collection of file-based medical and scientific research skills. Compatible skills can be inspected and imported into Open Science from GitHub.
+- [aipoch/medical-research-skills](https://github.com/aipoch/medical-research-skills) is a broader collection of 500+ file-based medical and scientific research skills, all of which can be inspected, imported, and paired with Open Science from GitHub.
 - Open Science supplies the project/session workspace, agent runtime, execution, artifacts, previews, permissions, and connectors that turn those instructions into an interactive workflow.
 
 Skills and connectors can execute code or send data externally. Review their source, license, scripts, and network behavior before enabling them.
@@ -331,7 +343,7 @@ Skills and connectors can execute code or send data externally. Review their sou
 
 ### **Q: What should I do the first time I open Open Science?**
 
-A: Complete **Prepare environment** and **Model provider**. Fix required rows marked `Action needed`, use `Install missing runtime` if offered, click `Check again`, and then test a model connection.
+A: Complete the five setup steps: **Environment**, **Agent runtime**, **Model provider**, **Notebook runtime**, and **Data location**. Fix required rows marked `Action needed`, install or repair the selected agent if offered, and test the model connection. Notebook setup and a custom data location are optional.
 
 ### **Q: What is an API Key, and where do I get one?**
 
@@ -339,23 +351,58 @@ A: An API Key is a secret credential issued by a model provider. Create or copy 
 
 ### **Q: Do I need an API Key?**
 
-A: Not if you reuse an existing subscription login — `Local Claude` with a working Claude Code login on this computer, or a ChatGPT/Codex subscription login on the Codex backend. Built-in cloud providers and custom gateways require their own keys.
+A: Not if you reuse an existing subscription login — a Claude subscription through shared browser login or an isolated app-managed `claude setup-token` flow, or a ChatGPT/Codex subscription login on the Codex backend. Built-in cloud providers and custom gateways require their own keys.
 
 ### **Q: Which model providers can I use?**
 
-A: Open the provider picker during setup or under `Settings → Model` for the choices supported by your installed app. You can use a built-in cloud provider, an Anthropic-compatible Custom Gateway, or `Local Claude`.
+A: Open the provider picker during setup or under `Settings → Model` for the choices supported by your installed app and selected agent backend. You can use a built-in cloud provider, a compatible Custom Gateway, a Claude subscription through shared or isolated login, or a Codex subscription on the Codex backend.
 
 ### **Q: Why does the model connection test fail?**
 
-A: Check the API Key for missing characters or spaces, verify the Base URL and region, use the provider's exact model ID, and confirm network access and account balance. For `Local Claude`, run `claude` in a terminal and complete login before testing again.
+A: Check the API Key for missing characters or spaces, verify the Base URL and region, use the provider's exact model ID, and confirm network access and account balance. For a Claude subscription, retry the shared browser login or refresh the isolated `claude setup-token` credential, depending on the selected mode.
 
 ### **Q: Why is `Continue` disabled during setup?**
 
-A: At least one required environment check has not passed. Fix the row marked `Action needed`, return to automatic detection, and click `Check again`. Python is optional and only affects Notebook execution.
+A: The current step has not met its required condition. Fix any environment row marked `Action needed`, install or repair the selected agent runtime, or validate the model provider, depending on the active step. Notebook setup is optional and only affects Notebook execution.
 
 ### **Q: Setup is complete. How do I start a research task?**
 
 A: Create or open a project, start a session, attach any source files, and describe the goal, constraints, expected output, and validation criteria. Use `@` to reference a project file and `/` to select an enabled skill.
+
+### **Q: How do I run jobs on a remote HPC cluster?**
+
+A: Enable the **Remote Compute (SSH)** skill under **Settings → Skills**, register your cluster under **Settings → Compute**, then start a session and select the skill with `/remote-compute-ssh`. The skill handles host registration, short commands via SSH, and fully async job submission — the app automatically starts an analysis turn when the job finishes, so you never write a polling loop.
+
+### **Q: Is there a command-line interface?**
+
+A: Yes. Install it in one click from **Settings → General → Command line tool → Install command** (adds `open-science` to your PATH; no separate Node.js needed). The CLI controls the local service and submits research tasks without opening a browser:
+
+```bash
+# Start the service in the background
+open-science start --no-open
+
+# Create a project and run a task, wait for completion
+open-science project create "Systematic review"
+open-science run --project "Systematic review" \
+  --prompt-file ./task.md \
+  --approval-profile auto \
+  --skill literature-review \
+  --wait --json
+
+# Download a generated artifact
+open-science artifacts list <session-id> --json
+open-science artifacts download <artifact-id> --output ./report.md
+```
+
+See the [CLI guide](packages/open-science/CLI.md) for the full command reference, JSON/JSONL output formats, exit codes, and headless service options.
+
+### **Q: How do I inspect where a generated result came from?**
+
+A: Open the generated artifact and choose **Provenance**. Select a version to inspect the content identity and the available producer code, execution history, inputs, environment inventory, producing conversation context, and reviewer evidence. Evidence Open Science could not verify is marked unavailable.
+
+### **Q: Can I revise an earlier request without losing the conversation that followed?**
+
+A: Yes. Edit a completed user message and resend it to create a new branch from that point. The original later turns remain available, and the revision arrows beside the message switch between the alternative paths.
 
 ### **Q: Does my research data stay on my computer?**
 
@@ -367,8 +414,9 @@ A: Projects, sessions, files, settings, and configured credentials are stored lo
 | ------------------------------------------------------------------------ | ----------------------------------------------------------------------- |
 | [GitHub Issues](https://github.com/aipoch/open-science/issues)           | Bugs, reproducible failures, and concrete feature proposals             |
 | [GitHub Discussions](https://github.com/aipoch/open-science/discussions) | Design questions, roadmap proposals, and longer technical conversations |
-| [Discord](https://discord.gg/85dKfuGM9)                                  | Community help, contributor coordination, and informal discussion       |
+| [Discord](https://discord.gg/zxQAYjReRv)                                 | Community help, contributor coordination, and informal discussion       |
 | [X / @aipoch_ai](https://x.com/aipoch_ai)                                | Release announcements and build-in-public updates                       |
+| [Website](https://aipoch.com/)                                           | Product overview, downloads, and the rest of the AIPOCH ecosystem       |
 
 Before opening a public issue, remove API Keys, tokens, private file paths, unpublished data, patient identifiers, and other sensitive material from logs and screenshots. See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow.
 

@@ -1,47 +1,66 @@
 import {
+  AlertTriangle,
   ArrowLeft,
   ArrowRight,
+  Bot,
+  Brain,
   Cloud,
   Globe,
+  LockKeyhole,
   Maximize2,
+  Menu,
   Minimize2,
+  MonitorSmartphone,
   ScrollText,
   Settings2,
-  SlidersHorizontal,
   TerminalSquare,
+  Users,
   X,
   Zap
 } from 'lucide-react'
 import { Dialog } from 'radix-ui'
 import { useEffect, useState } from 'react'
 
-import type { ProviderView, UpsertProviderRequest } from '../../../../shared/settings'
+import {
+  resolveCodexSubscriptionType,
+  type ProviderView,
+  type UpsertProviderRequest
+} from '../../../../shared/settings'
+import type { SpecialistListItem } from '../../../../shared/specialist'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
+import { useMediaQuery } from '@/hooks/useMediaQuery'
 import { cn } from '@/lib/utils'
-import { useSettingsStore } from '@/stores/settings-store'
+import { selectFrameworkApiEndpoints, useSettingsStore } from '@/stores/settings-store'
+import type { SettingsPanelId } from './settings-navigation'
 import { useComputeStore } from '@/stores/compute-store'
+import { useSpecialistStore } from '@/stores/specialist-store'
 import { AgentPanel } from './AgentPanel'
 import { ProvidersPanel } from './ProvidersPanel'
 import { GeneralPanel } from './GeneralPanel'
 import { NetworkPanel } from './NetworkPanel'
 import { StoragePanel } from './StoragePanel'
 import { RuntimesPanel } from './RuntimesPanel'
+import { RemoteControlPanel } from './RemoteControlPanel'
 import { SkillsPanel, type SkillsView } from './SkillsPanel'
 import { ConnectorsPanel, type ConnectorsView } from './ConnectorsPanel'
+import { SpecialistsPanel, type SpecialistsView } from './SpecialistsPanel'
 import { ConnectorDetailView } from './ConnectorDetailView'
 import { ConnectorAddForm } from './ConnectorAddForm'
 import { ConnectorsNavIcon } from './connector-icons'
 import { ComputePanel, type ComputeView } from './ComputePanel'
 import { ComputeAddForm } from './ComputeAddForm'
 import { ComputeHostDetail } from './ComputeHostDetail'
+import { PermissionsPanel } from './PermissionsPanel'
 import { resolveVendorModelsUrl } from '../../../../shared/provider-registry'
 import { ProviderForm } from './ProviderForm'
 import {
   createEmptyProviderFormValue,
+  defaultCustomApiEndpoint,
   defaultProviderKindKey,
   getProviderFormErrors,
   hasProviderFormErrors,
+  providerFormApiEndpoints,
   providerKindPatch,
   type ProviderFormValue
 } from './provider-form-value'
@@ -49,6 +68,7 @@ import {
 type SettingsPageProps = {
   open: boolean
   onClose: () => void
+  onOpenSession?: (sessionId: string) => void
 }
 
 // The model panel sub-view, driven by the settings navigation history so add/edit is a breadcrumb page.
@@ -57,12 +77,18 @@ type ModelView = { kind: 'list' } | { kind: 'create' } | { kind: 'edit'; provide
 // Builds a form value from an existing provider (never carrying the plaintext key).
 const toFormValue = (provider: ProviderView): ProviderFormValue =>
   createEmptyProviderFormValue({
-    type: provider.type,
+    type:
+      provider.type === 'codex-shared' || provider.type === 'codex-isolated'
+        ? resolveCodexSubscriptionType(provider)
+        : provider.type,
     name: provider.name,
     baseUrl: provider.baseUrl ?? '',
     model: provider.model ?? '',
+    contextWindow: provider.contextWindow?.toString() ?? '',
     apiEndpoint: provider.apiEndpoints?.[0] ?? 'anthropic',
     supportsImageInput: provider.supportsImageInput,
+    reasoningEffortPreset: provider.reasoningEffortPreset ?? 'standard-5',
+    reasoningEffortTransport: provider.reasoningEffortTransport ?? 'reasoning-effort',
     vendorId: provider.vendorId,
     region: provider.region
   })
@@ -76,27 +102,25 @@ const toUpsertRequest = (
   name: value.name,
   baseUrl: value.baseUrl,
   model: value.model,
-  apiEndpoints: [value.apiEndpoint],
+  contextWindow:
+    value.type === 'custom'
+      ? value.contextWindow.trim()
+        ? Number(value.contextWindow)
+        : null
+      : undefined,
+  apiEndpoints: providerFormApiEndpoints(value),
   supportsImageInput: value.supportsImageInput,
+  reasoningEffortPreset: value.type === 'custom' ? value.reasoningEffortPreset : undefined,
+  reasoningEffortTransport: value.type === 'custom' ? value.reasoningEffortTransport : undefined,
   vendorId: value.vendorId,
   region: value.region,
   key: value.key || undefined
 })
 
-// Left-nav panels, grouped in the sidebar. "Capabilities" holds agent extensions (Skills); "Workspace"
-// holds environment/config (Model manages providers, its Agent sub-panel manages agent frameworks,
-// General holds app settings incl. logs).
-type SettingsPanelId =
-  'model' | 'agent' | 'skills' | 'connectors' | 'compute' | 'general' | 'storage' | 'network' | 'runtimes'
-
 type SettingsPanel = {
   id: SettingsPanelId
   label: string
-  // Top-level entries carry a nav icon; sub-items (see `parent`) render indented without one.
-  Icon?: React.ComponentType<{ className?: string }>
-  // Marks this panel as a sub-item of another panel in the nav (e.g. Agent under Model). Sub-items
-  // are still full panels in the location/history model — `parent` only affects nav presentation.
-  parent?: SettingsPanelId
+  Icon: React.ComponentType<{ className?: string }>
 }
 
 const SETTINGS_GROUPS: ReadonlyArray<{ label: string; panels: ReadonlyArray<SettingsPanel> }> = [
@@ -105,6 +129,7 @@ const SETTINGS_GROUPS: ReadonlyArray<{ label: string; panels: ReadonlyArray<Sett
     panels: [
       { id: 'skills', label: 'Skills', Icon: ScrollText },
       { id: 'connectors', label: 'Connectors', Icon: ConnectorsNavIcon },
+      { id: 'specialists', label: 'Specialists', Icon: Users },
       { id: 'compute', label: 'Compute', Icon: Zap },
       { id: 'network', label: 'Network', Icon: Globe }
     ]
@@ -112,12 +137,17 @@ const SETTINGS_GROUPS: ReadonlyArray<{ label: string; panels: ReadonlyArray<Sett
   {
     label: 'Workspace',
     panels: [
-      { id: 'model', label: 'Model', Icon: SlidersHorizontal },
-      { id: 'agent', label: 'Agent', parent: 'model' },
+      { id: 'model', label: 'Model', Icon: Brain },
+      { id: 'agent', label: 'Agent', Icon: Bot },
+      { id: 'permissions', label: 'Permissions', Icon: LockKeyhole },
       { id: 'runtimes', label: 'Runtimes', Icon: TerminalSquare },
       { id: 'storage', label: 'Storage', Icon: Cloud },
       { id: 'general', label: 'General', Icon: Settings2 }
     ]
+  },
+  {
+    label: 'Remote access',
+    panels: [{ id: 'remote-control', label: 'Remote control', Icon: MonitorSmartphone }]
   }
 ]
 
@@ -139,6 +169,7 @@ type NavLocation = {
   connectors?: ConnectorsView
   network?: NetworkView
   compute?: ComputeView
+  specialists?: SpecialistsView
 }
 
 const INITIAL_LOCATION: NavLocation = {
@@ -147,14 +178,17 @@ const INITIAL_LOCATION: NavLocation = {
   model: { kind: 'list' },
   connectors: { kind: 'list' },
   network: { kind: 'list' },
-  compute: { kind: 'list' }
+  compute: { kind: 'list' },
+  specialists: { kind: 'list' }
 }
 
 // App-level model settings surface. Reuses the onboarding cards/form; manages providers (CRUD +
 // activate + test). Opened from the Home/Workspace gear entry.
-const SettingsPage = ({ open, onClose }: SettingsPageProps): React.JSX.Element => {
+const SettingsPage = ({ open, onClose, onOpenSession }: SettingsPageProps): React.JSX.Element => {
   const providers = useSettingsStore((state) => state.providers)
   const agentFrameworkId = useSettingsStore((state) => state.agentFrameworkId)
+  const frameworkEndpoints = useSettingsStore(selectFrameworkApiEndpoints)
+  const customApiEndpoint = defaultCustomApiEndpoint(frameworkEndpoints)
   const opencode = useSettingsStore((state) => state.opencode)
   const isDetectingOpencode = useSettingsStore((state) => state.isDetectingOpencode)
   const detectOpencode = useSettingsStore((state) => state.detectOpencode)
@@ -168,7 +202,15 @@ const SettingsPage = ({ open, onClose }: SettingsPageProps): React.JSX.Element =
   const refreshProviderModels = useSettingsStore((state) => state.refreshProviderModels)
   const pendingSkillId = useSettingsStore((state) => state.pendingSkillId)
   const consumePendingSkill = useSettingsStore((state) => state.consumePendingSkill)
-  const pendingComputePanel = useSettingsStore((state) => state.pendingComputePanel)
+  const pendingSpecialistId = useSettingsStore((state) => state.pendingSpecialistId)
+  const consumePendingSpecialist = useSettingsStore((state) => state.consumePendingSpecialist)
+  const pendingSettingsPanel = useSettingsStore((state) => state.pendingSettingsPanel)
+  const consumePendingSettingsPanel = useSettingsStore((state) => state.consumePendingSettingsPanel)
+  const settingsWriteError = useSettingsStore((state) => state.settingsWriteError)
+  const clearSettingsWriteError = useSettingsStore((state) => state.clearSettingsWriteError)
+  const canImportInstalledSkills =
+    typeof window.api.settings.listAgentHomeSkills === 'function' &&
+    typeof window.api.settings.importAgentHomeSkills === 'function'
 
   // Settings navigation history (browser-like back/forward). Panel switches and drill-downs push a
   // new location; the active panel and open sub-views are derived from the current entry.
@@ -176,10 +218,13 @@ const SettingsPage = ({ open, onClose }: SettingsPageProps): React.JSX.Element =
   const [historyIndex, setHistoryIndex] = useState(0)
   // Whether the dialog is enlarged to near-fullscreen via the maximize control.
   const [isExpanded, setIsExpanded] = useState(false)
+  const isMobile = useMediaQuery('(max-width: 767px)')
+  const [isMobileNavOpen, setIsMobileNavOpen] = useState(false)
   const skills = useSettingsStore((state) => state.skills)
   const connectors = useSettingsStore((state) => state.connectors)
   const customServers = useSettingsStore((state) => state.customServers)
   const computeHosts = useComputeStore((state) => state.hosts)
+  const specialistItems = useSpecialistStore((state) => state.items)
   const [formValue, setFormValue] = useState<ProviderFormValue>(() =>
     createEmptyProviderFormValue()
   )
@@ -190,11 +235,6 @@ const SettingsPage = ({ open, onClose }: SettingsPageProps): React.JSX.Element =
   // Shared with ProvidersPanel: the post-save validation and the list's manual test both mark the
   // provider busy so its card shows "Testing…".
   const [busyProviderId, setBusyProviderId] = useState<string | undefined>(undefined)
-  // The Model branch's sub-item (Agent) starts expanded (settings lands on Model by default) and
-  // stays expanded once the user opens the branch — other panels never collapse it. Deep-linking
-  // elsewhere (e.g. a skill mention) collapses it: that case arrives AFTER mount (this component
-  // stays mounted while closed), so it is handled in the seeding block below, not the initializer.
-  const [agentMenuExpanded, setAgentMenuExpanded] = useState(true)
 
   // Refresh settings whenever the dialog opens so external changes are reflected.
   useEffect(() => {
@@ -208,9 +248,6 @@ const SettingsPage = ({ open, onClose }: SettingsPageProps): React.JSX.Element =
   const [seededSkillId, setSeededSkillId] = useState<string | undefined>(undefined)
   if (open && pendingSkillId !== undefined && pendingSkillId !== seededSkillId) {
     setSeededSkillId(pendingSkillId)
-    // Landing outside the Model branch starts the Agent sub-item collapsed; clicking Model
-    // re-expands it (sticky from then on).
-    setAgentMenuExpanded(false)
     setHistory([
       {
         panel: 'skills',
@@ -225,28 +262,48 @@ const SettingsPage = ({ open, onClose }: SettingsPageProps): React.JSX.Element =
     setSeededSkillId(undefined)
   }
 
-  // When opened from the Files panel "Add SSH host…" link, seed the history straight to the Compute
-  // panel. Follows the same derive-state-during-render pattern as pendingSkillId.
-  const [seededComputePanel, setSeededComputePanel] = useState(false)
-  if (open && pendingComputePanel && !seededComputePanel) {
-    setSeededComputePanel(true)
-    setHistory([{ ...INITIAL_LOCATION, panel: 'compute', compute: { kind: 'list' } }])
+  // External entry points seed one shared panel target. The consumed target cannot override a later
+  // manual navigation when the dialog is reopened normally.
+  const [seededSettingsPanel, setSeededSettingsPanel] = useState<SettingsPanelId | undefined>()
+  if (open && pendingSettingsPanel !== undefined && pendingSettingsPanel !== seededSettingsPanel) {
+    setSeededSettingsPanel(pendingSettingsPanel)
+    setHistory([{ ...INITIAL_LOCATION, panel: pendingSettingsPanel }])
     setHistoryIndex(0)
   }
-  if (!open && seededComputePanel) {
-    setSeededComputePanel(false)
+  if (!open && seededSettingsPanel !== undefined) {
+    setSeededSettingsPanel(undefined)
   }
 
-  // Clear the store's pending compute panel flag after it has been applied.
+  // When opened from the specialist switch approval card, seed the history straight onto that
+  // specialist's editor. Same derive-during-render pattern as the skill seed above; the
+  // Specialists panel resolves the profile from the catalog once it mounts.
+  const [seededSpecialistId, setSeededSpecialistId] = useState<string | undefined>(undefined)
+  if (open && pendingSpecialistId !== undefined && pendingSpecialistId !== seededSpecialistId) {
+    setSeededSpecialistId(pendingSpecialistId)
+    setHistory([
+      {
+        panel: 'specialists',
+        specialists: { kind: 'edit', id: pendingSpecialistId },
+        skills: { kind: 'list' },
+        model: { kind: 'list' }
+      }
+    ])
+    setHistoryIndex(0)
+  }
+  if (!open && seededSpecialistId !== undefined) {
+    setSeededSpecialistId(undefined)
+  }
+
   useEffect(() => {
-    if (pendingComputePanel) {
-      useSettingsStore.setState({ pendingComputePanel: undefined })
-    }
-  }, [pendingComputePanel])
+    if (pendingSettingsPanel !== undefined) consumePendingSettingsPanel()
+  }, [pendingSettingsPanel, consumePendingSettingsPanel])
   // Clear the store's pending flag after it has been applied, so a later normal open starts fresh.
   useEffect(() => {
     if (pendingSkillId !== undefined) consumePendingSkill()
   }, [pendingSkillId, consumePendingSkill])
+  useEffect(() => {
+    if (pendingSpecialistId !== undefined) consumePendingSpecialist()
+  }, [pendingSpecialistId, consumePendingSpecialist])
 
   // Auto-detect opencode the first time its detection card is shown without a known path, so the card
   // reflects reality without a manual re-detect. Guarded on path + in-flight to run at most once.
@@ -276,6 +333,7 @@ const SettingsPage = ({ open, onClose }: SettingsPageProps): React.JSX.Element =
   const connectorsView: ConnectorsView = currentLocation.connectors ?? { kind: 'list' }
   const networkView: NetworkView = currentLocation.network ?? { kind: 'list' }
   const computeView: ComputeView = currentLocation.compute ?? { kind: 'list' }
+  const specialistsView: SpecialistsView = currentLocation.specialists ?? { kind: 'list' }
   const canGoBack = historyIndex > 0
   const canGoForward = historyIndex < history.length - 1
 
@@ -284,6 +342,7 @@ const SettingsPage = ({ open, onClose }: SettingsPageProps): React.JSX.Element =
     const nextConnectors = location.connectors ?? { kind: 'list' }
     const nextNetwork = location.network ?? { kind: 'list' }
     const nextCompute = location.compute ?? { kind: 'list' }
+    const nextSpecialists = location.specialists ?? { kind: 'list' }
     if (
       location.panel === activePanel &&
       location.skills.kind === skillsView.kind &&
@@ -298,13 +357,20 @@ const SettingsPage = ({ open, onClose }: SettingsPageProps): React.JSX.Element =
       nextNetwork.kind === networkView.kind &&
       nextCompute.kind === computeView.kind &&
       ('providerId' in nextCompute ? nextCompute.providerId : undefined) ===
-        ('providerId' in computeView ? computeView.providerId : undefined)
+        ('providerId' in computeView ? computeView.providerId : undefined) &&
+      nextSpecialists.kind === specialistsView.kind &&
+      ('id' in nextSpecialists ? nextSpecialists.id : undefined) ===
+        ('id' in specialistsView ? specialistsView.id : undefined)
     ) {
       return
     }
     setHistory((entries) => [...entries.slice(0, historyIndex + 1), location])
     setHistoryIndex((index) => index + 1)
   }
+
+  // Internal panel transitions must use this dialog's history instead of reseeding an external
+  // entry point, so Back returns to the recovery panel the user just completed.
+  const navigatePanel = (panel: SettingsPanelId): void => navigate({ ...INITIAL_LOCATION, panel })
 
   // Navigates within the skills panel (list/detail/create/edit/import) as a history entry.
   const navigateSkills = (skills: SkillsView): void =>
@@ -313,6 +379,10 @@ const SettingsPage = ({ open, onClose }: SettingsPageProps): React.JSX.Element =
   // Navigates within the connectors panel (list/detail/add/edit) as a history entry.
   const navigateConnectors = (connectors: ConnectorsView): void =>
     navigate({ panel: 'connectors', skills: skillsView, model: modelView, connectors })
+
+  // Navigates within the specialists panel (list/create) as a history entry.
+  const navigateSpecialists = (specialists: SpecialistsView): void =>
+    navigate({ panel: 'specialists', skills: skillsView, model: modelView, specialists })
 
   // Navigates within the network panel (package-mirror list vs. configure) as a history entry, so the
   // configure form gets a proper "Network / Package mirror" breadcrumb + back/forward.
@@ -350,10 +420,12 @@ const SettingsPage = ({ open, onClose }: SettingsPageProps): React.JSX.Element =
             ? 'Upload skills'
             : skillsView.kind === 'import'
               ? 'Import from GitHub'
-              : (() => {
-                  const name = skills.find((skill) => skill.id === skillsView.id)?.name ?? ''
-                  return skillsView.kind === 'edit' ? `Edit ${name}`.trim() : name
-                })()
+              : skillsView.kind === 'import-agent-home'
+                ? 'Import installed skills'
+                : (() => {
+                    const name = skills.find((skill) => skill.id === skillsView.id)?.name ?? ''
+                    return skillsView.kind === 'edit' ? `Edit ${name}`.trim() : name
+                  })()
       return {
         rootLabel: 'Skills',
         rootTo: { panel: 'skills', skills: { kind: 'list' }, model: currentLocation.model },
@@ -415,6 +487,29 @@ const SettingsPage = ({ open, onClose }: SettingsPageProps): React.JSX.Element =
           model: currentLocation.model,
           connectors: currentLocation.connectors,
           compute: { kind: 'list' }
+        },
+        leaf
+      }
+    }
+    if (activePanel === 'specialists' && specialistsView.kind !== 'list') {
+      const editingSpecialist =
+        specialistsView.kind === 'edit'
+          ? specialistItems.find(
+              (item): item is Extract<SpecialistListItem, { kind: 'custom' }> =>
+                item.kind === 'custom' && item.id === specialistsView.id
+            )
+          : undefined
+      const leaf =
+        specialistsView.kind === 'create'
+          ? 'New specialist'
+          : (editingSpecialist?.name ?? 'Edit specialist')
+      return {
+        rootLabel: 'Specialists',
+        rootTo: {
+          panel: 'specialists',
+          skills: currentLocation.skills,
+          model: currentLocation.model,
+          specialists: { kind: 'list' }
         },
         leaf
       }
@@ -521,7 +616,14 @@ const SettingsPage = ({ open, onClose }: SettingsPageProps): React.JSX.Element =
   }
 
   return (
-    <Dialog.Root open={open} onOpenChange={(next) => (next ? undefined : onClose())}>
+    <Dialog.Root
+      open={open}
+      onOpenChange={(next) => {
+        if (next) return
+        setIsMobileNavOpen(false)
+        onClose()
+      }}
+    >
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 z-50 bg-black/50 data-[state=closed]:animate-out data-[state=open]:animate-in data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 motion-reduce:data-[state=closed]:animate-none motion-reduce:data-[state=open]:animate-none" />
         <Dialog.Content
@@ -535,8 +637,8 @@ const SettingsPage = ({ open, onClose }: SettingsPageProps): React.JSX.Element =
           className={cn(
             'fixed z-50 flex overflow-hidden overscroll-contain rounded-xl border border-border bg-card text-foreground shadow-dialog outline-none data-[state=closed]:animate-out data-[state=open]:animate-in data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 motion-reduce:data-[state=closed]:animate-none motion-reduce:data-[state=open]:animate-none',
             isExpanded
-              ? 'inset-4'
-              : 'left-1/2 top-1/2 h-[min(688px,calc(100vh-2rem))] w-[min(960px,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2'
+              ? 'inset-0 rounded-none md:inset-4 md:rounded-xl'
+              : 'inset-0 h-[100dvh] w-screen rounded-none md:bottom-auto md:left-1/2 md:right-auto md:top-1/2 md:h-[min(688px,calc(100vh-2rem))] md:w-[min(960px,calc(100vw-2rem))] md:-translate-x-1/2 md:-translate-y-1/2 md:rounded-xl'
           )}
         >
           {/* Radix requires a Title/Description for a11y; the visible panel title lives in the header. */}
@@ -545,10 +647,24 @@ const SettingsPage = ({ open, onClose }: SettingsPageProps): React.JSX.Element =
             Manage your agent runtime and model providers.
           </Dialog.Description>
 
-          {/* Left navigation: grouped settings panels (Capabilities, Workspace). */}
+          {isMobileNavOpen ? (
+            <button
+              type="button"
+              className="fixed inset-0 z-[65] bg-black/45 md:hidden"
+              aria-label="Close settings navigation"
+              onClick={() => setIsMobileNavOpen(false)}
+            />
+          ) : null}
+
+          {/* Left navigation becomes an off-canvas drawer on narrow browser screens. */}
           <nav
             aria-label="Settings"
-            className="flex w-52 shrink-0 flex-col gap-4 border-r border-border bg-background p-3"
+            aria-hidden={isMobile && !isMobileNavOpen ? true : undefined}
+            inert={isMobile && !isMobileNavOpen ? true : undefined}
+            className={cn(
+              'fixed inset-y-0 left-0 z-[70] flex w-[min(86vw,320px)] shrink-0 flex-col gap-4 border-r border-border bg-background p-3 transition-transform duration-200 ease-out md:static md:z-auto md:w-48 md:translate-x-0',
+              isMobileNavOpen ? 'translate-x-0' : '-translate-x-full'
+            )}
           >
             {SETTINGS_GROUPS.map((group) => (
               <div key={group.label} className="flex flex-col gap-0.5">
@@ -556,66 +672,31 @@ const SettingsPage = ({ open, onClose }: SettingsPageProps): React.JSX.Element =
                   {group.label}
                 </div>
                 <ul className="flex flex-col gap-0.5">
-                  {group.panels.map(({ id, label, Icon, parent }) => {
+                  {group.panels.map(({ id, label, Icon }) => {
                     const isActive = activePanel === id
-                    // A sub-item (Agent under Model) expands once the user enters the Model branch
-                    // and then stays expanded — selecting other panels never collapses it.
-                    const subItemExpanded = parent === undefined || agentMenuExpanded
-
-                    const button = (
-                      <button
-                        type="button"
-                        aria-current={isActive ? 'page' : undefined}
-                        // A collapsed sub-item is height-0/opacity-0 — keep it out of the tab order too.
-                        tabIndex={parent && !subItemExpanded ? -1 : undefined}
-                        onClick={() => {
-                          // Entering the Model branch expands its sub-item (sticky — see above).
-                          if (id === 'model' || id === 'agent') setAgentMenuExpanded(true)
-                          navigate({
-                            panel: id,
-                            skills: { kind: 'list' },
-                            model: { kind: 'list' }
-                          })
-                        }}
-                        className={`flex h-8 w-full items-center gap-2 rounded-lg px-2 text-left text-sm transition-colors duration-150 motion-reduce:transition-none ${
-                          parent ? 'h-7 text-[13px] ' : ''
-                        }${
-                          isActive
-                            ? 'bg-muted font-medium text-foreground'
-                            : 'text-muted-foreground hover:bg-muted hover:text-foreground'
-                        }`}
-                      >
-                        {Icon ? (
+                    return (
+                      <li key={id}>
+                        <button
+                          type="button"
+                          aria-current={isActive ? 'page' : undefined}
+                          onClick={() => {
+                            setIsMobileNavOpen(false)
+                            navigatePanel(id)
+                          }}
+                          className={`flex h-8 w-full items-center gap-2 rounded-lg px-2 text-left text-sm transition-colors duration-150 motion-reduce:transition-none ${
+                            isActive
+                              ? 'bg-muted font-medium text-foreground'
+                              : 'text-muted-foreground hover:bg-muted hover:text-foreground'
+                          }`}
+                        >
                           <Icon
                             className="size-4 shrink-0 text-muted-foreground"
                             aria-hidden="true"
                           />
-                        ) : null}
-                        <span className="min-w-0 flex-1 truncate">{label}</span>
-                      </button>
+                          <span className="min-w-0 flex-1 truncate">{label}</span>
+                        </button>
+                      </li>
                     )
-
-                    // Sub-items render inside a height-animated wrapper (0fr → 1fr) with a tree
-                    // guide line dropped from the parent's icon gutter, marking the relationship.
-                    if (parent) {
-                      return (
-                        <li
-                          key={id}
-                          className={cn(
-                            'grid transition-[grid-template-rows,opacity] duration-200 motion-reduce:transition-none',
-                            subItemExpanded
-                              ? 'grid-rows-[1fr] opacity-100'
-                              : 'grid-rows-[0fr] opacity-0'
-                          )}
-                        >
-                          <div className="ml-[15px] min-h-0 overflow-hidden border-l border-border pl-[9px]">
-                            {button}
-                          </div>
-                        </li>
-                      )
-                    }
-
-                    return <li key={id}>{button}</li>
                   })}
                 </ul>
               </div>
@@ -625,8 +706,23 @@ const SettingsPage = ({ open, onClose }: SettingsPageProps): React.JSX.Element =
           {/* Right column: header bar + scrollable panel content. */}
           <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-card">
             <TooltipProvider delayDuration={300}>
-              <div className="flex h-12 shrink-0 items-center justify-between gap-2 border-b border-border bg-card px-3">
+              <div className="flex h-12 shrink-0 items-center justify-between gap-2 border-b border-border bg-card px-2 md:px-3">
                 <div className="flex min-w-0 items-center gap-1">
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-sm"
+                        onClick={() => setIsMobileNavOpen(true)}
+                        aria-label="Open settings navigation"
+                        className="shrink-0 rounded-lg text-muted-foreground md:hidden"
+                      >
+                        <Menu className="size-4" aria-hidden="true" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>Navigation</TooltipContent>
+                  </Tooltip>
                   {/* Browser-like history controls for the settings navigation. */}
                   <Tooltip>
                     <TooltipTrigger asChild>
@@ -720,15 +816,50 @@ const SettingsPage = ({ open, onClose }: SettingsPageProps): React.JSX.Element =
                   </Tooltip>
                 </div>
               </div>
+
+              {settingsWriteError ? (
+                <div
+                  data-slot="settings-write-error"
+                  role="alert"
+                  className="mx-3 mt-3 flex items-start gap-2 rounded-lg border border-danger-000/30 bg-danger-000/10 px-3 py-2 text-xs text-danger-000"
+                >
+                  <AlertTriangle className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+                  <p className="min-w-0 flex-1 break-words py-0.5">{settingsWriteError}</p>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label="Dismiss settings error"
+                        className="-my-1 -mr-1 shrink-0 rounded-md text-danger-000 hover:bg-danger-000/10 hover:text-danger-000"
+                        onClick={clearSettingsWriteError}
+                      >
+                        <X className="size-3.5" aria-hidden="true" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>Dismiss</TooltipContent>
+                  </Tooltip>
+                </div>
+              ) : null}
             </TooltipProvider>
 
-            <div className="min-h-0 flex-1 overflow-y-auto">
+            <div data-slot="settings-content-scroll" className="min-h-0 flex-1 overflow-y-auto">
               <div className="mx-auto min-h-full w-full max-w-[880px]">
                 {activePanel === 'skills' ? (
-                  <SkillsPanel view={skillsView} onNavigate={navigateSkills} />
+                  <SkillsPanel
+                    view={skillsView}
+                    onNavigate={navigateSkills}
+                    canImportInstalledSkills={canImportInstalledSkills}
+                  />
+                ) : activePanel === 'specialists' ? (
+                  <SpecialistsPanel view={specialistsView} onNavigate={navigateSpecialists} />
                 ) : activePanel === 'connectors' ? (
                   connectorsView.kind === 'detail' ? (
-                    <ConnectorDetailView id={connectorsView.id} />
+                    <ConnectorDetailView
+                      id={connectorsView.id}
+                      onManagePermissions={() => navigatePanel('permissions')}
+                    />
                   ) : connectorsView.kind === 'add' ? (
                     <ConnectorAddForm
                       initialTransport={connectorsView.transport}
@@ -759,15 +890,38 @@ const SettingsPage = ({ open, onClose }: SettingsPageProps): React.JSX.Element =
                     <ComputePanel onNavigate={navigateCompute} />
                   )
                 ) : activePanel === 'storage' ? (
-                  <StoragePanel />
+                  <StoragePanel
+                    onContinueToAgent={() => {
+                      navigatePanel('agent')
+                    }}
+                  />
+                ) : activePanel === 'permissions' ? (
+                  <PermissionsPanel
+                    onOpenSession={onOpenSession}
+                    onOpenConnector={(id) =>
+                      navigateConnectors(
+                        customServers.some((server) => server.id === id)
+                          ? { kind: 'edit', id }
+                          : { kind: 'detail', id }
+                      )
+                    }
+                  />
                 ) : activePanel === 'runtimes' ? (
-                  <RuntimesPanel />
+                  <RuntimesPanel
+                    title="Notebook runtimes"
+                    description="Enable the environments each notebook language may run in. The app-managed environment is on by default; enable your own interpreters to make them available to the agent."
+                  />
                 ) : activePanel === 'network' ? (
                   <NetworkPanel view={networkView} onNavigate={navigateNetwork} />
                 ) : activePanel === 'general' ? (
                   <GeneralPanel />
+                ) : activePanel === 'remote-control' ? (
+                  <RemoteControlPanel />
                 ) : activePanel === 'agent' ? (
-                  <AgentPanel />
+                  <AgentPanel
+                    title="Agent framework"
+                    description="Choose which coding-agent backend drives your sessions. Select a card to switch; switching starts a fresh agent session, and open conversations have their transcript replayed to the new backend. The active runtime can't be uninstalled — switch to the other one first."
+                  />
                 ) : isProviderFormOpen ? (
                   // Add/edit provider is a secondary page reached via the shared back/forward arrows.
                   <div className="p-5">
@@ -800,6 +954,10 @@ const SettingsPage = ({ open, onClose }: SettingsPageProps): React.JSX.Element =
                       showCodexSubscriptions={
                         agentFrameworkId === 'codex' && editingProvider === undefined
                       }
+                      showClaudeIsolated={
+                        agentFrameworkId === 'claude-code' && editingProvider === undefined
+                      }
+                      defaultCustomApiEndpoint={customApiEndpoint}
                     />
                     {statusMessage ? (
                       <p

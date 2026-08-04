@@ -4,6 +4,10 @@
 // that refuses to settle, and reports { reaped } so the update-install gate can tell a clean teardown
 // (all process trees gone, file handles released) from a degraded one (taskkill fell back to the parent).
 
+import { diagnosticErrorFields, type Logger } from './logger'
+
+export type ShutdownStepOutcome = 'completed' | 'timeout' | 'failed' | 'degraded'
+
 export type ShutdownOutcome = {
   // The two backend teardowns settled within the budget (false = the deadline elapsed first).
   completed: boolean
@@ -11,17 +15,31 @@ export type ShutdownOutcome = {
   reaped: boolean
 }
 
-type ShutdownLogger = { error: (msg: string, err?: unknown) => void }
+export class BackendShutdownOutcomeError extends Error {
+  readonly name = 'BackendShutdownOutcomeError'
+
+  constructor(readonly outcome: Extract<ShutdownStepOutcome, 'timeout' | 'degraded'>) {
+    super('Backend shutdown did not complete cleanly.')
+  }
+
+  static assertClean(outcome: ShutdownOutcome): void {
+    if (!outcome.completed) throw new BackendShutdownOutcomeError('timeout')
+    if (!outcome.reaped) throw new BackendShutdownOutcomeError('degraded')
+  }
+}
+
+type ShutdownLogger = Pick<Logger, 'error'>
 
 // Deps for the quit/relaunch helper: only the latching teardown is needed. Kept narrow so the migration
-// relaunch path (storage/ipc.ts) does not have to expose the non-latching gate method it never uses.
+// relaunch path (storage/command-owner.ts) does not have to expose the non-latching gate method it
+// never uses.
 export type QuitShutdownDeps = {
   runtime: {
     // Latching quit teardown: sets the runtime's shutting-down flag so a mid-spawn connect self-aborts
     // instead of orphaning its freshly-spawned child. disconnect() alone does not set that latch.
     shutdownForQuit: () => Promise<{ reaped: boolean }>
   }
-  notebook: { shutdownAll: () => Promise<{ reaped: boolean }> }
+  notebook: { dispose: () => Promise<{ reaped: boolean }> }
   log?: ShutdownLogger
   // Upper bound for the quit-path helpers; defaults to QUIT_SHUTDOWN_BUDGET_MS.
   timeoutMs?: number
@@ -33,6 +51,10 @@ export type BackendShutdownDeps = QuitShutdownDeps & {
     // Non-latching pre-update-install teardown: reaps the agent tree but leaves the runtime usable so a
     // refused install does not wedge the app (the next prompt lazily reconnects).
     shutdownForUpdateGate: () => Promise<{ reaped: boolean }>
+  }
+  notebook: QuitShutdownDeps['notebook'] & {
+    // Reusable kernel teardown for update checks that may leave the current app running.
+    shutdownAll: () => Promise<{ reaped: boolean }>
   }
 }
 
@@ -54,15 +76,25 @@ const runBounded = async (
   log?: BackendShutdownDeps['log']
 ): Promise<ShutdownOutcome> => {
   let reaped = false
+  const logFailure = (backend: 'runtime' | 'notebook', error: unknown): void => {
+    try {
+      log?.error('backend shutdown failed', {
+        backend,
+        ...diagnosticErrorFields(error)
+      })
+    } catch {
+      // Shutdown progress is authoritative; diagnostics are best-effort.
+    }
+  }
 
   // allSettled ensures one rejection never short-circuits the other.
   const settleAll = Promise.allSettled([runtimeTeardown, notebookTeardown]).then(
     ([runtimeResult, notebookResult]) => {
       if (runtimeResult.status === 'rejected') {
-        log?.error('runtime shutdown failed during shutdown', runtimeResult.reason)
+        logFailure('runtime', runtimeResult.reason)
       }
       if (notebookResult.status === 'rejected') {
-        log?.error('notebook shutdownAll failed during shutdown', notebookResult.reason)
+        logFailure('notebook', notebookResult.reason)
       }
 
       // Optional chaining keeps the never-throw invariant even if a teardown resolves a malformed value.
@@ -90,12 +122,13 @@ const runBounded = async (
 }
 
 // Quit/relaunch helper (latching teardown). Kept as a standalone function for the data-root migration
-// relaunch path (storage/ipc.ts); the app-quit path goes through BackendShutdownCoordinator instead.
+// relaunch path (storage/command-owner.ts); the app-quit path goes through
+// BackendShutdownCoordinator instead.
 // Returns void for backward compatibility — that caller only needs the bounded, never-throwing await.
 export const shutdownBackends = async (deps: QuitShutdownDeps): Promise<void> => {
   await runBounded(
     deps.runtime.shutdownForQuit(),
-    deps.notebook.shutdownAll(),
+    deps.notebook.dispose(),
     deps.timeoutMs ?? QUIT_SHUTDOWN_BUDGET_MS,
     deps.log
   )
@@ -116,7 +149,7 @@ export class BackendShutdownCoordinator {
   ): Promise<ShutdownOutcome> {
     return runBounded(
       this.deps.runtime.shutdownForQuit(),
-      this.deps.notebook.shutdownAll(),
+      this.deps.notebook.dispose(),
       budgetMs,
       this.deps.log
     )

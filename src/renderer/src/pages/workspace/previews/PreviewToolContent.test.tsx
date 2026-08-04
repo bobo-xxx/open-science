@@ -13,9 +13,13 @@ vi.mock('@/stores/navigation-store', () => ({
     selector({ activeProjectId: mocks.activeProjectId })
 }))
 vi.mock('@/stores/review-store', () => ({
-  useReviewStore: <T,>(
-    selector: (state: { getReviewsForSession: typeof mocks.getReviewsForSession }) => T
-  ): T => selector({ getReviewsForSession: mocks.getReviewsForSession })
+  selectProjectSessionReviews: (
+    _reviewsBySession: Record<string, never[]>,
+    projectId: string | undefined,
+    sessionId: string
+  ) => mocks.getReviewsForSession(sessionId, projectId),
+  useReviewStore: <T,>(selector: (state: { reviewsBySession: Record<string, never[]> }) => T): T =>
+    selector({ reviewsBySession: {} })
 }))
 vi.mock('../NotebookPreview', () => ({
   NotebookPreview: ({ item }: { item: PreviewToolItem }): React.JSX.Element => (
@@ -65,7 +69,7 @@ describe('PreviewToolContent', () => {
   it('shows the reviewer empty state when the requested session has no reviews', () => {
     const html = render(createItem({ toolKind: 'reviewer', reviewerSessionId: 'review-session' }))
 
-    expect(mocks.getReviewsForSession).toHaveBeenCalledWith('review-session')
+    expect(mocks.getReviewsForSession).toHaveBeenCalledWith('review-session', 'project-1')
     expect(html).toContain('No review available for this session.')
   })
 

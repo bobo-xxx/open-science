@@ -3,9 +3,11 @@ import { describe, expect, it } from 'vitest'
 import {
   PROVIDER_KINDS,
   createEmptyProviderFormValue,
+  defaultCustomApiEndpoint,
   defaultProviderKindKey,
   getProviderFormErrors,
   hasProviderFormErrors,
+  providerFormApiEndpoints,
   providerKindPatch,
   selectedKindKey
 } from './provider-form-value'
@@ -15,6 +17,18 @@ describe('defaultProviderKindKey', () => {
     expect(defaultProviderKindKey('claude-code')).toBe('official:anthropic')
     expect(defaultProviderKindKey('codex')).toBe('official:openai')
     expect(defaultProviderKindKey('opencode')).toBe('official:deepseek')
+  })
+})
+
+describe('defaultCustomApiEndpoint', () => {
+  it('uses each framework capability set to choose its preferred custom API format', () => {
+    expect(defaultCustomApiEndpoint(['anthropic'])).toBe('anthropic')
+    expect(defaultCustomApiEndpoint(['anthropic', 'openai'])).toBe('openai')
+    expect(defaultCustomApiEndpoint(['responses'])).toBe('responses')
+  })
+
+  it('falls back to the legacy Messages API while framework capabilities are unavailable', () => {
+    expect(defaultCustomApiEndpoint([])).toBe('anthropic')
   })
 })
 
@@ -54,28 +68,75 @@ describe('getProviderFormErrors', () => {
     expect(hasProviderFormErrors(errors)).toBe(false)
   })
 
-  it('never requires fields for a local-claude provider', () => {
-    const errors = getProviderFormErrors(createEmptyProviderFormValue({ type: 'claude-default' }))
+  it('never requires fields for a complete custom provider', () => {
+    const errors = getProviderFormErrors(
+      createEmptyProviderFormValue({
+        type: 'custom',
+        baseUrl: 'https://g/v1',
+        model: 'm',
+        key: 'k'
+      })
+    )
 
     expect(errors).toEqual({})
     expect(hasProviderFormErrors(errors)).toBe(false)
   })
+
+  it('allows a blank context window and rejects non-positive or fractional values', () => {
+    const complete = {
+      type: 'custom' as const,
+      baseUrl: 'https://g',
+      model: 'm',
+      key: 'k'
+    }
+
+    expect(
+      getProviderFormErrors(createEmptyProviderFormValue({ ...complete, contextWindow: '' }))
+        .contextWindow
+    ).toBeUndefined()
+    expect(
+      getProviderFormErrors(createEmptyProviderFormValue({ ...complete, contextWindow: '0' }))
+        .contextWindow
+    ).toMatch(/positive whole number/i)
+    expect(
+      getProviderFormErrors(createEmptyProviderFormValue({ ...complete, contextWindow: '1.5' }))
+        .contextWindow
+    ).toMatch(/positive whole number/i)
+  })
 })
 
 describe('provider-kind helpers', () => {
-  it('lists official vendors under the API group and custom/local under Other', () => {
-    const codingKeys = PROVIDER_KINDS.filter((kind) => kind.group === 'coding').map(
-      (kind) => kind.key
-    )
-    const apiKeys = PROVIDER_KINDS.filter((kind) => kind.group === 'api').map((kind) => kind.key)
-    const otherKeys = PROVIDER_KINDS.filter((kind) => kind.group === 'other').map(
-      (kind) => kind.key
-    )
+  it('uses registry endpoints for official providers and the selected endpoint for custom gateways', () => {
+    expect(
+      providerFormApiEndpoints(
+        createEmptyProviderFormValue({
+          type: 'official',
+          vendorId: 'kimiforcode',
+          apiEndpoint: 'anthropic'
+        })
+      )
+    ).toEqual(['anthropic', 'openai'])
+    expect(
+      providerFormApiEndpoints(
+        createEmptyProviderFormValue({ type: 'custom', apiEndpoint: 'responses' })
+      )
+    ).toEqual(['responses'])
+  })
+
+  it('groups each subscription on its own, official vendors under API, and custom under Other', () => {
+    const groupKeys = (group: string): string[] =>
+      PROVIDER_KINDS.filter((kind) => kind.group === group).map((kind) => kind.key)
+
+    const apiKeys = groupKeys('api')
 
     expect(apiKeys).toContain('official:deepseek')
     expect(apiKeys).toContain('official:openai')
-    expect(codingKeys).toEqual(['codex-subscription'])
-    expect(otherKeys).toEqual(['custom', 'claude-default'])
+    // The two subscription sign-ins each get their own group, parallel to one another, rather than
+    // the Claude one hiding under Official API.
+    expect(groupKeys('codex')).toEqual(['codex-subscription'])
+    expect(groupKeys('claude')).toEqual(['claude-subscription'])
+    expect(apiKeys).not.toContain('claude-subscription')
+    expect(groupKeys('other')).toEqual(['custom'])
   })
 
   it('uses one provider kind while keeping the auth mode in the form value', () => {
@@ -98,7 +159,8 @@ describe('provider-kind helpers', () => {
       name: 'MiniMax',
       vendorId: 'minimax',
       region: 'global',
-      model: ''
+      model: '',
+      contextWindow: ''
     })
   })
 
@@ -108,33 +170,34 @@ describe('provider-kind helpers', () => {
       name: 'OpenAI',
       vendorId: 'openai',
       region: undefined,
-      model: ''
+      model: '',
+      contextWindow: ''
     })
     expect(
       selectedKindKey(createEmptyProviderFormValue({ type: 'official', vendorId: 'openai' }))
     ).toBe('official:openai')
   })
 
-  it('clears vendor-only fields when picking custom or local', () => {
+  it('clears vendor-only fields when picking custom', () => {
     expect(providerKindPatch('custom')).toEqual({
       type: 'custom',
+      apiEndpoint: 'anthropic',
       vendorId: undefined,
       region: undefined,
-      model: ''
+      model: '',
+      contextWindow: ''
     })
-    expect(providerKindPatch('claude-default')).toEqual({
-      type: 'claude-default',
-      vendorId: undefined,
-      region: undefined,
-      model: ''
+  })
+
+  it('seeds a custom provider with the active framework API format', () => {
+    expect(providerKindPatch('custom', 'openai')).toMatchObject({
+      type: 'custom',
+      apiEndpoint: 'openai'
     })
   })
 
   it('round-trips a value back to its picker key', () => {
     expect(selectedKindKey(createEmptyProviderFormValue({ type: 'custom' }))).toBe('custom')
-    expect(selectedKindKey(createEmptyProviderFormValue({ type: 'claude-default' }))).toBe(
-      'claude-default'
-    )
     expect(
       selectedKindKey(createEmptyProviderFormValue({ type: 'official', vendorId: 'zhipu' }))
     ).toBe('official:zhipu')

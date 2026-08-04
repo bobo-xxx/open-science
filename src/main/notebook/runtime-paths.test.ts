@@ -38,6 +38,7 @@ import {
   addRepairRequired,
   clearRepairRequired,
   condaActivatedPath,
+  isProtectedIdentityRepairRequired,
   isRepairRequired,
   readRepairRequired
 } from './runtime-paths'
@@ -71,17 +72,15 @@ describe('runtime-paths layout', () => {
     // assertions hold on Windows (Scripts\, python.exe, Lib\R\bin) as well as POSIX.
     const isWin = process.platform === 'win32'
     expect(runtimeRoot('/store')).toBe(join('/store', 'runtime'))
-    expect(envPrefix('/r', DEFAULT_PY_ENV)).toBe(join('/r', 'envs', 'default-python'))
+    const pythonPrefix = envPrefix('/r', DEFAULT_PY_ENV)
+    const rPrefix = envPrefix('/r', DEFAULT_R_ENV)
+    expect(pythonPrefix).toBe(join('/r', 'envs', envDirectoryName(DEFAULT_PY_ENV)))
     expect(pkgsCache('/r')).toBe(join('/r', 'pkgs'))
-    expect(pythonBin('/r/envs/default-python')).toBe(
-      isWin
-        ? join('/r/envs/default-python', 'python.exe')
-        : join('/r/envs/default-python', 'bin', 'python')
+    expect(pythonBin(pythonPrefix)).toBe(
+      isWin ? join(pythonPrefix, 'python.exe') : join(pythonPrefix, 'bin', 'python')
     )
-    expect(rBin('/r/envs/default-r')).toBe(
-      isWin
-        ? join('/r/envs/default-r', 'Lib', 'R', 'bin', 'R.exe')
-        : join('/r/envs/default-r', 'bin', 'R')
+    expect(rBin(rPrefix)).toBe(
+      isWin ? join(rPrefix, 'Lib', 'R', 'bin', 'R.exe') : join(rPrefix, 'bin', 'R')
     )
     expect(rScriptBin('/e')).toBe(
       isWin ? join('/e', 'Lib', 'R', 'bin', 'Rscript.exe') : join('/e', 'bin', 'Rscript')
@@ -362,11 +361,42 @@ describe('repair-required registry', () => {
     expect(readRepairRequired(root)).toEqual(['default-r'])
   })
 
-  it('returns an empty list for a missing or malformed registry file', () => {
+  it('treats a missing registry as empty but a malformed registry as a global protected block', () => {
     const root = makeRoot()
     expect(readRepairRequired(root)).toEqual([])
     writeFileSync(join(root, '.repair-required.json'), 'not json', 'utf8')
-    expect(readRepairRequired(root)).toEqual([])
-    expect(isRepairRequired(root, 'anything')).toBe(false)
+    expect(() => readRepairRequired(root)).toThrow(/RUNTIME_REPAIR_REGISTRY_CORRUPT/)
+    expect(isRepairRequired(root, 'anything')).toBe(true)
+    expect(isProtectedIdentityRepairRequired(root, 'anything')).toBe(true)
+    expect(() => addRepairRequired(root, 'default-r')).toThrow(/RUNTIME_REPAIR_REGISTRY_CORRUPT/)
+    expect(() => clearRepairRequired(root, 'default-r')).toThrow(/RUNTIME_REPAIR_REGISTRY_CORRUPT/)
+    expect(readFileSync(join(root, '.repair-required.json'), 'utf8')).toBe('not json')
+  })
+
+  it('keeps protected identity changes stronger than interrupted-install markers', () => {
+    const root = makeRoot()
+    addRepairRequired(root, 'default-r')
+    expect(isProtectedIdentityRepairRequired(root, 'default-r')).toBe(false)
+
+    addRepairRequired(root, 'default-r', 'protected-identity-change')
+    expect(isProtectedIdentityRepairRequired(root, 'default-r')).toBe(true)
+
+    // A later recovery pass must not downgrade the protected quarantine.
+    addRepairRequired(root, 'default-r', 'interrupted-install')
+    expect(isProtectedIdentityRepairRequired(root, 'default-r')).toBe(true)
+
+    clearRepairRequired(root, 'default-r')
+    expect(isProtectedIdentityRepairRequired(root, 'default-r')).toBe(false)
+  })
+
+  it('treats legacy untyped repair markers as protected instead of guessing safe', () => {
+    const root = makeRoot()
+    writeFileSync(
+      join(root, '.repair-required.json'),
+      `${JSON.stringify({ runtimeIds: ['default-r'] })}\n`,
+      'utf8'
+    )
+
+    expect(isProtectedIdentityRepairRequired(root, 'default-r')).toBe(true)
   })
 })

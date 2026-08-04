@@ -16,35 +16,24 @@ import type {
   SessionSetup,
   SessionSetupContext
 } from './types'
+import { renderAppMcpToolReferences } from './app-mcp-names'
 
-// Claude exposes ACP-provided MCP tools as mcp__<server>__<tool>; shared prompts stay framework-neutral.
-const CLAUDE_MCP_TOOL_NAMES = [
-  ['write_artifact_file', 'mcp__open-science-artifacts__write_artifact_file'],
-  ['notebook_execute', 'mcp__open-science-notebook__notebook_execute'],
-  ['repl_execute', 'mcp__open-science-notebook__repl_execute'],
-  ['bash_execute', 'mcp__open-science-notebook__bash_execute'],
-  ['notebook_state', 'mcp__open-science-notebook__notebook_state'],
-  ['list_notebook_runtimes', 'mcp__open-science-notebook__list_notebook_runtimes'],
-  ['notebook_bind_runtime', 'mcp__open-science-notebook__notebook_bind_runtime'],
-  ['notebook_switch_runtime', 'mcp__open-science-notebook__notebook_switch_runtime'],
-  ['notebook_restart', 'mcp__open-science-notebook__notebook_restart'],
-  ['notebook_shutdown', 'mcp__open-science-notebook__notebook_shutdown'],
-  ['manage_packages', 'mcp__open-science-notebook__manage_packages'],
-  ['manage_environments', 'mcp__open-science-notebook__manage_environments']
-] as const
-
-const renderClaudeMcpToolNames = (append: string): string =>
-  CLAUDE_MCP_TOOL_NAMES.reduce(
-    (rendered, [toolName, callableName]) =>
-      rendered.replace(new RegExp(`\\b${toolName}\\b`, 'g'), callableName),
-    append
-  )
+// Select Claude Code's complete built-in tool set explicitly instead of relying on
+// claude-agent-acp's current fallback. This keeps WebFetch/WebSearch available if the adapter's
+// default changes, while reviewer sessions can still replace this with `tools: []` at their boundary.
+const CLAUDE_CODE_BUILTIN_TOOLS = { type: 'preset', preset: 'claude_code' } as const
 
 // Claude Code adapter. A faithful extraction of behavior currently inline in AcpRuntime /
 // agent-process / provider-env — moving the runtime onto AgentFramework must not change it.
 export const claudeCodeFramework: AgentFramework = {
   id: 'claude-code',
   displayName: 'Claude Code',
+  contextCompaction: {
+    kind: 'native-command',
+    command: '/compact',
+    triggerAtPercent: 90,
+    failureTextPrefix: 'Compacting failed'
+  },
   supportsSkills: true,
   // Claude launches stdio MCP servers directly — the app's artifact/notebook tooling relies on this.
   acceptsStdioMcp: true,
@@ -73,21 +62,44 @@ export const claudeCodeFramework: AgentFramework = {
   },
 
   buildSessionSetup(ctx: SessionSetupContext): SessionSetup {
-    // settingSources:['user'] pins the app-owned config dir so a workspace ~/.claude env can't override
-    // the active provider endpoint. Appends ride the claude_code system-prompt preset.
+    // settingSources:['user'] excludes workspace settings that could override the active provider.
+    // Shared mode adds app-owned settings/plugins at the SDK flag layer via sessionOptions.
     const meta: Record<string, unknown> = {
-      claudeCode: { options: { settingSources: ['user'] } }
-    }
-
-    if (ctx.systemPromptAppends.length > 0) {
-      meta.systemPrompt = {
-        type: 'preset',
-        preset: 'claude_code',
-        append: ctx.systemPromptAppends.map(renderClaudeMcpToolNames).join('\n\n')
+      claudeCode: {
+        // The ACP usage total omits Claude SDK's agentic turn count. Request only terminal result
+        // frames through the adapter's extension channel so the runtime can retain `num_turns`.
+        emitRawSDKMessages: [{ type: 'result' }],
+        options: {
+          tools: CLAUDE_CODE_BUILTIN_TOOLS,
+          ...ctx.sessionOptions,
+          settingSources: ['user'],
+          ...(ctx.skillWhitelist !== undefined ? { skills: ctx.skillWhitelist } : {})
+        }
       }
     }
 
-    return { meta }
+    const persistentSystemPrompt = ctx.systemPromptAppends
+      .map((append) => renderAppMcpToolReferences('claude-code', append))
+      .filter(Boolean)
+      .join('\n\n')
+    if (persistentSystemPrompt) {
+      meta.systemPrompt = {
+        type: 'preset',
+        preset: 'claude_code',
+        append: persistentSystemPrompt
+      }
+    }
+
+    const promptPrefix = ctx.turnPromptReminders
+      ?.map((append) => renderAppMcpToolReferences('claude-code', append))
+      .filter(Boolean)
+      .join('\n\n')
+
+    return {
+      meta,
+      ...(persistentSystemPrompt ? { persistentSystemPrompt } : {}),
+      ...(promptPrefix ? { promptPrefix } : {})
+    }
   },
 
   mapPermissionProfile(

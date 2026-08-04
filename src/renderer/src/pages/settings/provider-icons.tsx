@@ -1,7 +1,15 @@
-import { CirclePlus, Laptop, Sparkles } from 'lucide-react'
+import { CirclePlus, Sparkles } from 'lucide-react'
+
+// Import the bare icon components so this shared renderer stays free of @lobehub/ui.
+import ClaudeColor from '@lobehub/icons/es/Claude/components/Color'
+import Codex from '@lobehub/icons/es/Codex/components/Mono'
+import OpenCode from '@lobehub/icons/es/OpenCode/components/Mono'
 
 import { cn } from '@/lib/utils'
+import anthropicLogo from '@/assets/provider-icons/anthropic.svg'
 import claudeLogo from '@/assets/provider-icons/claude.svg'
+import grokLogo from '@/assets/provider-icons/grok.svg'
+import bailianLogo from '@/assets/provider-icons/bailian.svg'
 import deepseekLogo from '@/assets/provider-icons/deepseek.svg'
 import minimaxLogo from '@/assets/provider-icons/minimax.svg'
 import stepfunLogo from '@/assets/provider-icons/stepfun.svg'
@@ -13,17 +21,39 @@ import xiaomimimoLogo from '@/assets/provider-icons/xiaomimimo.svg'
 import sensenovaLogo from '@/assets/provider-icons/sensenova.svg'
 import volcengineLogo from '@/assets/provider-icons/volcengine.svg'
 import type { OfficialVendorId } from '../../../../shared/provider-registry'
+import type { AgentFrameworkId } from '../../../../shared/settings'
 
-// Official vendor brand marks, bundled as assets. Both Kimi providers (the general Moonshot platform
-// and Kimi For Coding) share the one Kimi mark, and both GLM providers (pay-as-you-go Zhipu and the
-// GLM Coding Plan) share the one GLM mark. Any vendor without an entry falls back to a neutral glyph
-// rather than a made-up logo. Custom uses a plus-in-circle and local Claude a laptop.
+// The same framework marks are used by Settings cards and completed-message metadata.
+export const AgentFrameworkIcon = ({
+  frameworkId,
+  size = 20,
+  className
+}: {
+  frameworkId: AgentFrameworkId
+  size?: number
+  className?: string
+}): React.JSX.Element => {
+  if (frameworkId === 'claude-code') return <ClaudeColor size={size} className={className} />
+  if (frameworkId === 'opencode') {
+    return <OpenCode size={size} className={cn('text-foreground', className)} />
+  }
+  return <Codex size={size} className={cn('text-foreground', className)} />
+}
+
+// Official vendor brand marks, bundled as assets. Providers from the same vendor share one mark:
+// Bailian and Bailian for Plan, Kimi and Kimi For Coding, Zhipu and GLM Coding Plan, and StepFun and
+// Step Plan. Any vendor without an entry falls back to a neutral glyph rather than a made-up logo.
+// Custom uses a plus-in-circle.
 const VENDOR_LOGO: Partial<Record<OfficialVendorId, string>> = {
   openai: openaiLogo,
-  anthropic: claudeLogo,
+  anthropic: anthropicLogo,
+  xai: grokLogo,
   deepseek: deepseekLogo,
+  bailian: bailianLogo,
+  bailianplan: bailianLogo,
   minimax: minimaxLogo,
   stepfun: stepfunLogo,
+  stepplan: stepfunLogo,
   zhipu: zhipuLogo,
   glmcodingplan: zhipuLogo,
   kimi: kimiLogo,
@@ -34,7 +64,7 @@ const VENDOR_LOGO: Partial<Record<OfficialVendorId, string>> = {
   volcengine: volcengineLogo
 }
 
-// Renders the icon for a provider-kind key ('custom', 'claude-default', or `official:<vendorId>`).
+// Renders the icon for a provider-kind key ('custom' or `official:<vendorId>`).
 export const ProviderKindIcon = ({
   kindKey,
   className
@@ -51,21 +81,20 @@ export const ProviderKindIcon = ({
     )
   }
 
-  if (kindKey === 'claude-default') {
-    return (
-      <Laptop
-        className={cn('size-5 shrink-0 text-muted-foreground', className)}
-        aria-hidden="true"
-      />
-    )
-  }
-
   if (
     kindKey === 'codex-subscription' ||
     kindKey === 'codex-shared' ||
     kindKey === 'codex-isolated'
   ) {
     return <img src={openaiLogo} alt="" className={cn('size-5 shrink-0', className)} />
+  }
+
+  if (
+    kindKey === 'claude-subscription' ||
+    kindKey === 'claude-shared' ||
+    kindKey === 'claude-isolated'
+  ) {
+    return <img src={claudeLogo} alt="" className={cn('size-5 shrink-0', className)} />
   }
 
   const vendorId = kindKey.slice('official:'.length) as OfficialVendorId

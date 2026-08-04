@@ -1,13 +1,24 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { existsSync, realpathSync } from 'node:fs'
-import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join, win32 } from 'node:path'
+import { dirname, join, resolve, win32 } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { NotebookKernelExecutor } from './kernel-executor'
-import { DEFAULT_PY_ENV, DEFAULT_R_ENV, envPrefix, pythonBin } from './runtime-paths'
+import {
+  DEFAULT_PY_ENV,
+  DEFAULT_R_ENV,
+  envPrefix,
+  pythonBin,
+  rBin,
+  rScriptBin
+} from './runtime-paths'
 import { TimeoutController } from './timeout-controller'
+import {
+  startWorkingFileObservation,
+  toPortableNotebookRelativePath
+} from './working-file-observer'
 
 // -- TimeoutController: pure state machine, driven with fake timers + a signal recorder. ------------
 
@@ -136,6 +147,9 @@ const resolvePython3 = (): string | undefined =>
 
 const python3 = resolvePython3()
 const gate = python3 ? describe : describe.skip
+const posixGate = describe.skipIf(process.platform === 'win32' || !python3)
+const rExecutable = ['/usr/local/bin/R', '/opt/homebrew/bin/R'].find(existsSync)
+const rScriptExecutable = ['/usr/local/bin/Rscript', '/opt/homebrew/bin/Rscript'].find(existsSync)
 
 // Symlinks an env's python interpreter to the system python3 under a runtime root, so the strict
 // resolver (env interpreter only -- no system-PATH fallback) finds it and spawns the fake loop.
@@ -143,6 +157,13 @@ const stubEnvPython = async (runtimeRootDir: string, name: string): Promise<void
   const bin = pythonBin(envPrefix(runtimeRootDir, name))
   await mkdir(dirname(bin), { recursive: true })
   await symlink(python3 as string, bin)
+}
+
+const stubEnvR = async (runtimeRootDir: string, name: string): Promise<void> => {
+  const prefix = envPrefix(runtimeRootDir, name)
+  await mkdir(dirname(rBin(prefix)), { recursive: true })
+  await symlink(rExecutable as string, rBin(prefix))
+  await symlink(rScriptExecutable as string, rScriptBin(prefix))
 }
 
 // Makes a temp cwd AND stubs its default-python env interpreter, so a default-env execute() passes the
@@ -169,7 +190,7 @@ const procFor = (
 let cwdDir: string | undefined
 
 const makeExecutor = (): NotebookKernelExecutor =>
-  new NotebookKernelExecutor({ pythonBin: python3, pythonLoopPath: FIXTURE })
+  new NotebookKernelExecutor({ pythonBin: python3, pythonLoopPath: FIXTURE, platform: 'linux' })
 
 const baseRequest = (
   cwd: string
@@ -193,6 +214,90 @@ afterEach(async () => {
 })
 
 gate('NotebookKernelExecutor (fake loop)', () => {
+  it('normalizes persisted working-file paths across operating systems', () => {
+    expect(
+      toPortableNotebookRelativePath(
+        win32.relative('C:\\session', 'C:\\session\\data\\plot.png'),
+        win32.sep
+      )
+    ).toBe('data/plot.png')
+    expect(toPortableNotebookRelativePath('data/literal\\name.png')).toBe('data/literal\\name.png')
+  })
+
+  it('falls back to a bounded snapshot when the file watcher cannot start', async () => {
+    cwdDir = await mkdtemp(join(tmpdir(), 'os-working-file-fallback-'))
+    const sessionRoot = join(cwdDir, 'nb')
+    const dataRoot = join(sessionRoot, 'data')
+    await mkdir(dataRoot, { recursive: true })
+    const observation = await startWorkingFileObservation(
+      { dataRoot, notebookSessionRoot: sessionRoot },
+      {
+        watchDirectory: () => {
+          throw Object.assign(new Error('watch unavailable'), { code: 'ENOSPC' })
+        }
+      }
+    )
+
+    await writeFile(join(dataRoot, 'fallback.csv'), 'x,y\n1,2\n')
+
+    expect(await observation.finish()).toEqual([
+      expect.objectContaining({
+        path: resolve(dataRoot, 'fallback.csv'),
+        relativePath: 'data/fallback.csv',
+        size: 8
+      })
+    ])
+  })
+
+  it('ignores watcher startup noise for files that existed before execution', async () => {
+    cwdDir = await mkdtemp(join(tmpdir(), 'os-working-file-startup-noise-'))
+    const sessionRoot = join(cwdDir, 'nb')
+    const dataRoot = join(sessionRoot, 'data')
+    await mkdir(dataRoot, { recursive: true })
+    await writeFile(join(dataRoot, 'input.csv'), 'sample,value\na,1\n')
+    const watcher = {
+      close: vi.fn(),
+      on: vi.fn().mockReturnThis()
+    }
+
+    const observation = await startWorkingFileObservation(
+      { dataRoot, notebookSessionRoot: sessionRoot },
+      {
+        watchDirectory: ((_path, _options, listener) => {
+          if (typeof listener === 'function') listener('rename', 'input.csv')
+          return watcher
+        }) as never
+      }
+    )
+
+    await expect(observation.finish()).resolves.toEqual([])
+  })
+
+  it('falls back to a final snapshot when the watcher misses a file event', async () => {
+    cwdDir = await mkdtemp(join(tmpdir(), 'os-working-file-missed-event-'))
+    const sessionRoot = join(cwdDir, 'nb')
+    const dataRoot = join(sessionRoot, 'data')
+    await mkdir(dataRoot, { recursive: true })
+    const watcher = {
+      close: vi.fn(),
+      on: vi.fn().mockReturnThis()
+    }
+    const observation = await startWorkingFileObservation(
+      { dataRoot, notebookSessionRoot: sessionRoot },
+      { watchDirectory: (() => watcher) as never }
+    )
+
+    await writeFile(join(dataRoot, 'generated.csv'), 'x,y\n1,2\n')
+
+    await expect(observation.finish()).resolves.toEqual([
+      expect.objectContaining({
+        path: resolve(dataRoot, 'generated.csv'),
+        relativePath: 'data/generated.csv',
+        size: 8
+      })
+    ])
+  })
+
   it('runs a cell, echoes stdout, and reports the working directory', async () => {
     cwdDir = await makeDefaultEnvCwd('os-kernel-exec-')
     const executor = makeExecutor()
@@ -203,6 +308,90 @@ gate('NotebookKernelExecutor (fake loop)', () => {
       // The loop reports its resolved cwd (macOS maps /var -> /private/var).
       expect(result.cwdAfter).toBe(realpathSync(cwdDir))
       expect(result.outputs).toContainEqual({ type: 'stream', name: 'stdout', text: 'hello' })
+    } finally {
+      await executor.shutdown()
+    }
+  })
+
+  it('records files created by a data-kernel cell as trusted working files', async () => {
+    cwdDir = await makeDefaultEnvCwd('os-kernel-working-file-')
+    const dataRoot = join(cwdDir, 'nb', 'data')
+    await mkdir(dataRoot, { recursive: true })
+    const executor = makeExecutor()
+    try {
+      const result = await executor.execute({
+        ...baseRequest(cwdDir),
+        cwd: dataRoot,
+        code: '__WRITE_FILE__'
+      })
+
+      expect(result.status).toBe('completed')
+      expect(result.workingFiles).toEqual([
+        expect.objectContaining({
+          path: resolve(dataRoot, 'generated.csv'),
+          relativePath: 'data/generated.csv',
+          kind: 'other',
+          size: 8
+        })
+      ])
+    } finally {
+      await executor.shutdown()
+    }
+  })
+
+  it('records overwritten outputs without claiming unchanged data files', async () => {
+    cwdDir = await makeDefaultEnvCwd('os-kernel-overwritten-file-')
+    const dataRoot = join(cwdDir, 'nb', 'data')
+    await mkdir(dataRoot, { recursive: true })
+    await Promise.all([
+      writeFile(join(dataRoot, 'generated.csv'), 'x,y\n1,2\n'),
+      writeFile(join(dataRoot, 'input.csv'), 'sample,value\na,1\n')
+    ])
+    const executor = makeExecutor()
+    try {
+      const result = await executor.execute({
+        ...baseRequest(cwdDir),
+        cwd: dataRoot,
+        code: '__OVERWRITE_FILE__'
+      })
+
+      expect(result.workingFiles).toEqual([
+        expect.objectContaining({
+          path: resolve(dataRoot, 'generated.csv'),
+          relativePath: 'data/generated.csv',
+          size: 8
+        })
+      ])
+    } finally {
+      await executor.shutdown()
+    }
+  })
+
+  it('fails closed instead of cross-attributing files from overlapping kernels', async () => {
+    cwdDir = await makeDefaultEnvCwd('os-kernel-overlapping-files-')
+    await stubEnvPython(join(cwdDir, 'runtime'), 'analysis')
+    const dataRoot = join(cwdDir, 'nb', 'data')
+    await mkdir(dataRoot, { recursive: true })
+    const executor = makeExecutor()
+    try {
+      const [first, second] = await Promise.all([
+        executor.execute({
+          ...baseRequest(cwdDir),
+          cwd: dataRoot,
+          code: '__WRITE_DELAYED_A__'
+        }),
+        executor.execute({
+          ...baseRequest(cwdDir),
+          cwd: dataRoot,
+          environment: 'analysis',
+          code: '__WRITE_DELAYED_B__'
+        })
+      ])
+
+      expect(first.status).toBe('completed')
+      expect(second.status).toBe('completed')
+      expect(first.workingFiles).toEqual([])
+      expect(second.workingFiles).toEqual([])
     } finally {
       await executor.shutdown()
     }
@@ -418,6 +607,7 @@ gate('NotebookKernelExecutor (fake loop)', () => {
     const executor = new NotebookKernelExecutor({
       pythonBin: python3,
       pythonLoopPath: FIXTURE,
+      platform: 'linux',
       onTerminated: (kind) => terminated.push(kind)
     })
     try {
@@ -441,6 +631,7 @@ gate('NotebookKernelExecutor (fake loop)', () => {
     const executor = new NotebookKernelExecutor({
       pythonBin: python3,
       pythonLoopPath: FIXTURE,
+      platform: 'linux',
       onTerminated: (kind) => terminated.push(kind)
     })
     await executor.execute({ ...baseRequest(cwdDir), code: 'warm' })
@@ -461,6 +652,391 @@ gate('NotebookKernelExecutor (fake loop)', () => {
   }, 15_000)
 })
 
+posixGate('NotebookKernelExecutor (real Python loop mutation policy)', () => {
+  it('blocks dynamically assembled venv and pip subprocess entry points', async () => {
+    cwdDir = await mkdtemp(join(tmpdir(), 'os-python-loop-package-guard-'))
+    const request = baseRequest(cwdDir)
+    await stubEnvPython(request.runtimeRoot, DEFAULT_PY_ENV)
+    await symlink(request.runtimeRoot, join(cwdDir, 'runtime-link'))
+    const truncatePath = join(request.runtimeRoot, 'truncate-target.txt')
+    await writeFile(truncatePath, 'unchanged', 'utf8')
+    const executor = new NotebookKernelExecutor({
+      pythonLoopPath: join(__dirname, '../../../resources/notebook/python_loop.py'),
+      platform: 'linux'
+    })
+
+    try {
+      const echoResult = await executor.execute({
+        ...request,
+        code:
+          `import subprocess\n` +
+          `completed = subprocess.run(["echo", "pip install pandas"], stdout=subprocess.PIPE, text=True, check=True)\n` +
+          `print(completed.stdout.strip())`,
+        language: 'python'
+      })
+      expect(echoResult.status).toBe('completed')
+      expect(echoResult.stdout).toContain('pip install pandas')
+
+      const venvResult = await executor.execute({
+        ...request,
+        code: `getattr(__import__("ve" + "nv"), "create")("blocked-env")`,
+        language: 'python'
+      })
+      expect(venvResult.status).toBe('failed')
+      expect(venvResult.traceback).toMatch(/manage_packages/)
+      expect(existsSync(join(cwdDir, 'blocked-env'))).toBe(false)
+
+      const pipInspectionResult = await executor.execute({
+        ...request,
+        code:
+          `import subprocess, sys\n` +
+          `subprocess.run([sys.executable, "-m", "p" + "ip", "li" + "st", "--help"])`,
+        language: 'python'
+      })
+      expect(pipInspectionResult.status).toBe('completed')
+
+      const pipResult = await executor.execute({
+        ...request,
+        code:
+          `import subprocess, sys\n` +
+          `subprocess.run([sys.executable, "-m", "p" + "ip", "in" + "stall", "--help"])`,
+        language: 'python'
+      })
+      expect(pipResult.status).toBe('failed')
+      expect(pipResult.traceback).toMatch(/manage_packages/)
+
+      const rInstallerResult = await executor.execute({
+        ...request,
+        code:
+          `import subprocess\n` +
+          `runner = "R" + "script"\n` +
+          `operation = "install" + ".packages('dplyr')"\n` +
+          `subprocess.run([runner, "-e", operation])`,
+        language: 'python'
+      })
+      expect(rInstallerResult.status).toBe('failed')
+      expect(rInstallerResult.traceback).toMatch(/manage_packages/)
+
+      const ensurepipResult = await executor.execute({
+        ...request,
+        code: `getattr(__import__("ensure" + "pip"), "boot" + "strap")()`,
+        language: 'python'
+      })
+      expect(ensurepipResult.status).toBe('failed')
+      expect(ensurepipResult.traceback).toMatch(/manage_packages/)
+
+      const inProcessPipResult = await executor.execute({
+        ...request,
+        code:
+          `entry = getattr(__import__("pip._internal", fromlist=["main"]), "main")\n` +
+          `entry(["in" + "stall", "pandas"])`,
+        language: 'python'
+      })
+      expect(inProcessPipResult.status).toBe('failed')
+      expect(inProcessPipResult.traceback).toMatch(/manage_packages/)
+
+      const pipCommandFactoryResult = await executor.execute({
+        ...request,
+        code:
+          `commands = __import__("pip._internal.commands", fromlist=["create_command"])\n` +
+          `command = commands.create_command("in" + "stall")\n` +
+          `command.main(["--help"])`,
+        language: 'python'
+      })
+      expect(pipCommandFactoryResult.status).toBe('failed')
+      expect(pipCommandFactoryResult.traceback).toMatch(/manage_packages/)
+
+      const symlinkWriteResult = await executor.execute({
+        ...request,
+        code: `open("runtime-link/blocked-from-link.txt", "w").write("changed")`,
+        language: 'python'
+      })
+      expect(symlinkWriteResult.status).toBe('failed')
+      expect(symlinkWriteResult.traceback).toMatch(/manage_packages/)
+      expect(existsSync(join(request.runtimeRoot, 'blocked-from-link.txt'))).toBe(false)
+
+      const truncateResult = await executor.execute({
+        ...request,
+        code: `import os\n` + `getattr(os, "trun" + "cate")(${JSON.stringify(truncatePath)}, 0)`,
+        language: 'python'
+      })
+      expect(truncateResult.status).toBe('failed')
+      expect(truncateResult.traceback).toMatch(/manage_packages/)
+      expect(await readFile(truncatePath, 'utf8')).toBe('unchanged')
+
+      const descriptorPath = join(request.runtimeRoot, 'descriptor-mode-python.txt')
+      await writeFile(descriptorPath, 'unchanged', 'utf8')
+      await chmod(descriptorPath, 0o700)
+      const descriptorResult = await executor.execute({
+        ...request,
+        code:
+          `import os\n` +
+          `descriptor = os.open(${JSON.stringify(descriptorPath)}, os.O_RDONLY)\n` +
+          `try:\n` +
+          `    os.fchmod(descriptor, 0o600)\n` +
+          `finally:\n` +
+          `    os.close(descriptor)`,
+        language: 'python'
+      })
+      expect(descriptorResult.status).toBe('failed')
+      expect(descriptorResult.traceback).toMatch(/manage_packages/)
+      expect((await stat(descriptorPath)).mode & 0o777).toBe(0o700)
+
+      const posixSpawnPath = join(request.runtimeRoot, 'blocked-from-posix-spawn.txt')
+      const posixSpawnResult = await executor.execute({
+        ...request,
+        code:
+          `import os\n` +
+          `os.posix_spawn('/bin/sh', ['sh', '-c', ` +
+          `'touch "$OPEN_SCIENCE_RUNTIME_DIR/blocked-from-posix-spawn.txt"'], os.environ)`,
+        language: 'python'
+      })
+      expect(posixSpawnResult.status).toBe('failed')
+      expect(posixSpawnResult.traceback).toMatch(/manage_packages/)
+      expect(existsSync(posixSpawnPath)).toBe(false)
+    } finally {
+      await executor.shutdown()
+    }
+  })
+})
+
+describe.skipIf(!rExecutable || !rScriptExecutable)('NotebookKernelExecutor (real R loop)', () => {
+  it('rejects a package installer even when the main-process guard is bypassed', async () => {
+    cwdDir = await mkdtemp(join(tmpdir(), 'os-r-loop-package-guard-'))
+    const request = baseRequest(cwdDir)
+    await stubEnvR(request.runtimeRoot, DEFAULT_R_ENV)
+    const executor = new NotebookKernelExecutor({
+      rLoopPath: join(__dirname, '../../../resources/notebook/r_loop.R'),
+      platform: 'linux'
+    })
+
+    try {
+      const echoResult = await executor.execute({
+        ...request,
+        code: 'output <- system2("echo", "pip install pandas", stdout=TRUE); cat(output)',
+        language: 'r'
+      })
+      expect(echoResult.status).toBe('completed')
+      expect(echoResult.stdout).toContain('pip install pandas')
+
+      const result = await executor.execute({
+        ...request,
+        code: 'utils::install.packages("dplyr")',
+        language: 'r'
+      })
+
+      expect(result.status).toBe('failed')
+      expect(result.traceback).toMatch(/manage_packages/)
+    } finally {
+      await executor.shutdown()
+    }
+  })
+
+  it('keeps installer aliases blocked after user code shadows the policy helper names', async () => {
+    cwdDir = await mkdtemp(join(tmpdir(), 'os-r-loop-package-alias-'))
+    const request = baseRequest(cwdDir)
+    await stubEnvR(request.runtimeRoot, DEFAULT_R_ENV)
+    const executor = new NotebookKernelExecutor({
+      rLoopPath: join(__dirname, '../../../resources/notebook/r_loop.R'),
+      platform: 'linux'
+    })
+
+    try {
+      const shadow = await executor.execute({
+        ...request,
+        code:
+          'package_mutation_call_name <- function(expr) NULL; ' +
+          'is_package_mutation_name <- function(name) FALSE',
+        language: 'r'
+      })
+      expect(shadow.status).toBe('completed')
+
+      const alias = await executor.execute({
+        ...request,
+        code: 'installer <- utils::install.packages',
+        language: 'r'
+      })
+      expect(alias.status).toBe('failed')
+      expect(alias.traceback).toMatch(/manage_packages/)
+    } finally {
+      await executor.shutdown()
+    }
+  })
+
+  it('blocks a dynamically assembled lookup of the canonical R installer', async () => {
+    cwdDir = await mkdtemp(join(tmpdir(), 'os-r-loop-package-dynamic-'))
+    const request = baseRequest(cwdDir)
+    await stubEnvR(request.runtimeRoot, DEFAULT_R_ENV)
+    const executor = new NotebookKernelExecutor({
+      rLoopPath: join(__dirname, '../../../resources/notebook/r_loop.R'),
+      platform: 'linux'
+    })
+
+    try {
+      const result = await executor.execute({
+        ...request,
+        code:
+          'installer <- get(paste0("install", ".packages"), envir=asNamespace("utils")); ' +
+          'installer("dplyr")',
+        language: 'r'
+      })
+      expect(result.status).toBe('failed')
+      expect(result.traceback).toMatch(/manage_packages/)
+    } finally {
+      await executor.shutdown()
+    }
+  })
+
+  it('blocks the internal R system primitive from bypassing the persistent process guard', async () => {
+    cwdDir = await mkdtemp(join(tmpdir(), 'os-r-loop-internal-system-'))
+    const request = baseRequest(cwdDir)
+    await stubEnvR(request.runtimeRoot, DEFAULT_R_ENV)
+    const blockedPath = join(request.runtimeRoot, 'blocked-internal-system.txt')
+    const executor = new NotebookKernelExecutor({
+      rLoopPath: join(__dirname, '../../../resources/notebook/r_loop.R'),
+      platform: 'linux'
+    })
+
+    try {
+      const result = await executor.execute({
+        ...request,
+        code:
+          `target <- ${JSON.stringify(blockedPath)}; ` +
+          'command <- paste("touch", shQuote(target)); ' +
+          '.Internal(system(command, FALSE, 0L, TRUE))',
+        language: 'r'
+      })
+
+      expect(result.status).toBe('failed')
+      expect(result.traceback).toMatch(/manage_packages/)
+      expect(existsSync(blockedPath)).toBe(false)
+
+      const descriptorPath = join(request.runtimeRoot, 'descriptor-mode-r.txt')
+      await writeFile(descriptorPath, 'unchanged', 'utf8')
+      await chmod(descriptorPath, 0o700)
+      const descriptorResult = await executor.execute({
+        ...request,
+        code: `Sys.chmod(${JSON.stringify(descriptorPath)}, mode="0600")`,
+        language: 'r'
+      })
+      expect(descriptorResult.status).toBe('failed')
+      expect(descriptorResult.traceback).toMatch(/manage_packages/)
+      expect((await stat(descriptorPath)).mode & 0o777).toBe(0o700)
+    } finally {
+      await executor.shutdown()
+    }
+  })
+
+  it('blocks managed-runtime writes routed through a temporary R variable', async () => {
+    cwdDir = await mkdtemp(join(tmpdir(), 'os-r-loop-runtime-guard-'))
+    const request = baseRequest(cwdDir)
+    await stubEnvR(request.runtimeRoot, DEFAULT_R_ENV)
+    const blockedPath = join(request.runtimeRoot, 'blocked-r.txt')
+    const executor = new NotebookKernelExecutor({
+      rLoopPath: join(__dirname, '../../../resources/notebook/r_loop.R'),
+      platform: 'linux'
+    })
+
+    try {
+      const result = await executor.execute({
+        ...request,
+        code:
+          'target <- file.path(Sys.getenv("OPEN_SCIENCE_RUNTIME_DIR"), "blocked-r.txt"); ' +
+          'writeLines("changed", target)',
+        language: 'r'
+      })
+      expect(result.status).toBe('failed')
+      expect(result.traceback).toMatch(/manage_packages/)
+      expect(existsSync(blockedPath)).toBe(false)
+
+      const childPath = join(request.runtimeRoot, 'blocked-r-child.txt')
+      const childResult = await executor.execute({
+        ...request,
+        code:
+          'target <- file.path(Sys.getenv("OPEN_SCIENCE_RUNTIME_DIR"), "blocked-r-child.txt"); ' +
+          'system(paste("touch", shQuote(target)))',
+        language: 'r'
+      })
+      expect(childResult.status).toBe('failed')
+      expect(childResult.traceback).toMatch(/manage_packages/)
+      expect(existsSync(childPath)).toBe(false)
+
+      const packageCommandResult = await executor.execute({
+        ...request,
+        code:
+          'installer <- paste0("p", "ip"); operation <- paste0("in", "stall"); ' +
+          'system2(installer, c(operation, "dplyr"))',
+        language: 'r'
+      })
+      expect(packageCommandResult.status).toBe('failed')
+      expect(packageCommandResult.traceback).toMatch(/manage_packages/)
+    } finally {
+      await executor.shutdown()
+    }
+  })
+
+  it('blocks additional base R write and process APIs from reaching the managed runtime', async () => {
+    cwdDir = await mkdtemp(join(tmpdir(), 'os-r-loop-runtime-apis-'))
+    const request = baseRequest(cwdDir)
+    await stubEnvR(request.runtimeRoot, DEFAULT_R_ENV)
+    const sourcePath = join(cwdDir, 'source.txt')
+    await writeFile(sourcePath, 'source', 'utf8')
+    const executor = new NotebookKernelExecutor({
+      rLoopPath: join(__dirname, '../../../resources/notebook/r_loop.R'),
+      platform: 'linux'
+    })
+
+    try {
+      const cases = [
+        {
+          name: 'file.append',
+          path: join(request.runtimeRoot, 'blocked-file-append.txt'),
+          code:
+            'target <- file.path(Sys.getenv("OPEN_SCIENCE_RUNTIME_DIR"), "blocked-file-append.txt"); ' +
+            `file.append(target, ${JSON.stringify(sourcePath)})`
+        },
+        {
+          name: 'file.copy',
+          path: join(request.runtimeRoot, 'blocked-file-copy.txt'),
+          code:
+            'target <- file.path(Sys.getenv("OPEN_SCIENCE_RUNTIME_DIR"), "blocked-file-copy.txt"); ' +
+            `file.copy(${JSON.stringify(sourcePath)}, target, overwrite=TRUE)`
+        },
+        {
+          name: 'download.file',
+          path: join(request.runtimeRoot, 'blocked-download.txt'),
+          code:
+            'target <- file.path(Sys.getenv("OPEN_SCIENCE_RUNTIME_DIR"), "blocked-download.txt"); ' +
+            'download.file("https://example.invalid/report", target)'
+        },
+        {
+          name: 'fifo',
+          path: join(request.runtimeRoot, 'blocked-fifo'),
+          code:
+            'target <- file.path(Sys.getenv("OPEN_SCIENCE_RUNTIME_DIR"), "blocked-fifo"); ' +
+            'fifo(target, open="w", blocking=FALSE)'
+        },
+        {
+          name: 'pipe',
+          path: join(request.runtimeRoot, 'blocked-pipe.txt'),
+          code:
+            'target <- file.path(Sys.getenv("OPEN_SCIENCE_RUNTIME_DIR"), "blocked-pipe.txt"); ' +
+            'pipe(paste("touch", shQuote(target)), open="r")'
+        }
+      ]
+
+      for (const testCase of cases) {
+        const result = await executor.execute({ ...request, code: testCase.code, language: 'r' })
+        expect(result.status, testCase.name).toBe('failed')
+        expect(result.traceback, testCase.name).toMatch(/manage_packages/)
+        expect(existsSync(testCase.path), testCase.name).toBe(false)
+      }
+    } finally {
+      await executor.shutdown()
+    }
+  })
+})
+
 gate('NotebookKernelExecutor idle-timeout shutdown', () => {
   it('drops an idle proc when the idle timer fires, and respawns fresh on the next execute', async () => {
     cwdDir = await makeDefaultEnvCwd('os-kernel-idle-')
@@ -469,6 +1045,7 @@ gate('NotebookKernelExecutor idle-timeout shutdown', () => {
     const executor = new NotebookKernelExecutor({
       pythonBin: python3,
       pythonLoopPath: FIXTURE,
+      platform: 'linux',
       idleTimeoutMs: 1_000,
       scheduleIdleTimer: h.schedule,
       cancelIdleTimer: h.cancel,
@@ -504,6 +1081,7 @@ gate('NotebookKernelExecutor idle-timeout shutdown', () => {
     const executor = new NotebookKernelExecutor({
       pythonBin: python3,
       pythonLoopPath: FIXTURE,
+      platform: 'linux',
       idleTimeoutMs: 1_000,
       scheduleIdleTimer: h.schedule,
       cancelIdleTimer: h.cancel
@@ -532,6 +1110,7 @@ gate('NotebookKernelExecutor idle-timeout shutdown', () => {
     const executor = new NotebookKernelExecutor({
       pythonBin: python3,
       pythonLoopPath: FIXTURE,
+      platform: 'linux',
       idleTimeoutMs: 1_000,
       scheduleIdleTimer: h.schedule,
       cancelIdleTimer: h.cancel,
@@ -552,9 +1131,11 @@ gate('NotebookKernelExecutor idle-timeout shutdown', () => {
         code: '__SLEEP__',
         timeoutMs: 300
       })
-      await new Promise((resolve) => setTimeout(resolve, 0))
+      await vi.waitFor(
+        () => expect(internals.procs.get(procKeyFor('python'))?.pending).toBeDefined(),
+        { timeout: 1_000, interval: 10 }
+      )
       const proc = internals.procs.get(procKeyFor('python'))
-      expect(proc?.pending).toBeDefined()
 
       // Directly invoke the idle-fire handler as if a stale timer raced past the disarm point:
       // handleIdleTimeout's own `pending` guard must refuse to drop a proc that is mid-request.
@@ -576,6 +1157,7 @@ gate('NotebookKernelExecutor idle-timeout shutdown', () => {
     const executor = new NotebookKernelExecutor({
       pythonBin: python3,
       pythonLoopPath: FIXTURE,
+      platform: 'linux',
       scheduleIdleTimer: h.schedule,
       cancelIdleTimer: h.cancel
     })
@@ -623,6 +1205,7 @@ gate('NotebookKernelExecutor named environments', () => {
     const executor = new NotebookKernelExecutor({
       pythonBin: python3,
       pythonLoopPath: FIXTURE,
+      platform: 'linux',
       idleTimeoutMs: 1_000,
       scheduleIdleTimer: h.schedule,
       cancelIdleTimer: h.cancel,
@@ -664,6 +1247,7 @@ gate('NotebookKernelExecutor named environments', () => {
     const executor = new NotebookKernelExecutor({
       pythonBin: python3,
       pythonLoopPath: FIXTURE,
+      platform: 'linux',
       onTerminated: (kind, env) => terminated.push([kind, env])
     })
     await executor.execute({ ...req, code: 'warm', environment: 'my-analysis' })
@@ -854,7 +1438,7 @@ const REPL_LOOP = join(__dirname, '../../../resources/notebook/repl_loop.js')
 describe('NotebookKernelExecutor repl kind (real repl_loop.js)', () => {
   it('spawns the repl loop via process.execPath and returns the mapped return value', async () => {
     cwdDir = await mkdtemp(join(tmpdir(), 'os-kernel-repl-'))
-    const executor = new NotebookKernelExecutor({ replLoopPath: REPL_LOOP })
+    const executor = new NotebookKernelExecutor({ replLoopPath: REPL_LOOP, platform: 'linux' })
     try {
       const result = await executor.execute({
         ...baseRequest(cwdDir),
@@ -877,6 +1461,47 @@ describe('NotebookKernelExecutor repl kind (real repl_loop.js)', () => {
       await executor.shutdown()
     }
   })
+
+  it.skipIf(process.platform === 'win32')(
+    'allows read-only child argv but blocks descriptor permission changes in the managed runtime',
+    async () => {
+      cwdDir = await mkdtemp(join(tmpdir(), 'os-kernel-repl-runtime-guard-'))
+      const request = baseRequest(cwdDir)
+      const descriptorPath = join(request.runtimeRoot, 'descriptor-mode-node.txt')
+      await mkdir(request.runtimeRoot, { recursive: true })
+      await writeFile(descriptorPath, 'unchanged', 'utf8')
+      await chmod(descriptorPath, 0o700)
+      const executor = new NotebookKernelExecutor({ replLoopPath: REPL_LOOP, platform: 'linux' })
+      try {
+        const echoResult = await executor.execute({
+          ...request,
+          code:
+            `const { execFileSync } = require('node:child_process'); ` +
+            `return execFileSync('echo', ['pip install pandas'], { encoding: 'utf8' }).trim()`,
+          kind: 'repl'
+        })
+        expect(echoResult.status, echoResult.traceback).toBe('completed')
+        expect(echoResult.outputs).toContainEqual({
+          type: 'display',
+          data: { 'text/plain': 'pip install pandas' }
+        })
+
+        const descriptorResult = await executor.execute({
+          ...request,
+          code:
+            `const fs = require('node:fs'); ` +
+            `const fd = fs.openSync(${JSON.stringify(descriptorPath)}, 'r'); ` +
+            `try { fs.fchmodSync(fd, 0o600) } finally { fs.closeSync(fd) }`,
+          kind: 'repl'
+        })
+        expect(descriptorResult.status).toBe('failed')
+        expect(descriptorResult.traceback).toMatch(/manage_packages/)
+        expect((await stat(descriptorPath)).mode & 0o777).toBe(0o700)
+      } finally {
+        await executor.shutdown()
+      }
+    }
+  )
 })
 
 // -- Readiness gate: no spawn, no python3 required. -------------------------------------------------

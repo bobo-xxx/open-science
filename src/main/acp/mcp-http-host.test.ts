@@ -1,4 +1,5 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -11,11 +12,19 @@ import { ArtifactRepository } from '../artifacts/repository'
 
 describe('AgentMcpHttpHost', () => {
   let host: AgentMcpHttpHost | undefined
+  let rpcServer: Server | undefined
   let root: string | undefined
 
   afterEach(async () => {
     await host?.close()
     host = undefined
+    if (rpcServer) {
+      rpcServer.closeAllConnections()
+      await new Promise<void>((resolve, reject) =>
+        rpcServer?.close((error) => (error ? reject(error) : resolve()))
+      )
+      rpcServer = undefined
+    }
 
     if (root) {
       await rm(root, { recursive: true, force: true })
@@ -72,6 +81,125 @@ describe('AgentMcpHttpHost', () => {
       runId
     })
     expect(files.map((file) => file.name)).toContain('note.txt')
+  })
+
+  it('accepts a JSON-stringified artifact source from an MCP model call', async () => {
+    root = await mkdtemp(join(tmpdir(), 'mcp-http-host-'))
+    const projectName = 'default-project'
+    const artifactSessionId = 'artifact-session-1'
+    const runId = 'artifact-run-1'
+    const currentRunFile = join(root, 'current-run.json')
+    await writeFile(currentRunFile, JSON.stringify({ runId }), 'utf8')
+
+    host = new AgentMcpHttpHost()
+    const { token } = await host.ensureStarted()
+    host.registerArtifact(artifactSessionId, {
+      storageRoot: root,
+      projectName,
+      sessionId: artifactSessionId,
+      currentRunFile,
+      allowedImportRoots: [root]
+    })
+
+    const client = new Client({ name: 'test-client', version: '0.0.0' })
+    const transport = new StreamableHTTPClientTransport(
+      new URL(host.urlFor('artifact', artifactSessionId)),
+      { requestInit: { headers: { authorization: `Bearer ${token}` } } }
+    )
+    await client.connect(transport)
+
+    const result = await client.callTool({
+      name: 'write_artifact_file',
+      arguments: {
+        filename: 'report.md',
+        mimeType: 'text/markdown',
+        source: JSON.stringify({ kind: 'inline', content: '# Report' })
+      }
+    })
+    expect(JSON.stringify(result.content)).toContain('report.md')
+
+    await client.close()
+
+    const files = await new ArtifactRepository(root).listPendingRunFiles({
+      projectName,
+      sessionId: artifactSessionId,
+      runId
+    })
+    expect(files.map((file) => file.name)).toContain('report.md')
+  })
+
+  it('serves the conversation Skill import tool over http', async () => {
+    const routingId = 'skill-import-session-1'
+    const rpcRequest: { authorization?: string; body?: unknown } = {}
+    rpcServer = createServer((request, response) => {
+      void (async () => {
+        const chunks: Buffer[] = []
+        for await (const chunk of request) {
+          chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk)
+        }
+        rpcRequest.authorization = request.headers.authorization
+        rpcRequest.body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown
+        response.writeHead(200, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ result: { status: 'cancelled', skills: [] } }))
+      })()
+    })
+    await new Promise<void>((resolve, reject) => {
+      rpcServer?.once('error', reject)
+      rpcServer?.listen(0, '127.0.0.1', resolve)
+    })
+    const rpcAddress = rpcServer.address()
+    if (typeof rpcAddress !== 'object' || rpcAddress === null) {
+      throw new Error('Test Skill RPC server did not return a TCP address.')
+    }
+
+    host = new AgentMcpHttpHost()
+    const { token } = await host.ensureStarted()
+    host.registerSkillImport(routingId, {
+      endpoint: `http://127.0.0.1:${rpcAddress.port}/skill-import`,
+      token: 'rpc-token',
+      sessionId: routingId
+    })
+
+    const client = new Client({ name: 'test-client', version: '0.0.0' })
+    const skillImportUrl = host.urlFor('skill-import', routingId)
+    const transport = new StreamableHTTPClientTransport(new URL(skillImportUrl), {
+      requestInit: { headers: { authorization: `Bearer ${token}` } }
+    })
+    await client.connect(transport)
+
+    const tools = await client.listTools()
+    expect(tools.tools.map((tool) => tool.name)).toContain('request_skill_import')
+
+    const result = await client.callTool({
+      name: 'request_skill_import',
+      arguments: {
+        github_url: 'https://github.com/acme/skills/tree/main/slide-master'
+      }
+    })
+    expect(JSON.stringify(result.content)).toContain('cancelled')
+    expect(rpcRequest).toEqual({
+      authorization: 'Bearer rpc-token',
+      body: {
+        method: 'skillImport',
+        params: {
+          sessionId: routingId,
+          githubUrl: 'https://github.com/acme/skills/tree/main/slide-master'
+        }
+      }
+    })
+
+    await client.close()
+
+    host.unregister(routingId)
+    const removed = await fetch(skillImportUrl, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json'
+      },
+      body: '{}'
+    })
+    expect(removed.status).toBe(404)
   })
 
   it('rejects requests without the bearer token', async () => {

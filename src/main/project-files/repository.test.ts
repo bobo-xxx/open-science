@@ -1,10 +1,15 @@
+import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, relative, sep } from 'node:path'
 
-import type { PrismaClient } from '@prisma/client'
+import type { Prisma, PrismaClient } from '@prisma/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import {
+  createLinearConversationGraph,
+  forkEditedConversationMessage
+} from '../../shared/conversation-graph'
 import type { PersistedChatSession } from '../../shared/session-persistence'
 import { PENDING_UPLOAD_SESSION_ID } from '../../shared/uploads'
 import { createProjectDbClient, ensureProjectSchema } from '../projects/prisma-client'
@@ -12,6 +17,9 @@ import { createManagedFileIndexRepository, ManagedFileIndexRepository } from './
 
 const PROJECT_ID = 'project-a'
 const SESSION_ID = 'session-a'
+
+const storageKey = (storageRoot: string, path: string): string =>
+  relative(storageRoot, path).split(sep).join('/')
 
 const createSession = (overrides: Partial<PersistedChatSession> = {}): PersistedChatSession => ({
   id: SESSION_ID,
@@ -36,12 +44,12 @@ describe('ManagedFileIndexRepository', () => {
     client = createProjectDbClient(storageRoot)
     await ensureProjectSchema(client)
     repository = new ManagedFileIndexRepository(() => Promise.resolve(client), storageRoot)
-  })
+  }, 30_000)
 
   afterEach(async () => {
     await client.$disconnect()
     await rm(storageRoot, { recursive: true, force: true })
-  })
+  }, 30_000)
 
   it('indexes uploads and all finalized managed artifacts without requiring a message link', async () => {
     const uploadPath = join(storageRoot, 'uploads', 'default-project', SESSION_ID, 'input.csv')
@@ -157,6 +165,20 @@ describe('ManagedFileIndexRepository', () => {
       ])
     )
 
+    const allFiles = await repository.listFiles({
+      projectId: PROJECT_ID,
+      collection: { kind: 'all' },
+      limit: 24
+    })
+    expect(allFiles.totalCount).toBe(3)
+    expect(allFiles.items).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ source: 'upload', sourceFileId: 'upload-1' }),
+        expect.objectContaining({ source: 'artifact', sourceFileId: 'artifact-linked' }),
+        expect.objectContaining({ source: 'artifact', sourceFileId: 'artifact-orphan' })
+      ])
+    )
+
     await expect(
       repository.listArtifactGroups({ projectId: PROJECT_ID, limit: 10 })
     ).resolves.toEqual({
@@ -164,6 +186,586 @@ describe('ManagedFileIndexRepository', () => {
       totalCount: 1,
       nextCursor: undefined
     })
+  })
+
+  it('projects the latest finalized Artifact Version instead of a stale Session descriptor', async () => {
+    const lineageId = 'artifact-lineage-latest'
+    const versionOneId = 'artifact-version-stale'
+    const versionTwoId = 'artifact-version-latest'
+    const versionOnePath = join(
+      storageRoot,
+      'artifacts',
+      PROJECT_ID,
+      SESSION_ID,
+      lineageId,
+      'versions',
+      versionOneId,
+      'content'
+    )
+    const versionTwoPath = join(
+      storageRoot,
+      'artifacts',
+      PROJECT_ID,
+      SESSION_ID,
+      lineageId,
+      'versions',
+      versionTwoId,
+      'content'
+    )
+    await Promise.all([
+      writeManagedFile(versionOnePath, 'old image'),
+      writeManagedFile(versionTwoPath, 'latest image')
+    ])
+    await client.fileOriginSession.create({
+      data: { projectId: PROJECT_ID, sessionId: SESSION_ID }
+    })
+    await client.artifactLineage.create({
+      data: {
+        id: lineageId,
+        projectId: PROJECT_ID,
+        sessionId: SESSION_ID,
+        normalizedFilename: 'sin.png',
+        filename: 'sin.png'
+      }
+    })
+    const createVersionData = (
+      id: string,
+      versionNumber: number,
+      contentPath: string,
+      messageId: string,
+      checksumCharacter: string
+    ): Prisma.ArtifactVersionUncheckedCreateInput => ({
+      id,
+      artifactId: lineageId,
+      versionNumber,
+      filename: 'sin.png',
+      artifactRunId: `artifact-run-${versionNumber}`,
+      writeOperationId: `write-${versionNumber}`,
+      writeRequestChecksum: checksumCharacter.repeat(64),
+      rootFrameId: 'root-frame-1',
+      agentFrameId: 'agent-frame-1',
+      messageBranchId: 'branch-1',
+      runtimeSegmentId: 'runtime-segment-1',
+      promptMessageId: `prompt-${versionNumber}`,
+      messageId,
+      state: 'finalized',
+      contentStorageKey: storageKey(storageRoot, contentPath),
+      evidenceStorageKey: `artifacts/${PROJECT_ID}/${SESSION_ID}/.provenance/${lineageId}/versions/${id}/evidence.json`,
+      contentType: 'image/png',
+      sizeBytes: BigInt(versionNumber === 1 ? 9 : 12),
+      checksum: checksumCharacter.repeat(64),
+      evidenceJson: '{"schema_version":1}',
+      evidenceChecksum: checksumCharacter.toUpperCase().repeat(64),
+      createdAt: new Date(`2026-07-28T00:00:0${versionNumber}.000Z`)
+    })
+    await client.artifactVersion.create({
+      data: createVersionData(versionOneId, 1, versionOnePath, 'message-v1', 'a')
+    })
+
+    // Session metadata can lag the independently committed Version catalog until the next save.
+    const staleSession = createSession({
+      artifacts: [
+        {
+          id: versionOneId,
+          artifactId: lineageId,
+          versionId: versionOneId,
+          versionNumber: 1,
+          kind: 'managed-file',
+          path: versionOnePath,
+          name: 'sin.png',
+          mimeType: 'image/png',
+          size: 9,
+          mtimeMs: 1_710_000_000_100
+        }
+      ]
+    })
+    await repository.syncSession(staleSession)
+    await client.artifactVersion.create({
+      data: createVersionData(versionTwoId, 2, versionTwoPath, 'message-v2', 'b')
+    })
+    await expect(repository.syncSession(staleSession)).resolves.toContain('artifact')
+
+    await expect(
+      repository.listFiles({
+        projectId: PROJECT_ID,
+        collection: { kind: 'sessionArtifacts', sessionId: SESSION_ID },
+        limit: 10
+      })
+    ).resolves.toMatchObject({
+      totalCount: 1,
+      items: [
+        {
+          sourceFileId: lineageId,
+          sourceVersionId: versionTwoId,
+          messageId: 'message-v2',
+          name: 'sin.png',
+          path: `artifact-version:${PROJECT_ID}/${SESSION_ID}/${lineageId}/${versionTwoId}`,
+          checksum: 'b'.repeat(64),
+          size: 12
+        }
+      ]
+    })
+    await expect(
+      repository.searchArtifacts({
+        primaryProjectId: PROJECT_ID,
+        otherProjectIds: [],
+        filenameContains: 'sin.png',
+        primaryLimit: 8,
+        otherLimit: 0
+      })
+    ).resolves.toMatchObject({
+      primary: {
+        items: [
+          {
+            sourceFileId: lineageId,
+            sourceVersionId: versionTwoId,
+            sortAtMs: new Date('2026-07-28T00:00:02.000Z').getTime()
+          }
+        ]
+      }
+    })
+  })
+
+  it('exposes immutable uploads as project-and-session-scoped Version references', async () => {
+    const uploadPath = join(
+      storageRoot,
+      'uploads',
+      PROJECT_ID,
+      SESSION_ID,
+      'upload-1',
+      'versions',
+      'upload-version-1',
+      'content'
+    )
+    const content = 'a,b\n1,2'
+    await writeManagedFile(uploadPath, content)
+    await client.fileOriginSession.create({
+      data: { projectId: PROJECT_ID, sessionId: SESSION_ID }
+    })
+    await client.uploadFile.create({
+      data: {
+        id: 'upload-1',
+        projectId: PROJECT_ID,
+        sessionId: SESSION_ID,
+        filename: 'input.csv',
+        originalFilename: 'samples.csv',
+        versions: {
+          create: {
+            id: 'upload-version-1',
+            versionNumber: 1,
+            state: 'ready',
+            contentStorageKey: storageKey(storageRoot, uploadPath),
+            filename: 'input.csv',
+            originalFilename: 'samples.csv',
+            contentType: 'text/csv',
+            sizeBytes: BigInt(Buffer.byteLength(content)),
+            checksum: createHash('sha256').update(content).digest('hex')
+          }
+        }
+      }
+    })
+    await repository.syncSession(
+      createSession({
+        messages: [
+          {
+            id: 'message-user',
+            role: 'user',
+            content: 'Analyze',
+            status: 'complete',
+            eventIds: [],
+            uploads: [
+              {
+                id: 'upload-1',
+                versionId: 'upload-version-1',
+                versionNumber: 1,
+                sessionId: SESSION_ID,
+                name: 'input.csv',
+                originalName: 'samples.csv',
+                size: Buffer.byteLength(content)
+              }
+            ],
+            createdAt: 1_710_000_000_100,
+            updatedAt: 1_710_000_000_200
+          }
+        ]
+      })
+    )
+
+    await expect(
+      repository.listFiles({
+        projectId: PROJECT_ID,
+        collection: { kind: 'uploads' },
+        limit: 24
+      })
+    ).resolves.toMatchObject({
+      items: [
+        expect.objectContaining({
+          path: `upload-version:${PROJECT_ID}/${SESSION_ID}/upload-version-1`
+        })
+      ]
+    })
+  })
+
+  it('repairs a native Upload projection that copied the referencing Session scope', async () => {
+    const sourceSessionId = 'session-source'
+    const uploadId = 'upload-cross-session'
+    const versionId = 'upload-version-cross-session'
+    const uploadPath = join(
+      storageRoot,
+      'uploads',
+      PROJECT_ID,
+      sourceSessionId,
+      uploadId,
+      'versions',
+      versionId,
+      'content'
+    )
+    const content = 'sample,value\na,1'
+    await writeManagedFile(uploadPath, content)
+    await client.fileOriginSession.create({
+      data: { projectId: PROJECT_ID, sessionId: sourceSessionId }
+    })
+    await client.uploadFile.create({
+      data: {
+        id: uploadId,
+        projectId: PROJECT_ID,
+        sessionId: sourceSessionId,
+        filename: 'source.csv',
+        originalFilename: 'source.csv',
+        versions: {
+          create: {
+            id: versionId,
+            versionNumber: 1,
+            state: 'ready',
+            contentStorageKey: storageKey(storageRoot, uploadPath),
+            filename: 'source.csv',
+            originalFilename: 'source.csv',
+            contentType: 'text/csv',
+            sizeBytes: BigInt(Buffer.byteLength(content)),
+            checksum: createHash('sha256').update(content).digest('hex')
+          }
+        }
+      }
+    })
+    await client.managedFile.create({
+      data: {
+        source: 'upload',
+        sourceFileId: uploadId,
+        sourceVersionId: versionId,
+        projectId: PROJECT_ID,
+        // This is the stale pre-repair state: the row copied the Session containing the @ reference.
+        sessionId: SESSION_ID,
+        displayName: 'source.csv',
+        storageKey: storageKey(storageRoot, uploadPath),
+        mimeType: 'text/csv',
+        sizeBytes: BigInt(Buffer.byteLength(content)),
+        sortAtMs: 1_710_000_000_200n
+      }
+    })
+    await client.managedFileSessionSync.create({
+      data: {
+        projectId: PROJECT_ID,
+        sessionId: SESSION_ID,
+        filesRevision: 1,
+        groupSortAtMs: 1_710_000_001_000n,
+        uploadCount: 1
+      }
+    })
+    const referencingSession = createSession({
+      messages: [
+        {
+          id: 'message-reference',
+          role: 'user',
+          content: 'Use the source upload',
+          status: 'complete',
+          eventIds: [],
+          uploads: [
+            {
+              id: uploadId,
+              versionId,
+              versionNumber: 1,
+              sessionId: sourceSessionId,
+              name: 'source.csv',
+              originalName: 'source.csv',
+              mimeType: 'text/csv',
+              size: Buffer.byteLength(content)
+            }
+          ],
+          createdAt: 1_710_000_000_100,
+          updatedAt: 1_710_000_000_200
+        }
+      ]
+    })
+
+    await expect(repository.syncSession(referencingSession)).resolves.toContain('upload')
+    await expect(
+      client.managedFileSessionSync.findUnique({
+        where: { projectId_sessionId: { projectId: PROJECT_ID, sessionId: SESSION_ID } }
+      })
+    ).resolves.toMatchObject({ uploadCount: 0 })
+    await expect(
+      repository.listFiles({
+        projectId: PROJECT_ID,
+        collection: { kind: 'uploads' },
+        limit: 10
+      })
+    ).resolves.toMatchObject({
+      items: [
+        {
+          sourceFileId: uploadId,
+          sourceVersionId: versionId,
+          sessionId: sourceSessionId,
+          path: `upload-version:${PROJECT_ID}/${sourceSessionId}/${versionId}`
+        }
+      ]
+    })
+  })
+
+  it('repairs a legacy Upload projection that copied the referencing Session scope', async () => {
+    const sourceSessionId = 'session-source-legacy'
+    const uploadId = 'upload-cross-session-legacy'
+    const uploadPath = join(
+      storageRoot,
+      'uploads',
+      'default-project',
+      sourceSessionId,
+      'reference.pdf'
+    )
+    const content = 'legacy pdf bytes'
+    await writeManagedFile(uploadPath, content)
+    await client.managedFile.create({
+      data: {
+        source: 'upload',
+        sourceFileId: uploadId,
+        projectId: PROJECT_ID,
+        // This is the stale pre-repair state: the row copied the Session containing the @ reference.
+        sessionId: SESSION_ID,
+        displayName: 'reference.pdf',
+        storageKey: storageKey(storageRoot, uploadPath),
+        mimeType: 'application/pdf',
+        sizeBytes: BigInt(Buffer.byteLength(content)),
+        sortAtMs: 1_710_000_000_200n
+      }
+    })
+    await client.managedFileSessionSync.create({
+      data: {
+        projectId: PROJECT_ID,
+        sessionId: SESSION_ID,
+        filesRevision: 1,
+        groupSortAtMs: 1_710_000_001_000n,
+        uploadCount: 1
+      }
+    })
+    const referencingSession = createSession({
+      messages: [
+        {
+          id: 'message-reference-legacy',
+          role: 'user',
+          content: 'Use the source PDF',
+          status: 'complete',
+          eventIds: [],
+          uploads: [
+            {
+              id: uploadId,
+              sessionId: sourceSessionId,
+              name: 'reference.pdf',
+              originalName: 'reference.pdf',
+              path: uploadPath,
+              mimeType: 'application/pdf',
+              size: Buffer.byteLength(content)
+            }
+          ],
+          createdAt: 1_710_000_000_100,
+          updatedAt: 1_710_000_000_200
+        }
+      ]
+    })
+
+    await expect(repository.syncSession(referencingSession)).resolves.toContain('upload')
+    await expect(
+      client.managedFileSessionSync.findUnique({
+        where: { projectId_sessionId: { projectId: PROJECT_ID, sessionId: SESSION_ID } }
+      })
+    ).resolves.toMatchObject({ uploadCount: 0 })
+    await expect(
+      repository.listFiles({
+        projectId: PROJECT_ID,
+        collection: { kind: 'uploads' },
+        limit: 10
+      })
+    ).resolves.toMatchObject({
+      items: [
+        {
+          sourceFileId: uploadId,
+          sourceVersionId: undefined,
+          sessionId: sourceSessionId,
+          path: uploadPath
+        }
+      ]
+    })
+  })
+
+  it('keeps file Versions visible after their Message Branch becomes inactive', async () => {
+    const uploadPath = join(
+      storageRoot,
+      'uploads',
+      PROJECT_ID,
+      SESSION_ID,
+      'upload-inactive',
+      'versions',
+      'upload-version-inactive',
+      'content'
+    )
+    const artifactPath = join(
+      storageRoot,
+      'artifacts',
+      PROJECT_ID,
+      SESSION_ID,
+      'artifact-lineage-inactive',
+      'versions',
+      'artifact-version-inactive',
+      'content'
+    )
+    const content = 'sample,value\na,1'
+    await Promise.all([
+      writeManagedFile(uploadPath, content),
+      writeManagedFile(artifactPath, 'inactive artifact')
+    ])
+    await client.fileOriginSession.create({
+      data: { projectId: PROJECT_ID, sessionId: SESSION_ID }
+    })
+    await client.uploadFile.create({
+      data: {
+        id: 'upload-inactive',
+        projectId: PROJECT_ID,
+        sessionId: SESSION_ID,
+        filename: 'inactive.csv',
+        originalFilename: 'inactive.csv',
+        versions: {
+          create: {
+            id: 'upload-version-inactive',
+            versionNumber: 1,
+            state: 'ready',
+            contentStorageKey: storageKey(storageRoot, uploadPath),
+            filename: 'inactive.csv',
+            originalFilename: 'inactive.csv',
+            contentType: 'text/csv',
+            sizeBytes: BigInt(Buffer.byteLength(content)),
+            checksum: createHash('sha256').update(content).digest('hex')
+          }
+        }
+      }
+    })
+    const inactiveMessage = {
+      id: 'message-inactive-upload',
+      role: 'user' as const,
+      content: 'Analyze the upload',
+      status: 'complete' as const,
+      eventIds: [],
+      artifactIds: ['artifact-version-inactive'],
+      uploads: [
+        {
+          id: 'upload-inactive',
+          sessionId: SESSION_ID,
+          name: 'inactive.csv',
+          originalName: 'inactive.csv',
+          mimeType: 'text/csv',
+          size: Buffer.byteLength(content),
+          versionId: 'upload-version-inactive'
+        }
+      ],
+      createdAt: 1_710_000_000_100,
+      updatedAt: 1_710_000_000_200
+    }
+    const originalGraph = createLinearConversationGraph({
+      sessionId: SESSION_ID,
+      messages: [inactiveMessage],
+      createdAt: 1_710_000_000_000,
+      updatedAt: 1_710_000_000_200
+    })
+    const activeGraph = forkEditedConversationMessage(
+      originalGraph,
+      inactiveMessage.id,
+      'message-branch-active',
+      1_710_000_000_300
+    )
+    await client.artifactLineage.create({
+      data: {
+        id: 'artifact-lineage-inactive',
+        projectId: PROJECT_ID,
+        sessionId: SESSION_ID,
+        normalizedFilename: 'inactive-result.txt',
+        filename: 'inactive-result.txt'
+      }
+    })
+    await client.artifactVersion.create({
+      data: {
+        id: 'artifact-version-inactive',
+        artifactId: 'artifact-lineage-inactive',
+        versionNumber: 1,
+        filename: 'inactive-result.txt',
+        artifactRunId: 'artifact-run-inactive',
+        writeOperationId: 'write-inactive',
+        writeRequestChecksum: 'a'.repeat(64),
+        rootFrameId: 'root-frame-inactive',
+        agentFrameId: 'agent-frame-inactive',
+        messageBranchId: activeGraph.frames[0].activeBranchId,
+        runtimeSegmentId: 'runtime-segment-inactive',
+        promptMessageId: inactiveMessage.id,
+        messageId: inactiveMessage.id,
+        state: 'finalized',
+        contentStorageKey: storageKey(storageRoot, artifactPath),
+        evidenceStorageKey:
+          'artifacts/project-a/session-a/.provenance/artifact-lineage-inactive/versions/artifact-version-inactive/evidence.json',
+        contentType: 'text/plain',
+        sizeBytes: BigInt(Buffer.byteLength('inactive artifact')),
+        checksum: createHash('sha256').update('inactive artifact').digest('hex'),
+        evidenceJson: '{"schema_version":1}',
+        evidenceChecksum: 'b'.repeat(64)
+      }
+    })
+
+    await repository.syncSession(
+      createSession({
+        messages: [],
+        conversationGraph: activeGraph,
+        artifacts: [
+          {
+            id: 'artifact-version-inactive',
+            artifactId: 'artifact-lineage-inactive',
+            versionId: 'artifact-version-inactive',
+            versionNumber: 1,
+            kind: 'managed-file',
+            path: artifactPath,
+            name: 'inactive-result.txt',
+            mimeType: 'text/plain'
+          }
+        ],
+        filesRevision: 2
+      })
+    )
+
+    const files = await repository.listFiles({
+      projectId: PROJECT_ID,
+      collection: { kind: 'all' },
+      limit: 24
+    })
+    expect(files.items).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          source: 'upload',
+          sourceVersionId: 'upload-version-inactive',
+          name: 'inactive.csv'
+        }),
+        expect.objectContaining({
+          source: 'artifact',
+          sourceFileId: 'artifact-lineage-inactive',
+          sourceVersionId: 'artifact-version-inactive',
+          name: 'inactive-result.txt'
+        })
+      ])
+    )
+    expect(files.totalCount).toBe(2)
   })
 
   it('keeps the SQLite config root separate from the relocatable data root', async () => {
@@ -786,6 +1388,47 @@ describe('ManagedFileIndexRepository', () => {
     ).rejects.toThrow(/cursor.*collection/i)
   })
 
+  it('paginates the flat picker collection and binds its cursor to that collection', async () => {
+    const artifacts = await Promise.all(
+      ['a', 'b', 'c'].map(async (id) => {
+        const path = join(
+          storageRoot,
+          'artifacts',
+          'default-project',
+          SESSION_ID,
+          'message-1',
+          `${id}.txt`
+        )
+        await writeManagedFile(path, id)
+        return { id, kind: 'managed-file' as const, path, name: `${id}.txt`, mtimeMs: 100 }
+      })
+    )
+    await repository.syncSession(createSession({ artifacts }))
+
+    const first = await repository.listFiles({
+      projectId: PROJECT_ID,
+      collection: { kind: 'all' },
+      limit: 2
+    })
+    const second = await repository.listFiles({
+      projectId: PROJECT_ID,
+      collection: { kind: 'all' },
+      cursor: first.nextCursor,
+      limit: 2
+    })
+
+    expect(first.nextCursor).toBeDefined()
+    expect(new Set([...first.items, ...second.items].map((file) => file.id)).size).toBe(3)
+    await expect(
+      repository.listFiles({
+        projectId: PROJECT_ID,
+        collection: { kind: 'sessionArtifacts', sessionId: SESSION_ID },
+        cursor: first.nextCursor,
+        limit: 2
+      })
+    ).rejects.toThrow(/cursor.*collection/i)
+  })
+
   it('paginates artifact session groups with a separate cursor', async () => {
     for (const sessionId of ['session-a', 'session-b']) {
       const path = join(
@@ -825,6 +1468,351 @@ describe('ManagedFileIndexRepository', () => {
     expect(new Set([...first.items, ...second.items].map((group) => group.sessionId))).toEqual(
       new Set(['session-a', 'session-b'])
     )
+  })
+
+  it('loads all search overview counts with one database query', async () => {
+    const queryRaw = vi.spyOn(client, '$queryRaw')
+
+    await expect(
+      repository.getOverview({
+        projectId: PROJECT_ID,
+        search: { filenameContains: 'impact' }
+      })
+    ).resolves.toEqual({
+      totalCount: 0,
+      uploadCount: 0,
+      artifactCount: 0,
+      artifactGroupCount: 0,
+      isIndexComplete: true
+    })
+    expect(queryRaw).toHaveBeenCalledTimes(1)
+  })
+
+  it('searches filenames across independent collections and binds cursors to the query', async () => {
+    const uploadPath = join(
+      storageRoot,
+      'uploads',
+      'default-project',
+      SESSION_ID,
+      'impact-input.csv'
+    )
+    const sessionAFiles = [
+      ['impact-a', 'Impact_Timeline.csv'],
+      ['impact-b', 'impact_notes.txt'],
+      ['literal', '%_literal.txt'],
+      ['unicode', 'École.txt'],
+      ['other', 'summary.txt']
+    ] as const
+    const sessionBPath = join(
+      storageRoot,
+      'artifacts',
+      'default-project',
+      'session-b',
+      'message-1',
+      'IMPACT_chart.png'
+    )
+    await Promise.all([
+      writeManagedFile(uploadPath, 'a,b'),
+      writeManagedFile(sessionBPath, 'chart'),
+      ...sessionAFiles.map(([id, name]) =>
+        writeManagedFile(
+          join(
+            storageRoot,
+            'artifacts',
+            'default-project',
+            SESSION_ID,
+            'message-1',
+            `${id}-${name}`
+          ),
+          id
+        )
+      )
+    ])
+    await repository.syncSession(
+      createSession({
+        messages: [
+          {
+            id: 'message-user',
+            role: 'user',
+            content: 'Analyze',
+            status: 'complete',
+            eventIds: [],
+            uploads: [
+              {
+                id: 'upload-impact',
+                sessionId: SESSION_ID,
+                name: 'impact-input.csv',
+                originalName: 'Impact_Input.csv',
+                path: uploadPath,
+                size: 3
+              }
+            ],
+            createdAt: 100,
+            updatedAt: 200
+          }
+        ],
+        artifacts: sessionAFiles.map(([id, name]) => ({
+          id,
+          kind: 'managed-file' as const,
+          path: join(
+            storageRoot,
+            'artifacts',
+            'default-project',
+            SESSION_ID,
+            'message-1',
+            `${id}-${name}`
+          ),
+          name,
+          mtimeMs: 100
+        }))
+      })
+    )
+    await repository.syncSession(
+      createSession({
+        id: 'session-b',
+        artifacts: [
+          {
+            id: 'impact-chart',
+            kind: 'managed-file',
+            path: sessionBPath,
+            name: 'IMPACT_chart.png',
+            mtimeMs: 100
+          }
+        ]
+      })
+    )
+
+    const search = { filenameContains: '  ImPaCt  ' }
+    await expect(repository.getOverview({ projectId: PROJECT_ID, search })).resolves.toEqual({
+      totalCount: 4,
+      uploadCount: 1,
+      artifactCount: 3,
+      artifactGroupCount: 2,
+      isIndexComplete: true
+    })
+    const allMatches = await repository.listFiles({
+      projectId: PROJECT_ID,
+      collection: { kind: 'all' },
+      search,
+      limit: 10
+    })
+    expect(allMatches.totalCount).toBe(4)
+    expect(new Set(allMatches.items.map((file) => file.source))).toEqual(
+      new Set(['artifact', 'upload'])
+    )
+    await expect(
+      repository.listFiles({
+        projectId: PROJECT_ID,
+        collection: { kind: 'uploads' },
+        search,
+        limit: 10
+      })
+    ).resolves.toMatchObject({
+      items: [expect.objectContaining({ name: 'Impact_Input.csv' })],
+      totalCount: 1
+    })
+    const groups = await repository.listArtifactGroups({
+      projectId: PROJECT_ID,
+      search,
+      limit: 10
+    })
+    expect(groups.totalCount).toBe(2)
+    expect(new Map(groups.items.map((group) => [group.sessionId, group.artifactCount]))).toEqual(
+      new Map([
+        ['session-a', 2],
+        ['session-b', 1]
+      ])
+    )
+
+    const first = await repository.listFiles({
+      projectId: PROJECT_ID,
+      collection: { kind: 'sessionArtifacts', sessionId: SESSION_ID },
+      search,
+      limit: 1
+    })
+    expect(first.totalCount).toBe(2)
+    expect(first.nextCursor).toBeDefined()
+    await expect(
+      repository.listFiles({
+        projectId: PROJECT_ID,
+        collection: { kind: 'sessionArtifacts', sessionId: SESSION_ID },
+        search: { filenameContains: 'summary' },
+        cursor: first.nextCursor,
+        limit: 1
+      })
+    ).rejects.toThrow(/cursor.*search/i)
+
+    await expect(
+      repository.listFiles({
+        projectId: PROJECT_ID,
+        collection: { kind: 'sessionArtifacts', sessionId: SESSION_ID },
+        search: { filenameContains: '%_' },
+        limit: 10
+      })
+    ).resolves.toMatchObject({
+      items: [expect.objectContaining({ name: '%_literal.txt' })],
+      totalCount: 1
+    })
+
+    await expect(
+      repository.listFiles({
+        projectId: PROJECT_ID,
+        collection: { kind: 'sessionArtifacts', sessionId: SESSION_ID },
+        search: { filenameContains: 'école' },
+        limit: 10
+      })
+    ).resolves.toMatchObject({ items: [], totalCount: 0 })
+    await expect(
+      repository.listFiles({
+        projectId: PROJECT_ID,
+        collection: { kind: 'sessionArtifacts', sessionId: SESSION_ID },
+        search: { filenameContains: 'ÉCOLE' },
+        limit: 10
+      })
+    ).resolves.toMatchObject({
+      items: [expect.objectContaining({ name: 'École.txt' })],
+      totalCount: 1
+    })
+
+    const groupFirst = await repository.listArtifactGroups({
+      projectId: PROJECT_ID,
+      search,
+      limit: 1
+    })
+    await expect(
+      repository.listArtifactGroups({
+        projectId: PROJECT_ID,
+        search: { filenameContains: 'summary' },
+        cursor: groupFirst.nextCursor,
+        limit: 1
+      })
+    ).rejects.toThrow(/cursor.*search/i)
+  })
+
+  it('searches generated artifacts with a primary cursor and one combined other-project result', async () => {
+    const primaryFiles = [
+      ['sin-old', 'sin-old.png', 100],
+      ['sin-new', 'sin-new.png', 300],
+      ['sin-mid', 'sin-mid.csv', 200]
+    ] as const
+    const otherPath = join(
+      storageRoot,
+      'artifacts',
+      'project-b',
+      'session-b',
+      'message-1',
+      'sin-other.png'
+    )
+    const uploadPath = join(storageRoot, 'uploads', 'default-project', SESSION_ID, 'sin-input.csv')
+
+    await Promise.all([
+      ...primaryFiles.map(([id, name]) =>
+        writeManagedFile(
+          join(
+            storageRoot,
+            'artifacts',
+            'default-project',
+            SESSION_ID,
+            'message-1',
+            `${id}-${name}`
+          ),
+          id
+        )
+      ),
+      writeManagedFile(otherPath, 'other'),
+      writeManagedFile(uploadPath, 'upload')
+    ])
+    await repository.syncSession(
+      createSession({
+        messages: [
+          {
+            id: 'message-user',
+            role: 'user',
+            content: 'Analyze',
+            status: 'complete',
+            eventIds: [],
+            uploads: [
+              {
+                id: 'sin-upload',
+                sessionId: SESSION_ID,
+                name: 'sin-input.csv',
+                originalName: 'sin-input.csv',
+                path: uploadPath,
+                size: 6
+              }
+            ],
+            createdAt: 50,
+            updatedAt: 50
+          }
+        ],
+        artifacts: primaryFiles.map(([id, name, mtimeMs]) => ({
+          id,
+          kind: 'managed-file' as const,
+          path: join(
+            storageRoot,
+            'artifacts',
+            'default-project',
+            SESSION_ID,
+            'message-1',
+            `${id}-${name}`
+          ),
+          name,
+          mtimeMs
+        }))
+      })
+    )
+    await repository.syncSession(
+      createSession({
+        id: 'session-b',
+        projectId: 'project-b',
+        artifacts: [
+          {
+            id: 'sin-other',
+            kind: 'managed-file',
+            path: otherPath,
+            name: 'sin-other.png',
+            mtimeMs: 400
+          }
+        ]
+      })
+    )
+
+    const first = await repository.searchArtifacts({
+      primaryProjectId: PROJECT_ID,
+      otherProjectIds: ['project-b'],
+      filenameContains: 'SIN',
+      primaryLimit: 2,
+      otherLimit: 1
+    })
+
+    expect(first.primary).toMatchObject({
+      totalCount: 3,
+      items: [
+        expect.objectContaining({ name: 'sin-new.png', source: 'artifact' }),
+        expect.objectContaining({ name: 'sin-mid.csv', source: 'artifact' })
+      ]
+    })
+    expect(first.primary.nextCursor).toBeDefined()
+    expect(first.other).toEqual([expect.objectContaining({ name: 'sin-other.png' })])
+    expect(first.isIndexComplete).toBe(true)
+
+    await expect(
+      repository.searchArtifacts({
+        primaryProjectId: PROJECT_ID,
+        otherProjectIds: ['project-b'],
+        filenameContains: 'sin',
+        primaryLimit: 2,
+        primaryCursor: first.primary.nextCursor,
+        otherLimit: 0
+      })
+    ).resolves.toMatchObject({
+      primary: {
+        totalCount: 3,
+        items: [expect.objectContaining({ name: 'sin-old.png' })],
+        nextCursor: undefined
+      },
+      other: []
+    })
   })
 
   it('indexes readable files while retrying an unreadable file from the same session', async () => {
@@ -952,6 +1940,127 @@ describe('ManagedFileIndexRepository', () => {
     await repository.reconcileActiveSessions([])
 
     await expect(repository.getOverview(PROJECT_ID)).resolves.toMatchObject({ totalCount: 0 })
+  })
+
+  it('keeps native Artifact projections visible after the origin Session is deleted', async () => {
+    const artifactPath = join(
+      storageRoot,
+      'artifacts',
+      'default-project',
+      SESSION_ID,
+      'message-1',
+      'result.txt'
+    )
+    await writeManagedFile(artifactPath, 'result')
+    await repository.syncSession(
+      createSession({
+        title: 'Retained analysis',
+        artifacts: [
+          {
+            id: 'artifact-version-1',
+            artifactId: 'artifact-lineage-1',
+            versionId: 'artifact-version-1',
+            versionNumber: 1,
+            kind: 'managed-file',
+            path: artifactPath,
+            name: 'result.txt',
+            sha256: 'a'.repeat(64)
+          }
+        ]
+      })
+    )
+    await client.fileOriginSession.create({
+      data: {
+        projectId: PROJECT_ID,
+        sessionId: SESSION_ID,
+        titleSnapshot: 'Retained analysis',
+        state: 'deleted',
+        deletedAt: new Date('2026-07-27T12:00:00.000Z')
+      }
+    })
+    await client.artifactLineage.create({
+      data: {
+        id: 'artifact-lineage-1',
+        projectId: PROJECT_ID,
+        sessionId: SESSION_ID,
+        normalizedFilename: 'result.txt',
+        filename: 'result.txt'
+      }
+    })
+    await client.artifactVersion.create({
+      data: {
+        id: 'artifact-version-1',
+        artifactId: 'artifact-lineage-1',
+        versionNumber: 1,
+        filename: 'result.txt',
+        artifactRunId: 'artifact-run-1',
+        writeOperationId: 'write-1',
+        writeRequestChecksum: 'b'.repeat(64),
+        rootFrameId: 'root-frame-1',
+        agentFrameId: 'agent-frame-1',
+        messageBranchId: 'branch-1',
+        runtimeSegmentId: 'runtime-segment-1',
+        promptMessageId: 'prompt-1',
+        messageId: 'message-1',
+        state: 'finalized',
+        contentStorageKey: storageKey(storageRoot, artifactPath),
+        evidenceStorageKey:
+          'artifacts/project-a/session-a/.provenance/artifact-lineage-1/versions/artifact-version-1/evidence.json',
+        contentType: 'text/plain',
+        sizeBytes: 6n,
+        checksum: 'a'.repeat(64),
+        evidenceJson: '{"schema_version":1}',
+        evidenceChecksum: 'c'.repeat(64)
+      }
+    })
+    // Session JSON is gone and the derived row is accidentally lost. SQLite Version authority must
+    // be sufficient to recreate Project Files without reconstructing identity from a filename/path.
+    await client.managedFile.deleteMany({ where: { projectId: PROJECT_ID } })
+
+    await repository.reconcileActiveSessions([])
+
+    await expect(repository.getOverview(PROJECT_ID)).resolves.toMatchObject({
+      totalCount: 1,
+      artifactCount: 1,
+      artifactGroupCount: 1
+    })
+    await expect(
+      repository.listFiles({
+        projectId: PROJECT_ID,
+        collection: { kind: 'sessionArtifacts', sessionId: SESSION_ID },
+        limit: 20
+      })
+    ).resolves.toMatchObject({
+      items: [
+        {
+          sourceFileId: 'artifact-lineage-1',
+          sourceVersionId: 'artifact-version-1',
+          checksum: 'a'.repeat(64),
+          path: 'artifact-version:project-a/session-a/artifact-lineage-1/artifact-version-1',
+          originSession: {
+            state: 'deleted',
+            title: 'Retained analysis',
+            deletedAt: '2026-07-27T12:00:00.000Z'
+          }
+        }
+      ],
+      totalCount: 1
+    })
+    await expect(
+      repository.listArtifactGroups({ projectId: PROJECT_ID, limit: 20 })
+    ).resolves.toMatchObject({
+      items: [
+        {
+          sessionId: SESSION_ID,
+          artifactCount: 1,
+          originSession: {
+            state: 'deleted',
+            title: 'Retained analysis',
+            deletedAt: '2026-07-27T12:00:00.000Z'
+          }
+        }
+      ]
+    })
   })
 
   it('reports an incomplete index until failed startup reconciliation succeeds', async () => {

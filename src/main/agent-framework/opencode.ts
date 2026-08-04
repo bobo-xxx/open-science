@@ -8,10 +8,11 @@ import {
 } from '../acp/permission-profile-controller'
 import type { PermissionProfileId } from '../../shared/permission-profiles'
 import { preferredEndpoint } from '../../shared/settings'
-import type { ReasoningEffort } from '../../shared/settings'
-import { openAiCompletionsBase } from '../settings/base-url'
+import type { ModelReasoningEffort } from '../../shared/reasoning-effort'
+import { anthropicMessagesBase, openAiCompletionsBase } from '../settings/base-url'
 import { augmentedPathEnv } from '../settings/shell-path'
 import type { ResolvedProvider } from '../settings/provider-env'
+import { resolveChatReasoningTransport } from '../settings/reasoning-transport'
 import type {
   AgentFramework,
   AgentModelConfig,
@@ -20,10 +21,11 @@ import type {
   SessionSetup,
   SessionSetupContext
 } from './types'
+import { renderAppMcpToolReferences } from './app-mcp-names'
 
 // opencode speaks ACP over `opencode acp` (stdio JSON-RPC). Only the shapes that differ from Claude
 // are implemented here: model config (a generated opencode.json, not ANTHROPIC_* env), system-prompt
-// delivery (a prompt prefix, since opencode has no preset), and skills (materialized into opencode's
+// delivery (generated native instructions), and skills (materialized into opencode's
 // config dir, which its native skill tool discovers). Everything else reuses the generic runtime.
 // See docs/internal/pluggable-agent-framework-feasibility.md.
 
@@ -65,9 +67,25 @@ const OPENCODE_ENDPOINT_PROVIDER: Record<'anthropic' | 'openai', { id: string; n
 // plaintext key OFF disk — opencode.json only ever holds the reference, never the secret.
 const OPENCODE_API_KEY_ENV = 'OPENCODE_APP_API_KEY'
 
+// opencode's model `limit` block requires BOTH `context` and `output` (its config schema rejects a
+// limit that carries only one — "Missing key ...limit.output" and the ACP connection closes). We set
+// context from the provider catalog (the whole point: it makes opencode emit usage_update); opencode
+// uses these limits for context accounting, so a best-effort output cap is fine here. Tunable.
+const OPENCODE_DEFAULT_OUTPUT_LIMIT = 32_000
+
+const opencodeOutputLimit = (contextWindow: number, configured?: unknown): number => {
+  const requested =
+    typeof configured === 'number' && Number.isFinite(configured) && configured > 0
+      ? configured
+      : OPENCODE_DEFAULT_OUTPUT_LIMIT
+
+  return Math.min(requested, contextWindow)
+}
+
 // The app's permission policy for opencode: every side-effecting/MCP tool must ASK the ACP client (the
-// app's broker then enforces the selected profile); only safe read-only tools run silently (parity with
-// Claude's Ask mode). The `*` catch-all covers unlisted tools (MCP artifact/notebook/connectors, etc.),
+// app's broker then enforces the selected profile); safe read-only tools and OpenCode's native skill
+// loader run silently (parity with other Agent frameworks). The `*` catch-all covers unlisted tools
+// (MCP artifact/notebook/connectors, etc.),
 // and the sensitive built-ins are pinned to `ask` explicitly so a lower-precedence config that sets one
 // of those keys to `allow` is overridden rather than winning. Enforced via the OPENCODE_CONFIG_CONTENT
 // layer (see prepareModelConfig), which also disables project config entirely — the config-file block is
@@ -82,7 +100,9 @@ const OPENCODE_PERMISSION_RULES: Record<string, 'ask' | 'allow' | 'deny'> = {
   edit: 'ask',
   bash: 'ask',
   task: 'ask',
-  skill: 'ask',
+  // Skill loading only reads definitions already provisioned into the isolated OpenCode config.
+  // Permission for creating/editing/enabling those definitions remains app-owned elsewhere.
+  skill: 'allow',
   webfetch: 'ask',
   websearch: 'ask',
   external_directory: 'ask'
@@ -108,34 +128,59 @@ const resolveOpencodeEndpoint = (
   // The @ai-sdk/openai-compatible client appends `/chat/completions` to baseURL, so hand it the
   // resolved OpenAI completions base — an official vendor's exact versioned base (GLM's /api/paas/v4,
   // DeepSeek/Kimi /v1), or a custom gateway root normalized to `<root>/v1`. Matches the validator and
-  // bridge. The anthropic endpoint keeps the provider's own baseUrl.
+  // bridge. The Anthropic AI SDK appends `/messages` (not `/v1/messages`), so its base must carry the
+  // `/v1` segment that Claude Code and the validator append themselves.
   const baseURL =
-    endpoint === 'openai' ? (openAiCompletionsBase(provider) ?? provider.baseUrl) : provider.baseUrl
+    endpoint === 'openai'
+      ? (openAiCompletionsBase(provider) ?? provider.baseUrl)
+      : provider.baseUrl
+        ? anthropicMessagesBase(provider.baseUrl)
+        : undefined
 
   return { bareModel, providerId, npm, baseURL }
+}
+
+// Current OpenCode accepts the provider-neutral ladder through `reasoningEffort` up to `max`.
+// `ultra` is a Codex-specific top rung, so map it to OpenCode's highest transport value rather than
+// dropping the user's explicit top-effort selection and falling back to the provider default.
+// Provider-specific wire shapes (thinking switches and OpenRouter's reasoning object) are resolved
+// separately and passed through model options by the openai-compatible AI SDK.
+const opencodeReasoningOptions = (
+  provider: ResolvedProvider,
+  effort: ModelReasoningEffort
+): Record<string, unknown> => {
+  const transportEffort = effort === 'ultra' ? 'max' : effort
+  const transport = resolveChatReasoningTransport(
+    provider.vendorId,
+    provider.model,
+    transportEffort,
+    provider.reasoningEffortTransport
+  )
+
+  return {
+    ...(transport.reasoningEffort ? { reasoningEffort: transport.reasoningEffort } : {}),
+    ...(transport.thinking ? { thinking: transport.thinking } : {}),
+    ...(transport.reasoning ? { reasoning: transport.reasoning } : {})
+  }
 }
 
 // The opencode per-model capability block. opencode strips image parts before calling the provider for
 // any model whose config does not declare vision — custom and freshly-registered models default to
 // text-only — so a base64 image sent over ACP silently never reaches the provider. A multimodal model
 // must therefore advertise both the attachment capability and an image input modality. Empty (text-only)
-// otherwise, so a non-vision model is never told it can accept images. A reasoning-effort preference is
-// declared via the model's `options.reasoningEffort`, opencode's per-model knob passed through to the
-// AI SDK provider; providers that don't support it ignore the option.
+// otherwise, so a non-vision model is never told it can accept images. Reasoning preferences are
+// declared in the model's `options` block, which OpenCode passes through to the AI SDK provider.
 const buildModelCapabilities = (
   provider: ResolvedProvider,
-  reasoningEffort?: ReasoningEffort
-): Record<string, unknown> => ({
-  ...(provider.supportsImageInput
-    ? { attachment: true, modalities: { input: ['text', 'image'] } }
-    : {}),
-  ...(reasoningEffort ? { options: { reasoningEffort: clampOpencodeEffort(reasoningEffort) } } : {})
-})
-
-// opencode's reasoningEffort follows the AI SDK levels, which top out at 'high'; the app's top level
-// 'max' clamps down to it. 'default' is filtered upstream and never reaches here.
-const clampOpencodeEffort = (effort: ReasoningEffort): 'low' | 'medium' | 'high' =>
-  effort === 'low' || effort === 'medium' ? effort : 'high'
+  reasoningEffort?: ModelReasoningEffort
+): Record<string, unknown> => {
+  return {
+    ...(provider.supportsImageInput
+      ? { attachment: true, modalities: { input: ['text', 'image'] } }
+      : {}),
+    ...(reasoningEffort ? { options: opencodeReasoningOptions(provider, reasoningEffort) } : {})
+  }
+}
 
 // The app-authoritative config layer (model + provider block + permission policy) passed verbatim to
 // opencode via OPENCODE_CONFIG_CONTENT, which opencode deep-merges ABOVE both the app-owned global config
@@ -145,9 +190,20 @@ const clampOpencodeEffort = (effort: ReasoningEffort): 'low' | 'medium' | 'high'
 // real key can only ever go to the app's own endpoint. The key stays an env reference, never plaintext.
 const buildAppConfigContent = (
   provider: ResolvedProvider,
-  reasoningEffort?: ReasoningEffort
+  reasoningEffort?: ModelReasoningEffort
 ): Record<string, unknown> => {
   const { bareModel, providerId, npm, baseURL } = resolveOpencodeEndpoint(provider)
+  const modelConfig = {
+    ...buildModelCapabilities(provider, reasoningEffort),
+    ...(provider.contextWindow === undefined
+      ? {}
+      : {
+          limit: {
+            context: provider.contextWindow,
+            output: opencodeOutputLimit(provider.contextWindow)
+          }
+        })
+  }
 
   return {
     ...(bareModel ? { model: `${providerId}/${bareModel}` } : {}),
@@ -159,9 +215,7 @@ const buildAppConfigContent = (
           ...(baseURL ? { baseURL } : {}),
           ...(provider.key ? { apiKey: `{env:${OPENCODE_API_KEY_ENV}}` } : {})
         },
-        ...(bareModel
-          ? { models: { [bareModel]: buildModelCapabilities(provider, reasoningEffort) } }
-          : {})
+        ...(bareModel ? { models: { [bareModel]: modelConfig } } : {})
       }
     }
   }
@@ -176,7 +230,7 @@ const buildOpencodeConfig = (
   provider: ResolvedProvider,
   baseConfig: Record<string, unknown> = {},
   instructionPaths: string[] = [],
-  reasoningEffort?: ReasoningEffort
+  reasoningEffort?: ModelReasoningEffort
 ): string => {
   const { bareModel, providerId, npm, baseURL } = resolveOpencodeEndpoint(provider)
 
@@ -184,7 +238,31 @@ const buildOpencodeConfig = (
   const baseProvider = asRecord(baseProviders[providerId])
   const baseOptions = asRecord(baseProvider.options)
   const baseModels = asRecord(baseProvider.models)
+  const baseModel = bareModel ? asRecord(baseModels[bareModel]) : {}
+  const baseLimit = asRecord(baseModel.limit)
   const basePermission = asRecord(baseConfig.permission)
+  const modelCapabilities = buildModelCapabilities(provider, reasoningEffort)
+  const modelConfig = {
+    ...baseModel,
+    ...modelCapabilities,
+    ...(modelCapabilities.options
+      ? {
+          options: {
+            ...asRecord(baseModel.options),
+            ...asRecord(modelCapabilities.options)
+          }
+        }
+      : {}),
+    ...(provider.contextWindow === undefined
+      ? {}
+      : {
+          limit: {
+            ...baseLimit,
+            context: provider.contextWindow,
+            output: opencodeOutputLimit(provider.contextWindow, baseLimit.output)
+          }
+        })
+  }
   // Preserve any instructions the base config already declared, then append ours (de-duplicated).
   const baseInstructions = Array.isArray(baseConfig.instructions)
     ? baseConfig.instructions.filter((entry): entry is string => typeof entry === 'string')
@@ -223,7 +301,7 @@ const buildOpencodeConfig = (
           ? {
               models: {
                 ...baseModels,
-                [bareModel]: buildModelCapabilities(provider, reasoningEffort)
+                [bareModel]: modelConfig
               }
             }
           : {})
@@ -239,6 +317,7 @@ export { buildOpencodeConfig }
 export const opencodeFramework: AgentFramework = {
   id: 'opencode',
   displayName: 'OpenCode',
+  contextCompaction: { kind: 'native-command', command: '/compact', triggerAtPercent: 90 },
   // opencode discovers skills natively at <configDir>/skills/<name>/SKILL.md (same layout as Claude),
   // loaded on-demand via its skill tool; the app materializes the enabled set into the isolated config.
   supportsSkills: true,
@@ -282,12 +361,27 @@ export const opencodeFramework: AgentFramework = {
     const configPath = join(opencodeDir, 'opencode.json')
     const configFiles = [{ path: configPath, content: '' }]
 
-    // Connector conventions + tools, wired via opencode's `instructions` config so the agent uses
-    // host.mcp instead of raw HTTP. Absolute path keeps it independent of the session cwd.
+    // Stable app guidance belongs in OpenCode's native instructions layer, never ordinary user prompt
+    // history. Keep connector conventions separate so their independent lifecycle remains explicit;
+    // both absolute paths are backend-scoped and independent of the session cwd.
     const instructionPaths: string[] = []
+    const persistentInstructions: string[] = []
+    if (ctx.systemPromptAppends?.length) {
+      const instructions = ctx.systemPromptAppends
+        .map((append) => renderAppMcpToolReferences('opencode', append))
+        .filter(Boolean)
+        .join('\n\n')
+      if (instructions) {
+        const instructionsPath = join(opencodeDir, 'instructions', 'open-science.md')
+        instructionPaths.push(instructionsPath)
+        persistentInstructions.push(instructions)
+        configFiles.push({ path: instructionsPath, content: instructions })
+      }
+    }
     if (ctx.instructions) {
       const instructionsPath = join(opencodeDir, 'instructions', 'connectors.md')
       instructionPaths.push(instructionsPath)
+      persistentInstructions.push(ctx.instructions)
       configFiles.push({ path: instructionsPath, content: ctx.instructions })
     }
 
@@ -306,9 +400,15 @@ export const opencodeFramework: AgentFramework = {
         // empty dir so the user's `~/.opencode` cannot inject config/providers/permissions — the last
         // non-repo override surface left after OPENCODE_DISABLE_PROJECT_CONFIG closes project config. This
         // changes ONLY opencode's notion of home; the child's real HOME is untouched, so shell/git tools
-        // behave normally. Tradeoff: opencode also won't read `~/.claude/CLAUDE.md` or home-level skills —
-        // acceptable since the app owns the whole opencode config.
+        // behave normally. The explicit skill flags below enforce the skill boundary independently.
         OPENCODE_TEST_HOME: opencodeHomeDir(ctx.storageRoot),
+        // OpenCode discovers `skills/**/SKILL.md` under both `.agents` and `.claude`, walking from the
+        // session cwd to the worktree root AND scanning those directories under its notion of home.
+        // OPENCODE_DISABLE_PROJECT_CONFIG does not cover this separate discovery path. Disable external
+        // discovery at the source so only the skills the app materialized into the isolated XDG config
+        // are advertised. Keep the narrower Claude flag explicit as defense in depth for that source.
+        OPENCODE_DISABLE_EXTERNAL_SKILLS: 'true',
+        OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: 'true',
         // Refuse to load ANY project config: this stops the session cwd's opencode.json / opencode.jsonc
         // (walked up to the worktree root) and its .opencode/ directory from injecting config at all. A
         // repo therefore cannot flip permission["*"] to "allow", add an exact-id "allow" rule for an MCP
@@ -327,15 +427,22 @@ export const opencodeFramework: AgentFramework = {
         // Pass the decrypted key ONLY via the environment; the config references it as `{env:...}`.
         ...(provider.key ? { [OPENCODE_API_KEY_ENV]: provider.key } : {})
       },
-      configFiles
+      configFiles,
+      ...(persistentInstructions.length > 0
+        ? { persistentSystemPrompt: persistentInstructions.join('\n\n') }
+        : {})
     }
   },
 
   buildSessionSetup(ctx: SessionSetupContext): SessionSetup {
-    // No claude_code preset here; deliver appends as a prompt prefix instead of session meta.
+    // Production backends pass no stable appends here because they are already installed in native
+    // instructions. Retain the append fallback for injected/legacy backends and ephemeral reviewers.
+    const promptPrefix = [...ctx.systemPromptAppends, ...(ctx.turnPromptReminders ?? [])]
+      .map((append) => renderAppMcpToolReferences('opencode', append))
+      .filter(Boolean)
+      .join('\n\n')
     return {
-      promptPrefix:
-        ctx.systemPromptAppends.length > 0 ? ctx.systemPromptAppends.join('\n\n') : undefined
+      ...(promptPrefix ? { promptPrefix } : {})
     }
   },
 

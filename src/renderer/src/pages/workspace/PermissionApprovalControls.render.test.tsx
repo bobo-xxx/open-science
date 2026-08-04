@@ -37,8 +37,85 @@ const permissionRequest: AcpPermissionRequest = {
       name: unknownKindOptionNameWithAlways,
       kind: 'custom_permission'
     }
-  ],
-  raw: {}
+  ]
+}
+
+const bashPermissionRequest: AcpPermissionRequest = {
+  requestId: 'bash-1',
+  sessionId: 'session-1',
+  toolCallId: 'tool-bash',
+  title: 'ls -la /tmp',
+  providerToolName: 'Bash',
+  toolKind: 'execute',
+  rawInput: { command: 'ls -la /tmp' },
+  options: [
+    { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
+    { optionId: 'allow-always', name: 'Always', kind: 'allow_always' },
+    { optionId: 'reject-once', name: 'Reject once', kind: 'reject_once' }
+  ]
+}
+
+// The broker resolves provider-specific MCP names to this stable identity before the dialog sees it.
+const notebookPermissionRequest: AcpPermissionRequest = {
+  requestId: 'nb-1',
+  sessionId: 'session-1',
+  toolCallId: 'tool-nb',
+  title: 'mcp__open-science-notebook__notebook_execute',
+  providerToolName: 'mcp__open-science-notebook__notebook_execute',
+  isMcp: true,
+  mcpIdentity: 'open-science-notebook/notebook_execute',
+  rawInput: { kernelKind: 'python', code: 'import numpy as np\nx = np.linspace(0, 1)' },
+  options: [
+    { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
+    { optionId: 'allow-always', name: 'Always', kind: 'allow_always' }
+  ]
+}
+
+// R kernel run whose rawInput carries no explicit kernel field; language must be inferred from code.
+const rNotebookRequest: AcpPermissionRequest = {
+  requestId: 'nb-r-1',
+  sessionId: 'session-1',
+  toolCallId: 'tool-nb-r',
+  title: 'mcp__open-science-notebook__notebook_execute',
+  providerToolName: 'mcp__open-science-notebook__notebook_execute',
+  isMcp: true,
+  mcpIdentity: 'open-science-notebook/notebook_execute',
+  rawInput: { code: 'df <- read.csv("x.csv")\nlibrary(ggplot2)' },
+  options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }]
+}
+
+// repl_execute pins JavaScript regardless of code content.
+const replRequest: AcpPermissionRequest = {
+  requestId: 'nb-repl',
+  sessionId: 'session-1',
+  toolCallId: 'tool-repl',
+  title: 'mcp__open-science-notebook__repl_execute',
+  providerToolName: 'mcp__open-science-notebook__repl_execute',
+  isMcp: true,
+  mcpIdentity: 'open-science-notebook/repl_execute',
+  rawInput: { code: 'const x = 1' },
+  options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }]
+}
+
+// bash_execute pins bash regardless of code content.
+const bashExecuteRequest: AcpPermissionRequest = {
+  requestId: 'nb-bash',
+  sessionId: 'session-1',
+  toolCallId: 'tool-bashx',
+  title: 'mcp__open-science-notebook__bash_execute',
+  providerToolName: 'mcp__open-science-notebook__bash_execute',
+  isMcp: true,
+  mcpIdentity: 'open-science-notebook/bash_execute',
+  rawInput: { command: 'ls' },
+  options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }]
+}
+
+const noInputRequest: AcpPermissionRequest = {
+  requestId: 'no-input-1',
+  sessionId: 'session-1',
+  toolCallId: 'tool-no-input',
+  title: 'some tool',
+  options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }]
 }
 
 const renderControls = (): string =>
@@ -56,98 +133,30 @@ const secondPermissionRequest: AcpPermissionRequest = {
   options: [
     { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
     { optionId: 'reject-once', name: 'Reject once', kind: 'reject_once' }
-  ],
-  raw: {}
+  ]
 }
 
 describe('PermissionApprovalControls', () => {
-  it('shows the full command with copy and keeps details off action labels', () => {
+  it('renders the Allow button with the Session scope by default', () => {
     const html = renderControls()
-
-    expect(html).toContain(longRequestTitle)
-    expect(html).toContain('whitespace-pre-wrap break-words')
-    expect(html).toContain('aria-label="Copy command"')
-    expect(html).not.toContain(`title="${longAlwaysOptionName}"`)
-    expect(html).toContain('flex min-w-0 flex-col items-stretch gap-2 overflow-hidden')
-    expect(html).toContain('Always</span>')
-    expect(html).not.toContain(`>${longAlwaysOptionName}</span>`)
+    expect(html).toContain('for this session')
+    expect(html).not.toContain('for this call only')
+    expect(html).toContain('data-testid="allow-primary"')
+    expect(html).toContain('data-testid="deny-button"')
+    expect(html).toContain('data-testid="scope-chevron"')
   })
 
-  it('orders actions by exact ACP kind with restrained design-system colors', () => {
-    const html = renderControls()
-    const alwaysIndex = html.indexOf('Always</span>')
-    const allowOnceIndex = html.indexOf('Allow once</span>')
-    const rejectIndex = html.indexOf('Reject</span>')
-    const unknownKindIndex = html.indexOf(`${unknownKindOptionNameWithAlways}</span>`)
-    const cancelIndex = html.indexOf('Cancel</span>')
-
-    expect(alwaysIndex).toBeGreaterThan(-1)
-    expect(allowOnceIndex).toBeGreaterThan(alwaysIndex)
-    expect(rejectIndex).toBeGreaterThan(allowOnceIndex)
-    expect(unknownKindIndex).toBeGreaterThan(rejectIndex)
-    expect(cancelIndex).toBeGreaterThan(unknownKindIndex)
-    expect(html).not.toContain(`>${allowOnceOptionNameWithAlways}</span>`)
-    expect(html).toContain('border border-amber-200 bg-amber-50')
-    expect(html).toContain('text-amber-900')
-    expect(html).toContain('border border-amber-300 bg-white')
-    expect(html).toContain('hover:bg-amber-100')
-    expect(html).toContain('flex flex-wrap items-center justify-end gap-1 w-full overflow-hidden')
-  })
-
-  it('keeps multiple always-allow scopes distinguishable', () => {
+  it('does not show the second queued request', () => {
     const html = renderToStaticMarkup(
       <PermissionApprovalControls
-        requests={[
-          {
-            ...permissionRequest,
-            options: [
-              {
-                optionId: 'allow-session',
-                name: 'Allow for This Session',
-                kind: 'allow_always'
-              },
-              {
-                optionId: 'allow-always',
-                name: "Allow and Don't Ask Again",
-                kind: 'allow_always'
-              },
-              { optionId: 'allow-once', name: 'Allow', kind: 'allow_once' },
-              { optionId: 'decline', name: 'Decline', kind: 'reject_once' }
-            ]
-          }
-        ]}
+        requests={[permissionRequest, secondPermissionRequest]}
         onRespond={() => undefined}
       />
     )
-
-    expect(html).toContain('Always - Allow for This Session</span>')
-    expect(html).toContain('Always - Allow and Don&#x27;t Ask Again</span>')
-    expect(html.match(/>Always<\/span>/g)).toBeNull()
+    expect(html).not.toContain(secondRequestTitle)
   })
 
-  it('keeps canonical semantics when provider scope names look like other actions', () => {
-    const html = renderToStaticMarkup(
-      <PermissionApprovalControls
-        requests={[
-          {
-            ...permissionRequest,
-            options: [
-              { optionId: 'malicious-always', name: 'Reject', kind: 'allow_always' },
-              { optionId: 'session-always', name: 'Allow once', kind: 'allow_always' }
-            ]
-          }
-        ]}
-        onRespond={() => undefined}
-      />
-    )
-
-    expect(html).toContain('Always - Reject</span>')
-    expect(html).toContain('Always - Allow once</span>')
-    expect(html.match(/>Reject<\/span>/g)).toBeNull()
-    expect(html.match(/>Allow once<\/span>/g)).toBeNull()
-  })
-
-  it('labels non-notebook MCP approvals as MCP instead of command execution', () => {
+  it('labels the managed artifact writer as an artifact save instead of command execution', () => {
     const html = renderToStaticMarkup(
       <PermissionApprovalControls
         requests={[
@@ -156,6 +165,7 @@ describe('PermissionApprovalControls', () => {
             title: 'mcp.open-science-artifacts.write_artifact_file',
             providerToolName: 'write_artifact_file',
             isMcp: true,
+            mcpIdentity: 'open-science-artifacts/write_artifact_file',
             toolKind: 'execute'
           }
         ]}
@@ -163,8 +173,121 @@ describe('PermissionApprovalControls', () => {
       />
     )
 
-    expect(html).toContain('MCP tool access</span>')
+    expect(html).toContain('Artifact save</span>')
+    expect(html).toContain('Save as artifact?')
     expect(html).not.toContain('Command execution</span>')
+  })
+
+  it('keeps an otherwise-opaque MCP request distinguishable without its protocol identity', () => {
+    const html = renderToStaticMarkup(
+      <PermissionApprovalControls
+        requests={[
+          {
+            ...permissionRequest,
+            title: 'mcp.open-science-artifacts.write_artifact_file',
+            providerToolName: 'write_artifact_file',
+            isMcp: true,
+            mcpIdentity: 'open-science-artifacts/write_artifact_file',
+            toolKind: 'execute',
+            rawInput: undefined
+          }
+        ]}
+        onRespond={() => undefined}
+      />
+    )
+
+    expect(html).toContain('Save as artifact?')
+    expect(html).toContain('Artifact save</span>')
+    expect(html).not.toContain('Use external service?')
+    expect(html).not.toContain('write_artifact_file')
+    expect(html).not.toContain('mcp.open-science-artifacts')
+  })
+
+  it('does not treat an unclassified raw MCP title as an artifact save', () => {
+    const rawTitle = 'mcp__open-science-artifacts__write_artifact_file'
+    const html = renderToStaticMarkup(
+      <PermissionApprovalControls
+        requests={[
+          {
+            ...permissionRequest,
+            title: rawTitle,
+            providerToolName: rawTitle,
+            isMcp: false,
+            toolKind: 'execute'
+          }
+        ]}
+        onRespond={() => undefined}
+      />
+    )
+
+    expect(html).toContain('Run command?')
+    expect(html).toContain('Command execution</span>')
+    expect(html).not.toContain('Artifact save</span>')
+  })
+
+  it('keeps every MCP execute argument in the external-service input preview', () => {
+    const html = renderToStaticMarkup(
+      <PermissionApprovalControls
+        requests={[
+          {
+            ...permissionRequest,
+            title: 'mcp__runner__execute',
+            providerToolName: 'mcp__runner__execute',
+            isMcp: true,
+            mcpIdentity: 'runner/execute',
+            toolKind: 'execute',
+            rawInput: { command: 'export-report --publish', target: 'production' }
+          }
+        ]}
+        onRespond={() => undefined}
+      />
+    )
+
+    expect(html).toContain('External service input')
+    expect(html).not.toContain('Run command')
+    expect(html).toContain('data-language="json"')
+    expect(html).toContain('export-report --publish')
+    expect(html).toContain('production')
+  })
+
+  it('keeps an MCP request external while showing its humanized action and paths', () => {
+    const html = renderToStaticMarkup(
+      <PermissionApprovalControls
+        requests={[
+          {
+            ...permissionRequest,
+            title: 'mcp__open-science-artifacts__write_artifact_file',
+            isMcp: true,
+            mcpIdentity: 'open-science-artifacts/write_artifact_file',
+            toolKind: 'edit',
+            toolLocations: [{ path: 'report.md' }],
+            rawInput: { value: 'updated' }
+          }
+        ]}
+        onRespond={() => undefined}
+      />
+    )
+
+    expect(html).toContain('Artifact save</span>')
+    expect(html).not.toContain('Open Science Artifacts / Write Artifact File')
+    expect(html).toContain('report.md')
+  })
+
+  it('keeps a title-only non-MCP execute target visible without inventing a command preview', () => {
+    const executeTitleOnly: AcpPermissionRequest = {
+      requestId: 'exec-title-1',
+      sessionId: 'session-1',
+      toolCallId: 'tool-exec-title',
+      title: 'python scripts/run_pipeline.py --full',
+      toolKind: 'execute',
+      options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }]
+    }
+    const html = renderToStaticMarkup(
+      <PermissionApprovalControls requests={[executeTitleOnly]} onRespond={() => undefined} />
+    )
+    expect(html).toContain('Run command?')
+    expect(html).not.toContain('data-testid="tool-code-block"')
+    expect(html).toContain('python scripts/run_pipeline.py --full')
   })
 
   it('serializes prompts by rendering only the first pending request', () => {
@@ -177,5 +300,436 @@ describe('PermissionApprovalControls', () => {
 
     expect(html).toContain(longRequestTitle)
     expect(html).not.toContain(secondRequestTitle)
+  })
+
+  it('renders a code block for a bash request', () => {
+    const html = renderToStaticMarkup(
+      <PermissionApprovalControls requests={[bashPermissionRequest]} onRespond={() => undefined} />
+    )
+    expect(html).toContain('data-testid="tool-code-block"')
+    expect(html).toContain('ls -la /tmp')
+  })
+
+  it('renders a code block with kernel code for a notebook request', () => {
+    const html = renderToStaticMarkup(
+      <PermissionApprovalControls
+        requests={[notebookPermissionRequest]}
+        onRespond={() => undefined}
+      />
+    )
+    expect(html).toContain('data-testid="tool-code-block"')
+    expect(html).toContain('import numpy as np')
+  })
+
+  it('shows an activity-style card title for the code section', () => {
+    const notebookHtml = renderToStaticMarkup(
+      <PermissionApprovalControls
+        requests={[notebookPermissionRequest]}
+        onRespond={() => undefined}
+      />
+    )
+    expect(notebookHtml).toContain('data-testid="permission-code-toggle"')
+    expect(notebookHtml).toContain('Run notebook cell')
+
+    const bashHtml = renderToStaticMarkup(
+      <PermissionApprovalControls requests={[bashPermissionRequest]} onRespond={() => undefined} />
+    )
+    expect(bashHtml).toContain('Run command')
+  })
+
+  it('uses the explicit kernelKind field to set the language', () => {
+    const html = renderToStaticMarkup(
+      <PermissionApprovalControls
+        requests={[notebookPermissionRequest]}
+        onRespond={() => undefined}
+      />
+    )
+    expect(html).toContain('data-language="python"')
+  })
+
+  it('infers R language from code when no explicit kernel field is present', () => {
+    const html = renderToStaticMarkup(
+      <PermissionApprovalControls requests={[rNotebookRequest]} onRespond={() => undefined} />
+    )
+    expect(html).toContain('data-language="r"')
+    expect(html).not.toContain('data-language="python"')
+  })
+
+  it('pins repl_execute to JavaScript and bash_execute to bash by tool name', () => {
+    const replHtml = renderToStaticMarkup(
+      <PermissionApprovalControls requests={[replRequest]} onRespond={() => undefined} />
+    )
+    expect(replHtml).toContain('data-language="javascript"')
+
+    const bashHtml = renderToStaticMarkup(
+      <PermissionApprovalControls requests={[bashExecuteRequest]} onRespond={() => undefined} />
+    )
+    expect(bashHtml).toContain('data-language="bash"')
+  })
+
+  it('recognizes the broker shape: namespaced title + bare leaf providerToolName', () => {
+    // Real broker output (see runtime.test.ts): the server segment lives only in the namespaced
+    // title, while providerToolName is the bare leaf. The dialog must still show the notebook code
+    // and label, not fall through to Bash and display the namespaced title as a command.
+    const brokerShape: AcpPermissionRequest = {
+      requestId: 'nb-broker',
+      sessionId: 'session-1',
+      toolCallId: 'tool-nbb',
+      title: 'mcp.open-science-notebook.notebook_execute',
+      providerToolName: 'notebook_execute',
+      toolKind: 'execute',
+      isMcp: true,
+      mcpIdentity: 'open-science-notebook/notebook_execute',
+      rawInput: { kernelKind: 'python', code: 'print("hi")' },
+      options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }]
+    }
+    const html = renderToStaticMarkup(
+      <PermissionApprovalControls requests={[brokerShape]} onRespond={() => undefined} />
+    )
+    expect(html).toContain('Run notebook cell')
+    expect(html).toContain('data-testid="permission-impact-info"')
+    expect(html).toContain('data-testid="permission-tool-info"')
+    expect(html).toContain('data-language="python"')
+    expect(html).toContain('print(&quot;hi&quot;)')
+    // Must not misclassify as a shell command showing the namespaced title.
+    expect(html).not.toContain('data-language="bash"')
+  })
+
+  it('recognizes the opencode single-underscore notebook tool name', () => {
+    const opencodeShape: AcpPermissionRequest = {
+      requestId: 'nb-oc',
+      sessionId: 'session-1',
+      toolCallId: 'tool-oc',
+      title: 'open-science-notebook_notebook_execute',
+      providerToolName: 'open-science-notebook_notebook_execute',
+      toolKind: 'execute',
+      isMcp: true,
+      mcpIdentity: 'open-science-notebook/notebook_execute',
+      rawInput: { kernelKind: 'python', code: 'print("oc")' },
+      options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }]
+    }
+    const html = renderToStaticMarkup(
+      <PermissionApprovalControls requests={[opencodeShape]} onRespond={() => undefined} />
+    )
+    expect(html).toContain('Run notebook cell')
+    expect(html).toContain('data-testid="permission-tool-info"')
+    expect(html).toContain('data-language="python"')
+    expect(html).not.toContain('data-language="bash"')
+  })
+
+  it('labels a fully-namespaced notebook request with the notebook badge cluster, not MCP', () => {
+    // The header cluster must agree with the code-card header for real
+    // mcp__<server>__notebook_execute names, not fall through to the generic MCP label.
+    const html = renderToStaticMarkup(
+      <PermissionApprovalControls
+        requests={[{ ...notebookPermissionRequest, isMcp: true }]}
+        onRespond={() => undefined}
+      />
+    )
+    expect(html).toContain('data-testid="permission-category-badge"')
+    expect(html).toContain('data-testid="permission-tool-info"')
+    expect(html).toContain('Python execution</span>')
+    expect(html).not.toContain('External service</span>')
+  })
+
+  it('shows a distinct execution category for each notebook runtime', () => {
+    const pythonHtml = renderToStaticMarkup(
+      <PermissionApprovalControls
+        requests={[notebookPermissionRequest]}
+        onRespond={() => undefined}
+      />
+    )
+    expect(pythonHtml).toContain('>Python execution</span>')
+
+    // The badge follows the inferred code language even without an explicit kernel field.
+    const rHtml = renderToStaticMarkup(
+      <PermissionApprovalControls requests={[rNotebookRequest]} onRespond={() => undefined} />
+    )
+    expect(rHtml).toContain('>R execution</span>')
+
+    // repl_execute pins JavaScript even though its code looks generic.
+    const replHtml = renderToStaticMarkup(
+      <PermissionApprovalControls requests={[replRequest]} onRespond={() => undefined} />
+    )
+    expect(replHtml).toContain('>JS REPL</span>')
+  })
+
+  it('renders no code block when rawInput is absent', () => {
+    const html = renderToStaticMarkup(
+      <PermissionApprovalControls requests={[noInputRequest]} onRespond={() => undefined} />
+    )
+    expect(html).not.toContain('data-testid="tool-code-block"')
+  })
+
+  it('shows JSON args for an execute-suffixed tool that is not a notebook', () => {
+    // A database executor ends in _execute but is not a notebook: its arguments must be shown
+    // as JSON, not hidden by the notebook path (which returns nothing without a code field).
+    const dbExecute: AcpPermissionRequest = {
+      requestId: 'db-1',
+      sessionId: 'session-1',
+      toolCallId: 'tool-db',
+      title: 'database_execute',
+      providerToolName: 'database_execute',
+      isMcp: true,
+      mcpIdentity: 'database/execute',
+      rawInput: { sql: 'DROP TABLE users' },
+      options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }]
+    }
+    const html = renderToStaticMarkup(
+      <PermissionApprovalControls requests={[dbExecute]} onRespond={() => undefined} />
+    )
+    expect(html).toContain('data-testid="tool-code-block"')
+    expect(html).toContain('DROP TABLE users')
+    expect(html).not.toContain('Run notebook cell')
+  })
+
+  it('treats a notebook_execute from another MCP server as generic JSON, not a notebook', () => {
+    // Same tool suffix but a different server: all arguments must stay reviewable as JSON, and it
+    // must not be labeled a notebook cell.
+    const lookalike: AcpPermissionRequest = {
+      requestId: 'la-1',
+      sessionId: 'session-1',
+      toolCallId: 'tool-la',
+      title: 'mcp__acme-db__notebook_execute',
+      providerToolName: 'mcp__acme-db__notebook_execute',
+      isMcp: true,
+      mcpIdentity: 'acme-db/notebook_execute',
+      rawInput: { target: 'prod', code: 'SELECT 1' },
+      options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }]
+    }
+    const html = renderToStaticMarkup(
+      <PermissionApprovalControls requests={[lookalike]} onRespond={() => undefined} />
+    )
+    // JSON path shows every argument, including the production target the notebook path would hide.
+    expect(html).toContain('data-language="json"')
+    expect(html).toContain('prod')
+    expect(html).not.toContain('Run notebook cell')
+    expect(html).toContain('External service</span>')
+  })
+
+  it('keeps the request title visible when it is the only file target', () => {
+    const write: AcpPermissionRequest = {
+      requestId: 'wr-1',
+      sessionId: 'session-1',
+      toolCallId: 'tool-wr',
+      title: 'Write report.md',
+      providerToolName: 'Write',
+      toolKind: 'edit',
+      options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }]
+    }
+    const html = renderToStaticMarkup(
+      <PermissionApprovalControls requests={[write]} onRespond={() => undefined} />
+    )
+    expect(html).toContain('data-testid="permission-impact-info"')
+    expect(html).toContain('Write report.md')
+  })
+
+  it('keeps a stable built-in provider name visible when the title is generic', () => {
+    const html = renderToStaticMarkup(
+      <PermissionApprovalControls
+        requests={[
+          {
+            ...permissionRequest,
+            title: 'WebFetch',
+            providerToolName: 'WebFetch',
+            toolKind: 'fetch'
+          }
+        ]}
+        onRespond={() => undefined}
+      />
+    )
+
+    expect(html).toContain('Network access</span>')
+    expect(html).toContain('data-testid="permission-impact-info"')
+    expect(html).toContain('WebFetch')
+  })
+
+  it('does not classify an untrusted notebook-looking name as notebook control', () => {
+    const identifier = 'open_science_notebook_notebook_restart'
+    const restart: AcpPermissionRequest = {
+      requestId: 'restart-1',
+      sessionId: 'session-1',
+      toolCallId: 'tool-restart',
+      title: identifier,
+      providerToolName: identifier,
+      isMcp: false,
+      options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }]
+    }
+
+    const html = renderToStaticMarkup(
+      <PermissionApprovalControls requests={[restart]} onRespond={() => undefined} />
+    )
+
+    expect(html).toContain('Allow tool access?')
+    expect(html).toContain('Tool access</span>')
+    expect(html).not.toContain('Restart notebook?')
+    expect(html).toContain('data-testid="permission-impact-info"')
+    expect(html).toContain('data-testid="permission-tool-info"')
+    expect(html).not.toContain('Notebook control</span>')
+  })
+
+  it('keeps trusted notebook control details in an impact tooltip without exposing its identifier', () => {
+    const identifier = 'mcp__open-science-notebook__notebook_restart'
+    const restart: AcpPermissionRequest = {
+      requestId: 'restart-1',
+      sessionId: 'session-1',
+      toolCallId: 'tool-restart',
+      title: identifier,
+      providerToolName: identifier,
+      isMcp: true,
+      mcpIdentity: 'open-science-notebook/notebook_restart',
+      options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }]
+    }
+
+    const html = renderToStaticMarkup(
+      <PermissionApprovalControls requests={[restart]} onRespond={() => undefined} />
+    )
+
+    expect(html).toContain('Restart notebook?')
+    expect(html).toContain('Notebook control</span>')
+    expect(html).not.toContain(identifier)
+  })
+
+  it('surfaces a non-canonical option kind as its own labeled button', () => {
+    // An option kind outside allow_*/reject_* must stay selectable rather than disappearing.
+    const withCustom: AcpPermissionRequest = {
+      requestId: 'custom-1',
+      sessionId: 'session-1',
+      toolCallId: 'tool-custom',
+      title: 'Edit',
+      providerToolName: 'Edit',
+      toolKind: 'edit',
+      options: [
+        { optionId: 'opt-once', name: 'Allow once', kind: 'allow_once' },
+        { optionId: 'opt-reject', name: 'Reject', kind: 'reject_once' },
+        { optionId: 'opt-sandbox', name: 'Run in sandbox', kind: 'allow_sandbox' }
+      ]
+    }
+    const html = renderToStaticMarkup(
+      <PermissionApprovalControls requests={[withCustom]} onRespond={() => undefined} />
+    )
+    expect(html).toContain('data-testid="extra-option"')
+    expect(html).toContain('Run in sandbox')
+  })
+
+  it('routes explicit Project and Global choices through the scope picker, not extra actions', () => {
+    const twoAlways: AcpPermissionRequest = {
+      requestId: 'two-1',
+      sessionId: 'session-1',
+      toolCallId: 'tool-two',
+      title: 'Edit',
+      providerToolName: 'Edit',
+      toolKind: 'edit',
+      options: [
+        { optionId: 'opt-once', name: 'Allow once', kind: 'allow_once', scope: 'once' },
+        {
+          optionId: 'opt-always-session',
+          name: 'This session',
+          kind: 'allow_always',
+          scope: 'session'
+        },
+        {
+          optionId: 'opt-always-project',
+          name: 'This project',
+          kind: 'allow_always',
+          scope: 'project'
+        },
+        {
+          optionId: 'opt-always-global',
+          name: 'Global',
+          kind: 'allow_always',
+          scope: 'global'
+        }
+      ]
+    }
+    const html = renderToStaticMarkup(
+      <PermissionApprovalControls requests={[twoAlways]} onRespond={() => undefined} />
+    )
+    expect(html).not.toContain('data-testid="extra-option"')
+    expect(html).toContain('data-testid="scope-chevron"')
+  })
+
+  it('discloses the command prefix covered by remembered scopes', () => {
+    const html = renderToStaticMarkup(
+      <PermissionApprovalControls
+        requests={[
+          {
+            ...bashPermissionRequest,
+            commandPrefix: ['python', 'analyze.py'],
+            rawInput: { command: 'python analyze.py --input data.csv' }
+          }
+        ]}
+        onRespond={() => undefined}
+      />
+    )
+
+    expect(html).toContain('Remembered scopes apply to commands starting with:')
+    expect(html).toContain('[&quot;python&quot;,&quot;analyze.py&quot;]')
+    expect(html).toContain('python analyze.py --input data.csv')
+  })
+
+  it('keeps reject_always reachable with a canonical label when Deny sends reject_once', () => {
+    // Deny sends reject_once; reject_always must stay selectable (not hidden), and its label must
+    // disclose the persistent scope rather than a generic "Deny".
+    const canonical: AcpPermissionRequest = {
+      requestId: 'canon-1',
+      sessionId: 'session-1',
+      toolCallId: 'tool-canon',
+      title: 'Edit',
+      providerToolName: 'Edit',
+      toolKind: 'edit',
+      options: [
+        { optionId: 'a-once', name: 'Allow once', kind: 'allow_once' },
+        { optionId: 'a-always', name: 'Allow always', kind: 'allow_always' },
+        { optionId: 'r-once', name: 'Reject once', kind: 'reject_once' },
+        { optionId: 'r-always', name: 'Reject always', kind: 'reject_always' }
+      ]
+    }
+    const html = renderToStaticMarkup(
+      <PermissionApprovalControls requests={[canonical]} onRespond={() => undefined} />
+    )
+    expect(html).toContain('data-testid="extra-option"')
+    expect(html).toContain('Reject always')
+  })
+
+  it('derives the action label from kind so an adversarial provider name cannot mislead', () => {
+    // An allow_always option maliciously named "Reject" must still read as an Allow action.
+    const adversarial: AcpPermissionRequest = {
+      requestId: 'adv-1',
+      sessionId: 'session-1',
+      toolCallId: 'tool-adv',
+      title: 'Edit',
+      providerToolName: 'Edit',
+      toolKind: 'edit',
+      options: [
+        { optionId: 'a-once', name: 'Allow once', kind: 'allow_once' },
+        { optionId: 'a-always-1', name: 'Allow always', kind: 'allow_always' },
+        { optionId: 'a-always-evil', name: 'Reject', kind: 'allow_always' }
+      ]
+    }
+    const html = renderToStaticMarkup(
+      <PermissionApprovalControls requests={[adversarial]} onRespond={() => undefined} />
+    )
+    // The second allow_always surfaces as an extra, labeled with the canonical Allow action word,
+    // never as a standalone "Reject".
+    expect(html).toContain('data-testid="extra-option"')
+    expect(html).toContain('Allow always · Reject')
+    expect(html).not.toContain('>Reject<')
+  })
+
+  it('renders tool locations so the affected path is always visible', () => {
+    const html = renderToStaticMarkup(
+      <PermissionApprovalControls
+        requests={[
+          {
+            ...permissionRequest,
+            toolKind: 'edit',
+            toolLocations: [{ path: '/repo/config/prod.env' }]
+          }
+        ]}
+        onRespond={() => undefined}
+      />
+    )
+    expect(html).toContain('/repo/config/prod.env')
   })
 })

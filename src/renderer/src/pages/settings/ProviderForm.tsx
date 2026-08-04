@@ -10,7 +10,17 @@ import {
   SelectLabel,
   SelectTrigger
 } from '@/components/ui/select'
-import { getOfficialVendor, resolveVendorApiKeyUrl } from '../../../../shared/provider-registry'
+import {
+  getOfficialVendor,
+  getOfficialVendorModelIds,
+  resolveVendorApiKeyUrl
+} from '../../../../shared/provider-registry'
+import {
+  CUSTOM_REASONING_EFFORT_PRESETS,
+  CUSTOM_REASONING_EFFORT_TRANSPORTS,
+  type CustomReasoningEffortTransport,
+  type ReasoningEffortPresetId
+} from '../../../../shared/reasoning-effort'
 import { getApiKeySecurityCopy } from './provider-key-security'
 import { ProviderKindIcon } from './provider-icons'
 import {
@@ -43,6 +53,12 @@ type ProviderFormProps = {
   // Whether Electron can protect new keys with the operating system's secure storage.
   encryptionAvailable?: boolean
   showCodexSubscriptions?: boolean
+  // Whether to surface the Claude subscription option in the provider-kind picker. Mirrors
+  // showCodexSubscriptions: claude-isolated is only meaningful while Claude Code is the active
+  // framework, so the wizard/settings page toggles this rather than showing it unconditionally.
+  showClaudeIsolated?: boolean
+  // Preferred protocol for a newly selected Custom Gateway, derived from the active framework.
+  defaultCustomApiEndpoint?: ProviderFormValue['apiEndpoint']
 }
 
 const fieldLabelClassName = 'text-xs font-medium text-muted-foreground'
@@ -95,7 +111,7 @@ const RequiredMark = (): React.JSX.Element => (
 
 // Provider fields switch by type: pick a type first, then reveal its options. Custom exposes an
 // Anthropic-compatible gateway/key/model; an official vendor exposes a key (+ region) and picks a
-// model from the registry catalog; claude-default only a model override. No plaintext key is rendered.
+// model from the registry catalog. No plaintext key is rendered.
 const ProviderForm = ({
   value,
   onChange,
@@ -108,11 +124,14 @@ const ProviderForm = ({
   isRefreshingModels = false,
   disabled = false,
   encryptionAvailable = true,
-  showCodexSubscriptions = false
+  showCodexSubscriptions = false,
+  showClaudeIsolated = false,
+  defaultCustomApiEndpoint = 'anthropic'
 }: ProviderFormProps): React.JSX.Element => {
   const isCustom = value.type === 'custom'
   const isOfficial = value.type === 'official'
   const isCodexSubscription = value.type === 'codex-shared' || value.type === 'codex-isolated'
+  const isClaudeSubscription = value.type === 'claude-shared' || value.type === 'claude-isolated'
   const vendor = isOfficial && value.vendorId ? getOfficialVendor(value.vendorId) : undefined
 
   const selectedKey = selectedKindKey(value)
@@ -173,7 +192,10 @@ const ProviderForm = ({
           <span className={fieldLabelClassName}>Provider type</span>
           {selectedKind ? <FieldHelp content={selectedKind.description} /> : null}
         </div>
-        <Select value={selectedKey} onValueChange={(key) => onChange(providerKindPatch(key))}>
+        <Select
+          value={selectedKey}
+          onValueChange={(key) => onChange(providerKindPatch(key, defaultCustomApiEndpoint))}
+        >
           <SelectTrigger aria-label="Provider type">
             <span className="flex items-center gap-2">
               <ProviderKindIcon kindKey={selectedKey} />
@@ -182,10 +204,17 @@ const ProviderForm = ({
           </SelectTrigger>
           <SelectContent scrollToTopOnOpen>
             {PROVIDER_KIND_GROUPS.map((group) => {
-              const kinds = PROVIDER_KINDS.filter(
-                (kind) =>
-                  kind.group === group.id && (group.id !== 'coding' || showCodexSubscriptions)
-              )
+              const kinds = PROVIDER_KINDS.filter((kind) => {
+                if (kind.group !== group.id) return false
+                // The Codex subscription section only shows when Codex is the active framework
+                // (the only one that can drive it), mirroring the showCodexSubscriptions gate.
+                if (group.id === 'codex' && !showCodexSubscriptions) return false
+                // The Claude subscription section mirrors it: gate on Claude Code being active,
+                // the only framework that speaks the app-owned bearer token.
+                if (group.id === 'claude' && !showClaudeIsolated) return false
+
+                return true
+              })
 
               if (kinds.length === 0) return null
 
@@ -208,7 +237,7 @@ const ProviderForm = ({
         </Select>
       </div>
 
-      {!isCodexSubscription ? (
+      {!isCodexSubscription && !isClaudeSubscription ? (
         <div className="space-y-1.5">
           <label className={fieldLabelClassName} htmlFor="provider-name">
             Name
@@ -218,7 +247,7 @@ const ProviderForm = ({
             aria-label="Provider name"
             value={value.name}
             disabled={disabled}
-            placeholder={vendor ? vendor.label : isCustom ? 'e.g. My gateway' : 'e.g. Local Claude'}
+            placeholder={vendor ? vendor.label : 'e.g. My gateway'}
             onChange={(event) => onChange({ name: event.target.value })}
           />
         </div>
@@ -238,22 +267,93 @@ const ProviderForm = ({
               <SelectTrigger aria-label="Codex authentication" disabled={disabled}>
                 <span>
                   {value.type === 'codex-shared'
-                    ? 'Use existing Codex profile'
+                    ? 'Import existing Codex sign-in'
                     : 'Sign in with Open Science'}
                 </span>
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="codex-shared">Use existing Codex profile</SelectItem>
+                <SelectItem value="codex-shared">Import existing Codex sign-in</SelectItem>
                 <SelectItem value="codex-isolated">Sign in with Open Science</SelectItem>
               </SelectContent>
             </Select>
           </div>
           <p className="text-xs text-muted-foreground">
             {value.type === 'codex-shared'
-              ? 'Uses the Codex profile in your user home directory. Authentication remains managed by Codex CLI.'
+              ? "Copies Codex authentication and, when compatible, the active provider's non-secret loopback route into Open Science app data. Other global config, Skills and sessions are not imported."
               : 'Stores a separate Codex login in Open Science app data without changing your Codex CLI profile.'}
           </p>
         </div>
+      ) : isClaudeSubscription ? (
+        <>
+          <div className="space-y-3 rounded-lg border border-border bg-muted/30 p-3">
+            <div className="space-y-1.5">
+              <span className={fieldLabelClassName}>Claude authentication</span>
+              <Select
+                value={value.type}
+                disabled={disabled}
+                onValueChange={(type) =>
+                  onChange({ type: type as 'claude-shared' | 'claude-isolated' })
+                }
+              >
+                <SelectTrigger aria-label="Claude authentication" disabled={disabled}>
+                  <span>
+                    {value.type === 'claude-shared'
+                      ? 'Use existing Claude profile (Recommended)'
+                      : 'Sign in separately (isolated)'}
+                  </span>
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="claude-shared">
+                    Use existing Claude profile (Recommended)
+                  </SelectItem>
+                  <SelectItem value="claude-isolated">Sign in separately (isolated)</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {value.type === 'claude-shared'
+                ? 'Recommended. Uses your existing Claude login from ~/.claude. Sign in once via browser OAuth and use across all Claude tools.'
+                : 'Advanced. Signs in through the browser and stores a separate Claude login in Open Science, completely isolated from your personal Claude profile.'}
+            </p>
+            <div className="space-y-1.5 border-t border-border-200 pt-3">
+              <p className="text-xs text-muted-foreground">
+                {value.type === 'claude-shared' ? (
+                  <>
+                    Sign in via browser OAuth. The Settings card will open your browser to sign in
+                    with your Claude account. Your credentials are stored in{' '}
+                    <code className="font-mono">~/.claude</code>.
+                  </>
+                ) : (
+                  <>
+                    Run <code className="font-mono">claude setup-token</code> in a terminal and
+                    paste the token below. It is stored encrypted under your app-owned Claude config
+                    dir; nothing is read from or written to{' '}
+                    <code className="font-mono">~/.claude</code>.
+                  </>
+                )}
+              </p>
+            </div>
+            {value.type === 'claude-isolated' && (
+              <p className="text-xs text-muted-foreground">
+                Paste the token in the Settings card after saving — the wizard&apos;s Test &amp;
+                continue flow signs you in.
+              </p>
+            )}
+          </div>
+          <div className="space-y-1.5">
+            <label className={fieldLabelClassName} htmlFor="provider-model">
+              Model <span className="text-muted-foreground">(optional override)</span>
+            </label>
+            <Input
+              id="provider-model"
+              aria-label="Model"
+              value={value.model}
+              disabled={disabled}
+              placeholder="Leave blank to use Claude's default"
+              onChange={(event) => onChange({ model: event.target.value })}
+            />
+          </div>
+        </>
       ) : isCustom ? (
         <>
           <div className="space-y-1.5">
@@ -320,6 +420,92 @@ const ProviderForm = ({
             />
           </div>
 
+          <div className="space-y-3 border-t border-border-200 pt-3">
+            <div className="flex items-center justify-between gap-4">
+              <label className="space-y-0.5" htmlFor="provider-reasoning-effort">
+                <span className="block text-xs font-medium">Reasoning effort</span>
+                <span className="block text-xs text-muted-foreground">
+                  Choose the exact effort levels accepted by this model. Open Science maps five
+                  relative strengths onto them, then sends the selected level using the request
+                  format below. Disable when the model does not accept an effort parameter.
+                </span>
+              </label>
+              <Switch
+                id="provider-reasoning-effort"
+                aria-label="Supports reasoning effort"
+                checked={value.reasoningEffortPreset !== 'unsupported'}
+                disabled={disabled}
+                onCheckedChange={(supported) =>
+                  onChange({
+                    reasoningEffortPreset: supported ? 'standard-5' : 'unsupported'
+                  })
+                }
+              />
+            </div>
+
+            {value.reasoningEffortPreset !== 'unsupported' ? (
+              <div className="space-y-3">
+                <Select
+                  value={value.reasoningEffortPreset}
+                  disabled={disabled}
+                  onValueChange={(reasoningEffortPreset) =>
+                    onChange({
+                      reasoningEffortPreset: reasoningEffortPreset as ReasoningEffortPresetId
+                    })
+                  }
+                >
+                  <SelectTrigger aria-label="Reasoning effort levels" disabled={disabled}>
+                    <span>
+                      {
+                        CUSTOM_REASONING_EFFORT_PRESETS.find(
+                          (preset) => preset.id === value.reasoningEffortPreset
+                        )?.label
+                      }
+                    </span>
+                  </SelectTrigger>
+                  <SelectContent>
+                    {CUSTOM_REASONING_EFFORT_PRESETS.map((preset) => (
+                      <SelectItem key={preset.id} value={preset.id}>
+                        {preset.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+
+                <div className="space-y-1.5">
+                  <span className="block text-xs font-medium">Request format</span>
+                  <Select
+                    value={value.reasoningEffortTransport}
+                    disabled={disabled}
+                    onValueChange={(reasoningEffortTransport) =>
+                      onChange({
+                        reasoningEffortTransport:
+                          reasoningEffortTransport as CustomReasoningEffortTransport
+                      })
+                    }
+                  >
+                    <SelectTrigger aria-label="Reasoning effort request format" disabled={disabled}>
+                      <span>
+                        {
+                          CUSTOM_REASONING_EFFORT_TRANSPORTS.find(
+                            (transport) => transport.id === value.reasoningEffortTransport
+                          )?.label
+                        }
+                      </span>
+                    </SelectTrigger>
+                    <SelectContent>
+                      {CUSTOM_REASONING_EFFORT_TRANSPORTS.map((transport) => (
+                        <SelectItem key={transport.id} value={transport.id}>
+                          {transport.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+            ) : null}
+          </div>
+
           {keyField}
 
           <div className="space-y-1.5">
@@ -338,6 +524,29 @@ const ProviderForm = ({
             {errors.model ? (
               <p className={fieldErrorClassName} role="alert">
                 {errors.model}
+              </p>
+            ) : null}
+          </div>
+
+          <div className="space-y-1.5">
+            <label className={fieldLabelClassName} htmlFor="provider-context-window">
+              Context window
+            </label>
+            <Input
+              id="provider-context-window"
+              aria-label="Context window"
+              type="number"
+              inputMode="numeric"
+              min={1}
+              step={1000}
+              value={value.contextWindow}
+              disabled={disabled}
+              placeholder="200000"
+              onChange={(event) => onChange({ contextWindow: event.target.value })}
+            />
+            {errors.contextWindow ? (
+              <p className={fieldErrorClassName} role="alert">
+                {errors.contextWindow}
               </p>
             ) : null}
           </div>
@@ -371,7 +580,8 @@ const ProviderForm = ({
           {keyField}
 
           {(() => {
-            const models = supportedModels ?? vendor?.models ?? []
+            const models =
+              supportedModels ?? (value.vendorId ? getOfficialVendorModelIds(value.vendorId) : [])
 
             if (models.length === 0) return null
 

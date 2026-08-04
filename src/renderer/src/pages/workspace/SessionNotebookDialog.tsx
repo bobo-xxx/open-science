@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react'
 import { Download, LoaderCircle, X } from 'lucide-react'
 import { Dialog } from 'radix-ui'
 
+import { dialogOverlayClassName, dialogPanelClassName } from '@/components/ui/dialog-chrome'
+import { useRetainedDialogValue } from '@/components/ui/use-retained-dialog-value'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 import type { ChatSession } from '@/stores/session-store'
@@ -10,6 +12,7 @@ import { resolveDataKernelForTab } from '../../../../shared/notebook'
 import type { NotebookKernelKind, NotebookRunRecord } from '../../../../shared/notebook'
 import { NotebookCodeBlock } from './notebook-code'
 import { NotebookRunOutputs } from './NotebookRunOutputs'
+import { NotebookInputDataStrip } from './NotebookInputDataStrip'
 import {
   isProblemRunStatus,
   kernelKindLabel,
@@ -36,10 +39,12 @@ const pluralize = (count: number, word: string): string =>
 // zero-based index is the cell number shown in [n], aligning the display with a notebook's cells.
 const NotebookDialogCell = ({
   run,
-  index
+  index,
+  showInputData = false
 }: {
   run: NotebookRunRecord
   index: number
+  showInputData?: boolean
 }): React.JSX.Element => {
   const isProblem = isProblemRunStatus(run.status)
   const errorLine = isProblem ? resolveRunErrorLine(run) : undefined
@@ -68,7 +73,17 @@ const NotebookDialogCell = ({
           </span>
         ) : null}
       </div>
-      <NotebookCodeBlock code={run.script} highlightLine={errorLine} />
+      {showInputData ? (
+        <NotebookInputDataStrip
+          inputFiles={run.inputFiles ?? []}
+          className="mb-2 rounded-md border border-border bg-muted px-2 py-1.5"
+        />
+      ) : null}
+      <NotebookCodeBlock
+        code={run.script}
+        language={kind === 'repl' ? 'javascript' : kind}
+        highlightLine={errorLine}
+      />
       <NotebookRunOutputs run={run} />
     </div>
   )
@@ -76,6 +91,7 @@ const NotebookDialogCell = ({
 
 type SessionNotebookContentProps = {
   sessionId: string
+  projectId?: string
   runs: NotebookRunRecord[]
   status: SessionNotebookStatus
   error?: string
@@ -89,6 +105,7 @@ type SessionNotebookContentProps = {
 // standalone in tests; close is delegated through onClose.
 const SessionNotebookContent = ({
   sessionId,
+  projectId,
   runs,
   status,
   error,
@@ -174,13 +191,13 @@ const SessionNotebookContent = ({
 
   return (
     <>
-      <div className="flex shrink-0 items-center justify-between border-b border-border-300/15 px-5 py-3.5">
-        <h2 className="flex min-w-0 items-center gap-3 text-lg font-semibold text-text-000">
+      <div className="flex shrink-0 items-center justify-between border-b border-border px-5 py-3.5">
+        <h2 className="flex min-w-0 items-center gap-3 text-lg font-semibold text-foreground">
           <span>Session notebook</span>
-          <span className="rounded bg-bg-200 px-2 py-0.5 font-mono text-xs font-normal text-text-200">
+          <span className="rounded bg-muted px-2 py-0.5 font-mono text-xs font-normal text-muted-foreground">
             {shortId}
           </span>
-          <span className="truncate text-xs font-normal text-text-300">
+          <span className="truncate text-xs font-normal text-muted-foreground">
             {pluralize(agents, 'agent')} · {pluralize(cells, 'cell')}
             {extraCounts.length > 0 ? ` · ${extraCounts.join(' / ')}` : ''}
           </span>
@@ -188,7 +205,7 @@ const SessionNotebookContent = ({
         <button
           type="button"
           onClick={onClose}
-          className="-m-1 rounded p-1 text-text-300 hover:text-text-000"
+          className="-m-1 rounded-lg p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
           aria-label="Close"
         >
           <X className="size-4" aria-hidden="true" />
@@ -197,13 +214,13 @@ const SessionNotebookContent = ({
 
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
         {status === 'loading' ? (
-          <p className="px-5 py-16 text-center text-sm text-text-300">Loading notebook…</p>
+          <p className="px-5 py-16 text-center text-sm text-muted-foreground">Loading notebook…</p>
         ) : status === 'error' ? (
           <p className="px-5 py-16 text-center text-sm text-danger-000">
             {error ?? 'Failed to load notebook.'}
           </p>
         ) : runs.length === 0 ? (
-          <p className="px-5 py-16 text-center text-sm text-text-300">
+          <p className="px-5 py-16 text-center text-sm text-muted-foreground">
             No execution records for this session.
           </p>
         ) : (
@@ -211,7 +228,7 @@ const SessionNotebookContent = ({
             <div
               role="tablist"
               data-testid="session-kernel-switcher"
-              className="flex shrink-0 items-center gap-1 border-y border-border-100 bg-bg-200 px-3 py-1.5"
+              className="flex shrink-0 items-center gap-1 border-y border-border bg-muted px-3 py-1.5"
             >
               {visibleKinds.map((kind) => (
                 <button
@@ -227,12 +244,12 @@ const SessionNotebookContent = ({
                   className={cn(
                     'flex items-center gap-1.5 rounded-md px-2 py-1 text-xs transition-colors',
                     effectiveActiveKind === kind
-                      ? 'bg-bg-300 text-text-000'
-                      : 'text-text-300 hover:bg-bg-300/60 hover:text-text-100'
+                      ? 'bg-card text-foreground'
+                      : 'text-muted-foreground hover:bg-card/70 hover:text-foreground'
                   )}
                 >
                   <span>{kernelKindLabel(kind)}</span>
-                  <span className="font-mono text-text-300">
+                  <span className="font-mono text-muted-foreground">
                     {runs.filter((run) => resolveRunKernelKind(run) === kind).length}
                   </span>
                 </button>
@@ -243,7 +260,12 @@ const SessionNotebookContent = ({
               data-testid={`session-notebook-kernel-${effectiveActiveKind}`}
             >
               {visibleRuns.map((run, index) => (
-                <NotebookDialogCell key={run.runId} run={run} index={index} />
+                <NotebookDialogCell
+                  key={run.runId}
+                  run={run}
+                  index={index}
+                  showInputData={Boolean(projectId)}
+                />
               ))}
             </div>
           </>
@@ -254,7 +276,7 @@ const SessionNotebookContent = ({
         <p
           className={cn(
             'min-w-0 truncate text-xs',
-            exportError ? 'text-danger-000' : 'text-emerald-600'
+            exportError ? 'text-danger-000' : 'text-emerald-600 dark:text-emerald-400'
           )}
           role={exportError ? 'alert' : 'status'}
         >
@@ -340,6 +362,14 @@ type SessionNotebookDialogProps = {
   onClose: () => void
 }
 
+const filterNotebookRunsForSessionBranch = (
+  runs: NotebookRunRecord[],
+  session: ChatSession
+): NotebookRunRecord[] => {
+  const activeMessageIds = new Set(session.messages.map((message) => message.id))
+  return runs.filter((run) => !run.promptMessageId || activeMessageIds.has(run.promptMessageId))
+}
+
 // Modal container: owns the read-only load lifecycle and wraps the pure content in a Radix dialog.
 const SessionNotebookDialog = ({
   session,
@@ -348,6 +378,7 @@ const SessionNotebookDialog = ({
   const [runs, setRuns] = useState<NotebookRunRecord[]>([])
   const [status, setStatus] = useState<SessionNotebookStatus>('loading')
   const [error, setError] = useState<string | undefined>(undefined)
+  const dialogSession = useRetainedDialogValue(session)
 
   const sessionId = session?.id
   const projectId = session?.projectId
@@ -397,36 +428,40 @@ const SessionNotebookDialog = ({
       }}
     >
       <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-50 bg-black/50" />
+        <Dialog.Overlay className={dialogOverlayClassName} />
         <Dialog.Content
           aria-describedby={undefined}
-          className="fixed left-1/2 top-1/2 z-50 flex max-h-[85vh] w-[calc(100%-2rem)] max-w-5xl -translate-x-1/2 -translate-y-1/2 flex-col rounded-xl border border-border-300/15 bg-bg-000 text-text-100 shadow-xl"
+          onInteractOutside={(event) => event.preventDefault()}
+          className={dialogPanelClassName(
+            'flex max-h-[85vh] w-[calc(100%-2rem)] max-w-5xl flex-col overflow-hidden p-0'
+          )}
         >
           <Dialog.Title className="sr-only">Session notebook</Dialog.Title>
-          {session ? (
+          {dialogSession ? (
             <SessionNotebookContent
               // Remount per session: the dialog is mounted once and the session prop swaps in
               // place, so per-session export state (a failure banner, an in-flight setState from
               // a superseded export) must be discarded rather than leak into the next session.
-              key={session.id}
-              sessionId={session.id}
-              runs={runs}
+              key={dialogSession.id}
+              sessionId={dialogSession.id}
+              projectId={dialogSession.projectId}
+              runs={filterNotebookRunsForSessionBranch(runs, dialogSession)}
               status={status}
               error={error}
               onClose={onClose}
               onExport={async (kernel) => {
                 await window.api.notebook.exportIpynb({
-                  sessionId: session.id,
-                  projectName: session.projectId,
-                  workspaceCwd: session.cwd ?? '',
+                  sessionId: dialogSession.id,
+                  projectName: dialogSession.projectId,
+                  workspaceCwd: dialogSession.cwd ?? '',
                   kernel
                 })
               }}
               onExportAll={async () => {
                 const result = await window.api.notebook.exportIpynbAll({
-                  sessionId: session.id,
-                  projectName: session.projectId,
-                  workspaceCwd: session.cwd ?? ''
+                  sessionId: dialogSession.id,
+                  projectName: dialogSession.projectId,
+                  workspaceCwd: dialogSession.cwd ?? ''
                 })
                 if (result.saved) {
                   return `Saved ${result.files.length} notebooks to ${result.directory}`
@@ -441,4 +476,4 @@ const SessionNotebookDialog = ({
   )
 }
 
-export { SessionNotebookContent, SessionNotebookDialog }
+export { NotebookDialogCell, SessionNotebookContent, SessionNotebookDialog }

@@ -33,11 +33,13 @@ Commands:
   session status <session-id>
   artifacts list <session-id>
   artifacts download <artifact-id> --output <path>
+  rollback-to-0.7.3 --yes [--output <path>]
 
 Options:
   --port <port>          Web service port (default: 44100)
   --app-path <path>      Installed Open Science executable
   --config-root <path>   Config directory override
+  --data-root <path>     Current Data Root override (rollback only)
   --project <id-or-name> Project id or exact name
   --session <id>         Resume an existing session
   --prompt <text>        Prompt text (or read stdin when omitted)
@@ -48,7 +50,9 @@ Options:
   --timeout-ms <ms>      Stop waiting after this many milliseconds
   --jsonl                With run --wait, stream one machine-readable event per line
   --output <path>        Artifact download destination
+  --yes                  Confirm the offline rollback conversion
   --no-open              Do not open the browser after start
+  --no-sandbox           Disable Chromium's process sandbox (security risk; start only)
   --json                 Emit one machine-readable result
   -h, --help             Show this help`
 
@@ -58,6 +62,7 @@ const VALUE_OPTIONS = {
   '--port': 'port',
   '--app-path': 'appPath',
   '--config-root': 'configRoot',
+  '--data-root': 'dataRoot',
   '--project': 'project',
   '--session': 'session',
   '--prompt': 'prompt',
@@ -97,7 +102,9 @@ export const parseCliArgs = (argv) => {
   while (args.length > 0) {
     const arg = args.shift()
     if (arg === '--no-open') options.open = false
+    else if (arg === '--no-sandbox') options.noSandbox = true
     else if (arg === '--json') options.json = true
+    else if (arg === '--yes') options.yes = true
     else if (arg === '--jsonl') options.jsonl = true
     else if (arg === '--wait') options.wait = true
     else if (arg === '--skill') {
@@ -141,6 +148,15 @@ export const parseCliArgs = (argv) => {
   if (options.timeoutMs !== undefined && (command !== 'run' || subcommand || !options.wait)) {
     throw new CliUsageError('--timeout-ms requires run --wait.')
   }
+  if (options.noSandbox && command !== 'start') {
+    throw new CliUsageError('--no-sandbox requires start.')
+  }
+  if (options.yes && command !== 'rollback-to-0.7.3') {
+    throw new CliUsageError('--yes requires rollback-to-0.7.3.')
+  }
+  if (options.dataRoot && command !== 'rollback-to-0.7.3') {
+    throw new CliUsageError('--data-root requires rollback-to-0.7.3.')
+  }
   return {
     command,
     ...(subcommand ? { subcommand } : {}),
@@ -181,14 +197,61 @@ const healthCheck = async (state, deps = DEFAULT_DEPS) => {
 const sleep = (milliseconds) =>
   new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds))
 
-const waitForState = async (configRoot, deps = DEFAULT_DEPS, timeoutMs = START_TIMEOUT_MS) => {
+const waitForState = async (
+  configRoot,
+  deps = DEFAULT_DEPS,
+  timeoutMs = START_TIMEOUT_MS,
+  signal
+) => {
   const deadline = deps.now() + timeoutMs
-  while (deps.now() < deadline) {
+  while (deps.now() < deadline && !signal?.aborted) {
     const state = await deps.findServiceState({ override: configRoot })
+    if (signal?.aborted) return undefined
     if (await healthCheck(state, deps)) return state
+    if (signal?.aborted) return undefined
     await deps.sleep(250)
   }
   return undefined
+}
+
+// Keep the health poll and child-process lifecycle coupled: a fatal Electron startup error must not
+// look like a slow service startup and consume the full CLI timeout.
+export const waitForStartup = async (
+  configRoot,
+  child,
+  deps = DEFAULT_DEPS,
+  timeoutMs = START_TIMEOUT_MS
+) => {
+  const abortController = new AbortController()
+  let cleanup = () => {}
+  const childFailure = new Promise((resolveFailure) => {
+    const onExit = (code, signal) => {
+      // An already-running desktop app receives --serve through Electron's second-instance relay.
+      // The relay exits successfully before the primary app has necessarily written service state.
+      if (code === 0 && signal === null) return
+      abortController.abort()
+      resolveFailure({ kind: 'exit', code, signal })
+    }
+    const onError = (error) => {
+      abortController.abort()
+      resolveFailure({ kind: 'error', error })
+    }
+    child.once('exit', onExit)
+    child.once('error', onError)
+    cleanup = () => {
+      child.off('exit', onExit)
+      child.off('error', onError)
+    }
+  })
+  const healthy = waitForState(configRoot, deps, timeoutMs, abortController.signal).then((state) =>
+    state ? { kind: 'ready', state } : { kind: 'timeout' }
+  )
+  try {
+    return await Promise.race([healthy, childFailure])
+  } finally {
+    abortController.abort()
+    cleanup()
+  }
 }
 
 const openBrowser = (url) => {
@@ -287,6 +350,40 @@ const readLogTail = async (logPath) => {
   }
 }
 
+export const openLaunchLog = (logPath) => openSync(logPath, 'w')
+
+export const buildAppLaunchArgs = (appArgs, options, port) => [
+  ...(options.noSandbox ? ['--no-sandbox'] : []),
+  ...appArgs,
+  // `--open-science-headless` instead of `--headless`: Chromium consumes `--headless` and renders
+  // native menus (like the tray context menu) invisibly on Windows (electron/electron#48982).
+  '--open-science-headless',
+  `--serve=${port}`
+]
+
+const sandboxFailurePattern =
+  /SUID sandbox helper binary.*not configured correctly|No usable sandbox|The setuid sandbox is not running/i
+
+export const formatStartupFailure = (outcome, logTail, options) => {
+  if (!options.noSandbox && sandboxFailurePattern.test(logTail)) {
+    return [
+      'Open Science could not start because Chromium sandboxing is unavailable on this host.',
+      logTail,
+      'This can occur when an AppImage mount cannot provide the SUID permissions required by Chromium; some Linux hosts also restrict unprivileged user namespaces.',
+      'For an explicit rootless fallback, run "open-science start --no-sandbox".',
+      "Warning: --no-sandbox disables Chromium's process sandbox and reduces security. Prefer the Debian package or a host configuration that supports sandboxed startup."
+    ]
+      .filter(Boolean)
+      .join('\n\n')
+  }
+  if (outcome.kind === 'error') return `Could not start Open Science: ${outcome.error.message}`
+
+  const exitStatus = outcome.signal
+    ? ` after receiving ${outcome.signal}`
+    : ` with exit code ${outcome.code ?? 'unknown'}`
+  return `Open Science exited before becoming healthy${exitStatus}.${logTail ? `\n\n${logTail}` : ''}`
+}
+
 const startCommand = async (options, deps = DEFAULT_DEPS) => {
   const existing = await deps.findServiceState({ override: options.configRoot })
   if (await healthCheck(existing, deps)) {
@@ -310,10 +407,8 @@ const startCommand = async (options, deps = DEFAULT_DEPS) => {
   await deps.removeState(configRoot)
 
   const logPath = join(configRoot, 'cli-daemon.log')
-  const logFd = openSync(logPath, 'a')
+  const logFd = openLaunchLog(logPath)
   const port = options.port ?? DEFAULT_PORT
-  // `--open-science-headless` instead of `--headless`: Chromium consumes `--headless` and renders
-  // native menus (like the tray context menu) invisibly on Windows (electron/electron#48982).
   const childEnv = {
     ...process.env,
     ...(app.packaged ? {} : { OPEN_SCIENCE_STORAGE_ROOT: configRoot }),
@@ -322,22 +417,30 @@ const startCommand = async (options, deps = DEFAULT_DEPS) => {
   // The installed launcher runs this CLI via the app's Electron in Node mode (ELECTRON_RUN_AS_NODE=1).
   // Drop it here so the daemon we spawn starts as the normal Electron app, not another Node process.
   delete childEnv.ELECTRON_RUN_AS_NODE
-  const child = spawn(app.command, [...app.args, '--open-science-headless', `--serve=${port}`], {
+  if (options.noSandbox) {
+    deps.warn("Warning: --no-sandbox disables Chromium's process sandbox and reduces security.")
+  }
+  const child = spawn(app.command, buildAppLaunchArgs(app.args, options, port), {
     detached: true,
     stdio: ['ignore', logFd, logFd],
     windowsHide: true,
     env: childEnv
   })
+  const startupPromise = waitForStartup(configRoot, child, deps)
   child.unref()
   closeSync(logFd)
 
-  const state = await waitForState(configRoot, deps)
-  if (!state) {
+  const startup = await startupPromise
+  if (startup.kind !== 'ready') {
     const logTail = await readLogTail(logPath)
+    if (startup.kind !== 'timeout') {
+      throw new Error(formatStartupFailure(startup, logTail, options))
+    }
     throw new Error(
       `Open Science did not become healthy within ${START_TIMEOUT_MS / 1000}s.${logTail ? `\n\n${logTail}` : ''}`
     )
   }
+  const state = startup.state
   const url = await authenticatedUrl(state, deps)
   deps.log(`Open Science started (PID ${state.pid}).`)
   if (options.open) openBrowser(url)
@@ -457,6 +560,37 @@ const outputValue = (value, options, deps) => {
             .join('\t') || JSON.stringify(value)
     )
   }
+}
+
+export const rollbackCommand = async (options, dependencies = {}) => {
+  const defaultRunRollback = async (rollbackOptions) => {
+    const { runRollbackToV073 } = await import('./rollback-to-0.7.3.mjs')
+    return runRollbackToV073(rollbackOptions)
+  }
+  const deps = {
+    runRollback: defaultRunRollback,
+    log: (...args) => console.log(...args),
+    ...dependencies
+  }
+  if (!options.json) {
+    deps.log('Validating and copying rollback data. Keep this terminal open until it completes...')
+  }
+  const manifest = await deps.runRollback({
+    configRoot: options.configRoot,
+    dataRoot: options.dataRoot,
+    output: options.output,
+    confirm: options.yes === true
+  })
+  if (options.json) {
+    deps.log(JSON.stringify(manifest))
+    return
+  }
+  deps.log(`Prepared an isolated Open Science ${manifest.targetVersion} rollback.`)
+  deps.log(`Rollback Data Root: ${manifest.rollbackDataRoot}`)
+  deps.log(`Preserved newer Config Root: ${manifest.preservedConfigRoot}`)
+  deps.log(`Preserved newer Data Root: ${manifest.preservedDataRoot}`)
+  deps.log(`Converted Sessions: ${manifest.sessionsConverted}`)
+  deps.log(`You can now install and start Open Science ${manifest.targetVersion}.`)
 }
 
 const readPrompt = async (options, deps) => {
@@ -637,6 +771,7 @@ export const runCli = async (argv = process.argv.slice(2)) => {
   else if (command === 'stop') await stopCommand(options)
   else if (command === 'status') await statusCommand(options)
   else if (command === 'url') await urlCommand(options)
+  else if (command === 'rollback-to-0.7.3') await rollbackCommand(options)
   else if (TASK_COMMANDS.has(command)) await runTaskCommand(parsed)
   else throw new CliUsageError(`Unknown command: ${command}\n\n${usage}`)
 }

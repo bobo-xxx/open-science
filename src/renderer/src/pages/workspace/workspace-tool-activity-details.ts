@@ -2,6 +2,7 @@ import type { ContentBlock, ToolCallContent, ToolKind } from '@agentclientprotoc
 
 import { formatByteSize } from '@/lib/utils'
 import type { ToolActivity } from '@/stores/session-store'
+import { resolveNotebookLanguage, resolveNotebookRunToolName } from './notebook-tool-names'
 
 type ToolCodeSection = {
   kind: 'code'
@@ -45,6 +46,8 @@ type ToolActivityDetails = {
 
 // Bounds very large tool payloads so a single read/execute row cannot flood the transcript.
 const MAX_CODE_CHARS = 20000
+const SKILL_ACTIVITY_TITLE_PATTERN = /^(?:run|loading|loaded)\s+skill(?:\?|:|\s|$)/iu
+const SKILL_NAME_PATTERN = /^(?:loading|loaded)\s+skill:\s*(.+?)\s*$/iu
 
 // Human-readable fallbacks for ACP tool kinds when the provider tool name is unavailable.
 const TOOL_KIND_LABELS: Record<ToolKind, string> = {
@@ -111,6 +114,16 @@ const trimDetail = (value: string | null | undefined): string | undefined => {
 
   return trimmedValue ? trimmedValue : undefined
 }
+
+// Skill documents are internal agent instructions. Existing persisted sessions can contain their
+// old payloads, so keep native Skill activities as compact rows without an expandable detail view.
+const isSkillActivity = (activity: ToolActivity): boolean =>
+  activity.providerToolName?.trim().toLowerCase() === 'skill' ||
+  SKILL_ACTIVITY_TITLE_PATTERN.test(activity.title.trim())
+
+// Projected lifecycle titles are the stable, user-safe Skill names shared across providers.
+const getLoadedSkillName = (activity: ToolActivity): string | undefined =>
+  trimDetail(SKILL_NAME_PATTERN.exec(activity.title)?.[1])
 
 // Converts supported ACP content block variants into displayable text snippets.
 const collectContentText = (content: ContentBlock): string[] => {
@@ -366,14 +379,25 @@ const buildGenericDetails = (activity: ToolActivity): ToolActivityDetails | unde
   }
 }
 
+const ARTIFACT_WRITE_ACTIVITY_IDENTITIES = new Set([
+  'write_artifact_file',
+  'write artifact file',
+  'save_artifacts',
+  'mcp__open-science-artifacts__write_artifact_file',
+  'mcp__open_science_artifacts__write_artifact_file',
+  'mcp.open-science-artifacts.write_artifact_file',
+  'open-science-artifacts_write_artifact_file',
+  'open_science_artifacts_write_artifact_file'
+])
+
 // Detects the managed artifact-writing MCP tool (open-science-artifacts / write_artifact_file).
 const isArtifactWriteActivity = (activity: ToolActivity): boolean => {
   const providerName = trimDetail(activity.providerToolName)?.toLowerCase() ?? ''
+  const title = trimDetail(activity.title)?.toLowerCase() ?? ''
 
   return (
-    providerName === 'save_artifacts' ||
-    providerName.includes('artifact_file') ||
-    providerName.includes('write_artifact')
+    ARTIFACT_WRITE_ACTIVITY_IDENTITIES.has(providerName) ||
+    ARTIFACT_WRITE_ACTIVITY_IDENTITIES.has(title)
   )
 }
 
@@ -404,19 +428,49 @@ const isEditActivity = (activity: ToolActivity): boolean => {
   return EDIT_PROVIDER_TOOL_NAMES.has(providerName)
 }
 
-// Reads the artifact metadata the MCP tool echoes back as `{ "artifact": { … } }` JSON output.
-const extractArtifactOutput = (activity: ToolActivity): Record<string, unknown> | undefined => {
-  for (const text of collectToolTexts(activity)) {
-    try {
-      const parsed: unknown = JSON.parse(text)
+// Finds an Artifact receipt in direct JSON, MCP content blocks, or a Codex bridge result envelope.
+const extractArtifactRecord = (value: unknown, depth = 0): Record<string, unknown> | undefined => {
+  if (depth > 4) return undefined
 
-      if (isRecord(parsed) && isRecord(parsed.artifact)) return parsed.artifact
+  if (typeof value === 'string') {
+    try {
+      return extractArtifactRecord(JSON.parse(value) as unknown, depth + 1)
     } catch {
-      // Not a JSON payload; keep scanning the remaining content blocks.
+      return undefined
+    }
+  }
+
+  if (!isRecord(value)) return undefined
+  if (isRecord(value.artifact)) return value.artifact
+
+  for (const nested of [value.result, value.structuredContent]) {
+    const artifact = extractArtifactRecord(nested, depth + 1)
+
+    if (artifact) return artifact
+  }
+
+  if (Array.isArray(value.content)) {
+    for (const block of value.content) {
+      if (!isRecord(block) || block.type !== 'text' || typeof block.text !== 'string') continue
+
+      const artifact = extractArtifactRecord(block.text, depth + 1)
+
+      if (artifact) return artifact
     }
   }
 
   return undefined
+}
+
+// Reads the artifact metadata the MCP tool echoes back as `{ "artifact": { … } }` JSON output.
+const extractArtifactOutput = (activity: ToolActivity): Record<string, unknown> | undefined => {
+  for (const text of collectToolTexts(activity)) {
+    const artifact = extractArtifactRecord(text)
+
+    if (artifact) return artifact
+  }
+
+  return extractArtifactRecord(activity.rawOutput)
 }
 
 // Reads a trimmed string field from an optional record without leaking non-string values.
@@ -426,14 +480,34 @@ const getRecordString = (
 ): string | undefined =>
   record && typeof record[key] === 'string' ? trimDetail(record[key] as string) : undefined
 
+// Reads the first finite numeric field from one of the supported receipt spellings.
+const getRecordNumber = (
+  record: Record<string, unknown> | undefined,
+  ...keys: string[]
+): number | undefined => {
+  for (const key of keys) {
+    const value = record?.[key]
+
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+  }
+
+  return undefined
+}
+
 // Summarizes a saved artifact file (name/type/size/path) without echoing its raw content payload.
 const buildArtifactDetails = (activity: ToolActivity): ToolActivityDetails | undefined => {
   const rawInput = isRecord(activity.rawInput) ? activity.rawInput : undefined
   const output = extractArtifactOutput(activity)
-  const filename = getRecordString(rawInput, 'filename') ?? getRecordString(output, 'name')
-  const mimeType = getRecordString(rawInput, 'mimeType') ?? getRecordString(output, 'mimeType')
+  const filename =
+    getRecordString(rawInput, 'filename') ??
+    getRecordString(output, 'name') ??
+    getRecordString(output, 'filename')
+  const mimeType =
+    getRecordString(rawInput, 'mimeType') ??
+    getRecordString(output, 'mimeType') ??
+    getRecordString(output, 'content_type')
   const path = getRecordString(output, 'path')
-  const size = typeof output?.size === 'number' ? output.size : undefined
+  const size = getRecordNumber(output, 'size', 'size_bytes')
   const sizeLabel = formatByteSize(size)
 
   if (!filename && !path) return undefined
@@ -474,65 +548,61 @@ const buildArtifactDetails = (activity: ToolActivity): ToolActivityDetails | und
   }
 }
 
-// Detects the notebook execute MCP tool so its cell can render as code plus output.
-const isNotebookExecuteActivity = (activity: ToolActivity): boolean => {
-  const providerName = trimDetail(activity.providerToolName)?.toLowerCase() ?? ''
-
-  return providerName.includes('open-science-notebook') && providerName.endsWith('notebook_execute')
-}
-
 // The kernel kinds a notebook run tool can produce; drives language, label, and display name.
 type NotebookKernelKindLike = 'python' | 'r' | 'repl' | 'bash'
 
-const NOTEBOOK_KERNEL_KINDS = new Set<NotebookKernelKindLike>(['python', 'r', 'repl', 'bash'])
+const toNotebookKernelKind = (value: unknown): NotebookKernelKindLike | undefined => {
+  if (typeof value !== 'string') return undefined
 
-// Provider tool suffixes (under the notebook MCP server) whose result is one kernel run.
-const NOTEBOOK_RUN_TOOL_SUFFIXES = ['notebook_execute', 'repl_execute', 'bash_execute'] as const
-
-// Shiki language id for each kernel's code block: repl is JavaScript, bash is a shell command.
-const NOTEBOOK_KERNEL_LANGUAGE: Record<NotebookKernelKindLike, string> = {
-  python: 'python',
-  r: 'r',
-  repl: 'javascript',
-  bash: 'bash'
-}
-
-// Row heading per kernel: python/r are notebook cells, repl is the Agent SDK, bash is the shell.
-const NOTEBOOK_KERNEL_DISPLAY: Record<NotebookKernelKindLike, string> = {
-  python: 'Notebook cell',
-  r: 'Notebook cell',
-  repl: 'Agent SDK',
-  bash: 'Shell'
+  const normalized = value.toLowerCase()
+  return normalized === 'python' ||
+    normalized === 'r' ||
+    normalized === 'repl' ||
+    normalized === 'bash'
+    ? normalized
+    : undefined
 }
 
 // Detects any notebook kernel run (python/r cell, repl control-plane, or bash) so all three render
 // as code plus output rather than the raw run-summary JSON envelope.
-const isNotebookKernelRunActivity = (activity: ToolActivity): boolean => {
-  const providerName = trimDetail(activity.providerToolName)?.toLowerCase() ?? ''
+// Matches both server-name forms (Claude Code's hyphenated open-science-notebook and the
+// responses bridge's underscore-sanitized open_science_notebook) via the shared matcher, which
+// also requires the server segment to match exactly so lookalike server names are excluded.
+const getNotebookRunToolName = (activity: ToolActivity): string | undefined =>
+  resolveNotebookRunToolName(trimDetail(activity.providerToolName), trimDetail(activity.title))
 
-  if (!providerName.includes('open-science-notebook')) return false
+const getNotebookInput = (activity: ToolActivity): Record<string, unknown> => {
+  if (!isRecord(activity.rawInput)) return {}
 
-  return NOTEBOOK_RUN_TOOL_SUFFIXES.some((suffix) => providerName.endsWith(suffix))
+  // Codex preserves the MCP envelope on completed activities. The actual notebook input lives in
+  // `arguments`, while other providers expose those arguments directly.
+  return isRecord(activity.rawInput.arguments) ? activity.rawInput.arguments : activity.rawInput
 }
 
-// Resolves the kernel from the run summary, falling back to the tool name (repl_execute/bash_execute).
-const getNotebookKernelKind = (
+const isNotebookKernelRunActivity = (activity: ToolActivity): boolean =>
+  getNotebookRunToolName(activity) !== undefined
+
+// Resolves the kernel's Shiki language from input, run summary, tool name, and code heuristics.
+// Returns the language string directly (no intermediate NotebookKernelKindLike round-trip).
+// Uses the shared notebook-tool-names helper so the dialog and transcript agree on language.
+const getNotebookLanguage = (
   activity: ToolActivity,
   summary: Record<string, unknown> | undefined
-): NotebookKernelKindLike => {
-  const fromSummary =
-    summary && typeof summary.kernelKind === 'string' ? summary.kernelKind : undefined
-
-  if (fromSummary && NOTEBOOK_KERNEL_KINDS.has(fromSummary as NotebookKernelKindLike)) {
-    return fromSummary as NotebookKernelKindLike
-  }
-
-  const providerName = trimDetail(activity.providerToolName)?.toLowerCase() ?? ''
-
-  if (providerName.endsWith('repl_execute')) return 'repl'
-  if (providerName.endsWith('bash_execute')) return 'bash'
-
-  return 'python'
+): string => {
+  const input = getNotebookInput(activity)
+  const inputKernel = ['kernelKind', 'kernel', 'language'].reduce<
+    NotebookKernelKindLike | undefined
+  >((found, key) => found ?? toNotebookKernelKind(input[key]), undefined)
+  const summaryKernel = toNotebookKernelKind(summary?.kernelKind)
+  const resolvedInput =
+    inputKernel || !summaryKernel ? input : { ...input, kernelKind: summaryKernel }
+  const code =
+    typeof input.code === 'string'
+      ? input.code
+      : typeof summary?.script === 'string'
+        ? summary.script
+        : undefined
+  return resolveNotebookLanguage(getNotebookRunToolName(activity), resolvedInput, code)
 }
 
 // Reads the notebook run summary the execute tool returns as JSON content (or raw output).
@@ -556,9 +626,10 @@ const getNotebookCode = (
   activity: ToolActivity,
   summary: Record<string, unknown> | undefined
 ): string | undefined => {
-  if (isRecord(activity.rawInput)) {
+  const input = getNotebookInput(activity)
+  if (Object.keys(input).length > 0) {
     for (const key of ['code', 'command', 'script'] as const) {
-      const value = activity.rawInput[key]
+      const value = input[key]
 
       if (typeof value === 'string') {
         const trimmed = trimDetail(value)
@@ -635,13 +706,11 @@ const getNotebookOutput = (summary: Record<string, unknown> | undefined): string
 // kernel: python/r cells, the repl control-plane (Agent SDK), and bash shell runs.
 const buildNotebookDetails = (activity: ToolActivity): ToolActivityDetails | undefined => {
   const summary = parseNotebookRunSummary(activity)
-  const kernelKind = getNotebookKernelKind(activity, summary)
+  const language = getNotebookLanguage(activity, summary)
   const code = getNotebookCode(activity, summary)
   const sections: ToolDetailSection[] = []
-  const codeLabel = kernelKind === 'bash' ? 'Command' : 'Code'
-  const codeSection = code
-    ? createCodeSection(codeLabel, code, NOTEBOOK_KERNEL_LANGUAGE[kernelKind])
-    : undefined
+  const codeLabel = language === 'bash' ? 'Command' : 'Code'
+  const codeSection = code ? createCodeSection(codeLabel, code, language) : undefined
 
   if (codeSection) sections.push(codeSection)
 
@@ -656,8 +725,12 @@ const buildNotebookDetails = (activity: ToolActivity): ToolActivityDetails | und
 
   const status = summary && typeof summary.status === 'string' ? summary.status : undefined
 
+  // Derive display name from language: python/r are cells, javascript (repl) is Agent SDK, bash is shell.
+  const displayName =
+    language === 'javascript' ? 'Agent SDK' : language === 'bash' ? 'Shell' : 'Notebook cell'
+
   return {
-    displayName: NOTEBOOK_KERNEL_DISPLAY[kernelKind],
+    displayName,
     metaLabel: status,
     sections
   }
@@ -709,6 +782,23 @@ const getManagedPackageList = (activity: ToolActivity): string | undefined => {
   return names.length > 0 ? names.join(', ') : undefined
 }
 
+const formatPackageChange = (value: unknown): string | undefined => {
+  if (!isRecord(value)) return undefined
+  const name = getRecordString(value, 'name')
+  const change = getRecordString(value, 'change')
+  const before = getRecordString(value, 'beforeVersion')
+  const after = getRecordString(value, 'afterVersion')
+  if (!name || !change) return undefined
+
+  if (change === 'updated') return `${name}: ${before ?? 'unknown'} → ${after ?? 'unknown'}`
+  if (change === 'installed' || change === 'observed') {
+    return `${name}: ${change}${after ? ` ${after}` : ''}`
+  }
+  if (change === 'removed') return `${name}: removed${before ? ` ${before}` : ''}`
+  if (change === 'unchanged') return `${name}: unchanged${after ? ` at ${after}` : ''}`
+  return `${name}: ${change}`
+}
+
 // Summarizes a package install: which packages, the installer used, and a cleaned collapsible log —
 // instead of dumping the raw { ok, needsRestart, log, method } JSON envelope into the transcript.
 const buildManagePackagesDetails = (activity: ToolActivity): ToolActivityDetails | undefined => {
@@ -731,6 +821,9 @@ const buildManagePackagesDetails = (activity: ToolActivity): ToolActivityDetails
   const prefix = typeof result.prefix === 'string' ? trimDetail(result.prefix) : undefined
   const log = typeof result.log === 'string' ? cleanInstallLog(result.log) : ''
   const error = typeof result.error === 'string' ? trimDetail(result.error) : undefined
+  const packageChanges = Array.isArray(result.packageChanges)
+    ? result.packageChanges.map(formatPackageChange).filter((change): change is string => !!change)
+    : []
   const metaLabel = [ok === false ? 'failed' : method, needsRestart ? 'restart needed' : undefined]
     .filter(Boolean)
     .join(' · ')
@@ -754,6 +847,9 @@ const buildManagePackagesDetails = (activity: ToolActivity): ToolActivityDetails
   const commandSection = createCodeSection('Command', commandText)
 
   if (commandSection) sections.push(commandSection)
+
+  const packagesSection = createCodeSection('Packages', packageChanges.join('\n'))
+  if (packagesSection) sections.push(packagesSection)
 
   if (error) {
     const errorSection = createCodeSection('Error', error)
@@ -877,6 +973,7 @@ const buildFetchDetails = (activity: ToolActivity): ToolActivityDetails | undefi
 
 // Projects one tool activity into the structured, expandable detail model, or nothing for chips.
 const buildToolActivityDetails = (activity: ToolActivity): ToolActivityDetails | undefined => {
+  if (isSkillActivity(activity)) return undefined
   // Saved files show a metadata summary instead of dumping their (possibly base64) content.
   if (isArtifactWriteActivity(activity)) return buildArtifactDetails(activity)
   // File edits prefer a diff view, falling back to raw input/output when no diff is provided.
@@ -898,7 +995,13 @@ const buildToolActivityDetails = (activity: ToolActivity): ToolActivityDetails |
   return buildGenericDetails(activity)
 }
 
-export { buildToolActivityDetails, getToolDisplayName, isEditActivity, isNotebookExecuteActivity }
+export {
+  buildToolActivityDetails,
+  getLoadedSkillName,
+  getToolDisplayName,
+  isEditActivity,
+  isSkillActivity
+}
 export type {
   ToolActivityDetails,
   ToolCodeSection,

@@ -1,24 +1,55 @@
-import { resolve } from 'path'
+import { basename, dirname, resolve } from 'path'
 import { defineConfig, configDefaults } from 'vitest/config'
+
+const testRoot = resolve('.')
+const sharedInstallRoot = basename(dirname(testRoot)) === '.worktree' ? resolve('../..') : testRoot
+
+const VITEST_EXCLUDE_PATTERNS = [
+  ...configDefaults.exclude,
+  'e2e/**',
+  '**/.claude/**',
+  '**/.codex/**',
+  '**/.pnpm-store/**',
+  '**/tmp/**',
+  '**/.worktrees/**',
+  '**/.worktree/**'
+]
 
 // Mirrors the renderer alias from electron.vite.config.ts so tests that mount real component
 // trees (instead of mocking every aliased import) can resolve '@/...' without a build step.
 export default defineConfig({
+  server: {
+    // Vitest may still canonicalize worker URLs through the shared install even when module
+    // resolution preserves symlinks. Limit the additional allowance to this repository root.
+    fs: { allow: [...new Set([testRoot, sharedInstallRoot])] }
+  },
   resolve: {
+    // Git worktrees reuse the repository-root dependency install through a local node_modules
+    // symlink. Keep that logical path so Vite does not resolve PDF workers outside the test root and
+    // reject them before the component suite can run. A normal checkout already has a local install.
+    preserveSymlinks: true,
     alias: {
       '@': resolve('src/renderer/src'),
-      '@renderer': resolve('src/renderer/src')
+      '@renderer': resolve('src/renderer/src'),
+      'e-virt-table/dist/index.es.js': resolve('test/fixtures/fake-e-virt-table.ts')
     }
   },
   test: {
+    server: {
+      deps: {
+        inline: ['@file-viewer/renderer-spreadsheet']
+      }
+    },
     // Loads .env into process.env before tests run. Integration tests gated on RUN_COMPUTE_JOBS=1
     // read their target alias from COMPUTE_TEST_SSH_ALIAS. The file is gitignored; .env.example
     // documents the supported variables.
-    setupFiles: ['./test/setup-dotenv.ts'],
-    // Keep vitest's defaults (node_modules, dist, .git, ...) and also ignore git worktrees created
-    // under .claude/worktrees — those hold full source + node_modules copies that would otherwise be
-    // discovered and run as duplicate (and often stale) suites during local runs.
-    exclude: [...configDefaults.exclude, '**/.claude/**'],
+    setupFiles: ['./test/setup-dotenv.ts', './test/setup-jsdom-polyfills.ts'],
+    // Keep vitest's defaults (node_modules, dist, .git, ...) and also ignore git worktrees — those hold
+    // full source + node_modules copies that would otherwise be discovered and run as duplicate (and
+    // often stale) suites during local runs. Playwright owns e2e/; Vitest must not execute those specs
+    // in its Node workers. .worktree is the project-standard root; .claude remains excluded for
+    // existing local checkouts.
+    exclude: VITEST_EXCLUDE_PATTERNS,
     // Lift the 5s default: the full coverage run instruments 4400+ tests across parallel workers on a
     // shared CI runner, so a fast fully-mocked test can still be CPU-starved past 5s and time out
     // spuriously. 15s absorbs that contention without masking a genuine hang (real work is far slower).
@@ -64,3 +95,5 @@ export default defineConfig({
     }
   }
 })
+
+export { VITEST_EXCLUDE_PATTERNS }

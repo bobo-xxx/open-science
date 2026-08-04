@@ -7,9 +7,11 @@ import {
   mkdir,
   mkdtemp,
   open,
+  readFile,
   readdir,
   rename,
   rm,
+  stat,
   writeFile,
   type FileHandle
 } from 'node:fs/promises'
@@ -20,6 +22,7 @@ import { pipeline } from 'node:stream/promises'
 import { createGunzip } from 'node:zlib'
 
 import type { ClaudeInstallEvent, ClaudeInstallResult } from '../../shared/settings'
+import { ACP_MODEL_TURN_COUNT_META_KEY, ACP_TURN_TOKEN_USAGE_META_KEY } from '../../shared/acp'
 import {
   DEFAULT_REGISTRIES,
   defaultFetchJson,
@@ -105,6 +108,572 @@ const adapterEntryInRoot = (root: string): string => join(root, 'adapter', 'dist
 
 const codexBinaryInRoot = (root: string, platform: ManagedCodexPlatform): string =>
   join(root, 'codex', 'vendor', platform.target, 'bin', platform.binName)
+
+const CODEX_ACP_CONTEXT_USAGE_SOURCE =
+  '    const used = this.sessionState.lastTokenUsage?.totalTokens;'
+const CODEX_ACP_CONTEXT_USAGE_LEGACY_REPLACEMENT = [
+  '    const lastTokenUsage = this.sessionState.lastTokenUsage;',
+  '    const used =',
+  '      lastTokenUsage == null',
+  '        ? void 0',
+  '        : lastTokenUsage.inputTokens + (lastTokenUsage.cachedInputTokens ?? 0);'
+].join('\n')
+const CODEX_ACP_CONTEXT_USAGE_REPLACEMENT = [
+  '    const contextTokenUsage = this.sessionState.lastTokenUsage;',
+  '    const used =',
+  '      contextTokenUsage == null',
+  '        ? void 0',
+  '        : contextTokenUsage.inputTokens + (contextTokenUsage.cachedInputTokens ?? 0);'
+].join('\n')
+const CODEX_ACP_CONTEXT_USAGE_INPUT_ONLY_REPLACEMENT = [
+  '    const contextTokenUsage = this.sessionState.lastTokenUsage;',
+  '    const used =',
+  '      contextTokenUsage == null',
+  '        ? void 0',
+  '        : contextTokenUsage.inputTokens;'
+].join('\n')
+
+const CODEX_ACP_TURN_USAGE_UPDATE_SOURCE = [
+  '  createUsageUpdate(params) {',
+  '    this.handleTokenUsageUpdated(params);'
+].join('\n')
+const CODEX_ACP_TURN_USAGE_UPDATE_LEGACY_REPLACEMENT = [
+  '  createUsageUpdate(params) {',
+  '    const previousTotalTokenUsage = this.sessionState.totalTokenUsage;',
+  '    this.handleTokenUsageUpdated(params);',
+  '    const currentTotalTokenUsage = this.sessionState.totalTokenUsage;',
+  '    const lastTokenUsage = this.sessionState.lastTokenUsage;',
+  '    const promptTokenUsage = this.sessionState.promptTokenUsage;',
+  '    if (',
+  '      promptTokenUsage != null &&',
+  '      currentTotalTokenUsage != null &&',
+  '      lastTokenUsage != null',
+  '    ) {',
+  '      const tokenKeys = [',
+  '        "totalTokens",',
+  '        "inputTokens",',
+  '        "cachedInputTokens",',
+  '        "outputTokens",',
+  '        "reasoningOutputTokens"',
+  '      ];',
+  '      const cumulativeDelta = previousTotalTokenUsage == null',
+  '        ? lastTokenUsage',
+  '        : {',
+  '            totalTokens: currentTotalTokenUsage.totalTokens - previousTotalTokenUsage.totalTokens,',
+  '            inputTokens: currentTotalTokenUsage.inputTokens - previousTotalTokenUsage.inputTokens,',
+  '            cachedInputTokens:',
+  '              currentTotalTokenUsage.cachedInputTokens - previousTotalTokenUsage.cachedInputTokens,',
+  '            outputTokens:',
+  '              currentTotalTokenUsage.outputTokens - previousTotalTokenUsage.outputTokens,',
+  '            reasoningOutputTokens:',
+  '              currentTotalTokenUsage.reasoningOutputTokens -',
+  '              previousTotalTokenUsage.reasoningOutputTokens',
+  '          };',
+  '      const increment = tokenKeys.every(',
+  '        (key) => Number.isSafeInteger(cumulativeDelta[key]) && cumulativeDelta[key] >= 0',
+  '      )',
+  '        ? cumulativeDelta',
+  '        : lastTokenUsage;',
+  '      const nextPromptTokenUsage = {',
+  '        totalTokens: promptTokenUsage.totalTokens + increment.totalTokens,',
+  '        inputTokens: promptTokenUsage.inputTokens + increment.inputTokens,',
+  '        cachedInputTokens: promptTokenUsage.cachedInputTokens + increment.cachedInputTokens,',
+  '        outputTokens: promptTokenUsage.outputTokens + increment.outputTokens,',
+  '        reasoningOutputTokens:',
+  '          promptTokenUsage.reasoningOutputTokens + increment.reasoningOutputTokens',
+  '      };',
+  '      if (tokenKeys.every((key) => Number.isSafeInteger(nextPromptTokenUsage[key]))) {',
+  '        this.sessionState.promptTokenUsage = nextPromptTokenUsage;',
+  '        this.sessionState.promptTokenUsageObserved = true;',
+  '      }',
+  '    }'
+].join('\n')
+
+const CODEX_ACP_TURN_USAGE_UPDATE_WITHOUT_COUNT_REPLACEMENT = [
+  '  createUsageUpdate(params) {',
+  '    const normalizeTokenUsage = (usage) =>',
+  '      usage == null',
+  '        ? usage',
+  '        : { ...usage, cachedInputTokens: usage.cachedInputTokens ?? 0 };',
+  '    const previousTotalTokenUsage = normalizeTokenUsage(this.sessionState.totalTokenUsage);',
+  '    this.handleTokenUsageUpdated(params);',
+  '    const currentTotalTokenUsage = normalizeTokenUsage(this.sessionState.totalTokenUsage);',
+  '    const lastTokenUsage = normalizeTokenUsage(this.sessionState.lastTokenUsage);',
+  '    const promptTokenUsage = this.sessionState.promptTokenUsage;',
+  '    if (',
+  '      promptTokenUsage != null &&',
+  '      currentTotalTokenUsage != null &&',
+  '      lastTokenUsage != null',
+  '    ) {',
+  '      const tokenKeys = [',
+  '        "totalTokens",',
+  '        "inputTokens",',
+  '        "cachedInputTokens",',
+  '        "outputTokens",',
+  '        "reasoningOutputTokens"',
+  '      ];',
+  '      const cumulativeDelta = previousTotalTokenUsage == null',
+  '        ? lastTokenUsage',
+  '        : {',
+  '            totalTokens: currentTotalTokenUsage.totalTokens - previousTotalTokenUsage.totalTokens,',
+  '            inputTokens: currentTotalTokenUsage.inputTokens - previousTotalTokenUsage.inputTokens,',
+  '            cachedInputTokens:',
+  '              currentTotalTokenUsage.cachedInputTokens - previousTotalTokenUsage.cachedInputTokens,',
+  '            outputTokens:',
+  '              currentTotalTokenUsage.outputTokens - previousTotalTokenUsage.outputTokens,',
+  '            reasoningOutputTokens:',
+  '              currentTotalTokenUsage.reasoningOutputTokens -',
+  '              previousTotalTokenUsage.reasoningOutputTokens',
+  '          };',
+  '      const increment = tokenKeys.every(',
+  '        (key) => Number.isSafeInteger(cumulativeDelta[key]) && cumulativeDelta[key] >= 0',
+  '      )',
+  '        ? cumulativeDelta',
+  '        : lastTokenUsage;',
+  '      const nextPromptTokenUsage = {',
+  '        totalTokens: promptTokenUsage.totalTokens + increment.totalTokens,',
+  '        inputTokens: promptTokenUsage.inputTokens + increment.inputTokens,',
+  '        cachedInputTokens: promptTokenUsage.cachedInputTokens + increment.cachedInputTokens,',
+  '        outputTokens: promptTokenUsage.outputTokens + increment.outputTokens,',
+  '        reasoningOutputTokens:',
+  '          promptTokenUsage.reasoningOutputTokens + increment.reasoningOutputTokens',
+  '      };',
+  '      if (tokenKeys.every((key) => Number.isSafeInteger(nextPromptTokenUsage[key]))) {',
+  '        this.sessionState.promptTokenUsage = nextPromptTokenUsage;',
+  '        this.sessionState.promptTokenUsageObserved = true;',
+  '      }',
+  '    }'
+].join('\n')
+const CODEX_ACP_TURN_USAGE_UPDATE_REPLACEMENT =
+  CODEX_ACP_TURN_USAGE_UPDATE_WITHOUT_COUNT_REPLACEMENT.replace(
+    '    const promptTokenUsage = this.sessionState.promptTokenUsage;',
+    [
+      '    const promptTokenUsage = this.sessionState.promptTokenUsage;',
+      '    const promptModelTurnCount = this.sessionState.promptModelTurnCount;'
+    ].join('\n')
+  )
+    .replace(
+      '      lastTokenUsage != null\n    ) {',
+      '      lastTokenUsage != null &&\n      Number.isSafeInteger(promptModelTurnCount)\n    ) {'
+    )
+    .replace(
+      '      const nextPromptTokenUsage = {',
+      [
+        '      const observedModelTurn = tokenKeys.some((key) => increment[key] > 0);',
+        '      const nextPromptModelTurnCount = promptModelTurnCount + (observedModelTurn ? 1 : 0);',
+        '      const nextPromptTokenUsage = {'
+      ].join('\n')
+    )
+    .replace(
+      '      if (tokenKeys.every((key) => Number.isSafeInteger(nextPromptTokenUsage[key]))) {',
+      [
+        '      if (',
+        '        tokenKeys.every((key) => Number.isSafeInteger(nextPromptTokenUsage[key])) &&',
+        '        Number.isSafeInteger(nextPromptModelTurnCount)',
+        '      ) {'
+      ].join('\n')
+    )
+    .replace(
+      '        this.sessionState.promptTokenUsage = nextPromptTokenUsage;',
+      [
+        '        this.sessionState.promptTokenUsage = nextPromptTokenUsage;',
+        '        this.sessionState.promptModelTurnCount = nextPromptModelTurnCount;'
+      ].join('\n')
+    )
+const CODEX_ACP_TURN_USAGE_UPDATE_LEGACY_WITH_COUNT_REPLACEMENT =
+  CODEX_ACP_TURN_USAGE_UPDATE_REPLACEMENT.replace(
+    [
+      '    const normalizeTokenUsage = (usage) =>',
+      '      usage == null',
+      '        ? usage',
+      '        : { ...usage, cachedInputTokens: usage.cachedInputTokens ?? 0 };',
+      '    const previousTotalTokenUsage = normalizeTokenUsage(this.sessionState.totalTokenUsage);'
+    ].join('\n'),
+    '    const previousTotalTokenUsage = this.sessionState.totalTokenUsage;'
+  )
+    .replace(
+      '    const currentTotalTokenUsage = normalizeTokenUsage(this.sessionState.totalTokenUsage);',
+      '    const currentTotalTokenUsage = this.sessionState.totalTokenUsage;'
+    )
+    .replace(
+      '    const lastTokenUsage = normalizeTokenUsage(this.sessionState.lastTokenUsage);',
+      '    const lastTokenUsage = this.sessionState.lastTokenUsage;'
+    )
+
+const CODEX_ACP_TURN_USAGE_START_SOURCE = [
+  '    sessionState.currentTurnId = null;',
+  '    sessionState.lastTokenUsage = null;'
+].join('\n')
+const CODEX_ACP_TURN_USAGE_START_WITHOUT_COUNT_REPLACEMENT = [
+  CODEX_ACP_TURN_USAGE_START_SOURCE,
+  '    sessionState.promptTokenUsage = {',
+  '      totalTokens: 0,',
+  '      inputTokens: 0,',
+  '      cachedInputTokens: 0,',
+  '      outputTokens: 0,',
+  '      reasoningOutputTokens: 0',
+  '    };',
+  '    sessionState.promptTokenUsageObserved = false;'
+].join('\n')
+const CODEX_ACP_TURN_USAGE_START_REPLACEMENT = [
+  CODEX_ACP_TURN_USAGE_START_WITHOUT_COUNT_REPLACEMENT,
+  '    sessionState.promptModelTurnCount = 0;'
+].join('\n')
+
+const CODEX_ACP_TURN_USAGE_RESPONSE_SOURCE =
+  'usage: this.buildPromptUsage(sessionState.lastTokenUsage),'
+const CODEX_ACP_TURN_USAGE_RESPONSE_LEGACY_REPLACEMENT =
+  'usage: this.buildPromptUsage(sessionState.promptTokenUsageObserved ? sessionState.promptTokenUsage : null),'
+// The first turn-usage patch emitted a second `_meta` property immediately before the adapter's
+// existing quota metadata. JavaScript keeps only the latter property, so this exact shape must be
+// recognized and upgraded in already-managed installs.
+const CODEX_ACP_TURN_USAGE_RESPONSE_OVERWRITTEN_REPLACEMENT = [
+  'usage: this.buildPromptUsage(',
+  '  sessionState.lastTokenUsage',
+  '),',
+  '...(sessionState.promptTokenUsageObserved',
+  '  ? {',
+  '      _meta: {',
+  `        "${ACP_TURN_TOKEN_USAGE_META_KEY}": this.buildPromptUsage(sessionState.promptTokenUsage)`,
+  '      }',
+  '    }',
+  '  : {}),'
+].join('\n')
+const CODEX_ACP_TURN_USAGE_RESPONSE_OVERWRITTEN_WITH_COUNT_REPLACEMENT =
+  CODEX_ACP_TURN_USAGE_RESPONSE_OVERWRITTEN_REPLACEMENT.replace(
+    `        "${ACP_TURN_TOKEN_USAGE_META_KEY}": this.buildPromptUsage(sessionState.promptTokenUsage)`,
+    [
+      `        "${ACP_TURN_TOKEN_USAGE_META_KEY}": this.buildPromptUsage(sessionState.promptTokenUsage),`,
+      `        "${ACP_MODEL_TURN_COUNT_META_KEY}": sessionState.promptModelTurnCount`
+    ].join('\n')
+  )
+const CODEX_ACP_TURN_USAGE_RESPONSE_REPLACEMENT = [
+  'usage: this.buildPromptUsage(',
+  '  sessionState.lastTokenUsage',
+  '),'
+].join('\n')
+const CODEX_ACP_TURN_USAGE_META_SOURCE = '_meta: this.buildQuotaMeta(sessionState)'
+const CODEX_ACP_TURN_USAGE_META_WITHOUT_COUNT_REPLACEMENT = [
+  '_meta: {',
+  '  ...this.buildQuotaMeta(sessionState),',
+  '  ...(sessionState.promptTokenUsageObserved',
+  '    ? {',
+  `        "${ACP_TURN_TOKEN_USAGE_META_KEY}": this.buildPromptUsage(sessionState.promptTokenUsage)`,
+  '      }',
+  '    : {})',
+  '}'
+].join('\n')
+const CODEX_ACP_TURN_USAGE_META_REPLACEMENT =
+  CODEX_ACP_TURN_USAGE_META_WITHOUT_COUNT_REPLACEMENT.replace(
+    `        "${ACP_TURN_TOKEN_USAGE_META_KEY}": this.buildPromptUsage(sessionState.promptTokenUsage)`,
+    [
+      `        "${ACP_TURN_TOKEN_USAGE_META_KEY}": this.buildPromptUsage(sessionState.promptTokenUsage),`,
+      `        "${ACP_MODEL_TURN_COUNT_META_KEY}": sessionState.promptModelTurnCount`
+    ].join('\n')
+  )
+const CODEX_ACP_TURN_USAGE_FINISH_SOURCE = '      activePrompt.complete();'
+const CODEX_ACP_TURN_USAGE_FINISH_WITHOUT_COUNT_REPLACEMENT = [
+  '      sessionState.promptTokenUsage = void 0;',
+  '      sessionState.promptTokenUsageObserved = void 0;',
+  CODEX_ACP_TURN_USAGE_FINISH_SOURCE
+].join('\n')
+const CODEX_ACP_TURN_USAGE_FINISH_REPLACEMENT = [
+  '      sessionState.promptTokenUsage = void 0;',
+  '      sessionState.promptTokenUsageObserved = void 0;',
+  '      sessionState.promptModelTurnCount = void 0;',
+  CODEX_ACP_TURN_USAGE_FINISH_SOURCE
+].join('\n')
+
+const CODEX_ACP_SKILL_INPUT_SOURCE = [
+  'function buildPromptItems(prompt) {',
+  '  return prompt.map((block) => {',
+  '    switch (block.type) {',
+  '      case "text":',
+  '        return { type: "text", text: block.text, text_elements: [] };'
+].join('\n')
+
+const CODEX_ACP_SKILL_INPUT_REPLACEMENT = [
+  'function buildPromptItems(prompt) {',
+  '  return prompt.flatMap((block) => {',
+  '    switch (block.type) {',
+  '      case "text": {',
+  '        const requestedSkills = Array.isArray(block._meta?.["open-science/skill-inputs"])',
+  '          ? block._meta["open-science/skill-inputs"]',
+  '          : [];',
+  '        const codexHome = typeof process.env.CODEX_HOME === "string" ? process.env.CODEX_HOME : "";',
+  '        const skillRoot = codexHome ? path4.join(codexHome, "skills") : "";',
+  '        const seen = new Set();',
+  '        const nativeSkills = requestedSkills.flatMap((skill) => {',
+  '          const name = typeof skill?.name === "string" ? skill.name.trim() : "";',
+  '          const skillPath = typeof skill?.path === "string" ? skill.path.trim() : "";',
+  '          const relative = skillRoot && path4.isAbsolute(skillPath)',
+  '            ? path4.relative(skillRoot, skillPath)',
+  '            : "..";',
+  '          let realRelative = "..";',
+  '          try {',
+  '            realRelative = path4.relative(fs4.realpathSync(skillRoot), fs4.realpathSync(skillPath));',
+  '          } catch {}',
+  '          const key = name + "\\0" + skillPath;',
+  '          if (',
+  '            !name ||',
+  '            !skillRoot ||',
+  '            relative === "" ||',
+  '            relative === ".." ||',
+  '            relative.startsWith(".." + path4.sep) ||',
+  '            path4.isAbsolute(relative) ||',
+  '            realRelative === ".." ||',
+  '            realRelative.startsWith(".." + path4.sep) ||',
+  '            path4.isAbsolute(realRelative) ||',
+  '            path4.basename(skillPath) !== "SKILL.md" ||',
+  '            !fs4.existsSync(skillPath) ||',
+  '            seen.has(key)',
+  '          ) return [];',
+  '          seen.add(key);',
+  '          return [{ type: "skill", name, path: skillPath }];',
+  '        });',
+  '        return [...nativeSkills, { type: "text", text: block.text, text_elements: [] }];',
+  '      }'
+].join('\n')
+
+const CODEX_ACP_MODEL_CATALOG_STARTUP_SOURCE = [
+  'function startCodexConnection(codexPath, env) {',
+  '  const spawnEnv = env ?? process.env;',
+  '  let codex;',
+  '  if (codexPath) {',
+  '    codex = process.platform === "win32" ? spawn(`"${codexPath}" app-server`, { shell: true, env: spawnEnv }) : spawn(codexPath, ["app-server"], { env: spawnEnv });',
+  '  } else {',
+  '    const bundledCodexPath = createRequire(import.meta.url).resolve("@openai/codex/bin/codex.js");',
+  '    codex = spawn(process.execPath, [bundledCodexPath, "app-server"], { env: spawnEnv });',
+  '  }'
+].join('\n')
+
+const CODEX_ACP_MODEL_CATALOG_STARTUP_REPLACEMENT = [
+  'function startCodexConnection(codexPath, env) {',
+  '  const spawnEnv = env ?? process.env;',
+  '  const startupConfigString = spawnEnv["CODEX_CONFIG"];',
+  '  const startupConfig = startupConfigString ? JSON.parse(startupConfigString) : void 0;',
+  '  const modelCatalogPath = typeof startupConfig?.model_catalog_json === "string"',
+  '    ? startupConfig.model_catalog_json',
+  '    : void 0;',
+  '  const appServerArgs = modelCatalogPath',
+  '    ? ["app-server", "-c", `model_catalog_json=${JSON.stringify(modelCatalogPath)}`]',
+  '    : ["app-server"];',
+  '  let codex;',
+  '  if (codexPath) {',
+  '    codex = process.platform === "win32"',
+  '      ? spawn(`"${codexPath}" app-server`, appServerArgs.slice(1), { shell: true, env: spawnEnv })',
+  '      : spawn(codexPath, appServerArgs, { env: spawnEnv });',
+  '  } else {',
+  '    const bundledCodexPath = createRequire(import.meta.url).resolve("@openai/codex/bin/codex.js");',
+  '    codex = spawn(process.execPath, [bundledCodexPath, ...appServerArgs], { env: spawnEnv });',
+  '  }'
+].join('\n')
+
+const CODEX_ADAPTER_REPLACE_RETRY_DELAYS_MS = [25, 50, 100, 200, 400] as const
+
+const renameWithTransientLockRetry = async (source: string, destination: string): Promise<void> => {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await rename(source, destination)
+      return
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException)?.code
+      const retryDelay = CODEX_ADAPTER_REPLACE_RETRY_DELAYS_MS[attempt]
+      if ((code !== 'EPERM' && code !== 'EBUSY') || retryDelay === undefined) throw error
+      await new Promise<void>((resolve) => setTimeout(resolve, retryDelay))
+    }
+  }
+}
+
+// codex-acp receives a per-request tokenUsage.last snapshot but publishes totalTokens as ACP context
+// usage. Its internal TokenCount has already separated cached input from uncached input, so recombine
+// those two input categories while excluding output and reasoning. The registry integrity pin fixes
+// the input bundle; the guards make a future source drift fail during installation.
+export const patchCodexAcpContextUsageSource = (source: string): string => {
+  if (source.includes(CODEX_ACP_CONTEXT_USAGE_REPLACEMENT)) return source
+  if (source.includes(CODEX_ACP_CONTEXT_USAGE_INPUT_ONLY_REPLACEMENT)) {
+    return source.replace(
+      CODEX_ACP_CONTEXT_USAGE_INPUT_ONLY_REPLACEMENT,
+      CODEX_ACP_CONTEXT_USAGE_REPLACEMENT
+    )
+  }
+  if (source.includes(CODEX_ACP_CONTEXT_USAGE_LEGACY_REPLACEMENT)) {
+    return source.replace(
+      CODEX_ACP_CONTEXT_USAGE_LEGACY_REPLACEMENT,
+      CODEX_ACP_CONTEXT_USAGE_REPLACEMENT
+    )
+  }
+
+  const matches = source.split(CODEX_ACP_CONTEXT_USAGE_SOURCE).length - 1
+
+  if (matches === 1) {
+    return source.replace(CODEX_ACP_CONTEXT_USAGE_SOURCE, CODEX_ACP_CONTEXT_USAGE_REPLACEMENT)
+  }
+
+  if (
+    matches > 1 ||
+    (source.includes('createUsageUpdate(params)') && source.includes('totalTokens'))
+  ) {
+    throw new Error('Pinned Codex ACP context-usage patch no longer matches the adapter bundle')
+  }
+
+  // Unit-test fixtures use tiny stand-in adapters rather than the pinned production bundle.
+  return source
+}
+
+// Codex ACP 1.1.4 projects only tokenUsage.last into PromptResponse.usage. Preserve that latest
+// request for context reconciliation while accumulating whole-turn deltas into an app-owned _meta
+// field for the transcript footer. Falling back to `last` for the first update keeps resumed sessions
+// from attributing their historical cumulative total to the first new response.
+export const patchCodexAcpTurnUsageSource = (source: string): string => {
+  const repairedResponseSource = source
+    .replaceAll(
+      CODEX_ACP_TURN_USAGE_RESPONSE_OVERWRITTEN_WITH_COUNT_REPLACEMENT,
+      CODEX_ACP_TURN_USAGE_RESPONSE_REPLACEMENT
+    )
+    .replaceAll(
+      CODEX_ACP_TURN_USAGE_RESPONSE_OVERWRITTEN_REPLACEMENT,
+      CODEX_ACP_TURN_USAGE_RESPONSE_REPLACEMENT
+    )
+  if (repairedResponseSource !== source) {
+    return patchCodexAcpTurnUsageSource(repairedResponseSource)
+  }
+
+  if (
+    source.includes(CODEX_ACP_TURN_USAGE_UPDATE_REPLACEMENT) &&
+    source.includes(CODEX_ACP_TURN_USAGE_START_REPLACEMENT) &&
+    source.includes(CODEX_ACP_TURN_USAGE_RESPONSE_REPLACEMENT) &&
+    source.includes(CODEX_ACP_TURN_USAGE_META_REPLACEMENT) &&
+    source.includes(CODEX_ACP_TURN_USAGE_FINISH_REPLACEMENT)
+  ) {
+    return source
+  }
+
+  const sourceWithCurrentStart = source.includes(CODEX_ACP_TURN_USAGE_START_REPLACEMENT)
+    ? source
+    : source.replace(
+        CODEX_ACP_TURN_USAGE_START_WITHOUT_COUNT_REPLACEMENT,
+        CODEX_ACP_TURN_USAGE_START_REPLACEMENT
+      )
+  const migratedSource = sourceWithCurrentStart
+    .replace(
+      CODEX_ACP_TURN_USAGE_UPDATE_WITHOUT_COUNT_REPLACEMENT,
+      CODEX_ACP_TURN_USAGE_UPDATE_REPLACEMENT
+    )
+    .replace(
+      CODEX_ACP_TURN_USAGE_UPDATE_LEGACY_WITH_COUNT_REPLACEMENT,
+      CODEX_ACP_TURN_USAGE_UPDATE_REPLACEMENT
+    )
+    .replaceAll(
+      CODEX_ACP_TURN_USAGE_META_WITHOUT_COUNT_REPLACEMENT,
+      CODEX_ACP_TURN_USAGE_META_REPLACEMENT
+    )
+    .replace(
+      CODEX_ACP_TURN_USAGE_FINISH_WITHOUT_COUNT_REPLACEMENT,
+      CODEX_ACP_TURN_USAGE_FINISH_REPLACEMENT
+    )
+    .replace(
+      CODEX_ACP_TURN_USAGE_UPDATE_LEGACY_REPLACEMENT,
+      CODEX_ACP_TURN_USAGE_UPDATE_REPLACEMENT
+    )
+    .replaceAll(
+      CODEX_ACP_TURN_USAGE_RESPONSE_LEGACY_REPLACEMENT,
+      CODEX_ACP_TURN_USAGE_RESPONSE_REPLACEMENT
+    )
+    .replaceAll(CODEX_ACP_TURN_USAGE_META_SOURCE, CODEX_ACP_TURN_USAGE_META_REPLACEMENT)
+
+  if (
+    migratedSource.includes(CODEX_ACP_TURN_USAGE_UPDATE_REPLACEMENT) &&
+    migratedSource.includes(CODEX_ACP_TURN_USAGE_START_REPLACEMENT) &&
+    migratedSource.includes(CODEX_ACP_TURN_USAGE_RESPONSE_REPLACEMENT) &&
+    migratedSource.includes(CODEX_ACP_TURN_USAGE_META_REPLACEMENT) &&
+    migratedSource.includes(CODEX_ACP_TURN_USAGE_FINISH_REPLACEMENT)
+  ) {
+    return migratedSource
+  }
+
+  const updateMatches = migratedSource.split(CODEX_ACP_TURN_USAGE_UPDATE_SOURCE).length - 1
+  const startMatches = migratedSource.split(CODEX_ACP_TURN_USAGE_START_SOURCE).length - 1
+  const responseMatches = migratedSource.split(CODEX_ACP_TURN_USAGE_RESPONSE_SOURCE).length - 1
+  const metaMatches = migratedSource.split(CODEX_ACP_TURN_USAGE_META_REPLACEMENT).length - 1
+  const finishMatches = migratedSource.split(CODEX_ACP_TURN_USAGE_FINISH_SOURCE).length - 1
+
+  if (
+    updateMatches === 1 &&
+    startMatches === 1 &&
+    responseMatches === 3 &&
+    metaMatches === 3 &&
+    finishMatches === 1
+  ) {
+    return migratedSource
+      .replace(CODEX_ACP_TURN_USAGE_UPDATE_SOURCE, CODEX_ACP_TURN_USAGE_UPDATE_REPLACEMENT)
+      .replace(CODEX_ACP_TURN_USAGE_START_SOURCE, CODEX_ACP_TURN_USAGE_START_REPLACEMENT)
+      .replaceAll(CODEX_ACP_TURN_USAGE_RESPONSE_SOURCE, CODEX_ACP_TURN_USAGE_RESPONSE_REPLACEMENT)
+      .replace(CODEX_ACP_TURN_USAGE_FINISH_SOURCE, CODEX_ACP_TURN_USAGE_FINISH_REPLACEMENT)
+  }
+
+  if (responseMatches > 0 || migratedSource.includes('buildPromptUsage(lastTokenUsage)')) {
+    throw new Error('Pinned Codex ACP turn-usage patch no longer matches the adapter bundle')
+  }
+
+  // Unit-test fixtures use tiny stand-in adapters rather than the pinned production bundle.
+  return migratedSource
+}
+
+// The pinned adapter normally flattens every ACP text block into a Codex text input, discarding
+// private extension metadata. Extend that exact source shape so an explicit app Skill selection
+// becomes Codex's native UserInput::Skill while preserving the original text byte-for-byte.
+export const patchCodexAcpSkillInputSource = (source: string): string => {
+  if (source.includes(CODEX_ACP_SKILL_INPUT_REPLACEMENT)) return source
+
+  const matches = source.split(CODEX_ACP_SKILL_INPUT_SOURCE).length - 1
+  if (matches === 1) {
+    return source.replace(CODEX_ACP_SKILL_INPUT_SOURCE, CODEX_ACP_SKILL_INPUT_REPLACEMENT)
+  }
+
+  throw new Error('Pinned Codex ACP Skill-input patch no longer matches the adapter bundle')
+}
+
+// Codex builds its ModelsManager once when app-server starts. The adapter otherwise forwards
+// CODEX_CONFIG only in thread/start, which is too late for a generated model catalog to participate
+// in model lookup. Project just that immutable catalog path into this native process's CLI override;
+// the remaining request-scoped config continues through codex-acp unchanged.
+export const patchCodexAcpModelCatalogStartupSource = (source: string): string => {
+  if (source.includes(CODEX_ACP_MODEL_CATALOG_STARTUP_REPLACEMENT)) return source
+
+  const matches = source.split(CODEX_ACP_MODEL_CATALOG_STARTUP_SOURCE).length - 1
+  if (matches === 1) {
+    return source.replace(
+      CODEX_ACP_MODEL_CATALOG_STARTUP_SOURCE,
+      CODEX_ACP_MODEL_CATALOG_STARTUP_REPLACEMENT
+    )
+  }
+
+  throw new Error(
+    'Pinned Codex ACP model-catalog startup patch no longer matches the adapter bundle'
+  )
+}
+
+export const ensureManagedCodexContextUsage = async (adapterPath: string): Promise<void> => {
+  const source = await readFile(adapterPath, 'utf8')
+  const patched = patchCodexAcpModelCatalogStartupSource(
+    patchCodexAcpSkillInputSource(
+      patchCodexAcpTurnUsageSource(patchCodexAcpContextUsageSource(source))
+    )
+  )
+
+  if (patched === source) return
+
+  const temporaryPath = `${adapterPath}.${randomUUID()}.tmp`
+  try {
+    const { mode } = await stat(adapterPath)
+    await writeFile(temporaryPath, patched)
+    await chmod(temporaryPath, mode & 0o7777)
+    await renameWithTransientLockRetry(temporaryPath, adapterPath)
+  } finally {
+    await rm(temporaryPath, { force: true }).catch(() => undefined)
+  }
+}
 
 type PackageResolution = { tarball: string; integrity: string }
 
@@ -718,6 +1287,7 @@ export const installManagedCodex = async ({
         destPath: stagedAdapter
       })
       if (!foundAdapter) throw new Error('Codex ACP package did not contain dist/index.js')
+      await ensureManagedCodexContextUsage(stagedAdapter)
 
       await extractCodexVendor({
         tgzPath: codexTgz,

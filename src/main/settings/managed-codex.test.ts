@@ -1,10 +1,62 @@
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import {
+  access,
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  symlink,
+  writeFile
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, sep } from 'node:path'
 import { Readable } from 'node:stream'
 import { gzipSync } from 'node:zlib'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+
+import {
+  ACP_MODEL_TURN_COUNT_META_KEY,
+  ACP_TURN_TOKEN_USAGE_META_KEY,
+  toAcpTurnTokenUsage
+} from '../../shared/acp'
+
+const PINNED_SKILL_MAPPER_FIXTURE = [
+  'function buildPromptItems(prompt) {',
+  '  return prompt.map((block) => {',
+  '    switch (block.type) {',
+  '      case "text":',
+  '        return { type: "text", text: block.text, text_elements: [] };',
+  '      default:',
+  '        return null;',
+  '    }',
+  '  }).filter((block) => block !== null);',
+  '}'
+].join('\n')
+
+const PINNED_MODEL_CATALOG_STARTUP_FIXTURE = [
+  'function startCodexConnection(codexPath, env) {',
+  '  const spawnEnv = env ?? process.env;',
+  '  let codex;',
+  '  if (codexPath) {',
+  '    codex = process.platform === "win32" ? spawn(`"${codexPath}" app-server`, { shell: true, env: spawnEnv }) : spawn(codexPath, ["app-server"], { env: spawnEnv });',
+  '  } else {',
+  '    const bundledCodexPath = createRequire(import.meta.url).resolve("@openai/codex/bin/codex.js");',
+  '    codex = spawn(process.execPath, [bundledCodexPath, "app-server"], { env: spawnEnv });',
+  '  }',
+  '  return codex;',
+  '}'
+].join('\n')
+
+const adapterFixture = (marker: string): Buffer =>
+  Buffer.from(
+    `${marker}\n${PINNED_SKILL_MAPPER_FIXTURE}\n${PINNED_MODEL_CATALOG_STARTUP_FIXTURE}\n`
+  )
+
+const withPinnedSkillMapper = (source: string): string =>
+  `${source}\n${PINNED_SKILL_MAPPER_FIXTURE}\n${PINNED_MODEL_CATALOG_STARTUP_FIXTURE}`
 
 // Injectable fault flags for the fs/promises mock — each targets one specific rename call:
 //   onStagedMove: throw EPERM when src is the .codex-install- scratch dir (staged→destination)
@@ -12,12 +64,18 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 //   onDestBackup: throw EPERM when dest contains .backup- (destination→backup, upgrade path)
 //   onRestore: throw EPERM when src contains .backup- (backup→destination restore)
 //   cp: throw EPERM from cp() to exercise the copy-failure→backup-restore branch
+//   adapterReplaceFailures: transiently lock the destination during temp→adapter publication
 const fsFaults = vi.hoisted(() => ({
   renameOnStagedMove: false,
   renameOnStagedMoveEio: false,
   renameOnDestBackup: false,
   renameOnRestore: false,
-  cpFailure: false
+  cpFailure: false,
+  adapterReplaceFailures: 0,
+  adapterReplaceFailureCode: 'EPERM' as 'EPERM' | 'EBUSY',
+  pauseNextWrite: false,
+  partialWritePublished: undefined as (() => void) | undefined,
+  resumeWrite: undefined as Promise<void> | undefined
 }))
 
 vi.mock('node:fs/promises', async (importActual) => {
@@ -25,11 +83,15 @@ vi.mock('node:fs/promises', async (importActual) => {
   return {
     ...actual,
     rename: vi.fn(async (src: string, dest: string) => {
-      if (fsFaults.renameOnStagedMove && src.includes('.codex-install-')) {
+      if (fsFaults.renameOnStagedMove && src.includes('.codex-install-') && !src.endsWith('.tmp')) {
         fsFaults.renameOnStagedMove = false
         throw Object.assign(new Error('EPERM: operation not permitted, rename'), { code: 'EPERM' })
       }
-      if (fsFaults.renameOnStagedMoveEio && src.includes('.codex-install-')) {
+      if (
+        fsFaults.renameOnStagedMoveEio &&
+        src.includes('.codex-install-') &&
+        !src.endsWith('.tmp')
+      ) {
         fsFaults.renameOnStagedMoveEio = false
         throw Object.assign(new Error('EIO: i/o error, rename'), { code: 'EIO' })
       }
@@ -41,6 +103,17 @@ vi.mock('node:fs/promises', async (importActual) => {
         fsFaults.renameOnRestore = false
         throw Object.assign(new Error('EPERM: operation not permitted, rename'), { code: 'EPERM' })
       }
+      if (
+        fsFaults.adapterReplaceFailures > 0 &&
+        src.endsWith('.tmp') &&
+        dest.endsWith('index.js')
+      ) {
+        fsFaults.adapterReplaceFailures -= 1
+        const code = fsFaults.adapterReplaceFailureCode
+        throw Object.assign(new Error(`${code}: destination is temporarily locked, rename`), {
+          code
+        })
+      }
       return actual.rename(src, dest)
     }),
     cp: vi.fn(async (src: string, dest: string, opts?: object) => {
@@ -51,6 +124,20 @@ vi.mock('node:fs/promises', async (importActual) => {
         })
       }
       return actual.cp(src, dest, opts as Parameters<typeof actual.cp>[2])
+    }),
+    writeFile: vi.fn(async (...args: Parameters<typeof actual.writeFile>) => {
+      const [file, data] = args
+      if (fsFaults.pauseNextWrite && typeof data === 'string') {
+        fsFaults.pauseNextWrite = false
+        const patchTarget = '    const contextTokenUsage = this.sessionState.lastTokenUsage;'
+        const targetOffset = data.indexOf(patchTarget)
+        if (targetOffset !== -1) {
+          await actual.writeFile(file, data.slice(0, targetOffset))
+          fsFaults.partialWritePublished?.()
+          await fsFaults.resumeWrite
+        }
+      }
+      return actual.writeFile(...args)
     })
   }
 })
@@ -89,10 +176,15 @@ import {
   CODEX_ACP_INTEGRITY,
   CODEX_INTEGRITIES,
   CODEX_VERSION,
+  ensureManagedCodexContextUsage,
   managedCodexAdapterEntry,
   managedCodexBinary,
   managedCodexRoot,
   installManagedCodex,
+  patchCodexAcpContextUsageSource,
+  patchCodexAcpModelCatalogStartupSource,
+  patchCodexAcpSkillInputSource,
+  patchCodexAcpTurnUsageSource,
   resolveManagedCodexPlatform,
   sanitizeManagedCodexDiagnostic,
   verifyManagedCodexPair,
@@ -367,7 +459,7 @@ describe('installManagedCodex', () => {
     const adapterTgz = buildTgz([
       {
         name: 'package/dist/index.js',
-        content: Buffer.from('#!/usr/bin/env node\nconsole.log("codex-acp")\n'),
+        content: adapterFixture('#!/usr/bin/env node\nconsole.log("codex-acp")'),
         mode: 0o755
       }
     ])
@@ -451,7 +543,7 @@ describe('installManagedCodex', () => {
     root = await mkdtemp(join(tmpdir(), 'managed-codex-'))
     const platform = resolveManagedCodexPlatform({ platform: 'darwin', arch: 'arm64' })
     const adapterTgz = buildTgz([
-      { name: 'package/dist/index.js', content: Buffer.from('adapter'), mode: 0o755 }
+      { name: 'package/dist/index.js', content: adapterFixture('adapter'), mode: 0o755 }
     ])
     const nativeTgz = buildTgz([
       {
@@ -507,7 +599,7 @@ describe('installManagedCodex', () => {
     root = await mkdtemp(join(tmpdir(), 'managed-codex-'))
     const platform = resolveManagedCodexPlatform({ platform: 'linux', arch: 'x64' })
     const adapterTgz = buildTgz([
-      { name: 'package/dist/index.js', content: Buffer.from('adapter'), mode: 0o755 }
+      { name: 'package/dist/index.js', content: adapterFixture('adapter'), mode: 0o755 }
     ])
     const nativeTgz = buildTgz([
       {
@@ -560,7 +652,7 @@ describe('installManagedCodex', () => {
     root = await mkdtemp(join(tmpdir(), 'managed-codex-'))
     const platform = resolveManagedCodexPlatform({ platform: 'linux', arch: 'arm64' })
     const adapterTgz = buildTgz([
-      { name: 'package/dist/index.js', content: Buffer.from('adapter'), mode: 0o755 }
+      { name: 'package/dist/index.js', content: adapterFixture('adapter'), mode: 0o755 }
     ])
     const nativeTgz = buildTgz([
       {
@@ -611,7 +703,7 @@ describe('installManagedCodex', () => {
     root = await mkdtemp(join(tmpdir(), 'managed-codex-'))
     const platform = resolveManagedCodexPlatform({ platform: 'linux', arch: 'x64' })
     const adapterTgz = buildTgz([
-      { name: 'package/dist/index.js', content: Buffer.from('adapter-eperm'), mode: 0o755 }
+      { name: 'package/dist/index.js', content: adapterFixture('adapter-eperm'), mode: 0o755 }
     ])
     const nativeTgz = buildTgz([
       {
@@ -647,7 +739,7 @@ describe('installManagedCodex', () => {
       })
 
       expect(outcome.result.ok).toBe(true)
-      expect(await readFile(managedCodexAdapterEntry(root), 'utf8')).toBe('adapter-eperm')
+      expect(await readFile(managedCodexAdapterEntry(root), 'utf8')).toContain('adapter-eperm')
       expect(await readFile(managedCodexBinary(root, platform), 'utf8')).toBe('codex-eperm')
     } finally {
       fsFaults.renameOnStagedMove = false
@@ -658,7 +750,7 @@ describe('installManagedCodex', () => {
     root = await mkdtemp(join(tmpdir(), 'managed-codex-'))
     const platform = resolveManagedCodexPlatform({ platform: 'linux', arch: 'x64' })
     const adapterTgz = buildTgz([
-      { name: 'package/dist/index.js', content: Buffer.from('adapter-upgrade'), mode: 0o755 }
+      { name: 'package/dist/index.js', content: adapterFixture('adapter-upgrade'), mode: 0o755 }
     ])
     const nativeTgz = buildTgz([
       {
@@ -698,7 +790,7 @@ describe('installManagedCodex', () => {
       })
 
       expect(outcome.result.ok).toBe(true)
-      expect(await readFile(managedCodexAdapterEntry(root), 'utf8')).toBe('adapter-upgrade')
+      expect(await readFile(managedCodexAdapterEntry(root), 'utf8')).toContain('adapter-upgrade')
       expect(await readFile(managedCodexBinary(root, platform), 'utf8')).toBe('codex-upgrade')
       // Old runtime must be gone from the final destination.
       await expect(readFile(join(managedCodexRoot(root), 'old-runtime'))).rejects.toThrow()
@@ -711,7 +803,7 @@ describe('installManagedCodex', () => {
     root = await mkdtemp(join(tmpdir(), 'managed-codex-'))
     const platform = resolveManagedCodexPlatform({ platform: 'linux', arch: 'x64' })
     const adapterTgz = buildTgz([
-      { name: 'package/dist/index.js', content: Buffer.from('adapter-cp-fail'), mode: 0o755 }
+      { name: 'package/dist/index.js', content: adapterFixture('adapter-cp-fail'), mode: 0o755 }
     ])
     const nativeTgz = buildTgz([
       {
@@ -773,7 +865,7 @@ describe('installManagedCodex', () => {
     root = await mkdtemp(join(tmpdir(), 'managed-codex-'))
     const platform = resolveManagedCodexPlatform({ platform: 'linux', arch: 'x64' })
     const adapterTgz = buildTgz([
-      { name: 'package/dist/index.js', content: Buffer.from('adapter-restore'), mode: 0o755 }
+      { name: 'package/dist/index.js', content: adapterFixture('adapter-restore'), mode: 0o755 }
     ])
     const nativeTgz = buildTgz([
       {
@@ -837,7 +929,7 @@ describe('installManagedCodex', () => {
     root = await mkdtemp(join(tmpdir(), 'managed-codex-'))
     const platform = resolveManagedCodexPlatform({ platform: 'linux', arch: 'x64' })
     const adapterTgz = buildTgz([
-      { name: 'package/dist/index.js', content: Buffer.from('adapter-backup-fail'), mode: 0o755 }
+      { name: 'package/dist/index.js', content: adapterFixture('adapter-backup-fail'), mode: 0o755 }
     ])
     const nativeTgz = buildTgz([
       {
@@ -897,7 +989,7 @@ describe('installManagedCodex', () => {
     root = await mkdtemp(join(tmpdir(), 'managed-codex-'))
     const platform = resolveManagedCodexPlatform({ platform: 'linux', arch: 'x64' })
     const adapterTgz = buildTgz([
-      { name: 'package/dist/index.js', content: Buffer.from('adapter-eio'), mode: 0o755 }
+      { name: 'package/dist/index.js', content: adapterFixture('adapter-eio'), mode: 0o755 }
     ])
     const nativeTgz = buildTgz([
       {
@@ -957,7 +1049,7 @@ describe('installManagedCodex', () => {
     root = await mkdtemp(join(tmpdir(), 'managed-codex-'))
     const platform = resolveManagedCodexPlatform({ platform: 'linux', arch: 'x64' })
     const adapterTgz = buildTgz([
-      { name: 'package/dist/index.js', content: Buffer.from('adapter-local-fail'), mode: 0o755 }
+      { name: 'package/dist/index.js', content: adapterFixture('adapter-local-fail'), mode: 0o755 }
     ])
     const nativeTgz = buildTgz([
       {
@@ -1014,7 +1106,7 @@ describe('installManagedCodex', () => {
     root = await mkdtemp(join(tmpdir(), 'managed-codex-'))
     const platform = resolveManagedCodexPlatform({ platform: 'linux', arch: 'x64' })
     const adapterTgz = buildTgz([
-      { name: 'package/dist/index.js', content: Buffer.from('adapter-orphan'), mode: 0o755 }
+      { name: 'package/dist/index.js', content: adapterFixture('adapter-orphan'), mode: 0o755 }
     ])
     const nativeTgz = buildTgz([
       {
@@ -1105,6 +1197,790 @@ describe('installManagedCodex', () => {
 
     await expect(readFile(managedCodexAdapterEntry(root))).rejects.toThrow()
     expect(await readFile(join(root, 'unrelated-runtime'), 'utf8')).toBe('keep-me')
+  })
+})
+
+describe('patchCodexAcpContextUsageSource', () => {
+  it('treats omitted cached input tokens as zero', () => {
+    const source = [
+      '  const adapter = {',
+      '    sessionState: { lastTokenUsage: { inputTokens: 42 } },',
+      '    createUsageUpdate(params) {',
+      '    const used = this.sessionState.lastTokenUsage?.totalTokens;',
+      '    return used;',
+      '    }',
+      '  };',
+      '  return adapter.createUsageUpdate({});'
+    ].join('\n')
+
+    const patched = patchCodexAcpContextUsageSource(source)
+    const used = Function(patched)() as number
+
+    expect(used).toBe(42)
+  })
+
+  it("recombines the pinned adapter's exclusive input and cached input for context usage", () => {
+    const source = [
+      '  createUsageUpdate(params) {',
+      '    this.handleTokenUsageUpdated(params);',
+      '    const used = this.sessionState.lastTokenUsage?.totalTokens;',
+      '    return { used };',
+      '  }'
+    ].join('\n')
+
+    const patched = patchCodexAcpContextUsageSource(source)
+
+    expect(patched).toContain(
+      ': contextTokenUsage.inputTokens + (contextTokenUsage.cachedInputTokens ?? 0);'
+    )
+    expect(patched).not.toContain('lastTokenUsage?.totalTokens')
+    expect(patchCodexAcpContextUsageSource(patched)).toBe(patched)
+  })
+
+  it('updates an already-installed managed adapter in place', async () => {
+    const patchRoot = await mkdtemp(join(tmpdir(), 'managed-codex-patch-'))
+    try {
+      const adapterPath = join(patchRoot, 'index.js')
+      await writeFile(
+        adapterPath,
+        withPinnedSkillMapper(
+          [
+            '  createUsageUpdate(params) {',
+            '    const used = this.sessionState.lastTokenUsage?.totalTokens;',
+            '  }'
+          ].join('\n')
+        )
+      )
+
+      await ensureManagedCodexContextUsage(adapterPath)
+      await ensureManagedCodexContextUsage(adapterPath)
+
+      expect(await readFile(adapterPath, 'utf8')).toContain(
+        ': contextTokenUsage.inputTokens + (contextTokenUsage.cachedInputTokens ?? 0);'
+      )
+    } finally {
+      await rm(patchRoot, { recursive: true, force: true })
+    }
+  })
+
+  it.skipIf(process.platform === 'win32')(
+    'preserves executable access when patching an installed adapter',
+    async () => {
+      const patchRoot = await mkdtemp(join(tmpdir(), 'managed-codex-patch-mode-'))
+      try {
+        const adapterPath = join(patchRoot, 'index.js')
+        await writeFile(
+          adapterPath,
+          withPinnedSkillMapper(
+            [
+              '  createUsageUpdate(params) {',
+              '    const used = this.sessionState.lastTokenUsage?.totalTokens;',
+              '  }'
+            ].join('\n')
+          )
+        )
+        await chmod(adapterPath, 0o755)
+
+        await ensureManagedCodexContextUsage(adapterPath)
+
+        await expect(access(adapterPath, constants.X_OK)).resolves.toBeUndefined()
+      } finally {
+        await rm(patchRoot, { recursive: true, force: true })
+      }
+    }
+  )
+
+  it.each(['EPERM', 'EBUSY'] as const)(
+    'retries an atomic adapter replace after a transient %s destination lock',
+    async (errorCode) => {
+      const patchRoot = await mkdtemp(join(tmpdir(), 'managed-codex-patch-lock-'))
+      try {
+        const adapterPath = join(patchRoot, 'index.js')
+        await writeFile(
+          adapterPath,
+          withPinnedSkillMapper(
+            [
+              '  createUsageUpdate(params) {',
+              '    const used = this.sessionState.lastTokenUsage?.totalTokens;',
+              '  }'
+            ].join('\n')
+          )
+        )
+        fsFaults.adapterReplaceFailureCode = errorCode
+        fsFaults.adapterReplaceFailures = 1
+
+        await ensureManagedCodexContextUsage(adapterPath)
+
+        expect(await readFile(adapterPath, 'utf8')).toContain(
+          ': contextTokenUsage.inputTokens + (contextTokenUsage.cachedInputTokens ?? 0);'
+        )
+      } finally {
+        fsFaults.adapterReplaceFailures = 0
+        fsFaults.adapterReplaceFailureCode = 'EPERM'
+        await rm(patchRoot, { recursive: true, force: true })
+      }
+    }
+  )
+
+  it('keeps concurrent context-usage checks from observing a partially patched adapter', async () => {
+    const patchRoot = await mkdtemp(join(tmpdir(), 'managed-codex-patch-race-'))
+    let releaseWrite: (() => void) | undefined
+    try {
+      const adapterPath = join(patchRoot, 'index.js')
+      await writeFile(
+        adapterPath,
+        withPinnedSkillMapper(
+          [
+            '  const usageSchema = { totalTokens: true };',
+            '  createUsageUpdate(params) {',
+            '    this.handleTokenUsageUpdated(params);',
+            '    const used = this.sessionState.lastTokenUsage?.totalTokens;',
+            '    return { used };',
+            '  }'
+          ].join('\n')
+        )
+      )
+
+      const partialWritePublished = new Promise<void>((resolve) => {
+        fsFaults.partialWritePublished = resolve
+      })
+      fsFaults.resumeWrite = new Promise<void>((resolve) => {
+        releaseWrite = resolve
+      })
+      fsFaults.pauseNextWrite = true
+
+      const firstCheck = ensureManagedCodexContextUsage(adapterPath)
+      await partialWritePublished
+      const secondCheck = ensureManagedCodexContextUsage(adapterPath)
+
+      await expect(secondCheck).resolves.toBeUndefined()
+      releaseWrite?.()
+
+      await expect(firstCheck).resolves.toBeUndefined()
+      expect(await readFile(adapterPath, 'utf8')).toContain(
+        ': contextTokenUsage.inputTokens + (contextTokenUsage.cachedInputTokens ?? 0);'
+      )
+    } finally {
+      releaseWrite?.()
+      fsFaults.pauseNextWrite = false
+      fsFaults.partialWritePublished = undefined
+      fsFaults.resumeWrite = undefined
+      await rm(patchRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('fails closed when a Codex ACP bundle no longer matches the pinned patch target', () => {
+    const drifted = [
+      '  createUsageUpdate(params) {',
+      '    const used = this.sessionState.lastTokenUsage.totalTokens;',
+      '  }'
+    ].join('\n')
+
+    expect(() => patchCodexAcpContextUsageSource(drifted)).toThrow(
+      /context-usage patch no longer matches/
+    )
+  })
+})
+
+describe('patchCodexAcpTurnUsageSource', () => {
+  type FixtureTokenUsage = {
+    totalTokens: number
+    inputTokens: number
+    cachedInputTokens?: number
+    outputTokens: number
+    reasoningOutputTokens: number
+  }
+
+  const fixture = [
+    '  const sessionState = { currentTurnId: null, lastTokenUsage: null, totalTokenUsage: null };',
+    '  const activePrompt = { complete() {} };',
+    '  const adapter = {',
+    '    sessionState,',
+    '    handleTokenUsageUpdated(params) {',
+    '      this.sessionState.lastTokenUsage = params.tokenUsage.last;',
+    '      this.sessionState.totalTokenUsage = params.tokenUsage.total;',
+    '    },',
+    '  createUsageUpdate(params) {',
+    '    this.handleTokenUsageUpdated(params);',
+    '    return null;',
+    '  },',
+    '    buildPromptUsage(usage) { return usage; },',
+    '    buildQuotaMeta() { return { quota: { remaining: 42 } }; },',
+    '    startPrompt() {',
+    '    sessionState.currentTurnId = null;',
+    '    sessionState.lastTokenUsage = null;',
+    '    },',
+    '    commandResponse() { return { usage: this.buildPromptUsage(sessionState.lastTokenUsage), _meta: this.buildQuotaMeta(sessionState), }; },',
+    '    normalResponse() { return { usage: this.buildPromptUsage(sessionState.lastTokenUsage), _meta: this.buildQuotaMeta(sessionState), }; },',
+    '    cancelledResponse() { return { usage: this.buildPromptUsage(sessionState.lastTokenUsage), _meta: this.buildQuotaMeta(sessionState), }; },',
+    '    finishPrompt() {',
+    '      const response = this.normalResponse();',
+    '      activePrompt.complete();',
+    '      return response;',
+    '    }',
+    '  };',
+    '  return adapter;'
+  ].join('\n')
+
+  // Mirrors codex-acp 1.1.4's buildPromptUsage -> toPromptUsage output rather than using the
+  // passthrough mapper above, so this fixture covers the adapter-to-runtime cache-field contract.
+  const fixtureWithPinnedPromptUsage = fixture.replace(
+    '    buildPromptUsage(usage) { return usage; },',
+    [
+      '    buildPromptUsage(tokenCount) {',
+      '      if (tokenCount == null) return null;',
+      '      return {',
+      '        totalTokens: tokenCount.totalTokens,',
+      '        inputTokens: tokenCount.inputTokens,',
+      '        cachedReadTokens: tokenCount.cachedInputTokens,',
+      '        outputTokens: tokenCount.outputTokens,',
+      '        thoughtTokens: tokenCount.reasoningOutputTokens',
+      '      };',
+      '    },'
+    ].join('\n')
+  )
+
+  const usage = (
+    totalTokens: number,
+    inputTokens: number,
+    cachedInputTokens: number,
+    outputTokens: number,
+    reasoningOutputTokens: number
+  ): FixtureTokenUsage => ({
+    totalTokens,
+    inputTokens,
+    cachedInputTokens,
+    outputTokens,
+    reasoningOutputTokens
+  })
+
+  const uncachedUsage = (
+    totalTokens: number,
+    inputTokens: number,
+    outputTokens: number,
+    reasoningOutputTokens: number
+  ): FixtureTokenUsage => ({
+    totalTokens,
+    inputTokens,
+    outputTokens,
+    reasoningOutputTokens
+  })
+
+  it('accumulates every model request in one Codex prompt without double-counting updates', () => {
+    const patched = patchCodexAcpTurnUsageSource(fixture)
+    const adapter = Function(patched)() as {
+      startPrompt: () => void
+      createUsageUpdate: (params: unknown) => void
+      finishPrompt: () => {
+        usage: ReturnType<typeof usage> | null
+        _meta?: Record<string, unknown>
+      }
+    }
+
+    // Seed the previous completed turn so the first update is derived from cumulative totals.
+    adapter.createUsageUpdate({
+      tokenUsage: {
+        last: usage(100, 70, 13, 15, 2),
+        total: usage(100, 70, 13, 15, 2)
+      }
+    })
+    adapter.startPrompt()
+    adapter.createUsageUpdate({
+      tokenUsage: {
+        last: usage(18, 12, 3, 3, 0),
+        total: usage(118, 82, 16, 18, 2)
+      }
+    })
+    // Codex can repeat the same cumulative snapshot; a zero delta must not add the request twice.
+    adapter.createUsageUpdate({
+      tokenUsage: {
+        last: usage(18, 12, 3, 3, 0),
+        total: usage(118, 82, 16, 18, 2)
+      }
+    })
+    adapter.createUsageUpdate({
+      tokenUsage: {
+        last: usage(27, 19, 5, 3, 0),
+        total: usage(145, 101, 21, 21, 2)
+      }
+    })
+
+    const response = adapter.finishPrompt()
+    expect(response.usage).toEqual(usage(27, 19, 5, 3, 0))
+    expect(response._meta?.['open-science/turn-usage']).toEqual(usage(45, 31, 8, 6, 0))
+    expect(response._meta?.['open-science/model-turn-count']).toBe(2)
+    expect(patchCodexAcpTurnUsageSource(patched)).toBe(patched)
+  })
+
+  it('preserves cached-input totals through the pinned adapter mapping and ACP normalization', () => {
+    const adapter = Function(patchCodexAcpTurnUsageSource(fixtureWithPinnedPromptUsage))() as {
+      startPrompt: () => void
+      createUsageUpdate: (params: unknown) => void
+      finishPrompt: () => { _meta?: Record<string, unknown> }
+    }
+
+    adapter.createUsageUpdate({
+      tokenUsage: {
+        last: usage(100, 70, 13, 15, 2),
+        total: usage(100, 70, 13, 15, 2)
+      }
+    })
+    adapter.startPrompt()
+    adapter.createUsageUpdate({
+      tokenUsage: {
+        last: usage(18, 12, 3, 3, 0),
+        total: usage(118, 82, 16, 18, 2)
+      }
+    })
+    adapter.createUsageUpdate({
+      tokenUsage: {
+        last: usage(27, 19, 5, 3, 0),
+        total: usage(145, 101, 21, 21, 2)
+      }
+    })
+
+    const response = adapter.finishPrompt()
+    expect(toAcpTurnTokenUsage(response._meta?.[ACP_TURN_TOKEN_USAGE_META_KEY])).toEqual({
+      inputTokens: 31,
+      cacheTokens: 8,
+      outputTokens: 6
+    })
+  })
+
+  it('merges whole-turn usage with the pinned adapter quota metadata', () => {
+    const adapter = Function(patchCodexAcpTurnUsageSource(fixture))() as {
+      startPrompt: () => void
+      createUsageUpdate: (params: unknown) => void
+      finishPrompt: () => { _meta?: Record<string, unknown> }
+    }
+
+    adapter.startPrompt()
+    adapter.createUsageUpdate({
+      tokenUsage: {
+        last: usage(18, 12, 3, 3, 0),
+        total: usage(18, 12, 3, 3, 0)
+      }
+    })
+
+    expect(adapter.finishPrompt()._meta).toEqual({
+      quota: { remaining: 42 },
+      [ACP_TURN_TOKEN_USAGE_META_KEY]: usage(18, 12, 3, 3, 0),
+      [ACP_MODEL_TURN_COUNT_META_KEY]: 1
+    })
+  })
+
+  it('uses the first request snapshot when a resumed session has no cumulative baseline', () => {
+    const adapter = Function(patchCodexAcpTurnUsageSource(fixture))() as {
+      startPrompt: () => void
+      createUsageUpdate: (params: unknown) => void
+      finishPrompt: () => { usage: ReturnType<typeof usage> | null }
+    }
+
+    adapter.startPrompt()
+    adapter.createUsageUpdate({
+      tokenUsage: {
+        last: usage(18, 12, 3, 3, 0),
+        total: usage(10_018, 8_012, 1_003, 903, 100)
+      }
+    })
+
+    const response = adapter.finishPrompt() as {
+      usage: ReturnType<typeof usage> | null
+      _meta?: Record<string, unknown>
+    }
+    expect(response.usage).toEqual(usage(18, 12, 3, 3, 0))
+    expect(response._meta?.['open-science/turn-usage']).toEqual(usage(18, 12, 3, 3, 0))
+  })
+
+  it('normalizes omitted cached-input counters without double-counting repeated updates', () => {
+    const adapter = Function(patchCodexAcpTurnUsageSource(fixture))() as {
+      startPrompt: () => void
+      createUsageUpdate: (params: unknown) => void
+      finishPrompt: () => { _meta?: Record<string, unknown> }
+    }
+
+    adapter.createUsageUpdate({
+      tokenUsage: {
+        last: uncachedUsage(100, 70, 15, 2),
+        total: uncachedUsage(100, 70, 15, 2)
+      }
+    })
+    adapter.startPrompt()
+    for (const snapshot of [
+      uncachedUsage(118, 82, 18, 2),
+      uncachedUsage(118, 82, 18, 2),
+      uncachedUsage(145, 101, 21, 2)
+    ]) {
+      adapter.createUsageUpdate({
+        tokenUsage: {
+          last:
+            snapshot.totalTokens === 118
+              ? uncachedUsage(18, 12, 3, 0)
+              : uncachedUsage(27, 19, 3, 0),
+          total: snapshot
+        }
+      })
+    }
+
+    expect(adapter.finishPrompt()._meta?.['open-science/turn-usage']).toEqual(
+      usage(45, 31, 0, 6, 0)
+    )
+  })
+
+  it('upgrades the existing turn-usage patch to normalize cached-input counters', () => {
+    const normalized = patchCodexAcpTurnUsageSource(fixture)
+    const legacy = normalized
+      .replace(
+        [
+          '    const normalizeTokenUsage = (usage) =>',
+          '      usage == null',
+          '        ? usage',
+          '        : { ...usage, cachedInputTokens: usage.cachedInputTokens ?? 0 };',
+          '    const previousTotalTokenUsage = normalizeTokenUsage(this.sessionState.totalTokenUsage);'
+        ].join('\n'),
+        '    const previousTotalTokenUsage = this.sessionState.totalTokenUsage;'
+      )
+      .replace(
+        '    const currentTotalTokenUsage = normalizeTokenUsage(this.sessionState.totalTokenUsage);',
+        '    const currentTotalTokenUsage = this.sessionState.totalTokenUsage;'
+      )
+      .replace(
+        '    const lastTokenUsage = normalizeTokenUsage(this.sessionState.lastTokenUsage);',
+        '    const lastTokenUsage = this.sessionState.lastTokenUsage;'
+      )
+
+    expect(legacy).not.toBe(normalized)
+    expect(patchCodexAcpTurnUsageSource(legacy)).toBe(normalized)
+  })
+
+  it('upgrades the overwritten turn-usage metadata shape in an existing managed adapter', () => {
+    const patched = patchCodexAcpTurnUsageSource(fixture)
+    const latestUsage = [
+      'usage: this.buildPromptUsage(',
+      '  sessionState.lastTokenUsage',
+      '),'
+    ].join('\n')
+    const overwrittenUsage = [
+      latestUsage,
+      '...(sessionState.promptTokenUsageObserved',
+      '  ? {',
+      '      _meta: {',
+      `        "${ACP_TURN_TOKEN_USAGE_META_KEY}": this.buildPromptUsage(sessionState.promptTokenUsage),`,
+      `        "${ACP_MODEL_TURN_COUNT_META_KEY}": sessionState.promptModelTurnCount`,
+      '      }',
+      '    }',
+      '  : {}),'
+    ].join('\n')
+    const mergedMeta = [
+      '_meta: {',
+      '  ...this.buildQuotaMeta(sessionState),',
+      '  ...(sessionState.promptTokenUsageObserved',
+      '    ? {',
+      `        "${ACP_TURN_TOKEN_USAGE_META_KEY}": this.buildPromptUsage(sessionState.promptTokenUsage),`,
+      `        "${ACP_MODEL_TURN_COUNT_META_KEY}": sessionState.promptModelTurnCount`,
+      '      }',
+      '    : {})',
+      '}'
+    ].join('\n')
+    const overwritten = patched.replaceAll(
+      `${latestUsage} ${mergedMeta}`,
+      `${overwrittenUsage} _meta: this.buildQuotaMeta(sessionState)`
+    )
+
+    expect(overwritten).not.toBe(patched)
+    expect(patchCodexAcpTurnUsageSource(overwritten)).toBe(patched)
+  })
+
+  it('repairs an overwritten response when other response sites already match the current patch', () => {
+    const patched = patchCodexAcpTurnUsageSource(fixture)
+    const latestUsage = [
+      'usage: this.buildPromptUsage(',
+      '  sessionState.lastTokenUsage',
+      '),'
+    ].join('\n')
+    const overwrittenUsage = [
+      latestUsage,
+      '...(sessionState.promptTokenUsageObserved',
+      '  ? {',
+      '      _meta: {',
+      `        "${ACP_TURN_TOKEN_USAGE_META_KEY}": this.buildPromptUsage(sessionState.promptTokenUsage),`,
+      `        "${ACP_MODEL_TURN_COUNT_META_KEY}": sessionState.promptModelTurnCount`,
+      '      }',
+      '    }',
+      '  : {}),'
+    ].join('\n')
+    const mixedResponseSites = `${patched}\n${overwrittenUsage}`
+
+    expect(patchCodexAcpTurnUsageSource(mixedResponseSites)).toBe(`${patched}\n${latestUsage}`)
+  })
+
+  it('composes with the context-usage patch without duplicate declarations', () => {
+    const contextFixture = fixture.replace(
+      '    this.handleTokenUsageUpdated(params);\n    return null;',
+      [
+        '    this.handleTokenUsageUpdated(params);',
+        '    const used = this.sessionState.lastTokenUsage?.totalTokens;',
+        '    return used;'
+      ].join('\n')
+    )
+    const composed = patchCodexAcpTurnUsageSource(patchCodexAcpContextUsageSource(contextFixture))
+
+    expect(() => Function(composed)).not.toThrow()
+    expect(composed).toContain(
+      ': contextTokenUsage.inputTokens + (contextTokenUsage.cachedInputTokens ?? 0);'
+    )
+  })
+})
+
+describe('patchCodexAcpModelCatalogStartupSource', () => {
+  it('passes a generated model catalog to the native app-server at process startup', () => {
+    const patched = patchCodexAcpModelCatalogStartupSource(PINNED_MODEL_CATALOG_STARTUP_FIXTURE)
+    const spawn = vi.fn(() => ({ pid: 1 }))
+    const startCodexConnection = Function(
+      'spawn',
+      'process',
+      'createRequire',
+      'importMetaUrl',
+      `${patched.replace('import.meta.url', 'importMetaUrl')}; return startCodexConnection;`
+    )(
+      spawn,
+      { platform: 'darwin', execPath: '/runtime/node', env: {} },
+      () => ({ resolve: () => '/runtime/bundled-codex.js' }),
+      'file:///runtime/adapter.js'
+    ) as (codexPath: string, env: NodeJS.ProcessEnv) => unknown
+    const catalogPath = '/data/codex/model-catalog-with spaces.json'
+
+    startCodexConnection('/runtime/codex', {
+      CODEX_CONFIG: JSON.stringify({ model_catalog_json: catalogPath, model: 'MiniMax-M3' })
+    })
+
+    expect(spawn).toHaveBeenCalledWith(
+      '/runtime/codex',
+      ['app-server', '-c', `model_catalog_json=${JSON.stringify(catalogPath)}`],
+      expect.objectContaining({ env: expect.any(Object) })
+    )
+    expect(patchCodexAcpModelCatalogStartupSource(patched)).toBe(patched)
+  })
+
+  it('keeps the native app-server command unchanged without a generated catalog', () => {
+    const patched = patchCodexAcpModelCatalogStartupSource(PINNED_MODEL_CATALOG_STARTUP_FIXTURE)
+    const spawn = vi.fn(() => ({ pid: 1 }))
+    const startCodexConnection = Function(
+      'spawn',
+      'process',
+      'createRequire',
+      'importMetaUrl',
+      `${patched.replace('import.meta.url', 'importMetaUrl')}; return startCodexConnection;`
+    )(
+      spawn,
+      { platform: 'darwin', execPath: '/runtime/node', env: {} },
+      () => ({ resolve: () => '/runtime/bundled-codex.js' }),
+      'file:///runtime/adapter.js'
+    ) as (codexPath: string, env: NodeJS.ProcessEnv) => unknown
+
+    startCodexConnection('/runtime/codex', { CODEX_CONFIG: JSON.stringify({ model: 'gpt-5.4' }) })
+
+    expect(spawn).toHaveBeenCalledWith(
+      '/runtime/codex',
+      ['app-server'],
+      expect.objectContaining({ env: expect.any(Object) })
+    )
+  })
+
+  it('fails closed when the pinned app-server spawn source drifts', () => {
+    const drifted = PINNED_MODEL_CATALOG_STARTUP_FIXTURE.replace(
+      'spawn(codexPath, ["app-server"], { env: spawnEnv })',
+      'spawn(codexPath, ["app-server", "--stdio"], { env: spawnEnv })'
+    )
+
+    expect(() => patchCodexAcpModelCatalogStartupSource(drifted)).toThrow(
+      /model-catalog startup patch no longer matches/
+    )
+  })
+})
+
+describe('patchCodexAcpSkillInputSource', () => {
+  it('maps a private ACP descriptor to native Skill input before unchanged text', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'managed-codex-skill-input-'))
+    const codexHome = join(root, 'codex-home')
+    const skillPath = join(codexHome, 'skills', 'mcp-pubmed', 'SKILL.md')
+    try {
+      await mkdir(dirname(skillPath), { recursive: true })
+      await writeFile(skillPath, '# PubMed')
+      const source = [
+        'function buildPromptItems(prompt) {',
+        '  return prompt.map((block) => {',
+        '    switch (block.type) {',
+        '      case "text":',
+        '        return { type: "text", text: block.text, text_elements: [] };',
+        '      default:',
+        '        return null;',
+        '    }',
+        '  }).filter((block) => block !== null);',
+        '}'
+      ].join('\n')
+
+      const patched = patchCodexAcpSkillInputSource(source)
+      const buildPromptItems = Function(
+        'path4',
+        'fs4',
+        'process',
+        `${patched}; return buildPromptItems;`
+      )(await import('node:path'), await import('node:fs'), { env: { CODEX_HOME: codexHome } }) as (
+        prompt: unknown[]
+      ) => unknown[]
+
+      expect(
+        buildPromptItems([
+          {
+            type: 'text',
+            text: 'Search PubMed',
+            _meta: {
+              'open-science/skill-inputs': [{ name: 'mcp-pubmed', path: skillPath }]
+            }
+          }
+        ])
+      ).toEqual([
+        { type: 'skill', name: 'mcp-pubmed', path: skillPath },
+        { type: 'text', text: 'Search PubMed', text_elements: [] }
+      ])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it.skipIf(process.platform === 'win32')(
+    'ignores a descriptor whose apparent Skill path escapes through a symlink',
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), 'managed-codex-skill-symlink-'))
+      const codexHome = join(root, 'codex-home')
+      const outsidePath = join(root, 'outside-SKILL.md')
+      const skillPath = join(codexHome, 'skills', 'escape', 'SKILL.md')
+      try {
+        await mkdir(dirname(skillPath), { recursive: true })
+        await writeFile(outsidePath, '# Outside')
+        await symlink(outsidePath, skillPath)
+        const source = [
+          'function buildPromptItems(prompt) {',
+          '  return prompt.map((block) => {',
+          '    switch (block.type) {',
+          '      case "text":',
+          '        return { type: "text", text: block.text, text_elements: [] };',
+          '      default:',
+          '        return null;',
+          '    }',
+          '  }).filter((block) => block !== null);',
+          '}'
+        ].join('\n')
+        const patched = patchCodexAcpSkillInputSource(source)
+        const buildPromptItems = Function(
+          'path4',
+          'fs4',
+          'process',
+          `${patched}; return buildPromptItems;`
+        )(await import('node:path'), await import('node:fs'), {
+          env: { CODEX_HOME: codexHome }
+        }) as (prompt: unknown[]) => unknown[]
+
+        expect(
+          buildPromptItems([
+            {
+              type: 'text',
+              text: 'Keep this text',
+              _meta: {
+                'open-science/skill-inputs': [{ name: 'escape', path: skillPath }]
+              }
+            }
+          ])
+        ).toEqual([{ type: 'text', text: 'Keep this text', text_elements: [] }])
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    }
+  )
+
+  it('ignores invalid and duplicate descriptors while preserving original text', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'managed-codex-skill-validation-'))
+    const codexHome = join(root, 'codex-home')
+    const validPath = join(codexHome, 'skills', 'mcp-pubmed', 'SKILL.md')
+    const outsidePath = join(root, 'outside', 'SKILL.md')
+    try {
+      await mkdir(dirname(validPath), { recursive: true })
+      await mkdir(dirname(outsidePath), { recursive: true })
+      await writeFile(validPath, '# PubMed')
+      await writeFile(outsidePath, '# Outside')
+      const source = [
+        'function buildPromptItems(prompt) {',
+        '  return prompt.map((block) => {',
+        '    switch (block.type) {',
+        '      case "text":',
+        '        return { type: "text", text: block.text, text_elements: [] };',
+        '      default:',
+        '        return null;',
+        '    }',
+        '  }).filter((block) => block !== null);',
+        '}'
+      ].join('\n')
+      const patched = patchCodexAcpSkillInputSource(source)
+      const buildPromptItems = Function(
+        'path4',
+        'fs4',
+        'process',
+        `${patched}; return buildPromptItems;`
+      )(await import('node:path'), await import('node:fs'), {
+        env: { CODEX_HOME: codexHome }
+      }) as (prompt: unknown[]) => unknown[]
+
+      expect(
+        buildPromptItems([
+          {
+            type: 'text',
+            text: 'Original text',
+            _meta: {
+              'open-science/skill-inputs': [
+                { name: 'mcp-pubmed', path: validPath },
+                { name: 'mcp-pubmed', path: validPath },
+                { name: '', path: validPath },
+                { name: 'relative', path: 'skills/relative/SKILL.md' },
+                { name: 'outside', path: outsidePath },
+                { name: 'missing', path: join(codexHome, 'skills', 'missing', 'SKILL.md') }
+              ]
+            }
+          },
+          { type: 'text', text: 'No metadata' }
+        ])
+      ).toEqual([
+        { type: 'skill', name: 'mcp-pubmed', path: validPath },
+        { type: 'text', text: 'Original text', text_elements: [] },
+        { type: 'text', text: 'No metadata', text_elements: [] }
+      ])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('fails closed when the pinned buildPromptItems source drifts', () => {
+    const drifted = [
+      'function buildPromptItems(prompt) {',
+      '  return prompt.map((block) => ({ type: "text", text: block.text }));',
+      '}'
+    ].join('\n')
+
+    expect(() => patchCodexAcpSkillInputSource(drifted)).toThrow(
+      /Skill-input patch no longer matches/
+    )
+  })
+
+  it('fails closed when the pinned prompt mapper is renamed or removed', () => {
+    const drifted = [
+      'function mapPromptItems(prompt) {',
+      '  return prompt.map((block) => ({ type: "text", text: block.text }));',
+      '}'
+    ].join('\n')
+
+    expect(() => patchCodexAcpSkillInputSource(drifted)).toThrow(
+      /Skill-input patch no longer matches/
+    )
   })
 })
 

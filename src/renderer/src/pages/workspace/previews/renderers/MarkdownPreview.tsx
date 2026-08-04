@@ -6,16 +6,14 @@ import { usePreviewFileContent } from '../usePreviewFileContent'
 import { SourcePreviewContent } from './SourcePreview'
 
 export const MarkdownPreviewRenderer = ({ item }: PreviewFileRendererProps): React.JSX.Element => {
-  const state = usePreviewFileContent({ path: item.path, source: item.source })
+  const state = usePreviewFileContent(item)
 
   if (state.status === 'loading') return <PreviewLoadingContent />
 
   if (state.status === 'error' || state.preview.encoding !== 'utf8') {
     return (
       <PreviewErrorCard
-        path={item.path}
         name={item.name}
-        source={item.source}
         error={state.status === 'error' ? state.error : undefined}
         fallbackMessage="Markdown couldn't be read for preview"
       />

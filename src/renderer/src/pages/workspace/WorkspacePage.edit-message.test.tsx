@@ -36,6 +36,9 @@ const runtime = vi.hoisted(() => ({
 }))
 
 vi.mock('@/components/ui/resizable', () => ({
+  ResizablePanel: ({ children }: { children: React.ReactNode }): React.JSX.Element => (
+    <div>{children}</div>
+  ),
   ResizablePanelGroup: ({ children }: { children: React.ReactNode }): React.JSX.Element => (
     <div>{children}</div>
   ),
@@ -149,7 +152,7 @@ describe('WorkspacePage inline edit resend', () => {
         load: vi.fn(() => Promise.resolve(undefined)),
         save: vi.fn(() => Promise.resolve())
       },
-      uploads: { deleteUpload: vi.fn(), stageFiles: vi.fn() },
+      uploads: { deleteUpload: vi.fn() },
       reviewer: {
         onUpdated: vi.fn(() => vi.fn()),
         onSuppressNextAutoReview: vi.fn(() => vi.fn()),
@@ -174,7 +177,13 @@ describe('WorkspacePage inline edit resend', () => {
   const renderPage = async (): Promise<void> => {
     root = createRoot(container)
     await act(async () => {
-      root.render(<WorkspacePage isSessionPersistenceReady={true} />)
+      root.render(
+        <WorkspacePage
+          isSessionPersistenceHydrated={true}
+          isSessionPersistenceReady={true}
+          canDeleteConversations={true}
+        />
+      )
     })
   }
 
@@ -253,5 +262,18 @@ describe('WorkspacePage inline edit resend', () => {
       useSessionStore.getState().finishRun('sess-a')
     })
     expect(conversationProps.canEditMessage).toBe(true)
+  })
+
+  it('keeps the resend handler stable when only the branch-switch operation gate changes', async () => {
+    await renderPage()
+
+    const initialHandler = conversationProps.onSendEditedMessage
+
+    await act(async () => {
+      useSessionStore.getState().setBranchSwitchBlocked('sess-a', true)
+    })
+
+    expect(conversationProps.canEditMessage).toBe(true)
+    expect(conversationProps.onSendEditedMessage).toBe(initialHandler)
   })
 })

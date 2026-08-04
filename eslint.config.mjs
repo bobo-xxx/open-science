@@ -15,8 +15,14 @@ export default defineConfig(
       '**/dist-e2e-*',
       // Runtime kernel loop scripts shipped as raw resources (CommonJS, not part of the TS source tree).
       'resources/notebook/*.js',
-      // Git worktrees live under .claude/worktrees and hold full source copies; don't lint duplicates.
+      // Whole-window find overlay: an ES-module page shipped as a raw resource (not part of the TS source tree).
+      'resources/find-overlay/*.js',
+      // Git worktrees hold full source copies; don't lint duplicate source from either supported root.
       '**/.claude/**',
+      '**/.worktree/**',
+      // Codex worktrees (same duplicate-source rationale as .claude/.worktree) and local SDD scratch.
+      '**/.codex/**',
+      '**/.scratch/**',
       // Local subagent scratch (ledgers, briefs, ad-hoc demo scripts) — never shipped.
       '**/.superpowers/**',
       // Keep official shadcn registry output unmodified; local adaptations live in wrappers.

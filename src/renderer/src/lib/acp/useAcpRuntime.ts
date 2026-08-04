@@ -19,6 +19,7 @@ const emptyAcpState: AcpStateSnapshot = {
   pendingPermissions: [],
   permissionProfiles: {},
   permissionGrants: {},
+  contextUsageBySession: {},
   promptInFlight: false,
   promptInFlightSessionIds: []
 }
@@ -44,7 +45,8 @@ const useAcpRuntime = (): {
   createSession: (
     cwd?: string,
     projectName?: string,
-    permissionProfile?: PermissionProfileId
+    permissionProfile?: PermissionProfileId,
+    specialistId?: string
   ) => Promise<AcpCreateSessionResponse>
   resumeSession: (
     sessionId: AcpResumeSessionRequest['sessionId'],
@@ -52,7 +54,8 @@ const useAcpRuntime = (): {
     projectName?: string,
     permissionProfile?: PermissionProfileId,
     previousFrameworkId?: AcpResumeSessionRequest['previousFrameworkId'],
-    previousBackendId?: AcpResumeSessionRequest['previousBackendId']
+    previousBackendId?: AcpResumeSessionRequest['previousBackendId'],
+    specialistId?: AcpResumeSessionRequest['specialistId']
   ) => Promise<AcpCreateSessionResponse>
   resetSessionContext: (
     sessionId: AcpResumeSessionRequest['sessionId'],
@@ -60,6 +63,10 @@ const useAcpRuntime = (): {
     projectName?: string,
     permissionProfile?: PermissionProfileId
   ) => Promise<AcpCreateSessionResponse>
+  compactSession: (
+    sessionId: string,
+    reason?: 'manual' | 'overflow-recovery'
+  ) => Promise<AcpStateSnapshot | undefined>
   deleteSession: (sessionId: string) => Promise<AcpStateSnapshot | undefined>
   cancel: (sessionId: string) => Promise<AcpStateSnapshot | undefined>
   sendPrompt: (
@@ -71,12 +78,10 @@ const useAcpRuntime = (): {
     historyPreamble?: AcpPromptRequest['historyPreamble'],
     historyAttachments?: AcpPromptRequest['historyAttachments'],
     historyImages?: AcpPromptRequest['historyImages'],
-    resumeFallback?: AcpPromptRequest['resumeFallback']
+    resumeFallback?: AcpPromptRequest['resumeFallback'],
+    provenanceContext?: AcpPromptRequest['provenanceContext']
   ) => Promise<AcpStateSnapshot>
-  respondToPermission: (
-    requestId: string,
-    optionId?: string
-  ) => Promise<AcpStateSnapshot | undefined>
+  respondToPermission: (requestId: string, optionId?: string) => Promise<AcpStateSnapshot>
   setPermissionProfile: (
     sessionId: string,
     profile: PermissionProfileId
@@ -203,9 +208,14 @@ const useAcpRuntime = (): {
 
   // Creates a protocol session and returns the runtime-provided id.
   const createSession = useCallback(
-    (cwd?: string, projectName?: string, permissionProfile?: PermissionProfileId) =>
+    (
+      cwd?: string,
+      projectName?: string,
+      permissionProfile?: PermissionProfileId,
+      specialistId?: string
+    ) =>
       runValueAction(setIsConnecting, () =>
-        window.api.acp.createSession({ cwd, projectName, permissionProfile })
+        window.api.acp.createSession({ cwd, projectName, permissionProfile, specialistId })
       ),
     [runValueAction]
   )
@@ -218,7 +228,8 @@ const useAcpRuntime = (): {
       projectName?: string,
       permissionProfile?: PermissionProfileId,
       previousFrameworkId?: AcpResumeSessionRequest['previousFrameworkId'],
-      previousBackendId?: AcpResumeSessionRequest['previousBackendId']
+      previousBackendId?: AcpResumeSessionRequest['previousBackendId'],
+      specialistId?: AcpResumeSessionRequest['specialistId']
     ) =>
       runValueAction(setIsConnecting, () =>
         window.api.acp.resumeSession({
@@ -227,7 +238,8 @@ const useAcpRuntime = (): {
           projectName,
           permissionProfile,
           previousFrameworkId,
-          previousBackendId
+          previousBackendId,
+          specialistId
         })
       ),
     [runValueAction]
@@ -246,6 +258,15 @@ const useAcpRuntime = (): {
         window.api.acp.resetSessionContext({ sessionId, cwd, projectName, permissionProfile })
       ),
     [runValueAction]
+  )
+
+  // Asks the active agent framework to compact its own session context.
+  const compactSession = useCallback(
+    (sessionId: string, reason?: 'manual' | 'overflow-recovery') =>
+      runSnapshotAction(undefined, () =>
+        window.api.acp.compactSession({ sessionId, ...(reason ? { reason } : {}) })
+      ),
+    [runSnapshotAction]
   )
 
   // Deletes a runtime session and returns the updated snapshot if it succeeds.
@@ -272,7 +293,8 @@ const useAcpRuntime = (): {
       historyPreamble?: AcpPromptRequest['historyPreamble'],
       historyAttachments?: AcpPromptRequest['historyAttachments'],
       historyImages?: AcpPromptRequest['historyImages'],
-      resumeFallback?: AcpPromptRequest['resumeFallback']
+      resumeFallback?: AcpPromptRequest['resumeFallback'],
+      provenanceContext?: AcpPromptRequest['provenanceContext']
     ) =>
       runSendPromptAction(() =>
         window.api.acp.sendPrompt({
@@ -287,7 +309,8 @@ const useAcpRuntime = (): {
           ...(historyPreamble ? { historyPreamble } : {}),
           ...(historyAttachments && historyAttachments.length > 0 ? { historyAttachments } : {}),
           ...(historyImages && historyImages.length > 0 ? { historyImages } : {}),
-          ...(resumeFallback ? { resumeFallback } : {})
+          ...(resumeFallback ? { resumeFallback } : {}),
+          ...(provenanceContext ? { provenanceContext } : {})
         })
       ),
     [runSendPromptAction]
@@ -295,16 +318,23 @@ const useAcpRuntime = (): {
 
   // Converts a UI permission click into the response shape expected by IPC.
   const respondToPermission = useCallback(
-    (requestId: string, optionId?: string) => {
+    async (requestId: string, optionId?: string): Promise<AcpStateSnapshot> => {
       const response: AcpPermissionResponse = {
         requestId,
         optionId,
         cancelled: !optionId
       }
-
-      return runSnapshotAction(undefined, () => window.api.acp.respondToPermission(response))
+      setActionError(null)
+      try {
+        const snapshot = await window.api.acp.respondToPermission(response)
+        setState(snapshot)
+        return snapshot
+      } catch (error) {
+        setActionError(getErrorMessage(error))
+        throw error
+      }
     },
-    [runSnapshotAction]
+    []
   )
 
   const setPermissionProfile = useCallback(
@@ -336,6 +366,7 @@ const useAcpRuntime = (): {
     createSession,
     resumeSession,
     resetSessionContext,
+    compactSession,
     deleteSession,
     cancel,
     sendPrompt,

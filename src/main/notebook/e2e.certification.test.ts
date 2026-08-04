@@ -111,10 +111,17 @@ const makeHarness = async (opts: { idleTimeoutMs?: number } = {}): Promise<Harne
     // v4 seam: discovery surfaces the system python as a user-own runtime and enablement turns it on,
     // so the session can bind it below (no micromamba provisioning exists on this machine).
     discoverRuntimes: async (language) => (language === 'python' ? [externalPython] : []),
-    getRuntimeEnablement: async () => ({
-      enabled: { [pyBin as string]: true },
-      installAuthorized: {}
-    }),
+    notebookRuntimeSettings: {
+      getSnapshot: async (language) => ({
+        language,
+        runtimeEnablement: {
+          enabled: { [pyBin as string]: true },
+          installAuthorized: {}
+        },
+        manualInterpreters: [],
+        packageMirror: {}
+      })
+    },
     // The real kernel executor with the shipped loop scripts. No micromamba provisioning exists on this
     // machine, so the two runtimes reach the system interpreters by different (both production) routes:
     // Python via the Runtime Registry's EXTERNAL (BYO) seam (setRuntimeSelectionResolver below), R via
@@ -150,9 +157,12 @@ const makeHarness = async (opts: { idleTimeoutMs?: number } = {}): Promise<Harne
   })
 
   const rpcServer = new NotebookLocalRpcServer(service, { connectorService })
-  // Same wiring order as main/ipc.ts: the repl kernel gets the RPC server's connection for host.mcp().
-  service.setMcpRpcConnectionResolver(() => rpcServer.ensureStarted())
-  const conn = await rpcServer.ensureStarted()
+  // Same wiring order as main/ipc.ts: the Agent-facing MCP and persistent control REPL receive
+  // separate session-bound capabilities, so rotating one cannot invalidate the other.
+  service.setMcpRpcConnectionResolver(({ sessionId, projectId }) =>
+    rpcServer.issueControlConnection(sessionId, projectId)
+  )
+  const conn = await rpcServer.issueSessionConnection(SESSION, PROJECT)
 
   const env: NotebookMcpEnvironment = {
     endpoint: conn.endpoint,

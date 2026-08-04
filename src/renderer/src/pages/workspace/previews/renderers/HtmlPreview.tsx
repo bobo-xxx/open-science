@@ -21,15 +21,13 @@ const HtmlSourceContent = ({
   item,
   topContent
 }: PreviewFileRendererProps & { topContent: React.ReactNode }): React.JSX.Element => {
-  const state = usePreviewFileContent({ path: item.path, source: item.source })
+  const state = usePreviewFileContent(item)
 
   if (state.status === 'loading') return <PreviewLoadingContent />
   if (state.status === 'error' || state.preview.encoding !== 'utf8') {
     return (
       <PreviewErrorCard
-        path={item.path}
         name={item.name}
-        source={item.source}
         error={state.status === 'error' ? state.error : undefined}
         fallbackMessage="HTML couldn't be read for preview"
       />
@@ -103,9 +101,7 @@ export const HtmlPreviewRenderer = ({ item }: PreviewFileRendererProps): React.J
         {modeToggle}
         <div className="min-h-0 flex-1">
           <PreviewErrorCard
-            path={item.path}
             name={item.name}
-            source={item.source}
             error={resourceState.status === 'error' ? resourceState.error : undefined}
             fallbackMessage="HTML couldn't be read for preview"
           />

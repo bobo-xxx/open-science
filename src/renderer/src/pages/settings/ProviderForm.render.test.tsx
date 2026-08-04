@@ -32,11 +32,13 @@ const render = (
   {
     onChange = vi.fn(),
     errors,
-    showCodexSubscriptions = false
+    showCodexSubscriptions = false,
+    showClaudeIsolated = false
   }: {
     onChange?: () => void
     errors?: ProviderFormErrors
     showCodexSubscriptions?: boolean
+    showClaudeIsolated?: boolean
   } = {}
 ): void => {
   act(() => {
@@ -46,6 +48,7 @@ const render = (
         onChange={onChange}
         errors={errors}
         showCodexSubscriptions={showCodexSubscriptions}
+        showClaudeIsolated={showClaudeIsolated}
       />
     )
   })
@@ -58,6 +61,9 @@ describe('ProviderForm field switching', () => {
     expect(container.querySelector('[aria-label="Base URL"]')).not.toBeNull()
     expect(container.querySelector('[aria-label="API key"]')).not.toBeNull()
     expect(container.querySelector('[aria-label="Model"]')).not.toBeNull()
+    expect(
+      container.querySelector<HTMLInputElement>('[aria-label="Context window"]')?.placeholder
+    ).toBe('200000')
     // The auth style selector was removed; custom always uses a bearer token.
     expect(container.querySelector('[aria-label="Auth style"]')).toBeNull()
   })
@@ -76,10 +82,70 @@ describe('ProviderForm field switching', () => {
     expect(container.querySelector('[aria-label="Base URL"]')).toBeNull()
     expect(container.querySelector('[aria-label="API format"]')).toBeNull()
     expect(container.querySelector('[aria-label="Model"]')).toBeNull()
+    expect(container.querySelector('[aria-label="Context window"]')).toBeNull()
     expect(container.textContent).toContain('gpt-5.6-sol')
     expect(container.querySelector<HTMLAnchorElement>('a')?.href).toBe(
       'https://platform.openai.com/api-keys'
     )
+  })
+
+  it('renders the bundled Grok brand mark for the xAI provider', () => {
+    render(
+      createEmptyProviderFormValue({
+        type: 'official',
+        name: 'Grok (xAI)',
+        vendorId: 'xai',
+        apiEndpoint: 'responses'
+      })
+    )
+
+    const providerType = container.querySelector('[aria-label="Provider type"]')
+    const icon = providerType?.querySelector('img')
+
+    expect(providerType?.textContent).toContain('Grok (xAI)')
+    expect(icon?.getAttribute('src')).toMatch(/^data:image\/svg\+xml/)
+    expect(decodeURIComponent(icon?.getAttribute('src') ?? '')).toContain('<title>Grok</title>')
+    expect(container.textContent).toContain('grok-4.5')
+  })
+
+  it('renders the bundled Bailian brand mark and regional catalog', () => {
+    render(
+      createEmptyProviderFormValue({
+        type: 'official',
+        name: 'Bailian',
+        vendorId: 'bailian',
+        region: 'china',
+        apiEndpoint: 'responses'
+      })
+    )
+
+    const providerType = container.querySelector('[aria-label="Provider type"]')
+    const icon = providerType?.querySelector('img')
+
+    expect(providerType?.textContent).toContain('Bailian')
+    expect(icon?.getAttribute('src')).toMatch(/^data:image\/svg\+xml/)
+    expect(decodeURIComponent(icon?.getAttribute('src') ?? '')).toContain('<title>BaiLian</title>')
+    expect(container.querySelector('[aria-label="Endpoint"]')?.textContent).toContain('China')
+    expect(container.textContent).toContain('qwen3.8-max')
+  })
+
+  it('reuses the bundled Bailian brand mark for Bailian for Plan', () => {
+    render(
+      createEmptyProviderFormValue({
+        type: 'official',
+        name: 'Bailian for Plan',
+        vendorId: 'bailianplan',
+        apiEndpoint: 'openai'
+      })
+    )
+
+    const providerType = container.querySelector('[aria-label="Provider type"]')
+    const icon = providerType?.querySelector('img')
+
+    expect(providerType?.textContent).toContain('Bailian for Plan')
+    expect(icon?.getAttribute('src')).toMatch(/^data:image\/svg\+xml/)
+    expect(decodeURIComponent(icon?.getAttribute('src') ?? '')).toContain('<title>BaiLian</title>')
+    expect(container.textContent).toContain('qwen3.8-max-preview')
   })
 
   it('allows a custom gateway to select the Responses endpoint', () => {
@@ -103,16 +169,44 @@ describe('ProviderForm field switching', () => {
     )
   })
 
-  it('hides gateway/key fields for a local-claude provider', () => {
-    render(createEmptyProviderFormValue({ type: 'claude-default' }))
+  it('lets a custom model declare its reasoning effort group', () => {
+    render(
+      createEmptyProviderFormValue({
+        type: 'custom',
+        reasoningEffortPreset: 'none-high',
+        reasoningEffortTransport: 'deepseek'
+      })
+    )
 
-    expect(container.querySelector('[aria-label="Base URL"]')).toBeNull()
-    expect(container.querySelector('[aria-label="API key"]')).toBeNull()
-    // Only the optional model override remains.
-    expect(container.querySelector('[aria-label="Model"]')).not.toBeNull()
+    expect(
+      container
+        .querySelector('[aria-label="Supports reasoning effort"]')
+        ?.getAttribute('data-state')
+    ).toBe('checked')
+    expect(
+      container.querySelector('[aria-label="Reasoning effort levels"]')?.textContent
+    ).toContain('None / High')
+    expect(container.textContent).toContain('exact effort levels accepted by this model')
+    expect(container.textContent).toContain('maps five relative strengths onto them')
+    expect(
+      container.querySelector('[aria-label="Reasoning effort request format"]')?.textContent
+    ).toContain('DeepSeek thinking + effort')
   })
 
-  it('shows a fixed shared Codex subscription without editable credentials or identity', () => {
+  it('lets a custom model explicitly disable reasoning effort', () => {
+    const onChange = vi.fn()
+    render(createEmptyProviderFormValue({ type: 'custom' }), { onChange })
+
+    act(() => {
+      container
+        .querySelector<HTMLButtonElement>('[aria-label="Supports reasoning effort"]')
+        ?.click()
+    })
+
+    expect(onChange).toHaveBeenCalledWith({ reasoningEffortPreset: 'unsupported' })
+  })
+
+  it('describes existing Codex authentication as a one-time import', () => {
     render(
       createEmptyProviderFormValue({
         type: 'codex-shared',
@@ -125,7 +219,10 @@ describe('ProviderForm field switching', () => {
     expect(container.querySelector('[aria-label="Provider name"]')).toBeNull()
     expect(container.querySelector('[aria-label="API key"]')).toBeNull()
     expect(container.querySelector('[aria-label="Model"]')).toBeNull()
-    expect(container.textContent).toContain('managed by Codex CLI')
+    expect(container.textContent).toContain(
+      "Copies Codex authentication and, when compatible, the active provider's non-secret loopback route into Open Science"
+    )
+    expect(container.textContent).toContain('Skills and sessions are not imported')
   })
 
   it('chooses the Codex authentication mode inside the single provider form', () => {
@@ -135,7 +232,29 @@ describe('ProviderForm field switching', () => {
 
     const trigger = container.querySelector('[aria-label="Codex authentication"]')
     expect(trigger).not.toBeNull()
-    expect(trigger?.textContent).toContain('Use existing Codex profile')
+    expect(trigger?.textContent).toContain('Import existing Codex sign-in')
+  })
+
+  it('shows a fixed Claude subscription without an editable name or API key', () => {
+    render(
+      createEmptyProviderFormValue({
+        type: 'claude-isolated',
+        name: 'Claude subscription',
+        apiEndpoint: 'anthropic'
+      }),
+      { showClaudeIsolated: true }
+    )
+
+    // Mirrors the Codex subscription: the identity is a fixed builtin, so no editable name, and the
+    // browser sign-in (both isolated and shared modes) lives in the Settings card, not an inline
+    // API-key field. The authentication mode selector is shown.
+    expect(container.querySelector('[aria-label="Provider name"]')).toBeNull()
+    expect(container.querySelector('[aria-label="API key"]')).toBeNull()
+    expect(container.querySelector('[aria-label="Model"]')).not.toBeNull()
+    expect(container.textContent).toContain('Claude authentication')
+    expect(container.textContent).toContain('Sign in separately')
+    expect(container.textContent).toContain('claude setup-token')
+    expect(container.textContent).toContain('nothing is read from or written to')
   })
 
   it('surfaces the provider-type picker with the current selection', () => {
@@ -244,19 +363,6 @@ describe('ProviderForm field switching', () => {
     expect(document.body.textContent).toContain(
       'Bundled with the app. Refresh from the vendor to pull the latest.'
     )
-  })
-
-  it('shows only provider-type help for local Claude', async () => {
-    render(createEmptyProviderFormValue({ type: 'claude-default' }))
-    const helpButtons = Array.from(
-      container.querySelectorAll<HTMLButtonElement>('[data-slot="field-help"]')
-    )
-
-    expect(helpButtons).toHaveLength(1)
-    expect(container.textContent).not.toContain("Reuse this machine's Claude login")
-
-    await act(async () => helpButtons[0]?.focus())
-    expect(document.body.textContent).toContain("Reuse this machine's Claude login")
   })
 
   it('describes encrypted and unavailable storage accurately', () => {

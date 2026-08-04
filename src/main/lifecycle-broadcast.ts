@@ -1,14 +1,20 @@
-import { ipcMain } from 'electron'
+import { ipcMainHandle } from './ipc-handler-registry'
 
 import { LIFECYCLE_CHANNELS } from '../shared/lifecycle-events'
+import { callerLeaseForEvent } from './caller-lifecycle'
+import { callerContextForEvent } from './caller-context'
 import { createLogger } from './logger'
+import type { ApplicationEventChannel, ApplicationEventMap } from './application-events'
 import { broadcastToRenderers } from './renderer-broadcast'
 
 const log = createLogger('lifecycle-broadcast')
 
 // Lifecycle notifications keep first-party clients fresh, but a disconnected renderer must never
 // turn an already-committed repository mutation into a failed RPC.
-const broadcastLifecycleEvent = <Payload>(channel: string, payload: Payload): void => {
+const broadcastLifecycleEvent = <Channel extends ApplicationEventChannel>(
+  channel: Channel,
+  payload: ApplicationEventMap[Channel]
+): void => {
   try {
     broadcastToRenderers(channel, payload)
   } catch (error) {
@@ -19,12 +25,17 @@ const broadcastLifecycleEvent = <Payload>(channel: string, payload: Payload): vo
   }
 }
 
-const getLifecycleClientId = (event: {
-  sender: { id: number; lifecycleClientId?: string }
-}): string => event.sender.lifecycleClientId ?? `electron:${event.sender.id}`
+const getLifecycleClientId = (event: { sender: { id: number } }): string => {
+  const context = callerContextForEvent(event)
+  const lease = callerLeaseForEvent(event)
+  if (lease.leaseId !== context.leaseId || !lease.isCurrent()) {
+    throw new Error('Application caller lease is no longer current.')
+  }
+  return context.lifecycleClientId
+}
 
 const registerLifecycleIpcHandlers = (): void => {
-  ipcMain.handle(LIFECYCLE_CHANNELS.clientId, (event) => getLifecycleClientId(event))
+  ipcMainHandle(LIFECYCLE_CHANNELS.clientId, (event) => getLifecycleClientId(event))
 }
 
 export { broadcastLifecycleEvent, getLifecycleClientId, registerLifecycleIpcHandlers }

@@ -1,12 +1,26 @@
-import type { AcpRuntimeEvent, AcpPermissionRequest } from '../../../../shared/acp'
-import type { ArtifactFile, FinalizeRunArtifactsRequest } from '../../../../shared/artifacts'
+import type {
+  AcpRuntimeEvent,
+  AcpPermissionRequest,
+  AcpTurnTokenUsage
+} from '../../../../shared/acp'
+import {
+  ARTIFACT_OWNERSHIP_PERSISTENCE_RACE,
+  type ArtifactFile,
+  type FinalizeRunArtifactsRequest
+} from '../../../../shared/artifacts'
 import type { ReviewRunNotStartedReason, ReviewRunRequest } from '../../../../shared/reviewer'
-import { createPreviewFileItem } from '../../pages/workspace/preview-file-item'
+import type { PersistedChatSession } from '../../../../shared/session-persistence'
+import { createPreviewFileItemFromArtifact } from '../../pages/workspace/preview-file-item'
 import { getPreviewFormatForFile } from '../../pages/workspace/preview-support'
 import { usePreviewWorkbenchStore } from '../../stores/preview-workbench-store'
 import { isMediaOverflowError } from '../../../../shared/media-overflow'
-import { useSessionStore } from '../../stores/session-store'
+import {
+  getActivityGroupTitleFromToolEvent,
+  isActivityGroupToolEvent
+} from '../../../../shared/activity-groups'
+import { toPersistedSession, useSessionStore } from '../../stores/session-store'
 import { useSettingsStore } from '../../stores/settings-store'
+import { saveSessionInOrder } from '../session-persistence/session-persistence'
 import {
   createRuntimeStreamId,
   getAcpRuntimeEventImage,
@@ -22,6 +36,51 @@ const pendingPermissionSessionIds = new Set<string>()
 // the main process broadcasts reviewer:suppress-next-auto-review before sending the correction prompt;
 // the renderer calls suppressNextAutoReview(sessionId) so the correction turn's stop event is ignored.
 const suppressAutoReviewOnceFor = new Set<string>()
+const activityGroupToolCallIdsBySession = new Map<string, Set<string>>()
+
+type DeferredArtifactEvent = {
+  event: AcpRuntimeEvent
+  dependencies: WorkspaceRuntimeEventDependencies
+}
+
+type PendingArtifactTurnUsage = {
+  turnUsage?: AcpTurnTokenUsage
+  turnUsageUnavailable?: true
+}
+
+// The runtime deliberately publishes generated files immediately before its stop event. Providers may
+// still have a terminal assistant chunk queued behind the tool result, so binding at the artifact event
+// can capture an intermediate message. Hold every event until stop makes the renderer's terminal
+// Message/Branch projection authoritative; one turn may publish more than one generated file claim.
+const deferredArtifactEventsBySession = new Map<string, DeferredArtifactEvent[]>()
+// Some providers reverse that order and publish an artifact-only response just after stop. Keep the
+// terminal usage scoped to its prompt until the matching Artifact creates the owning Agent message.
+const pendingArtifactTurnUsageBySession = new Map<string, Map<string, PendingArtifactTurnUsage>>()
+const MAX_PENDING_ARTIFACT_TURNS_PER_SESSION = 16
+const scheduledAutoReviewsBySession = new Map<string, ReturnType<typeof setTimeout>>()
+let autoReviewsSuppressedForQuit = false
+const AUTO_REVIEW_ARTIFACT_SETTLE_DELAY_MS = 100
+
+const resetDeferredArtifactEventsForTests = (): void => {
+  deferredArtifactEventsBySession.clear()
+  pendingArtifactTurnUsageBySession.clear()
+  for (const timer of scheduledAutoReviewsBySession.values()) clearTimeout(timer)
+  scheduledAutoReviewsBySession.clear()
+  autoReviewsSuppressedForQuit = false
+}
+
+const isActivityGroupControlEvent = (event: AcpRuntimeEvent): boolean => {
+  if (!event.sessionId || !event.toolCallId) return false
+
+  if (isActivityGroupToolEvent(event)) {
+    const toolCallIds = activityGroupToolCallIdsBySession.get(event.sessionId) ?? new Set<string>()
+    toolCallIds.add(event.toolCallId)
+    activityGroupToolCallIdsBySession.set(event.sessionId, toolCallIds)
+    return true
+  }
+
+  return activityGroupToolCallIdsBySession.get(event.sessionId)?.has(event.toolCallId) === true
+}
 
 // Marks the next triggerAutoReview call for a session as suppressed. Cleared on use (one-shot).
 const suppressNextAutoReview = (sessionId: string): void => {
@@ -43,6 +102,13 @@ const getEventErrorText = (event: AcpRuntimeEvent): string =>
 const getErrorText = (error: unknown): string =>
   error instanceof Error ? error.message : String(error)
 
+// A terminal message and its Branch projection are persisted by separate runtime events. Retry only
+// the main process's explicit persistence-race code; proof identity and publication failures remain
+// terminal regardless of their human-readable wording.
+const isArtifactOwnershipPersistenceRace = (error: unknown): boolean =>
+  error instanceof Error &&
+  (error as Error & { code?: unknown }).code === ARTIFACT_OWNERSHIP_PERSISTENCE_RACE
+
 // Codex writes two informational diagnostics to stderr during otherwise-successful turns: skill
 // descriptions may be compacted to their context budget, and a timed-out WebSocket attempt may fall
 // back to working HTTPS. codex-acp can repeat or concatenate them, but neither asks the user to act
@@ -63,31 +129,139 @@ const isNonActionableCodexDiagnostic = (text: string): boolean => {
 
 type WorkspaceRuntimeEventDependencies = {
   finalizeRunArtifacts?: (request: FinalizeRunArtifactsRequest) => Promise<ArtifactFile[]>
+  saveSession?: (session: PersistedChatSession) => Promise<PersistedChatSession | void>
 }
 
 // Defaults to the preload artifact API while allowing tests to inject a fake finalizer.
-const finalizeRunArtifacts = (request: FinalizeRunArtifactsRequest): Promise<ArtifactFile[]> =>
-  window.api.artifacts.finalizeRunArtifacts(request)
+const finalizeRunArtifacts = async (
+  request: FinalizeRunArtifactsRequest
+): Promise<ArtifactFile[]> => {
+  const result = await window.api.artifacts.finalizeRunArtifacts(request)
+  if (result.ok) return result.artifacts
+
+  const error = new Error(result.message) as Error & { code: typeof result.code }
+  error.code = result.code
+  throw error
+}
+
+// Artifact finalization validates its renderer-selected Message against the durable Session graph.
+// Persist that graph explicitly instead of relying on the asynchronous store saver to win the IPC race.
+const saveSessionForArtifactFinalization = (
+  session: PersistedChatSession
+): Promise<PersistedChatSession> => saveSessionInOrder(session)
+
+type FinalizableArtifactEvent = AcpRuntimeEvent & {
+  kind: 'artifact'
+  sessionId: string
+  runId: string
+  artifactClaimId: string
+  artifacts: ArtifactFile[]
+}
+
+const isFinalizableArtifactEvent = (event: AcpRuntimeEvent): event is FinalizableArtifactEvent =>
+  event.kind === 'artifact' &&
+  Boolean(event.sessionId && event.runId && event.artifactClaimId && event.artifacts?.length)
+
+const attachArtifactEvent = (
+  event: FinalizableArtifactEvent,
+  turnUsage?: PendingArtifactTurnUsage
+): { sessionId: string; messageId: string } | undefined =>
+  useSessionStore.getState().attachRunArtifacts({
+    sessionId: event.sessionId,
+    runId: event.runId,
+    promptMessageId: event.promptMessageId,
+    eventId: event.id,
+    artifacts: event.artifacts,
+    turnUsage: turnUsage?.turnUsage,
+    turnUsageUnavailable: turnUsage?.turnUsageUnavailable
+  })
+
+const finalizeArtifactEvent = async (
+  event: AcpRuntimeEvent,
+  dependencies: WorkspaceRuntimeEventDependencies,
+  turnUsage?: PendingArtifactTurnUsage
+): Promise<boolean> => {
+  if (!isFinalizableArtifactEvent(event)) return false
+
+  const attached = attachArtifactEvent(event, turnUsage)
+
+  if (!attached) return true
+
+  const store = useSessionStore.getState()
+
+  try {
+    const persistLatestSession = async (): Promise<void> => {
+      const attachedSession = useSessionStore
+        .getState()
+        .sessions.find((session) => session.id === event.sessionId)
+      if (!attachedSession) {
+        throw new Error('Artifact finalization Session is no longer available.')
+      }
+      const submittedSession = toPersistedSession(attachedSession)
+      const durableSession = await (dependencies.saveSession ?? saveSessionForArtifactFinalization)(
+        submittedSession
+      )
+      if (durableSession) {
+        useSessionStore.getState().applyDurableSessionProjection({
+          source: attachedSession,
+          session: durableSession
+        })
+      }
+    }
+
+    await persistLatestSession()
+
+    const finalize = dependencies.finalizeRunArtifacts ?? finalizeRunArtifacts
+    const finalizeRequest = {
+      claimId: event.artifactClaimId,
+      messageId: attached.messageId
+    }
+    let finalizedArtifacts: ArtifactFile[]
+    try {
+      finalizedArtifacts = await finalize(finalizeRequest)
+    } catch (error) {
+      if (!isArtifactOwnershipPersistenceRace(error)) throw error
+      await persistLatestSession()
+      finalizedArtifacts = await finalize(finalizeRequest)
+    }
+
+    store.replaceMessageArtifacts({
+      sessionId: event.sessionId,
+      messageId: attached.messageId,
+      artifacts: finalizedArtifacts
+    })
+    // Auto-review and every main-process provenance reader load the durable Session, not renderer
+    // memory. Persist the checksum-bearing finalized Version descriptors before the stop handler may
+    // trigger a Review, otherwise it can freeze a pre-finalization scope.
+    await persistLatestSession()
+    store.clearArtifactError(event.sessionId)
+    openMoleculePreviews(event.sessionId, finalizedArtifacts)
+    return true
+  } catch (error) {
+    store.recordArtifactError(event.sessionId, getErrorText(error))
+    throw error
+  }
+}
 
 // Opens freshly generated molecular-structure artifacts in the preview panel so the OpenChemLib
 // viewer renders them without a manual click. Only molecule-format files auto-open; other artifacts
 // (charts, tables, …) still wait for an explicit click. Fires only on live-run artifact events.
 const openMoleculePreviews = (sessionId: string, artifacts: ArtifactFile[]): void => {
   const workbench = usePreviewWorkbenchStore.getState()
+  const projectId = useSessionStore
+    .getState()
+    .sessions.find((session) => session.id === sessionId)?.projectId
 
   for (const artifact of artifacts) {
     const format = getPreviewFormatForFile({ name: artifact.name, mimeType: artifact.mimeType })
     if (format !== 'molecule') continue
 
-    workbench.upsertAndActivateItem(
-      createPreviewFileItem({
-        id: artifact.id,
-        sessionId,
-        path: artifact.path,
-        name: artifact.name,
-        mimeType: artifact.mimeType
-      })
+    const item = createPreviewFileItemFromArtifact(
+      artifact,
+      sessionId,
+      projectId || artifact.projectName
     )
+    if (item) workbench.upsertAndActivateItem(item)
   }
 }
 
@@ -142,6 +316,8 @@ const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 // Fire-and-forget: errors are caught and silently dropped so the main session is never blocked.
 const triggerAutoReview = async (sessionId: string): Promise<void> => {
   try {
+    if (autoReviewsSuppressedForQuit) return
+
     // Loop guard: if this session's next review was suppressed (e.g. because the stop comes from
     // the [Auditor] correction turn), skip exactly this one call and clear the flag.
     if (suppressAutoReviewOnceFor.has(sessionId)) {
@@ -172,6 +348,7 @@ const triggerAutoReview = async (sessionId: string): Promise<void> => {
     // main and comes back 'already-reviewed' rather than launching a duplicate. A renderer-local store
     // check could only race that cross-process window, so we rely on main's verdict.
     for (let attempt = 0; attempt < AUTO_REVIEW_START_ATTEMPTS; attempt++) {
+      if (autoReviewsSuppressedForQuit) return
       const result = await window.api.reviewer.run({ ...request, origin: 'auto' })
       if (result?.started !== false) return
       if (!result.reason || !RETRYABLE_START_FAILURE_REASONS.has(result.reason)) return
@@ -180,6 +357,31 @@ const triggerAutoReview = async (sessionId: string): Promise<void> => {
   } catch {
     // Reviewer errors must never surface to the main session.
   }
+}
+
+const cancelScheduledAutoReview = (sessionId: string): void => {
+  const timer = scheduledAutoReviewsBySession.get(sessionId)
+  if (timer) clearTimeout(timer)
+  scheduledAutoReviewsBySession.delete(sessionId)
+}
+
+const suppressAutoReviewsForQuit = (): void => {
+  autoReviewsSuppressedForQuit = true
+  for (const timer of scheduledAutoReviewsBySession.values()) clearTimeout(timer)
+  scheduledAutoReviewsBySession.clear()
+}
+
+// Stop and artifact events normally arrive together, but some providers publish the Artifact just
+// after stop. A short debounced barrier lets that claim finalize before Reviewer freezes its scope.
+// A post-stop Artifact cancels this timer immediately and schedules a fresh review after finalization.
+const scheduleAutoReview = (sessionId: string): void => {
+  if (autoReviewsSuppressedForQuit) return
+  cancelScheduledAutoReview(sessionId)
+  const timer = setTimeout(() => {
+    scheduledAutoReviewsBySession.delete(sessionId)
+    void triggerAutoReview(sessionId)
+  }, AUTO_REVIEW_ARTIFACT_SETTLE_DELAY_MS)
+  scheduledAutoReviewsBySession.set(sessionId, timer)
 }
 
 // Applies one runtime event to the workspace store when it affects chat state.
@@ -205,10 +407,12 @@ const applyWorkspaceRuntimeEvent = async (
       return true
     }
 
+    store.completeActivityGroup(event.sessionId, event.promptMessageId)
     store.appendAgentMessageChunk({
       sessionId: event.sessionId,
       streamId: createRuntimeStreamId(event),
       eventId: event.id,
+      promptMessageId: event.promptMessageId,
       content,
       image
     })
@@ -217,10 +421,19 @@ const applyWorkspaceRuntimeEvent = async (
 
   // Tool calls become visible activity rows, including web-search query/result payloads.
   if (event.kind === 'tool' && event.sessionId && event.toolCallId) {
+    if (isActivityGroupControlEvent(event)) {
+      const title = getActivityGroupTitleFromToolEvent(event)
+      if (title) {
+        store.beginActivityGroup(event.sessionId, event.toolCallId, title, event.promptMessageId)
+      }
+      return true
+    }
+
     store.upsertToolActivity({
       sessionId: event.sessionId,
       toolCallId: event.toolCallId,
       eventId: event.id,
+      promptMessageId: event.promptMessageId,
       title: event.title,
       status: event.status,
       providerToolName: event.providerToolName,
@@ -236,11 +449,104 @@ const applyWorkspaceRuntimeEvent = async (
   }
 
   if (event.kind === 'stop' && event.sessionId) {
-    store.finishRun(event.sessionId)
+    activityGroupToolCallIdsBySession.delete(event.sessionId)
+    const deferredArtifacts = deferredArtifactEventsBySession.get(event.sessionId)
+    const activeSession = store.sessions.find((session) => session.id === event.sessionId)
+    const terminalPromptMessageId =
+      event.promptMessageId ?? activeSession?.activeRun?.promptMessageId
+    let deferredAttachmentError: unknown
+    let deferredAttachmentFailed = false
+
+    // Artifact-only turns need their terminal Agent message before finishRun chooses the owner of the
+    // usage footer. Binding is synchronous; durable finalization still happens after the run settles.
+    if (!activeSession?.conversationGraphSyncBlocked && deferredArtifacts) {
+      try {
+        for (const deferredArtifact of deferredArtifacts) {
+          if (isFinalizableArtifactEvent(deferredArtifact.event)) {
+            attachArtifactEvent(deferredArtifact.event)
+          }
+        }
+      } catch (error) {
+        deferredAttachmentError = error
+        deferredAttachmentFailed = true
+      }
+    }
+
+    store.finishRun(event.sessionId, event.turnUsage, event.promptMessageId)
+
+    const terminalSession = useSessionStore
+      .getState()
+      .sessions.find((session) => session.id === event.sessionId)
+    if (terminalSession?.conversationGraphSyncBlocked) {
+      // The run is visibly settled as an integrity error, but its terminal Message is not proven to
+      // belong to the active Branch. Acknowledge the stop without publishing Artifact or Review data.
+      deferredArtifactEventsBySession.delete(event.sessionId)
+      pendingArtifactTurnUsageBySession.delete(event.sessionId)
+      return true
+    }
+
+    if (deferredAttachmentFailed) {
+      deferredArtifactEventsBySession.delete(event.sessionId)
+      throw deferredAttachmentError
+    }
+
+    const terminalResponse = terminalPromptMessageId
+      ? [...(terminalSession?.messages ?? [])]
+          .reverse()
+          .find(
+            (message) =>
+              message.role === 'agent' && message.responseToMessageId === terminalPromptMessageId
+          )
+      : undefined
+    if (terminalPromptMessageId && !terminalResponse) {
+      const pendingByPrompt =
+        pendingArtifactTurnUsageBySession.get(event.sessionId) ??
+        new Map<string, PendingArtifactTurnUsage>()
+      pendingByPrompt.set(terminalPromptMessageId, {
+        ...(event.turnUsage
+          ? { turnUsage: event.turnUsage }
+          : { turnUsageUnavailable: true as const })
+      })
+      if (pendingByPrompt.size > MAX_PENDING_ARTIFACT_TURNS_PER_SESSION) {
+        const oldestPromptMessageId = pendingByPrompt.keys().next().value
+        if (oldestPromptMessageId) pendingByPrompt.delete(oldestPromptMessageId)
+      }
+      pendingArtifactTurnUsageBySession.set(event.sessionId, pendingByPrompt)
+    } else if (terminalPromptMessageId) {
+      const pendingByPrompt = pendingArtifactTurnUsageBySession.get(event.sessionId)
+      pendingByPrompt?.delete(terminalPromptMessageId)
+      if (pendingByPrompt?.size === 0) pendingArtifactTurnUsageBySession.delete(event.sessionId)
+    }
+
+    if (deferredArtifacts) {
+      deferredArtifactEventsBySession.delete(event.sessionId)
+      for (const deferredArtifact of deferredArtifacts) {
+        await finalizeArtifactEvent(deferredArtifact.event, deferredArtifact.dependencies)
+      }
+    }
 
     // Trigger a background review for the just-completed turn.
-    // We read the session state AFTER finishRun so messages are complete.
-    void triggerAutoReview(event.sessionId)
+    // We read the session state after both finishRun and Artifact finalization so the scope includes
+    // the terminal message and its finalized Artifact Version ids.
+    scheduleAutoReview(event.sessionId)
+
+    return true
+  }
+
+  // Native compaction is a framework control turn, not a chat turn. Reflect its lifecycle in the
+  // existing neutral compacting state while keeping command/status output out of the transcript.
+  if (event.kind === 'compaction' && event.sessionId) {
+    if (event.status === 'in_progress') {
+      store.beginCompaction(event.sessionId)
+    } else if (event.compactionReason === 'overflow-recovery') {
+      // The recovery flow owns the terminal transition: keep the composer gated until its retry
+      // replaces compacting with a new active run, or its fallback reports a concrete failure.
+      return true
+    } else if (event.status === 'completed' || event.status === 'cancelled') {
+      store.finishCompaction(event.sessionId)
+    } else if (event.status === 'failed') {
+      store.failCompaction(event.sessionId, getEventErrorText(event))
+    }
 
     return true
   }
@@ -253,44 +559,32 @@ const applyWorkspaceRuntimeEvent = async (
     event.artifacts &&
     event.artifacts.length > 0
   ) {
-    // First attach pending artifacts to whichever assistant message represents this run locally.
-    const attached = store.attachRunArtifacts({
-      sessionId: event.sessionId,
-      runId: event.runId,
-      eventId: event.id,
-      artifacts: event.artifacts
-    })
-
-    if (attached) {
-      try {
-        // Then move files from pending run storage into the final message-owned directory.
-        const finalizedArtifacts = await (
-          dependencies.finalizeRunArtifacts ?? finalizeRunArtifacts
-        )({
-          claimId: event.artifactClaimId,
-          messageId: attached.messageId
-        })
-
-        // Replace temporary run paths with finalized message paths before persistence/UI rendering.
-        store.replaceMessageArtifacts({
-          sessionId: event.sessionId,
-          messageId: attached.messageId,
-          artifacts: finalizedArtifacts
-        })
-        store.clearArtifactError(event.sessionId)
-
-        // Auto-open any molecular-structure files this run produced, using the finalized paths.
-        openMoleculePreviews(event.sessionId, finalizedArtifacts)
-      } catch (error) {
-        store.recordArtifactError(event.sessionId, getErrorText(error))
-        throw error
-      }
+    const session = store.sessions.find((candidate) => candidate.id === event.sessionId)
+    if (session?.conversationGraphSyncBlocked) return true
+    if (session?.activeRun) {
+      const deferredArtifacts = deferredArtifactEventsBySession.get(event.sessionId) ?? []
+      deferredArtifacts.push({ event, dependencies })
+      deferredArtifactEventsBySession.set(event.sessionId, deferredArtifacts)
+      return true
     }
 
-    return true
+    cancelScheduledAutoReview(event.sessionId)
+    const pendingByPrompt = pendingArtifactTurnUsageBySession.get(event.sessionId)
+    const matchingTurnUsage = event.promptMessageId
+      ? pendingByPrompt?.get(event.promptMessageId)
+      : undefined
+    const wasFinalized = await finalizeArtifactEvent(event, dependencies, matchingTurnUsage)
+    if (wasFinalized && matchingTurnUsage && event.promptMessageId) {
+      pendingByPrompt?.delete(event.promptMessageId)
+      if (pendingByPrompt?.size === 0) pendingArtifactTurnUsageBySession.delete(event.sessionId)
+    }
+    if (wasFinalized) scheduleAutoReview(event.sessionId)
+    return wasFinalized
   }
 
   if (event.kind === 'error' && event.sessionId) {
+    activityGroupToolCallIdsBySession.delete(event.sessionId)
+    pendingArtifactTurnUsageBySession.delete(event.sessionId)
     // A recoverable request-size overflow shows the neutral "compacting" note ONLY while a recovery is
     // actually in flight — the workspace runtime flips the session to `compacting` first (its recovery
     // effect runs before this event is applied). If the session is not compacting, no recovery started
@@ -310,7 +604,22 @@ const applyWorkspaceRuntimeEvent = async (
       return true
     }
 
-    store.failRun(event.sessionId, getEventErrorText(event))
+    // A model-provider failure (upstream LLM/HTTP error the agent relayed, tagged structurally in the
+    // runtime) keeps its message but is not a bug worth a GitHub issue — hide the report button. For
+    // everything else, defer to failRun's text tier (undefined) rather than forcing reportable=true: a
+    // non-recovered overflow reaches here (repeat inside cooldown, nothing to replay, detached session)
+    // with providerError=false but IS a client-side/size failure the text tier recognizes as expected —
+    // forcing true here would wrongly show and persist the report button over it. Opaque ACP-layer
+    // failures still fall through the text tier to reportable.
+    store.failRun(event.sessionId, getEventErrorText(event), {
+      reportable: event.providerError ? false : undefined
+    })
+    const failedSession = useSessionStore
+      .getState()
+      .sessions.find((session) => session.id === event.sessionId)
+    if (failedSession?.conversationGraphSyncBlocked) {
+      deferredArtifactEventsBySession.delete(event.sessionId)
+    }
     return true
   }
 
@@ -366,6 +675,8 @@ export {
   applyWorkspaceRuntimeEvent,
   assembleReviewRunRequest,
   syncWorkspacePermissionState,
+  suppressAutoReviewsForQuit,
   suppressNextAutoReview,
-  clearSuppressNextAutoReview
+  clearSuppressNextAutoReview,
+  resetDeferredArtifactEventsForTests
 }

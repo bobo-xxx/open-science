@@ -3,11 +3,14 @@ import { describe, expect, it } from 'vitest'
 import { MAX_ACP_SESSION_IMAGE_BYTES } from './acp'
 
 import {
+  createSessionFile,
+  sanitizeActivityGroup,
   normalizeSessionFile,
   sanitizeMessageImages,
   sanitizeToolActivity,
   type PersistedChatSession
 } from './session-persistence'
+import { createLinearConversationGraph } from './conversation-graph'
 
 const createSessionWithActivity = (activity: unknown): Record<string, unknown> => ({
   id: 'session-1',
@@ -23,6 +26,183 @@ const createSessionWithActivity = (activity: unknown): Record<string, unknown> =
 
 const getRestoredActivities = (session: unknown): PersistedChatSession['activities'] =>
   normalizeSessionFile(session)?.activities
+
+describe('message part persistence', () => {
+  it('preserves a linked-folder reference as root id plus relative path', () => {
+    const restored = normalizeSessionFile({
+      ...createSessionWithActivity(undefined),
+      activities: undefined,
+      messages: [
+        {
+          id: 'message-1',
+          role: 'user',
+          content: '@study.csv',
+          parts: [
+            {
+              type: 'artifact',
+              id: 'linked-1',
+              name: 'study.csv',
+              source: 'linked-folder',
+              rootId: 'root-1',
+              relativePath: 'data/study.csv',
+              path: '/must/not/be/persisted'
+            }
+          ],
+          createdAt: 1,
+          updatedAt: 1
+        }
+      ]
+    })
+
+    expect(restored?.messages[0].parts).toEqual([
+      {
+        type: 'artifact',
+        id: 'linked-1',
+        name: 'study.csv',
+        source: 'linked-folder',
+        rootId: 'root-1',
+        relativePath: 'data/study.csv'
+      }
+    ])
+  })
+})
+
+describe('message terminal time persistence', () => {
+  it('backfills stable terminal timestamps for legacy agent messages', () => {
+    const restored = normalizeSessionFile({
+      ...createSessionWithActivity(undefined),
+      activities: undefined,
+      messages: [
+        {
+          id: 'complete-message',
+          role: 'agent',
+          content: 'Done',
+          status: 'complete',
+          eventIds: [],
+          createdAt: 10,
+          updatedAt: 20
+        },
+        {
+          id: 'failed-message',
+          role: 'agent',
+          content: 'Partial',
+          status: 'error',
+          eventIds: [],
+          createdAt: 30,
+          updatedAt: 40
+        }
+      ]
+    })
+
+    expect(restored?.messages).toEqual([
+      expect.objectContaining({ id: 'complete-message', completedAt: 20 }),
+      expect.objectContaining({ id: 'failed-message', failedAt: 40 })
+    ])
+  })
+
+  it('preserves response linkage and explicit terminal timestamps when updatedAt changes later', () => {
+    const restored = normalizeSessionFile({
+      ...createSessionWithActivity(undefined),
+      activities: undefined,
+      messages: [
+        {
+          id: 'prompt-message',
+          role: 'user',
+          content: 'Run the analysis',
+          status: 'complete',
+          eventIds: [],
+          createdAt: 10,
+          updatedAt: 10
+        },
+        {
+          id: 'complete-message',
+          role: 'agent',
+          content: 'Done',
+          status: 'complete',
+          eventIds: [],
+          responseToMessageId: 'prompt-message',
+          createdAt: 11,
+          completedAt: 20,
+          updatedAt: 99
+        },
+        {
+          id: 'failed-message',
+          role: 'agent',
+          content: 'Partial result',
+          status: 'error',
+          eventIds: [],
+          responseToMessageId: 'prompt-message',
+          createdAt: 12,
+          failedAt: 30,
+          updatedAt: 100
+        }
+      ]
+    })
+
+    expect(restored?.messages[1]).toMatchObject({
+      responseToMessageId: 'prompt-message',
+      completedAt: 20,
+      updatedAt: 99
+    })
+    expect(restored?.messages[2]).toMatchObject({
+      responseToMessageId: 'prompt-message',
+      failedAt: 30,
+      updatedAt: 100
+    })
+  })
+})
+
+describe('upload message persistence', () => {
+  it('keeps immutable Version identity while removing absolute legacy paths', () => {
+    const restored = normalizeSessionFile({
+      id: 'session-1',
+      projectId: 'project-a',
+      title: 'Uploads',
+      cwd: '/workspace',
+      status: 'idle',
+      messages: [
+        {
+          id: 'message-1',
+          role: 'user',
+          content: 'Analyze this',
+          uploads: [
+            {
+              id: 'upload-1',
+              versionId: 'upload-version-1',
+              versionNumber: 1,
+              createdAt: '2026-07-27T12:00:00.000Z',
+              sessionId: 'session-1',
+              name: 'input.csv',
+              originalName: 'input.csv',
+              path: '/Users/private/input.csv',
+              size: 12,
+              checksum: 'a'.repeat(64)
+            }
+          ],
+          createdAt: 1,
+          updatedAt: 1
+        }
+      ],
+      createdAt: 1,
+      updatedAt: 1
+    })
+
+    expect(restored?.messages[0].uploads).toEqual([
+      {
+        id: 'upload-1',
+        versionId: 'upload-version-1',
+        versionNumber: 1,
+        createdAt: '2026-07-27T12:00:00.000Z',
+        sessionId: 'session-1',
+        name: 'input.csv',
+        originalName: 'input.csv',
+        size: 12,
+        sha256: 'a'.repeat(64)
+      }
+    ])
+    expect(JSON.stringify(restored)).not.toContain('/Users/private/input.csv')
+  })
+})
 
 describe('message image persistence', () => {
   it('keeps only bounded raster images with recomputed byte metadata', () => {
@@ -107,6 +287,194 @@ describe('message image persistence', () => {
       MAX_ACP_SESSION_IMAGE_BYTES
     )
   })
+
+  it('sanitizes images that exist only on an inactive conversation branch before writing', () => {
+    const activeMessage = {
+      id: 'active-message',
+      role: 'user' as const,
+      content: 'Active prompt',
+      status: 'complete' as const,
+      eventIds: [],
+      createdAt: 1,
+      updatedAt: 1
+    }
+    const graph = createLinearConversationGraph({
+      sessionId: 'session-1',
+      messages: [activeMessage],
+      createdAt: 1,
+      updatedAt: 2
+    })
+    const inactiveBranchId = 'message-branch-inactive'
+    const inactiveMessageId = 'inactive-message'
+    const session: PersistedChatSession = {
+      id: 'session-1',
+      projectId: 'project-a',
+      title: 'Images',
+      cwd: '/workspace',
+      status: 'idle',
+      messages: [activeMessage],
+      conversationGraph: {
+        ...graph,
+        branches: [
+          ...graph.branches,
+          {
+            id: inactiveBranchId,
+            agentFrameId: graph.rootFrameId,
+            parentBranchId: graph.branches[0].id,
+            headMessageId: inactiveMessageId,
+            createdAt: 2,
+            updatedAt: 2
+          }
+        ],
+        messages: [
+          ...graph.messages,
+          {
+            id: inactiveMessageId,
+            role: 'agent',
+            content: 'Inactive reply',
+            status: 'complete',
+            eventIds: [],
+            images: Array.from({ length: 6 }, (_, index) => ({
+              id: `inactive-image-${index}`,
+              mimeType: 'image/png' as const,
+              data: 'AQID',
+              byteLength: 999
+            })),
+            agentFrameId: graph.rootFrameId,
+            introducedOnBranchId: inactiveBranchId,
+            createdAt: 2,
+            updatedAt: 2
+          }
+        ]
+      },
+      createdAt: 1,
+      updatedAt: 2
+    }
+
+    const persisted = createSessionFile(session).session
+    const inactiveImages = persisted.conversationGraph?.messages.find(
+      (message) => message.id === inactiveMessageId
+    )?.images
+
+    expect(inactiveImages).toHaveLength(4)
+    expect(inactiveImages?.every((image) => image.byteLength === 3)).toBe(true)
+  })
+})
+
+describe('turn token usage persistence', () => {
+  it('round-trips valid totals and drops invalid usage fields', () => {
+    const restored = normalizeSessionFile({
+      id: 'session-1',
+      projectId: 'project-a',
+      title: 'Usage',
+      cwd: '/workspace',
+      status: 'idle',
+      messages: [
+        {
+          id: 'message-valid',
+          role: 'agent',
+          content: 'Done',
+          status: 'complete',
+          eventIds: [],
+          turnUsage: {
+            inputTokens: 12_345,
+            cacheTokens: 678,
+            cachedReadTokens: 500,
+            cachedWriteTokens: 178,
+            outputTokens: 90,
+            turnCount: 3
+          },
+          createdAt: 1,
+          updatedAt: 1
+        },
+        {
+          id: 'message-invalid',
+          role: 'agent',
+          content: 'Also done',
+          status: 'complete',
+          eventIds: [],
+          turnUsage: { inputTokens: -1, cacheTokens: 2, outputTokens: 3 },
+          turnUsageUnavailable: true,
+          createdAt: 2,
+          updatedAt: 2
+        },
+        {
+          id: 'message-user',
+          role: 'user',
+          content: 'Prompt',
+          status: 'complete',
+          eventIds: [],
+          turnUsageUnavailable: true,
+          createdAt: 3,
+          updatedAt: 3
+        }
+      ],
+      createdAt: 1,
+      updatedAt: 2
+    })
+
+    expect(restored?.messages[0].turnUsage).toEqual({
+      inputTokens: 12_345,
+      cacheTokens: 678,
+      cachedReadTokens: 500,
+      cachedWriteTokens: 178,
+      outputTokens: 90,
+      turnCount: 3
+    })
+    expect(restored?.messages[1].turnUsage).toBeUndefined()
+    expect(restored?.messages[1].turnUsageUnavailable).toBe(true)
+    expect(restored?.messages[2].turnUsageUnavailable).toBeUndefined()
+  })
+})
+
+describe('context usage persistence', () => {
+  it('round-trips a valid snapshot and drops malformed usage', () => {
+    const contextUsage = {
+      used: 29_500,
+      agentUsed: 29_500,
+      size: 168_000,
+      breakdown: {
+        source: 'estimated',
+        tokenizer: 'o200k_base',
+        model: 'gpt-5.6-sol',
+        estimatedTokens: 29_405,
+        difference: 95,
+        status: 'reconciled',
+        categories: [
+          { key: 'system', tokens: 7_200, estimated: true },
+          { key: 'other', tokens: 95, estimated: false }
+        ]
+      }
+    }
+    const restored = normalizeSessionFile({
+      ...createSessionWithActivity(undefined),
+      activities: undefined,
+      contextUsage
+    })
+    const malformed = normalizeSessionFile({
+      ...createSessionWithActivity(undefined),
+      activities: undefined,
+      contextUsage: { used: -1, size: 168_000 }
+    })
+    const unsafeBreakdown = normalizeSessionFile({
+      ...createSessionWithActivity(undefined),
+      activities: undefined,
+      contextUsage: {
+        used: 100,
+        breakdown: {
+          source: 'estimated',
+          estimatedTokens: 100,
+          difference: 0,
+          status: 'reconciled',
+          categories: [{ key: 'unknown', tokens: 100, estimated: true }]
+        }
+      }
+    })
+
+    expect(restored?.contextUsage).toEqual(contextUsage)
+    expect(malformed?.contextUsage).toBeUndefined()
+    expect(unsafeBreakdown?.contextUsage).toEqual({ used: 100 })
+  })
 })
 
 describe('sanitizeToolActivity', () => {
@@ -115,6 +483,8 @@ describe('sanitizeToolActivity', () => {
       id: 'tool-1',
       kind: 'tool',
       title: 'Edit app.ts',
+      activityGroupId: 'group-1',
+      promptMessageId: 'prompt-1',
       status: 'completed',
       sortIndex: 3,
       eventIds: ['event-1'],
@@ -134,6 +504,8 @@ describe('sanitizeToolActivity', () => {
       id: 'tool-1',
       kind: 'tool',
       title: 'Edit app.ts',
+      activityGroupId: 'group-1',
+      promptMessageId: 'prompt-1',
       status: 'completed',
       providerToolName: 'Edit',
       toolKind: 'edit',
@@ -178,6 +550,28 @@ describe('sanitizeToolActivity', () => {
   })
 })
 
+describe('sanitizeActivityGroup', () => {
+  it('keeps a valid group declaration bounded and structured', () => {
+    expect(
+      sanitizeActivityGroup({
+        id: 'group-1',
+        title: 'Inspect the implementation.',
+        sortIndex: 4,
+        activityIds: ['tool-1'],
+        createdAt: 5,
+        updatedAt: 6
+      })
+    ).toEqual({
+      id: 'group-1',
+      title: 'Inspect the implementation',
+      sortIndex: 4,
+      activityIds: ['tool-1'],
+      createdAt: 5,
+      updatedAt: 6
+    })
+  })
+})
+
 describe('normalizeSessionFile with activities', () => {
   it('restores a persisted session with its activities intact', () => {
     const activities = getRestoredActivities(
@@ -217,6 +611,63 @@ describe('normalizeSessionFile with activities', () => {
     expect(activities?.[0]?.status).toBe('failed')
   })
 
+  it('restores open conversation graph activities as failed', () => {
+    const persisted = createSessionFile({
+      ...(createSessionWithActivity({
+        id: 'activity-1',
+        kind: 'tool',
+        title: 'downloading',
+        status: 'in_progress',
+        sortIndex: 1,
+        eventIds: [],
+        createdAt: 1,
+        updatedAt: 1
+      }) as PersistedChatSession),
+      messages: [
+        {
+          id: 'message-1',
+          role: 'user',
+          content: 'Download it',
+          status: 'complete',
+          eventIds: [],
+          createdAt: 1,
+          updatedAt: 1
+        }
+      ]
+    })
+
+    const restored = normalizeSessionFile(persisted)
+
+    expect(restored?.conversationGraph?.activities[0]?.status).toBe('failed')
+  })
+
+  it('builds a legacy conversation graph from normalized interrupted messages', () => {
+    const restored = normalizeSessionFile({
+      id: 'session-1',
+      projectId: 'project-a',
+      title: 'Interrupted session',
+      cwd: '/workspace',
+      status: 'running',
+      messages: [
+        {
+          id: 'message-1',
+          role: 'agent',
+          content: 'Partial response',
+          status: 'streaming',
+          createdAt: 1,
+          updatedAt: 7
+        }
+      ],
+      createdAt: 1,
+      updatedAt: 1
+    })
+
+    expect(restored?.messages[0]?.status).toBe('error')
+    expect(restored?.messages[0]?.failedAt).toBe(7)
+    expect(restored?.conversationGraph?.messages[0]?.status).toBe('error')
+    expect(restored?.conversationGraph?.messages[0]?.failedAt).toBe(7)
+  })
+
   it('loads sessions that predate persisted activities', () => {
     const session = normalizeSessionFile({
       id: 'session-1',
@@ -249,16 +700,18 @@ describe('normalizeSessionFile with activities', () => {
     expect(malformed?.filesRevision).toBeUndefined()
   })
 
-  it('round-trips the agent backend identity used to resume a session', () => {
+  it('round-trips the agent backend identity and run model used for diagnostics', () => {
     const session = normalizeSessionFile({
       ...createSessionWithActivity(undefined),
       activities: undefined,
       agentFrameworkId: 'codex',
-      agentBackendId: 'codex:codex-isolated'
+      agentBackendId: 'codex:codex-isolated',
+      agentModel: 'gpt-5.6-sol'
     })
 
     expect(session?.agentFrameworkId).toBe('codex')
     expect(session?.agentBackendId).toBe('codex:codex-isolated')
+    expect(session?.agentModel).toBe('gpt-5.6-sol')
   })
 
   it('keeps known approval profiles and safely defaults unknown values', () => {
@@ -331,5 +784,36 @@ describe('normalizeSessionFile with activities', () => {
     expect(legacy?.enabledComputeHosts).toBeUndefined()
     expect(mixedValid?.enabledComputeHosts).toEqual(['ssh:valid'])
     expect(allInvalid?.enabledComputeHosts).toBeUndefined()
+  })
+
+  it('persists errorReportable only when a model-provider error marked it false', () => {
+    const base = { ...createSessionWithActivity(undefined), activities: undefined, status: 'error' }
+
+    // A provider error tagged non-reportable at the ACP layer round-trips as false so the reloaded
+    // session keeps the report button hidden.
+    const providerFailure = normalizeSessionFile({
+      ...base,
+      error: 'Invalid API key',
+      errorReportable: false
+    })
+    // A reportable failure does not persist the field (default is reportable — no need to store true).
+    const reportableFailure = normalizeSessionFile({
+      ...base,
+      error: 'Agent session could not be created.',
+      errorReportable: true
+    })
+    // An older session file, written before the flag existed, has no field and defaults to reportable.
+    const legacy = normalizeSessionFile({ ...base, error: 'Some old failure' })
+    // The flag is meaningless without an error and is dropped.
+    const noError = normalizeSessionFile({
+      ...createSessionWithActivity(undefined),
+      activities: undefined,
+      errorReportable: false
+    })
+
+    expect(providerFailure?.errorReportable).toBe(false)
+    expect(reportableFailure?.errorReportable).toBeUndefined()
+    expect(legacy?.errorReportable).toBeUndefined()
+    expect(noError?.errorReportable).toBeUndefined()
   })
 })

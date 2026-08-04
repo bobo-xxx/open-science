@@ -19,6 +19,7 @@ import type { AcpRuntime } from '../acp/runtime'
 import { ReviewRepository } from './repository'
 import { createProjectDbClient, ensureProjectSchema } from '../projects/prisma-client'
 import { runReview } from './orchestrator'
+import { callSubmitFindingsAfterReadingEvidence as callSubmitFindings } from './reviewer-mcp-test-client'
 import type { PersistedChatSession } from '../../shared/session-persistence'
 
 // The reviewer prompt built by buildReviewerPrompt always starts with this line (see orchestrator.ts).
@@ -81,86 +82,17 @@ const makeFakeReviewerSession = (
 const makeStubRuntime = (session: unknown, promptPrefix: string | undefined): AcpRuntime =>
   ({
     buildReviewerSession: async () => ({ session, promptPrefix }),
-    disposeReviewerSession: () => 0
+    disposeReviewerSession: () => ({ rejectedToolCalls: 0, reviewerBridgeScoped: undefined })
   }) as unknown as AcpRuntime
 
 // --- Reviewer MCP submit helper (mirrors orchestrator.test.ts) ---
 // Used to drive the initial review to a warn outcome so the fix loop (and thus runScopedReview) runs.
 // The MCP Streamable HTTP transport answers over SSE, so responses are parsed out of the event stream.
-const MCP_ACCEPT = 'application/json, text/event-stream'
-
-const parseMcpSseBody = (body: string): { result?: unknown; error?: { message?: string } } => {
-  const dataLine = body.split('\n').find((line) => line.startsWith('data:'))
-  const json = dataLine ? dataLine.slice('data:'.length).trim() : body.trim()
-  return json ? (JSON.parse(json) as { result?: unknown; error?: { message?: string } }) : {}
-}
-
 type SubmittedCheck = {
   status: 'pass' | 'warn' | 'fail'
   claim: string
   evidence: string
   locator?: { blockRef: { messageId?: string; blockIndex: number }; contentHash: string }
-}
-
-const callSubmitFindings = async (
-  mcpBaseUrl: string,
-  token: string,
-  checks: SubmittedCheck[]
-): Promise<void> => {
-  const initResponse = await fetch(mcpBaseUrl, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      accept: MCP_ACCEPT,
-      authorization: `Bearer ${token}`
-    },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'initialize',
-      params: {
-        protocolVersion: '2024-11-05',
-        capabilities: {},
-        clientInfo: { name: 'test-client', version: '1.0' }
-      }
-    })
-  })
-  if (!initResponse.ok) throw new Error(`MCP initialize failed: ${initResponse.status}`)
-
-  const initJson = parseMcpSseBody(await initResponse.text())
-  const sessionId = initResponse.headers.get('mcp-session-id')
-  if (!sessionId || !initJson.result) throw new Error('MCP initialize did not return a session id')
-
-  await fetch(mcpBaseUrl, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      accept: MCP_ACCEPT,
-      authorization: `Bearer ${token}`,
-      'mcp-session-id': sessionId
-    },
-    body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} })
-  })
-
-  const toolResponse = await fetch(mcpBaseUrl, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      accept: MCP_ACCEPT,
-      authorization: `Bearer ${token}`,
-      'mcp-session-id': sessionId
-    },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 2,
-      method: 'tools/call',
-      params: { name: 'submit_findings', arguments: { checks } }
-    })
-  })
-  if (!toolResponse.ok) throw new Error(`submit_findings call failed: ${toolResponse.status}`)
-  const toolJson = parseMcpSseBody(await toolResponse.text())
-  if (toolJson.error)
-    throw new Error(`submit_findings error: ${toolJson.error.message ?? 'unknown'}`)
 }
 
 // Pulls the reviewer HTTP MCP server url + bearer token out of the mcpServers config that runReview
@@ -257,6 +189,140 @@ describe('runReview — framework-neutral rubric delivery (promptPrefix)', () =>
 
     await client.$disconnect()
   })
+
+  it('fails closed when a completed bridged reviewer request was never session-scoped', async () => {
+    const runtime = {
+      buildReviewerSession: async (request: { mcpServers: unknown[] }) => {
+        const mcp = extractReviewerMcp(request.mcpServers)
+        let submitDone: Promise<void> | null = null
+        return {
+          session: {
+            sessionId: 'reviewer-session-1',
+            prompt: () => {
+              submitDone = callSubmitFindings(mcp.url, mcp.token, [
+                { status: 'pass', claim: 'Scoped claim', evidence: 'Scoped evidence' }
+              ])
+            },
+            nextUpdate: async () => {
+              if (submitDone) await submitDone
+              return { kind: 'stop', stopReason: 'end_turn' }
+            },
+            dispose: () => {}
+          }
+        }
+      },
+      disposeReviewerSession: () => ({
+        rejectedToolCalls: 0,
+        reviewerBridgeScoped: false
+      })
+    } as unknown as AcpRuntime
+    const client = createProjectDbClient(temporaryRoot!)
+    await ensureProjectSchema(client)
+    const repository = new ReviewRepository(() => Promise.resolve(client))
+
+    const review = await runReview({
+      sessionId: 'session-1',
+      turnMessageId: 'msg-2',
+      projectId: 'project-1',
+      getSession: () => makeSession(),
+      reviewRepository: repository,
+      acpRuntime: runtime,
+      artifactStorageRoot: temporaryRoot!
+    })
+
+    expect(review.lifecycle).toBe('error')
+    expect(review.errorMessage).toContain('reviewer-only tool scope')
+    expect(review.checks).toEqual([])
+    await client.$disconnect()
+  })
+
+  it('returns an error review and stops the MCP server when reviewer disposal fails', async () => {
+    let reviewerEndpoint = ''
+    const runtime = {
+      buildReviewerSession: async (request: { mcpServers: unknown[] }) => {
+        const mcp = extractReviewerMcp(request.mcpServers)
+        reviewerEndpoint = mcp.url
+        let submitDone: Promise<void> | null = null
+        return {
+          session: {
+            sessionId: 'reviewer-session-1',
+            prompt: () => {
+              submitDone = callSubmitFindings(mcp.url, mcp.token, [
+                { status: 'pass', claim: 'Cleanup claim', evidence: 'Cleanup evidence' }
+              ])
+            },
+            nextUpdate: async () => {
+              if (submitDone) await submitDone
+              return { kind: 'stop', stopReason: 'end_turn' }
+            },
+            dispose: () => {}
+          }
+        }
+      },
+      disposeReviewerSession: () => {
+        throw new Error('reviewer dispose failed')
+      }
+    } as unknown as AcpRuntime
+    const client = createProjectDbClient(temporaryRoot!)
+    await ensureProjectSchema(client)
+    const repository = new ReviewRepository(() => Promise.resolve(client))
+
+    const review = await runReview({
+      sessionId: 'session-1',
+      turnMessageId: 'msg-2',
+      projectId: 'project-1',
+      getSession: () => makeSession(),
+      reviewRepository: repository,
+      acpRuntime: runtime,
+      artifactStorageRoot: temporaryRoot!
+    })
+
+    expect(review.lifecycle).toBe('error')
+    expect(review.errorMessage).toContain('reviewer dispose failed')
+    await expect(fetch(reviewerEndpoint)).rejects.toThrow()
+    await client.$disconnect()
+  })
+
+  it('keeps the reviewer failure primary when disposal also fails', async () => {
+    let reviewerEndpoint = ''
+    const runtime = {
+      buildReviewerSession: async (request: { mcpServers: unknown[] }) => {
+        reviewerEndpoint = extractReviewerMcp(request.mcpServers).url
+        return {
+          session: {
+            sessionId: 'reviewer-session-1',
+            prompt: () => {
+              throw new Error('reviewer prompt failed')
+            },
+            nextUpdate: async () => ({ kind: 'stop', stopReason: 'end_turn' }),
+            dispose: () => {}
+          }
+        }
+      },
+      disposeReviewerSession: () => {
+        throw new Error('reviewer dispose failed')
+      }
+    } as unknown as AcpRuntime
+    const client = createProjectDbClient(temporaryRoot!)
+    await ensureProjectSchema(client)
+    const repository = new ReviewRepository(() => Promise.resolve(client))
+
+    const review = await runReview({
+      sessionId: 'session-1',
+      turnMessageId: 'msg-2',
+      projectId: 'project-1',
+      getSession: () => makeSession(),
+      reviewRepository: repository,
+      acpRuntime: runtime,
+      artifactStorageRoot: temporaryRoot!
+    })
+
+    expect(review.lifecycle).toBe('error')
+    expect(review.errorMessage).toContain('reviewer prompt failed')
+    expect(review.errorMessage).not.toContain('reviewer dispose failed')
+    await expect(fetch(reviewerEndpoint)).rejects.toThrow()
+    await client.$disconnect()
+  })
 })
 
 // The second promptPrefix concat site lives inside the module-local runScopedReview, reachable only
@@ -303,7 +369,7 @@ describe('runScopedReview — framework-neutral rubric delivery (fix-loop re-rev
         }
         return { session: makeFakeReviewerSession(scopedPromptSink), promptPrefix: scopedPrefix }
       },
-      disposeReviewerSession: () => 0,
+      disposeReviewerSession: () => ({ rejectedToolCalls: 0, reviewerBridgeScoped: undefined }),
       // The [Auditor] correction turn: append the auditor user turn + the agent's correction turn so
       // the fix loop resolves a new correctionTurnMessageId (msg-4-correction) for the scoped review.
       sendPrompt: async () => {
@@ -362,6 +428,118 @@ describe('runScopedReview — framework-neutral rubric delivery (fix-loop re-rev
     expect(sent).toContain(scopedHead)
     expect(sent.startsWith(`${scopedPrefix}\n\n${scopedHead}`)).toBe(true)
 
+    await client.$disconnect()
+  })
+
+  it.each([
+    {
+      caseName: 'records disposal failure as the scoped error',
+      scopedPromptError: undefined,
+      expectedError: 'scoped reviewer dispose failed'
+    },
+    {
+      caseName: 'keeps an existing scoped reviewer failure primary',
+      scopedPromptError: 'scoped reviewer prompt failed',
+      expectedError: 'scoped reviewer prompt failed'
+    }
+  ])('$caseName and stops the MCP server', async ({ scopedPromptError, expectedError }) => {
+    let currentSession = makeSession()
+    let buildCall = 0
+    let disposeCall = 0
+    let scopedEndpoint = ''
+    const runtime = {
+      buildReviewerSession: async (request: { mcpServers: unknown[] }) => {
+        buildCall += 1
+        const mcp = extractReviewerMcp(request.mcpServers)
+        let submitDone: Promise<void> | null = null
+        return {
+          session: {
+            sessionId: `reviewer-${buildCall}`,
+            prompt: () => {
+              if (buildCall === 1) {
+                submitDone = callSubmitFindings(mcp.url, mcp.token, [
+                  {
+                    status: 'warn',
+                    claim: 'Result count is unverified',
+                    evidence: 'No artifact supports the result count.',
+                    locator: {
+                      blockRef: { messageId: 'msg-2', blockIndex: 0 },
+                      contentHash: 'h-msg-2'
+                    }
+                  }
+                ])
+              } else {
+                scopedEndpoint = mcp.url
+                if (scopedPromptError) throw new Error(scopedPromptError)
+              }
+            },
+            nextUpdate: async () => {
+              if (submitDone) await submitDone
+              return { kind: 'stop', stopReason: 'end_turn' }
+            },
+            dispose: () => {}
+          }
+        }
+      },
+      disposeReviewerSession: () => {
+        disposeCall += 1
+        if (disposeCall === 2) throw new Error('scoped reviewer dispose failed')
+        return { rejectedToolCalls: 0, reviewerBridgeScoped: undefined }
+      },
+      sendPrompt: async () => {
+        currentSession = {
+          ...currentSession,
+          messages: [
+            ...currentSession.messages,
+            {
+              id: 'msg-3-auditor',
+              role: 'user',
+              content: '[Auditor] verify the result count.',
+              status: 'complete',
+              eventIds: [],
+              createdAt: 3000,
+              updatedAt: 3000
+            },
+            {
+              id: 'msg-4-correction',
+              role: 'agent',
+              content: 'Verified the result count.',
+              status: 'complete',
+              eventIds: [],
+              createdAt: 4000,
+              updatedAt: 4000
+            }
+          ],
+          updatedAt: 4000
+        }
+      }
+    } as unknown as AcpRuntime
+    const client = createProjectDbClient(temporaryRoot!)
+    await ensureProjectSchema(client)
+    const repository = new ReviewRepository(() => Promise.resolve(client))
+
+    await runReview({
+      sessionId: 'session-1',
+      turnMessageId: 'msg-2',
+      projectId: 'project-1',
+      mainSessionId: 'session-1',
+      getSession: () => currentSession,
+      reviewRepository: repository,
+      acpRuntime: runtime,
+      artifactStorageRoot: temporaryRoot!,
+      fixLoopMaxRounds: 1
+    })
+
+    const reviews = await repository.getReviewsForSession('session-1')
+    expect(reviews).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          lifecycle: 'error',
+          errorMessage: expectedError
+        })
+      ])
+    )
+    await expect(fetch(scopedEndpoint)).rejects.toThrow()
     await client.$disconnect()
   })
 })

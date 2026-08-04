@@ -9,6 +9,10 @@ import {
 // Bounds how much of a failed tool's result text reaches the log, so large or sensitive tool output
 // cannot flood it. Tuned to fit a typical error message (e.g. WebFetch's domain-safety preflight).
 const TOOL_FAILURE_TEXT_LIMIT = 300
+const MAX_RUNTIME_RAW_PAYLOAD_CHARS = 8_000
+const MAX_SKILL_NAME_CHARS = 200
+const SKILL_TOOL_TITLE_PATTERN = /^(?:run|loaded)\s+skill(?:\?|:|\s|$)/iu
+const SKILL_CONTENT_PATTERN = /^\s*<skill_content(?:\s|>)/iu
 
 // Narrows protocol extension values before reading provider-specific metadata.
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -21,6 +25,31 @@ const trimProviderValue = (value: unknown): string | undefined => {
   const trimmedValue = value.trim()
 
   return trimmedValue ? trimmedValue : undefined
+}
+
+const containsControlCharacter = (value: string): boolean =>
+  [...value].some((character) => {
+    const codePoint = character.codePointAt(0)
+
+    return codePoint !== undefined && (codePoint <= 0x1f || codePoint === 0x7f)
+  })
+
+// Keeps small JSON payloads for activity details while dropping values that would make runtime
+// snapshots expensive or impossible to structured-clone across IPC.
+const sanitizeRawToolPayload = (value: unknown): unknown | undefined => {
+  if (value === undefined || value === null) return undefined
+
+  try {
+    const serialized = JSON.stringify(value)
+
+    if (serialized === undefined || serialized.length > MAX_RUNTIME_RAW_PAYLOAD_CHARS) {
+      return undefined
+    }
+
+    return JSON.parse(serialized) as unknown
+  } catch {
+    return undefined
+  }
 }
 
 // Extracts a safe tool identity (e.g. "WebFetch") from ACP extension metadata without exposing
@@ -138,6 +167,65 @@ const extractToolFailureText = (content: ToolCallContent[] | undefined): string 
   return text.length > TOOL_FAILURE_TEXT_LIMIT ? `${text.slice(0, TOOL_FAILURE_TEXT_LIMIT)}…` : text
 }
 
+type ToolCallUpdate = Extract<
+  SessionNotification['update'],
+  { sessionUpdate: 'tool_call' | 'tool_call_update' }
+>
+
+// Native Skill calls return their instruction document as a tool result. It is agent context, not
+// user-facing output, so do not send it through the activity, IPC, or persistence pipelines.
+const isNativeSkillToolUpdate = (update: ToolCallUpdate): boolean => {
+  const title = trimProviderValue(update.title)
+  const providerToolName = extractProviderToolName(update)?.toLowerCase()
+  const containsSkillContent = update.content?.some(
+    (item) =>
+      item.type === 'content' &&
+      item.content.type === 'text' &&
+      SKILL_CONTENT_PATTERN.test(item.content.text)
+  )
+
+  return (
+    providerToolName === 'skill' ||
+    (title !== undefined && SKILL_TOOL_TITLE_PATTERN.test(title)) ||
+    containsSkillContent === true
+  )
+}
+
+// Keeps the single user-facing identity field from a native Skill call without retaining its input
+// object or instruction document. Generic follow-up titles are omitted so they cannot overwrite the
+// canonical name captured from the initial event in the renderer activity store.
+const projectToolTitle = (update: ToolCallUpdate): string | undefined => {
+  if (!isNativeSkillToolUpdate(update)) return update.title ?? undefined
+
+  const rawInput = isRecord(update.rawInput) ? update.rawInput : undefined
+  const skillName = trimProviderValue(rawInput?.name)
+
+  if (
+    skillName &&
+    skillName.length <= MAX_SKILL_NAME_CHARS &&
+    !containsControlCharacter(skillName)
+  ) {
+    return `Loaded skill: ${skillName}`
+  }
+
+  return trimProviderValue(update.title)?.toLowerCase() === 'skill'
+    ? undefined
+    : (update.title ?? undefined)
+}
+
+// Projects activity detail fields only for tools whose payload is safe and useful to show.
+const projectToolDetailPayload = (update: ToolCallUpdate): Partial<AcpRuntimeEvent> => {
+  if (isNativeSkillToolUpdate(update)) return {}
+
+  return {
+    toolContent: update.content ?? undefined,
+    toolLocations: update.locations ?? undefined,
+    rawInput: sanitizeRawToolPayload(update.rawInput),
+    rawOutput: sanitizeRawToolPayload(update.rawOutput),
+    ...extractTerminalMeta(update)
+  }
+}
+
 // Normalizes protocol session notifications into a renderer-friendly event shape.
 const toAcpRuntimeEvent = (
   notification: SessionNotification,
@@ -192,35 +280,30 @@ const toAcpRuntimeEvent = (
         text: contentToText(update.content)
       }
     case 'tool_call':
-      // Keep provider-specific tool metadata only in raw; preview behavior is file-only for now.
+      // Tool events expose only the bounded fields consumed by the UI. Do not retain the original
+      // notification because it duplicates the unbounded arguments and results inside `raw`.
       return {
         ...base,
+        raw: undefined,
         kind: 'tool',
         toolCallId: update.toolCallId,
         providerToolName: extractProviderToolName(update),
         toolKind: update.kind,
-        toolContent: update.content,
-        toolLocations: update.locations,
-        rawInput: update.rawInput,
-        rawOutput: update.rawOutput,
-        ...extractTerminalMeta(update),
-        title: update.title,
+        ...projectToolDetailPayload(update),
+        title: projectToolTitle(update),
         status: update.status
       }
     case 'tool_call_update':
       // Tool updates stay compact and do not expose future preview metadata assumptions.
       return {
         ...base,
+        raw: undefined,
         kind: 'tool',
         toolCallId: update.toolCallId,
         providerToolName: extractProviderToolName(update),
         toolKind: update.kind ?? undefined,
-        toolContent: update.content ?? undefined,
-        toolLocations: update.locations ?? undefined,
-        rawInput: update.rawInput,
-        rawOutput: update.rawOutput,
-        ...extractTerminalMeta(update),
-        title: update.title ?? undefined,
+        ...projectToolDetailPayload(update),
+        title: projectToolTitle(update),
         status: update.status ?? undefined
       }
     case 'plan':
@@ -233,11 +316,17 @@ const toAcpRuntimeEvent = (
         text: update.sessionUpdate
       }
     case 'usage_update':
+      // Carry the real numbers on the event so the runtime can record context usage by session. The
+      // runtime consumes this and suppresses the event, so it never appears as conversation noise.
       return {
         ...base,
         kind: 'system',
-        title: 'Usage update',
-        text: 'Token usage changed'
+        title: 'Context usage update',
+        text: 'Context usage changed',
+        contextUsage: {
+          used: update.used,
+          size: update.size
+        }
       }
     case 'available_commands_update':
     case 'config_option_update':
@@ -259,4 +348,10 @@ const toAcpRuntimeEvent = (
   }
 }
 
-export { extractProviderToolName, extractTerminalMeta, extractToolFailureText, toAcpRuntimeEvent }
+export {
+  extractProviderToolName,
+  extractTerminalMeta,
+  extractToolFailureText,
+  isNativeSkillToolUpdate,
+  toAcpRuntimeEvent
+}

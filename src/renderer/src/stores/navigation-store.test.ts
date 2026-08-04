@@ -1,11 +1,18 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   SESSION_MANIFEST_VERSION,
   type PersistedChatSession
 } from '../../../shared/session-persistence'
+import { recordLastOpenedProject } from '@/lib/last-opened-project'
 import { createInitialSessionState, useSessionStore } from './session-store'
 import { useNavigationStore } from './navigation-store'
+
+vi.mock('@/lib/last-opened-project', () => ({
+  recordLastOpenedProject: vi.fn(),
+  getLastOpenedProjectId: vi.fn(() => undefined),
+  resolveCustomizeProjectId: vi.fn(() => undefined)
+}))
 
 const createSession = (overrides: Partial<PersistedChatSession>): PersistedChatSession => ({
   id: 'session-1',
@@ -21,7 +28,16 @@ const createSession = (overrides: Partial<PersistedChatSession>): PersistedChatS
 
 beforeEach(() => {
   useSessionStore.setState(createInitialSessionState())
-  useNavigationStore.setState({ view: 'home', activeProjectId: undefined })
+  useNavigationStore.setState({
+    view: 'home',
+    activeProjectId: undefined,
+    userNavigationRevision: 0,
+    explicitNavigationRevision: 0,
+    pendingCustomizePrefill: undefined,
+    pendingArtifactMention: undefined,
+    artifactMentionAvailability: undefined
+  })
+  vi.mocked(recordLastOpenedProject).mockClear()
 })
 
 describe('navigation store', () => {
@@ -37,7 +53,7 @@ describe('navigation store', () => {
         { version: SESSION_MANIFEST_VERSION }
       )
 
-    useNavigationStore.getState().openProject('project-a')
+    useNavigationStore.getState().openProject('project-a', 'user')
 
     expect(useNavigationStore.getState().view).toBe('workspace')
     expect(useNavigationStore.getState().activeProjectId).toBe('project-a')
@@ -52,7 +68,7 @@ describe('navigation store', () => {
         version: SESSION_MANIFEST_VERSION
       })
 
-    useNavigationStore.getState().openProject('project-empty')
+    useNavigationStore.getState().openProject('project-empty', 'user')
 
     expect(useNavigationStore.getState().activeProjectId).toBe('project-empty')
     expect(useSessionStore.getState().selectedSessionId).toBeUndefined()
@@ -69,7 +85,7 @@ describe('navigation store', () => {
         { version: SESSION_MANIFEST_VERSION }
       )
 
-    useNavigationStore.getState().openSession('project-b', 'b')
+    useNavigationStore.getState().openSession('project-b', 'b', 'user')
 
     expect(useNavigationStore.getState().view).toBe('workspace')
     expect(useNavigationStore.getState().activeProjectId).toBe('project-b')
@@ -83,7 +99,7 @@ describe('navigation store', () => {
         version: SESSION_MANIFEST_VERSION
       })
 
-    useNavigationStore.getState().openSessionById('a')
+    useNavigationStore.getState().openSessionById('a', 'notification')
 
     expect(useNavigationStore.getState().view).toBe('workspace')
     expect(useNavigationStore.getState().activeProjectId).toBe('project-a')
@@ -91,7 +107,7 @@ describe('navigation store', () => {
   })
 
   it('stays put when a notification names a session that no longer exists', () => {
-    useNavigationStore.getState().openSessionById('gone')
+    useNavigationStore.getState().openSessionById('gone', 'notification')
 
     expect(useNavigationStore.getState().view).toBe('home')
     expect(useNavigationStore.getState().activeProjectId).toBeUndefined()
@@ -99,9 +115,99 @@ describe('navigation store', () => {
   })
 
   it('returns to the home screen without losing session state', () => {
-    useNavigationStore.getState().openSession('project-a', 'session-1')
-    useNavigationStore.getState().goHome()
+    useNavigationStore.getState().openSession('project-a', 'session-1', 'user')
+    useNavigationStore.getState().goHome('user')
 
     expect(useNavigationStore.getState().view).toBe('home')
+  })
+
+  it('advances user navigation revision only for explicit user actions', () => {
+    useNavigationStore.getState().goHome('automatic')
+    expect(useNavigationStore.getState().userNavigationRevision).toBe(0)
+    expect(useNavigationStore.getState().explicitNavigationRevision).toBe(0)
+
+    useNavigationStore.getState().goHome('notification')
+    expect(useNavigationStore.getState().userNavigationRevision).toBe(0)
+    expect(useNavigationStore.getState().explicitNavigationRevision).toBe(1)
+
+    useNavigationStore.getState().goHome('user')
+    expect(useNavigationStore.getState().userNavigationRevision).toBe(1)
+    expect(useNavigationStore.getState().explicitNavigationRevision).toBe(2)
+
+    useNavigationStore.getState().recordUserNavigation()
+    expect(useNavigationStore.getState().userNavigationRevision).toBe(2)
+    expect(useNavigationStore.getState().explicitNavigationRevision).toBe(3)
+  })
+
+  it('records the last-opened project only for explicit user project opens', () => {
+    useNavigationStore.getState().openProject('project-a', 'user')
+    expect(recordLastOpenedProject).toHaveBeenCalledWith('project-a')
+
+    vi.mocked(recordLastOpenedProject).mockClear()
+    useNavigationStore.getState().openProject('project-b', 'automatic')
+    expect(recordLastOpenedProject).not.toHaveBeenCalled()
+  })
+
+  it('records the last-opened project when a user opens a session', () => {
+    useNavigationStore.getState().openSession('project-a', 'session-1', 'user')
+    expect(recordLastOpenedProject).toHaveBeenCalledWith('project-a')
+  })
+})
+
+describe('navigation store customize conversation', () => {
+  it('starts a customize conversation: opens the project, clears selection, and sets a prefill intent', () => {
+    useNavigationStore.getState().startCustomizeConversation('project-a')
+
+    const state = useNavigationStore.getState()
+    expect(state.view).toBe('workspace')
+    expect(state.activeProjectId).toBe('project-a')
+    // New conversation draft: no session selected, so no Specialist binding.
+    expect(useSessionStore.getState().selectedSessionId).toBeUndefined()
+    expect(state.pendingCustomizePrefill).toBe('project-a')
+  })
+
+  it('records the customize target as the last-opened project', () => {
+    useNavigationStore.getState().startCustomizeConversation('project-a')
+    expect(recordLastOpenedProject).toHaveBeenCalledWith('project-a')
+  })
+
+  it('counts the customize entry as explicit user navigation', () => {
+    useNavigationStore.getState().startCustomizeConversation('project-a')
+    expect(useNavigationStore.getState().userNavigationRevision).toBe(1)
+  })
+
+  it('clears the pending prefill intent once consumed', () => {
+    useNavigationStore.getState().startCustomizeConversation('project-a')
+    expect(useNavigationStore.getState().pendingCustomizePrefill).toBe('project-a')
+
+    useNavigationStore.getState().consumeCustomizePrefill()
+    expect(useNavigationStore.getState().pendingCustomizePrefill).toBeUndefined()
+  })
+})
+
+describe('navigation store global Artifact actions', () => {
+  it('accepts an Artifact mention only for the active workspace project and clears it after consumption', () => {
+    useNavigationStore.getState().openProject('project-a', 'user')
+    const file = {
+      id: 'artifact-1',
+      source: 'artifact' as const,
+      sourceFileId: 'artifact-1',
+      sourceVersionId: 'version-1',
+      projectId: 'project-a',
+      sessionId: 'session-1',
+      name: 'sin.png',
+      path: 'artifact-version:project-a/session-1/artifact-1/version-1',
+      size: 12,
+      sortAtMs: 1
+    }
+
+    useNavigationStore.getState().requestArtifactMention(file)
+    expect(useNavigationStore.getState().pendingArtifactMention).toMatchObject(file)
+
+    expect(useNavigationStore.getState().consumeArtifactMention()).toMatchObject(file)
+    expect(useNavigationStore.getState().pendingArtifactMention).toBeUndefined()
+
+    useNavigationStore.getState().requestArtifactMention({ ...file, projectId: 'project-b' })
+    expect(useNavigationStore.getState().pendingArtifactMention).toBeUndefined()
   })
 })

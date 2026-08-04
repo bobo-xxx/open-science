@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   createInitialPreviewWorkbenchState,
+  type PreviewFileItem,
   usePreviewWorkbenchStore
 } from '@/stores/preview-workbench-store'
 import { createInitialComputeState, useComputeStore } from '@/stores/compute-store'
@@ -17,7 +18,11 @@ import {
 } from '@/stores/session-store'
 import type { ArtifactPreviewResult } from '../../../../shared/artifacts'
 import type { ProjectFilesChangedEvent, ProjectFileItem } from '../../../../shared/project-files'
-import type { UploadedAttachment } from '../../../../shared/uploads'
+import {
+  createUploadVersionReference,
+  getUploadedAttachmentPath,
+  type UploadedAttachment
+} from '../../../../shared/uploads'
 
 const createMessage = (overrides: Partial<ChatMessage>): ChatMessage => ({
   id: 'message-1',
@@ -42,6 +47,22 @@ const createSession = (overrides: Partial<ChatSession>): ChatSession => ({
   ...overrides
 })
 
+const createArtifactSessions = (count: number): ChatSession[] =>
+  Array.from({ length: count }, (_, index) =>
+    createSession({
+      id: `session-${index + 1}`,
+      title: `Session ${index + 1}`,
+      artifacts: [
+        {
+          id: `artifact-${index + 1}`,
+          kind: 'managed-file',
+          path: `/workspace/file-${index + 1}.txt`,
+          name: `file-${index + 1}.txt`
+        }
+      ]
+    })
+  )
+
 const createUpload = (overrides: Partial<UploadedAttachment> = {}): UploadedAttachment => ({
   id: 'upload-1',
   sessionId: 'session-1',
@@ -57,6 +78,9 @@ const clickDropdownTrigger = (button: HTMLButtonElement | null): void => {
   button?.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, button: 0 }))
   button?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
 }
+
+const foldAsciiCase = (value: string): string =>
+  value.replace(/[A-Z]/g, (character) => character.toLowerCase())
 
 describe('buildProjectFileLibrary', () => {
   it('collects all user uploads into one flat newest-first list', async () => {
@@ -333,7 +357,11 @@ describe('ProjectFilesView', () => {
     vi.unstubAllGlobals()
   })
 
-  const renderView = async (sessions: ChatSession[], strict = false): Promise<void> => {
+  const renderView = async (
+    sessions: ChatSession[],
+    strict = false,
+    beforeRender?: () => void
+  ): Promise<void> => {
     const { useSessionStore } = await import('@/stores/session-store')
     const { useNavigationStore } = await import('@/stores/navigation-store')
     const { ProjectFilesView } = await import('./ProjectFilesView')
@@ -356,7 +384,7 @@ describe('ProjectFilesView', () => {
       projectId: 'default',
       sessionId: file.sessionId,
       name: file.name,
-      path: file.attachment.path,
+      path: getUploadedAttachmentPath(file.attachment, 'default'),
       mimeType: file.attachment.mimeType,
       size: file.size,
       mtimeMs: file.timestamp,
@@ -380,40 +408,58 @@ describe('ProjectFilesView', () => {
     })
 
     window.api.projectFiles = {
-      getOverview: vi.fn(async () => {
+      searchArtifacts: vi.fn(),
+      getOverview: vi.fn(async (request) => {
         const library = getLibrary()
-        const artifactCount = library.artifactGroups.reduce(
-          (total, group) => total + group.files.length,
-          0
-        )
+        const query = request.search
+          ? foldAsciiCase(request.search.filenameContains.trim())
+          : undefined
+        const matches = (name: string): boolean => !query || foldAsciiCase(name).includes(query)
+        const uploadCount = library.uploadFiles.filter((file) => matches(file.name)).length
+        const artifactGroups = library.artifactGroups
+          .map((group) => ({ ...group, files: group.files.filter((file) => matches(file.name)) }))
+          .filter((group) => group.files.length > 0)
+        const artifactCount = artifactGroups.reduce((total, group) => total + group.files.length, 0)
 
         return {
-          totalCount: library.uploadFiles.length + artifactCount,
-          uploadCount: library.uploadFiles.length,
+          totalCount: uploadCount + artifactCount,
+          uploadCount,
           artifactCount,
-          artifactGroupCount: library.artifactGroups.length,
+          artifactGroupCount: artifactGroups.length,
           isIndexComplete: true
         }
       }),
       listFiles: vi.fn(async (request) => {
         const library = getLibrary()
+        const query = request.search
+          ? foldAsciiCase(request.search.filenameContains.trim())
+          : undefined
+        const matches = (name: string): boolean => !query || foldAsciiCase(name).includes(query)
         const items =
           request.collection.kind === 'uploads'
-            ? library.uploadFiles.map(toUploadItem)
+            ? library.uploadFiles.filter((file) => matches(file.name)).map(toUploadItem)
             : (library.artifactGroups
                 .find((group) => group.sessionId === request.collection.sessionId)
-                ?.files.map((file) => toArtifactItem(file, request.collection.sessionId)) ?? [])
+                ?.files.filter((file) => matches(file.name))
+                .map((file) => toArtifactItem(file, request.collection.sessionId)) ?? [])
 
         return { items, totalCount: items.length }
       }),
-      listArtifactGroups: vi.fn(async () => {
+      listArtifactGroups: vi.fn(async (request) => {
         const groups = getLibrary().artifactGroups
+        const query = request.search
+          ? foldAsciiCase(request.search.filenameContains.trim())
+          : undefined
+        const matches = (name: string): boolean => !query || foldAsciiCase(name).includes(query)
+        const matchingGroups = groups
+          .map((group) => ({ ...group, files: group.files.filter((file) => matches(file.name)) }))
+          .filter((group) => group.files.length > 0)
         return {
-          items: groups.map((group) => ({
+          items: matchingGroups.map((group) => ({
             sessionId: group.sessionId,
             artifactCount: group.files.length
           })),
-          totalCount: groups.length
+          totalCount: matchingGroups.length
         }
       }),
       repairIndex: vi.fn().mockResolvedValue(undefined),
@@ -425,6 +471,7 @@ describe('ProjectFilesView', () => {
     // The view lists only the active project's files; test sessions use the 'default' projectId.
     useNavigationStore.setState({ view: 'workspace', activeProjectId: 'default' })
     root = createRoot(container)
+    beforeRender?.()
     await act(async () => {
       root.render(strict ? <StrictMode>{<ProjectFilesView />}</StrictMode> : <ProjectFilesView />)
       await Promise.resolve()
@@ -437,6 +484,498 @@ describe('ProjectFilesView', () => {
 
     expect(container.querySelector('[data-testid="files-view"]')).not.toBeNull()
     expect(container.textContent).toContain('No files yet')
+  })
+
+  it('searches within the selected source and keeps a zero-result session selected', async () => {
+    await renderView([
+      createSession({
+        id: 'session-a',
+        title: 'Session A',
+        artifacts: [
+          {
+            id: 'timeline',
+            kind: 'managed-file',
+            path: '/workspace/timeline.csv',
+            name: 'timeline.csv'
+          }
+        ]
+      }),
+      createSession({
+        id: 'session-b',
+        title: 'Session B',
+        artifacts: [
+          { id: 'notes', kind: 'managed-file', path: '/workspace/notes.txt', name: 'notes.txt' }
+        ]
+      })
+    ])
+    const filterButton = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Filter project files"]'
+    )
+    await act(async () => clickDropdownTrigger(filterButton))
+    await act(async () => {
+      document.body
+        .querySelector<HTMLButtonElement>('[data-filter-id="session:session-b"]')
+        ?.click()
+    })
+
+    const search = container.querySelector<HTMLInputElement>('[aria-label="Search project files"]')
+    expect(search).not.toBeNull()
+    if (!search) return
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
+    await act(async () => {
+      setter?.call(search, 'timeline')
+      search?.dispatchEvent(new Event('input', { bubbles: true }))
+      await new Promise((resolve) => window.setTimeout(resolve, 300))
+      await Promise.resolve()
+    })
+
+    expect(filterButton?.textContent).toContain('Session B')
+    expect(container.textContent).toContain('No files match “timeline”')
+    expect(window.api.projectFiles.listFiles).toHaveBeenCalledWith(
+      expect.objectContaining({
+        collection: { kind: 'sessionArtifacts', sessionId: 'session-b' },
+        search: { filenameContains: 'timeline' }
+      })
+    )
+  })
+
+  it('mirrors the repository ASCII-only case folding in search results', async () => {
+    await renderView([
+      createSession({
+        artifacts: [
+          {
+            id: 'accented-name',
+            kind: 'managed-file',
+            path: '/workspace/École.txt',
+            name: 'École.txt'
+          }
+        ]
+      })
+    ])
+    const search = container.querySelector<HTMLInputElement>('[aria-label="Search project files"]')
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
+
+    await act(async () => {
+      setter?.call(search, 'école')
+      search?.dispatchEvent(new Event('input', { bubbles: true }))
+      await new Promise((resolve) => window.setTimeout(resolve, 300))
+      await Promise.resolve()
+    })
+
+    expect(container.textContent).toContain('No files match “école”')
+  })
+
+  it('switches between grid and list without refetching project files', async () => {
+    await renderView([
+      createSession({
+        artifacts: [
+          {
+            id: 'artifact-1',
+            kind: 'managed-file',
+            path: '/workspace/result.txt',
+            name: 'result.txt'
+          }
+        ]
+      })
+    ])
+    const getOverview = vi.mocked(window.api.projectFiles.getOverview)
+    const listFiles = vi.mocked(window.api.projectFiles.listFiles)
+    const overviewCalls = getOverview.mock.calls.length
+    const fileCalls = listFiles.mock.calls.length
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="List view"]')?.click()
+    })
+
+    expect(container.querySelector('[data-view-mode="list"]')).not.toBeNull()
+    expect(
+      container.querySelector('[aria-label="Preview generated file result.txt"]')
+    ).not.toBeNull()
+    expect(getOverview).toHaveBeenCalledTimes(overviewCalls)
+    expect(listFiles).toHaveBeenCalledTimes(fileCalls)
+  })
+
+  it('preserves the file extension when a long list-row name runs out of width', async () => {
+    const name = 'very_long_experiment_analysis_result_2025.csv'
+    await renderView([
+      createSession({
+        artifacts: [
+          {
+            id: 'long-name-artifact',
+            kind: 'managed-file',
+            path: `/workspace/${name}`,
+            name
+          }
+        ]
+      })
+    ])
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="List view"]')?.click()
+    })
+
+    const row = container.querySelector(`[aria-label="Preview generated file ${name}"]`)
+    expect(row?.querySelector('[data-testid="file-name-root"]')).not.toBeNull()
+    expect(row?.querySelector('[data-testid="file-name-head"]')?.textContent).toMatch(/^very/)
+    expect(row?.querySelector('[data-testid="file-name-tail"]')?.textContent).toBe('_2025')
+    expect(row?.querySelector('[data-testid="file-name-extension"]')?.textContent).toBe('.csv')
+  })
+
+  it('uses the requested search, list-row, and view-mode interaction styling', async () => {
+    await renderView([
+      createSession({
+        artifacts: [
+          {
+            id: 'artifact-1',
+            kind: 'managed-file',
+            path: '/workspace/result.txt',
+            name: 'result.txt'
+          }
+        ]
+      })
+    ])
+    const search = container.querySelector<HTMLInputElement>('[aria-label="Search project files"]')
+    const gridControl = container.querySelector<HTMLButtonElement>('[aria-label="Grid view"]')
+    const listControl = container.querySelector<HTMLButtonElement>('[aria-label="List view"]')
+
+    expect(search?.className).toContain('h-[30px]')
+    expect(search?.className).toContain('border-0')
+    expect(search?.className).not.toContain('h-8')
+    expect(search?.className).not.toContain('h-7')
+    expect(search?.className).not.toContain('focus-visible:ring-0')
+    expect(gridControl?.getAttribute('aria-checked')).toBe('true')
+    expect(listControl?.getAttribute('aria-checked')).toBe('false')
+    expect(gridControl?.className).toContain('hover:bg-muted')
+    expect(gridControl?.className).toContain('aria-checked:bg-bg-400')
+    expect(gridControl?.className).toContain('aria-checked:hover:bg-bg-400')
+    expect(gridControl?.className).toContain('aria-checked:shadow-sm')
+    expect(listControl?.className).toContain('aria-checked:bg-bg-400')
+    expect(gridControl?.className).not.toContain('aria-checked:bg-accent')
+
+    await act(async () => gridControl?.focus())
+    expect(document.body.textContent).toContain('Grid view')
+    expect(gridControl?.className).toContain('focus-visible:ring-3')
+    expect(listControl?.className).toContain('focus-visible:ring-3')
+
+    await act(async () => listControl?.click())
+    expect(gridControl?.getAttribute('aria-checked')).toBe('false')
+    expect(listControl?.getAttribute('aria-checked')).toBe('true')
+    const listRow = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Preview generated file result.txt"]'
+    )?.parentElement
+    expect(listRow?.className).toContain('h-9')
+    expect(listRow?.className).toContain('rounded-md')
+    expect(listRow?.className).toContain('hover:bg-bg-200')
+    expect(listRow?.className).not.toContain('hover:bg-accent')
+    expect(listRow?.className).not.toContain('hover:text-accent-foreground')
+    const listRowButton = listRow?.querySelector<HTMLButtonElement>(
+      '[aria-label="Preview generated file result.txt"]'
+    )
+    expect(listRowButton?.className).toContain('focus-visible:outline-none')
+    expect(listRowButton?.className).toContain('cursor-pointer')
+    expect(listRow?.className).toContain('has-[:focus-visible]:ring-3')
+  })
+
+  it('uses matching two-button file actions in grid and list views', async () => {
+    await renderView([
+      createSession({
+        artifacts: [
+          {
+            id: 'artifact-1',
+            kind: 'managed-file',
+            path: '/workspace/result.txt',
+            name: 'result.txt'
+          }
+        ]
+      })
+    ])
+
+    const expectFileActions = (): void => {
+      const buttons = [
+        container.querySelector<HTMLButtonElement>('[aria-label="Download result.txt"]'),
+        container.querySelector<HTMLButtonElement>(
+          '[aria-label="Open result.txt in split view beside the session"]'
+        )
+      ]
+
+      expect(buttons.every(Boolean)).toBe(true)
+      expect(buttons.every((button) => button?.dataset.size === 'icon-sm')).toBe(true)
+      expect(buttons.every((button) => button?.className.includes('cursor-pointer'))).toBe(true)
+      expect(container.querySelector('[aria-label="More actions for result.txt"]')).toBeNull()
+      expect(buttons[1]?.parentElement?.className).toContain('flex')
+    }
+
+    expectFileActions()
+    await act(async () => {
+      container
+        .querySelector<HTMLButtonElement>(
+          '[aria-label="Open result.txt in split view beside the session"]'
+        )
+        ?.focus()
+    })
+    expect(document.body.textContent).toContain('Open in split view beside the session')
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="List view"]')?.click()
+    })
+    expectFileActions()
+  })
+
+  it('removes the divider only from the first visible file group', async () => {
+    await renderView([
+      createSession({
+        id: 'session-a',
+        title: 'First generated group',
+        artifacts: [
+          {
+            id: 'artifact-a',
+            kind: 'managed-file',
+            path: '/workspace/a.txt',
+            name: 'a.txt'
+          }
+        ]
+      }),
+      createSession({
+        id: 'session-b',
+        title: 'Second generated group',
+        artifacts: [
+          {
+            id: 'artifact-b',
+            kind: 'managed-file',
+            path: '/workspace/b.txt',
+            name: 'b.txt'
+          }
+        ]
+      })
+    ])
+
+    const sectionHeaders = Array.from(
+      container.querySelectorAll<HTMLButtonElement>('[data-testid="project-file-section-header"]')
+    )
+
+    expect(sectionHeaders).toHaveLength(2)
+    expect(sectionHeaders[0]?.className).not.toContain('border-t')
+    expect(sectionHeaders[1]?.className).toContain('border-t')
+  })
+
+  it('shows the Session artifact count and update age with the default cursor in list view', async () => {
+    const now = 1710061200000
+    vi.spyOn(Date, 'now').mockReturnValue(now)
+    await renderView([
+      createSession({
+        title: 'Recent analysis',
+        updatedAt: now,
+        artifacts: [
+          {
+            id: 'artifact-now',
+            kind: 'managed-file',
+            path: '/workspace/current.txt',
+            name: 'current.txt'
+          }
+        ]
+      }),
+      createSession({
+        id: 'session-older',
+        title: 'Earlier analysis',
+        updatedAt: now - 15 * 60 * 60 * 1000,
+        artifacts: [
+          {
+            id: 'artifact-older',
+            kind: 'managed-file',
+            path: '/workspace/earlier.txt',
+            name: 'earlier.txt'
+          }
+        ]
+      })
+    ])
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="List view"]')?.click()
+    })
+
+    const headers = Array.from(
+      container.querySelectorAll<HTMLButtonElement>('[data-testid="project-file-section-header"]')
+    )
+    const recentHeader = headers.find((header) => header.textContent?.includes('Recent analysis'))
+    const earlierHeader = headers.find((header) => header.textContent?.includes('Earlier analysis'))
+
+    expect(recentHeader?.lastElementChild?.textContent).toBe('1 · now')
+    expect(earlierHeader?.lastElementChild?.textContent).toBe('1 · 15h ago')
+    expect(recentHeader?.className).toContain('cursor-default')
+    expect(recentHeader?.getAttribute('aria-expanded')).toBe('true')
+  })
+
+  it('replaces compact list metadata with the row action on hover', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1710007202000)
+    await renderView([
+      createSession({
+        artifacts: [
+          {
+            id: 'artifact-meta',
+            kind: 'managed-file',
+            path: '/workspace/result.txt',
+            name: 'result.txt',
+            size: 4096,
+            mtimeMs: 1710000002000
+          }
+        ]
+      })
+    ])
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="List view"]')?.click()
+    })
+
+    const previewButton = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Preview generated file result.txt"]'
+    )
+    const metadata = previewButton?.querySelector('[data-testid="project-file-list-meta"]')
+    const downloadWrapper = container
+      .querySelector<HTMLButtonElement>('[aria-label="Download result.txt"]')
+      ?.closest('[data-testid="download-tooltip-trigger"]')
+
+    expect(metadata?.textContent).toBe('4 KB·2 hours ago')
+    expect(metadata?.className).toContain('group-hover:invisible')
+    expect(metadata?.className).not.toContain('w-16')
+    expect(metadata?.className).not.toContain('w-20')
+    expect(downloadWrapper?.parentElement?.className).toContain('absolute')
+    expect(downloadWrapper?.parentElement?.className).toContain('right-2')
+  })
+
+  it('uses a dark neutral clear button with a light neutral hover surface', async () => {
+    await renderView([])
+
+    const search = container.querySelector<HTMLInputElement>('[aria-label="Search project files"]')
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
+
+    expect(container.querySelector('[aria-label="Clear file search"]')).toBeNull()
+    await act(async () => {
+      setter?.call(search, 'result')
+      search?.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+
+    const clearButton = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Clear file search"]'
+    )
+    expect(search?.className).toContain('[&::-webkit-search-cancel-button]:hidden')
+    expect(clearButton?.getAttribute('data-slot')).toBe('button')
+    expect(clearButton?.getAttribute('data-variant')).toBe('ghost')
+    expect(clearButton?.getAttribute('data-size')).toBe('icon-xs')
+    expect(clearButton?.className).toContain('text-text-100')
+    expect(clearButton?.className).toContain('hover:bg-bg-200')
+    expect(clearButton?.className).not.toContain('hover:text-text-000')
+    expect(clearButton?.className).toContain('focus-visible:ring-3')
+    expect(clearButton?.className).not.toContain('focus-visible:ring-2')
+
+    await act(async () => clearButton?.focus())
+    expect(document.body.textContent).toContain('Clear search')
+
+    await act(async () => clearButton?.click())
+    expect(search?.value).toBe('')
+    expect(container.querySelector('[aria-label="Clear file search"]')).toBeNull()
+  })
+
+  it('does not read thumbnail bytes for files updated while list view is active', async () => {
+    await renderView([
+      createSession({
+        artifacts: [
+          {
+            id: 'artifact-1',
+            kind: 'managed-file',
+            path: '/workspace/result.txt',
+            name: 'result.txt',
+            size: 12,
+            mtimeMs: 1710000000000
+          }
+        ]
+      })
+    ])
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="List view"]')?.click()
+    })
+    const readPreview = vi.mocked(window.api.artifacts.readPreview)
+    readPreview.mockClear()
+
+    const { useSessionStore } = await import('@/stores/session-store')
+    await act(async () => {
+      useSessionStore.setState({
+        sessions: [
+          createSession({
+            artifacts: [
+              {
+                id: 'artifact-1',
+                kind: 'managed-file',
+                path: '/workspace/result-v2.txt',
+                name: 'result.txt',
+                size: 24,
+                mtimeMs: 1710000001000
+              }
+            ]
+          })
+        ]
+      })
+      projectFilesChangedListener?.({
+        projectId: 'default',
+        sessionId: 'session-1',
+        sources: ['artifact'],
+        kind: 'upsert'
+      })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      await Promise.resolve()
+    })
+
+    const thumbnailReads = readPreview.mock.calls.filter(([request]) => request.maxBytes !== 1)
+    expect(thumbnailReads).toHaveLength(0)
+  })
+
+  it('keeps the catalog count when selecting a collapsed session after an index refresh', async () => {
+    await renderView([
+      createSession({
+        id: 'session-a',
+        title: 'Session A',
+        artifacts: [
+          {
+            id: 'artifact-a',
+            kind: 'managed-file',
+            path: '/workspace/a.csv',
+            name: 'a.csv'
+          }
+        ]
+      })
+    ])
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+
+    const sessionHeader = Array.from(container.querySelectorAll<HTMLButtonElement>('button')).find(
+      (button) => button.textContent?.includes('Session A') && button.hasAttribute('aria-expanded')
+    )
+    await act(async () => sessionHeader?.click())
+    expect(sessionHeader?.getAttribute('aria-expanded')).toBe('false')
+
+    await act(async () => {
+      projectFilesChangedListener?.({
+        projectId: 'default',
+        sources: ['artifact'],
+        kind: 'reset'
+      })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    await act(async () => {
+      clickDropdownTrigger(
+        container.querySelector<HTMLButtonElement>('[aria-label="Filter project files"]')
+      )
+    })
+    await act(async () => {
+      document.body
+        .querySelector<HTMLButtonElement>('[data-filter-id="session:session-a"]')
+        ?.click()
+    })
+
+    const countLabel = container.querySelector<HTMLInputElement>(
+      '[aria-label="Search project files"]'
+    )?.parentElement?.nextElementSibling
+    expect(countLabel?.textContent).toBe('1 file')
   })
 
   it('shows an actionable incomplete-index state instead of an empty state', async () => {
@@ -493,13 +1032,17 @@ describe('ProjectFilesView', () => {
     ])
 
     expect(container.textContent).toContain('Your uploads')
-    expect(container.textContent).toContain('iso621_bridg...inase.fasta')
+    expect(container.textContent).toContain('iso621_bridge_recombinase.fasta')
     expect(container.querySelector('[title="iso621_bridge_recombinase.fasta"]')).not.toBeNull()
     expect(container.textContent).not.toContain('Hidden session title')
-    expect(
-      container.querySelector('[data-testid="project-file-preview"]')?.parentElement?.parentElement
-        ?.className
-    ).toContain('focus-within:ring')
+    const tileClassName = container.querySelector('[data-testid="project-file-preview"]')
+      ?.parentElement?.parentElement?.className
+    const tileButtonClassName = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Preview uploaded file iso621_bridge_recombinase.fasta"]'
+    )?.className
+    expect(tileClassName).toContain('has-[:focus-visible]:ring-2')
+    expect(tileClassName).not.toContain('focus-within:ring')
+    expect(tileButtonClassName).toContain('cursor-pointer')
   })
 
   it('downloads an uploaded file without opening its preview', async () => {
@@ -515,7 +1058,7 @@ describe('ProjectFilesView', () => {
     )
     expect(downloadButton).not.toBeNull()
     expect(
-      downloadButton?.closest('[data-testid="download-tooltip-trigger"]')?.className
+      downloadButton?.closest('[data-testid="download-tooltip-trigger"]')?.parentElement?.className
     ).toContain('absolute')
 
     await act(async () => {
@@ -907,7 +1450,7 @@ describe('ProjectFilesView', () => {
     expect(container.querySelectorAll('[data-testid="project-files-end"]')).toHaveLength(1)
   })
 
-  it('opens a filter menu without This computer entries', async () => {
+  it('opens a filter menu with a "this computer" entry', async () => {
     await renderView([
       createSession({
         title: 'Session A',
@@ -942,7 +1485,9 @@ describe('ProjectFilesView', () => {
     expect(document.body.textContent).toContain('All artifacts')
     expect(document.body.textContent).toContain('Your uploads')
     expect(document.body.textContent).toContain('Session A')
-    expect(document.body.textContent).not.toContain('This computer')
+    // localFs is absent in this environment, so the entry falls back to its default label.
+    expect(document.body.textContent).toContain('This computer')
+    expect(document.body.querySelector('[data-filter-id="all"] .lucide-boxes')).not.toBeNull()
   })
 
   it('uses the global semantic menu surface and hover feedback for filter items', async () => {
@@ -990,7 +1535,378 @@ describe('ProjectFilesView', () => {
     )
   })
 
-  it('filters to uploads or a single session from the menu', async () => {
+  it('limits session filters to five and restores that limit after Show fewer', async () => {
+    const sessions = createArtifactSessions(9)
+    await renderView(sessions)
+
+    await act(async () => {
+      clickDropdownTrigger(
+        container.querySelector<HTMLButtonElement>('[aria-label="Filter project files"]')
+      )
+    })
+
+    const sessionItems = (): NodeListOf<HTMLElement> =>
+      document.body.querySelectorAll('[data-filter-id^="session:"]')
+    expect(sessionItems()).toHaveLength(5)
+
+    const showAll = document.body.querySelector<HTMLElement>(
+      '[data-testid="session-options-toggle"]'
+    )
+    expect(showAll?.textContent).toBe('Show all 9 sessions')
+
+    await act(async () => {
+      showAll?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    expect(sessionItems()).toHaveLength(9)
+
+    const showFewer = document.body.querySelector<HTMLElement>(
+      '[data-testid="session-options-toggle"]'
+    )
+    expect(showFewer?.textContent).toBe('Show fewer')
+
+    await act(async () => {
+      showFewer?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    expect(sessionItems()).toHaveLength(5)
+    expect(document.body.querySelector('[data-testid="session-options-toggle"]')?.textContent).toBe(
+      'Show all 9 sessions'
+    )
+  })
+
+  it('loads every remaining session page after Show all', async () => {
+    const sessions = createArtifactSessions(12)
+    await renderView(sessions)
+
+    vi.mocked(window.api.projectFiles.listArtifactGroups).mockImplementation(async (request) => ({
+      items: (request.cursor ? sessions.slice(10) : sessions.slice(0, 10)).map((session) => ({
+        sessionId: session.id,
+        artifactCount: 1
+      })),
+      nextCursor: request.cursor ? undefined : 'page-2',
+      totalCount: 12
+    }))
+    await act(async () => {
+      projectFilesChangedListener?.({
+        projectId: 'default',
+        sources: ['artifact'],
+        kind: 'reset'
+      })
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      clickDropdownTrigger(
+        container.querySelector<HTMLButtonElement>('[aria-label="Filter project files"]')
+      )
+    })
+    expect(document.body.querySelectorAll('[data-filter-id^="session:"]')).toHaveLength(5)
+    expect(document.body.querySelector('[data-testid="session-options-toggle"]')?.textContent).toBe(
+      'Show all 12 sessions'
+    )
+    const fileRequestCount = vi.mocked(window.api.projectFiles.listFiles).mock.calls.length
+    const thumbnailReadCount = vi
+      .mocked(window.api.artifacts.readPreview)
+      .mock.calls.filter(([request]) => request.maxBytes !== 1).length
+
+    await act(async () => {
+      document.body
+        .querySelector<HTMLElement>('[data-testid="session-options-toggle"]')
+        ?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      await Promise.resolve()
+    })
+
+    expect(document.body.querySelectorAll('[data-filter-id^="session:"]')).toHaveLength(12)
+    expect(document.body.querySelector('[data-filter-id="session:session-12"]')).not.toBeNull()
+    expect(window.api.projectFiles.listFiles).toHaveBeenCalledTimes(fileRequestCount)
+    expect(
+      vi
+        .mocked(window.api.artifacts.readPreview)
+        .mock.calls.filter(([request]) => request.maxBytes !== 1)
+    ).toHaveLength(thumbnailReadCount)
+  })
+
+  it('offers a retry when loading every session option fails', async () => {
+    const sessions = createArtifactSessions(12)
+    await renderView(sessions)
+
+    let continuationAttempts = 0
+    vi.mocked(window.api.projectFiles.listArtifactGroups).mockImplementation(async (request) => {
+      if (!request.cursor) {
+        return {
+          items: sessions.slice(0, 10).map((session) => ({
+            sessionId: session.id,
+            artifactCount: 1
+          })),
+          nextCursor: 'page-2',
+          totalCount: 12
+        }
+      }
+      continuationAttempts += 1
+      if (continuationAttempts === 1) throw new Error('database busy')
+      return {
+        items: sessions.slice(10).map((session) => ({
+          sessionId: session.id,
+          artifactCount: 1
+        })),
+        totalCount: 12
+      }
+    })
+    await act(async () => {
+      projectFilesChangedListener?.({
+        projectId: 'default',
+        sources: ['artifact'],
+        kind: 'reset'
+      })
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      clickDropdownTrigger(
+        container.querySelector<HTMLButtonElement>('[aria-label="Filter project files"]')
+      )
+    })
+    await act(async () => {
+      document.body
+        .querySelector<HTMLElement>('[data-testid="session-options-toggle"]')
+        ?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+
+    const retry = document.body.querySelector<HTMLElement>('[data-testid="session-options-retry"]')
+    expect(retry?.textContent).toBe('Retry loading sessions')
+
+    await act(async () => {
+      retry?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+
+    expect(continuationAttempts).toBe(2)
+    expect(document.body.querySelectorAll('[data-filter-id^="session:"]')).toHaveLength(12)
+  })
+
+  it('keeps the selected session visible after Show fewer', async () => {
+    const sessions = createArtifactSessions(9)
+    await renderView(sessions)
+
+    await act(async () => {
+      clickDropdownTrigger(
+        container.querySelector<HTMLButtonElement>('[aria-label="Filter project files"]')
+      )
+    })
+    await act(async () => {
+      document.body
+        .querySelector<HTMLElement>('[data-testid="session-options-toggle"]')
+        ?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await act(async () => {
+      document.body
+        .querySelector<HTMLElement>(
+          '[data-slot="dropdown-menu-content"][data-state="open"] [data-filter-id="session:session-9"]'
+        )
+        ?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    const filterButton = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Filter project files"]'
+    )
+    if (filterButton?.getAttribute('aria-expanded') !== 'true') {
+      await act(async () => {
+        clickDropdownTrigger(filterButton)
+      })
+    }
+    await act(async () => {
+      document.body
+        .querySelector<HTMLElement>(
+          '[data-slot="dropdown-menu-content"][data-state="open"] [data-testid="session-options-toggle"]'
+        )
+        ?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    const openMenu = document.body.querySelector(
+      '[data-slot="dropdown-menu-content"][data-state="open"]'
+    )
+    expect(openMenu?.querySelectorAll('[data-filter-id^="session:"]')).toHaveLength(5)
+    expect(
+      openMenu?.querySelector('[data-filter-id="session:session-9"]')?.getAttribute('aria-checked')
+    ).toBe('true')
+  })
+
+  it('refreshes the count for a collapsed selected session outside the catalog group page', async () => {
+    const sessions = createArtifactSessions(12)
+    await renderView(sessions)
+    let selectedSessionCount = 1
+    const catalogListener = vi.mocked(window.api.projectFiles.onChanged).mock.calls[0]?.[0]
+
+    vi.mocked(window.api.projectFiles.listArtifactGroups).mockImplementation(async (request) => ({
+      items: (request.cursor ? sessions.slice(10) : sessions.slice(0, 10)).map((session) => ({
+        sessionId: session.id,
+        artifactCount: session.id === 'session-12' ? selectedSessionCount : 1
+      })),
+      nextCursor: request.cursor ? undefined : 'page-2',
+      totalCount: 12
+    }))
+    vi.mocked(window.api.projectFiles.listFiles).mockImplementation(async (request) => {
+      if (
+        request.collection.kind !== 'sessionArtifacts' ||
+        request.collection.sessionId !== 'session-12'
+      ) {
+        return { items: [], totalCount: 0 }
+      }
+
+      return {
+        items: Array.from({ length: selectedSessionCount }, (_, index) => ({
+          id: `artifact-12-${index}`,
+          source: 'artifact' as const,
+          sourceFileId: `artifact-12-${index}`,
+          projectId: 'default',
+          sessionId: 'session-12',
+          name: `file-12-${index}.txt`,
+          path: `/workspace/file-12-${index}.txt`,
+          size: 1,
+          sortAtMs: 12 - index
+        })),
+        totalCount: selectedSessionCount
+      }
+    })
+    await act(async () => {
+      catalogListener?.({
+        projectId: 'default',
+        sources: ['artifact'],
+        kind: 'reset'
+      })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      clickDropdownTrigger(
+        container.querySelector<HTMLButtonElement>('[aria-label="Filter project files"]')
+      )
+    })
+    await act(async () => {
+      document.body
+        .querySelector<HTMLElement>('[data-testid="session-options-toggle"]')
+        ?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    await act(async () => {
+      document.body
+        .querySelector<HTMLElement>('[data-filter-id="session:session-12"]')
+        ?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+
+    const selectedHeader = Array.from(
+      container.querySelectorAll<HTMLButtonElement>('[data-testid="project-file-section-header"]')
+    ).find((button) => button.textContent?.includes('Session 12'))
+    await act(async () => selectedHeader?.click())
+    expect(selectedHeader?.getAttribute('aria-expanded')).toBe('false')
+
+    const filterButton = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Filter project files"]'
+    )
+    if (filterButton?.getAttribute('aria-expanded') !== 'true') {
+      await act(async () => clickDropdownTrigger(filterButton))
+    }
+    await act(async () => {
+      document.body
+        .querySelector<HTMLElement>('[data-testid="session-options-toggle"]')
+        ?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    selectedSessionCount = 2
+    await act(async () => {
+      catalogListener?.({
+        projectId: 'default',
+        sources: ['artifact'],
+        kind: 'reset'
+      })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+
+    const countLabel = container.querySelector<HTMLInputElement>(
+      '[aria-label="Search project files"]'
+    )?.parentElement?.nextElementSibling
+    expect(countLabel?.textContent).toBe('2 files')
+  })
+
+  it('preserves a deleted source session title in a scoped search group', async () => {
+    await renderView([])
+    const catalogListener = vi.mocked(window.api.projectFiles.onChanged).mock.calls[0]?.[0]
+    const originSession = {
+      state: 'deleted' as const,
+      title: 'Retained analysis',
+      deletedAt: '2026-07-27T12:00:00.000Z'
+    }
+    const retainedFile: ProjectFileItem = {
+      id: 'retained-artifact',
+      source: 'artifact',
+      sourceFileId: 'retained-artifact',
+      projectId: 'default',
+      sessionId: 'deleted-session',
+      name: 'result.csv',
+      path: 'artifact-version:default/deleted-session/retained-artifact/version-1',
+      size: 12,
+      sortAtMs: 1,
+      originSession
+    }
+
+    vi.mocked(window.api.projectFiles.getOverview).mockResolvedValue({
+      totalCount: 1,
+      uploadCount: 0,
+      artifactCount: 1,
+      artifactGroupCount: 1,
+      isIndexComplete: true
+    })
+    vi.mocked(window.api.projectFiles.listArtifactGroups).mockResolvedValue({
+      items: [{ sessionId: 'deleted-session', artifactCount: 1, originSession }],
+      totalCount: 1
+    })
+    vi.mocked(window.api.projectFiles.listFiles).mockResolvedValue({
+      items: [retainedFile],
+      totalCount: 1
+    })
+    await act(async () => {
+      catalogListener?.({
+        projectId: 'default',
+        sources: ['artifact'],
+        kind: 'reset'
+      })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+
+    await act(async () => {
+      clickDropdownTrigger(
+        container.querySelector<HTMLButtonElement>('[aria-label="Filter project files"]')
+      )
+    })
+    await act(async () => {
+      document.body
+        .querySelector<HTMLElement>('[data-filter-id="session:deleted-session"]')
+        ?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+
+    const search = container.querySelector<HTMLInputElement>('[aria-label="Search project files"]')
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
+    await act(async () => {
+      setter?.call(search, 'result')
+      search?.dispatchEvent(new Event('input', { bubbles: true }))
+      await new Promise((resolve) => window.setTimeout(resolve, 300))
+      await Promise.resolve()
+    })
+
+    const selectedHeader = container.querySelector<HTMLButtonElement>(
+      '[data-testid="project-file-section-header"]'
+    )
+    expect(selectedHeader).not.toBeNull()
+    expect(selectedHeader?.textContent).toContain('Retained analysis · Source session deleted')
+  })
+
+  it('keeps filtered content and trigger icon synchronized with the selected category', async () => {
     await renderView([
       createSession({
         id: 'session-a',
@@ -1031,15 +1947,16 @@ describe('ProjectFilesView', () => {
       })
     ])
 
+    const filterButton = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Filter project files"]'
+    )
     const openFilterMenu = async (): Promise<void> => {
-      const filterButton = container.querySelector<HTMLButtonElement>(
-        '[aria-label="Filter project files"]'
-      )
-
       await act(async () => {
         clickDropdownTrigger(filterButton)
       })
     }
+
+    expect(filterButton?.querySelector('.lucide-boxes')).not.toBeNull()
 
     await openFilterMenu()
     await act(async () => {
@@ -1049,6 +1966,7 @@ describe('ProjectFilesView', () => {
     })
 
     expect(container.textContent).toContain('user upload.png')
+    expect(filterButton?.querySelector('.lucide-paperclip')).not.toBeNull()
     expect(container.textContent).not.toContain('a.png')
     expect(container.textContent).not.toContain('Session B')
 
@@ -1060,6 +1978,7 @@ describe('ProjectFilesView', () => {
     })
 
     expect(container.textContent).toContain('Session B')
+    expect(filterButton?.querySelector('.lucide-folder')).not.toBeNull()
     expect(container.textContent).toContain('b.png')
     expect(container.textContent).not.toContain('Your uploads')
     expect(container.textContent).not.toContain('a.png')
@@ -1090,6 +2009,11 @@ describe('ProjectFilesView', () => {
       clickDropdownTrigger(
         container.querySelector<HTMLButtonElement>('[aria-label="Filter project files"]')
       )
+    })
+    await act(async () => {
+      document.body
+        .querySelector<HTMLElement>('[data-testid="session-options-toggle"]')
+        ?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
     })
     await act(async () => {
       document.body
@@ -1368,6 +2292,45 @@ describe('ProjectFilesView', () => {
     expect(nextScrollContainer?.scrollTop).toBe(0)
   })
 
+  it('preserves queued dialogs and clears only the one owned by the unmounting Files surface', async () => {
+    const otherProjectFile: PreviewFileItem = {
+      id: 'other-artifact',
+      type: 'file',
+      source: 'artifact',
+      projectId: 'other-project',
+      sessionId: 'other-session',
+      title: 'other.png',
+      name: 'other.png',
+      path: '/workspace/other.png',
+      format: 'image',
+      mimeType: 'image/png',
+      size: 1024
+    }
+    const currentProjectFile = { ...otherProjectFile, projectId: 'default' }
+
+    await renderView([], true, () => {
+      usePreviewWorkbenchStore.getState().openFileDialog(currentProjectFile)
+    })
+    expect(usePreviewWorkbenchStore.getState().fileDialogItem).toEqual(currentProjectFile)
+
+    await act(async () => {
+      usePreviewWorkbenchStore.getState().openFileDialog(otherProjectFile)
+    })
+
+    const { useNavigationStore } = await import('@/stores/navigation-store')
+    await act(async () => {
+      useNavigationStore.setState({ activeProjectId: 'other-project' })
+      await Promise.resolve()
+    })
+    expect(usePreviewWorkbenchStore.getState().fileDialogItem).toEqual(otherProjectFile)
+
+    await act(async () => {
+      root.render(<div />)
+      await Promise.resolve()
+    })
+    expect(usePreviewWorkbenchStore.getState().fileDialogItem).toBeUndefined()
+  })
+
   it('drops queued thumbnail reads from the previous project during a project switch', async () => {
     const oldReadResolvers: Array<() => void> = []
     vi.mocked(window.api.uploads.readPreview).mockImplementation(
@@ -1503,6 +2466,9 @@ describe('ProjectFilesView', () => {
     const generatedMeta = generatedButton?.querySelector('[data-testid="project-file-meta"]')
 
     expect(generatedMeta?.className).toContain('flex-col')
+    expect(generatedMeta?.querySelector('[data-testid="file-name-extension"]')?.textContent).toBe(
+      '.png'
+    )
     expect(generatedButton?.textContent).toContain('4 KB')
     expect(generatedButton?.textContent).toContain('2 hours ago')
   })
@@ -1544,11 +2510,15 @@ describe('ProjectFilesView', () => {
     expect(window.api.previewResources.acquire).toHaveBeenCalledWith({
       source: 'artifact',
       path: '/workspace/typhoon_tracks.png',
+      projectId: 'default',
+      sessionId: 'session-1',
       mimeType: 'image/png'
     })
     expect(window.api.previewResources.acquire).toHaveBeenCalledWith({
       source: 'upload',
       path: '/uploads/uploaded_image.png',
+      projectId: 'default',
+      sessionId: 'session-1',
       mimeType: 'image/png'
     })
     expect(
@@ -1634,6 +2604,8 @@ describe('ProjectFilesView', () => {
     expect(window.api.previewResources.acquire).toHaveBeenCalledWith({
       source: 'artifact',
       path: '/workspace/generated-image',
+      projectId: 'default',
+      sessionId: 'session-1',
       mimeType: 'image/png'
     })
   })
@@ -1716,6 +2688,8 @@ describe('ProjectFilesView', () => {
 
     expect(window.api.artifacts.readPreview).toHaveBeenCalledWith({
       path: '/workspace/results.csv',
+      projectId: 'default',
+      sessionId: 'session-1',
       maxBytes: 32768,
       encoding: 'utf8'
     })
@@ -1921,6 +2895,7 @@ describe('ProjectFilesView', () => {
       await Promise.resolve()
     })
 
+    await vi.waitFor(() => expect(projectFilesChangedListener).toBeTypeOf('function'))
     const { useSessionStore } = await import('@/stores/session-store')
     await act(async () => {
       useSessionStore.getState().replaceMessageUploads({
@@ -1928,6 +2903,8 @@ describe('ProjectFilesView', () => {
         messageId: 'message-1',
         uploads: [
           createUpload({
+            versionId: 'upload-version-1',
+            versionNumber: 1,
             name: 'results.csv',
             originalName: 'results.csv',
             path: '/uploads/session-1/results.csv',
@@ -1952,10 +2929,56 @@ describe('ProjectFilesView', () => {
       'Failed to read project file preview',
       expect.any(Error)
     )
-    expect(window.api.uploads.readPreview).toHaveBeenCalledWith(
-      expect.objectContaining({ path: '/uploads/session-1/results.csv', encoding: 'utf8' })
+    await vi.waitFor(() =>
+      expect(window.api.uploads.readPreview).toHaveBeenCalledWith(
+        expect.objectContaining({
+          path: 'upload-version:default/session-1/upload-version-1',
+          encoding: 'utf8'
+        })
+      )
     )
     expect(container.textContent).toContain('1 rows · 2 columns')
+  })
+
+  it('reads a project upload preview with the source Session encoded by its Version locator', async () => {
+    const sourceSessionId = 'source-session'
+    const versionId = 'upload-version-cross-session'
+    const path = createUploadVersionReference(versionId, {
+      projectId: 'default',
+      sessionId: sourceSessionId
+    })
+    await renderView([
+      createSession({
+        id: 'current-session',
+        messages: [
+          createMessage({
+            uploads: [
+              createUpload({
+                id: 'upload-cross-session',
+                versionId,
+                sessionId: sourceSessionId,
+                path: undefined,
+                name: 'cross-session.csv',
+                originalName: 'cross-session.csv',
+                mimeType: 'text/csv'
+              })
+            ]
+          })
+        ]
+      })
+    ])
+
+    await vi.waitFor(() => {
+      const thumbnailRequest = vi
+        .mocked(window.api.uploads.readPreview)
+        .mock.calls.map(([request]) => request)
+        .find((request) => request.maxBytes !== 1)
+      expect(thumbnailRequest).toMatchObject({
+        path,
+        projectId: 'default',
+        sessionId: sourceSessionId
+      })
+    })
   })
 
   it('hides a stale thumbnail while a new file version is loading', async () => {
@@ -2002,6 +3025,7 @@ describe('ProjectFilesView', () => {
     })
     expect(container.textContent).toContain('legacy_column')
 
+    await vi.waitFor(() => expect(projectFilesChangedListener).toBeTypeOf('function'))
     const { useSessionStore } = await import('@/stores/session-store')
     await act(async () => {
       useSessionStore.getState().replaceMessageUploads({
@@ -2009,6 +3033,8 @@ describe('ProjectFilesView', () => {
         messageId: 'message-1',
         uploads: [
           createUpload({
+            versionId: 'upload-version-1',
+            versionNumber: 1,
             name: 'results.csv',
             originalName: 'results.csv',
             path: '/uploads/session-1/results.csv',
@@ -2026,8 +3052,13 @@ describe('ProjectFilesView', () => {
       await Promise.resolve()
     })
 
-    expect(window.api.uploads.readPreview).toHaveBeenCalledWith(
-      expect.objectContaining({ path: '/uploads/session-1/results.csv', encoding: 'utf8' })
+    await vi.waitFor(() =>
+      expect(window.api.uploads.readPreview).toHaveBeenCalledWith(
+        expect.objectContaining({
+          path: 'upload-version:default/session-1/upload-version-1',
+          encoding: 'utf8'
+        })
+      )
     )
     expect(container.textContent).not.toContain('legacy_column')
   })
@@ -2167,8 +3198,8 @@ describe('ProjectFilesView', () => {
       })
     ])
 
-    expect(container.textContent).toContain('denovo_desig...orklist.csv')
-    expect(container.textContent).not.toContain('denovo_design_worklist.csv')
+    expect(container.textContent).toContain('denovo_design_worklist.csv')
+    expect(container.querySelector('[data-testid="file-name-extension"]')?.textContent).toBe('.csv')
   })
 
   it('uses taller file cards and preview thumbnails', async () => {
@@ -2198,7 +3229,7 @@ describe('ProjectFilesView', () => {
     expect(previewSurface?.className).toContain('h-[82px]')
   })
 
-  it('opens an uploaded file in a large dialog without adding a workbench tab', async () => {
+  it('queues an uploaded file dialog without adding a workbench tab', async () => {
     await renderView([
       createSession({
         id: 'session-1',
@@ -2217,27 +3248,23 @@ describe('ProjectFilesView', () => {
         ?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
     })
 
-    const dialog = document.body.querySelector<HTMLElement>('[role="dialog"]')
-    expect(dialog).not.toBeNull()
-    expect(dialog?.className).toContain('h-[90vh]')
-    expect(dialog?.className).toContain('w-[90vw]')
-    expect(dialog?.querySelector('[aria-label="Download user upload.png"]')).not.toBeNull()
-    expect(
-      dialog?.querySelector('[aria-label="Open full screen preview of user upload.png"]')
-    ).toBeNull()
+    expect(usePreviewWorkbenchStore.getState().fileDialogItem).toMatchObject({
+      projectId: 'default',
+      sessionId: 'session-1',
+      source: 'upload',
+      name: 'user upload.png'
+    })
     expect(usePreviewWorkbenchStore.getState().items).toEqual([])
 
     await act(async () => {
-      dialog
-        ?.querySelector<HTMLButtonElement>('[aria-label="Close preview of user upload.png"]')
-        ?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      usePreviewWorkbenchStore.getState().closeFileDialog()
     })
 
-    expect(document.body.querySelector('[role="dialog"]')).toBeNull()
+    expect(usePreviewWorkbenchStore.getState().fileDialogItem).toBeUndefined()
     expect(container.querySelector('[data-testid="files-view"]')).not.toBeNull()
   })
 
-  it('opens a generated file in a large dialog without adding a workbench tab', async () => {
+  it('queues a generated file dialog without adding a workbench tab', async () => {
     await renderView([
       createSession({
         id: 'session-1',
@@ -2263,11 +3290,110 @@ describe('ProjectFilesView', () => {
         ?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
     })
 
-    const dialog = document.body.querySelector<HTMLElement>('[role="dialog"]')
-    expect(dialog).not.toBeNull()
-    expect(dialog?.querySelector('[aria-label="Download tree.png"]')).not.toBeNull()
-    expect(dialog?.querySelector('[aria-label="Open full screen preview of tree.png"]')).toBeNull()
+    expect(usePreviewWorkbenchStore.getState().fileDialogItem).toMatchObject({
+      projectId: 'default',
+      sessionId: 'session-1',
+      name: 'tree.png'
+    })
     expect(usePreviewWorkbenchStore.getState().items).toEqual([])
+  })
+
+  it('opens a generated file directly in the preview panel', async () => {
+    await renderView([
+      createSession({
+        id: 'session-1',
+        title: 'Generated session',
+        artifacts: [
+          {
+            id: 'artifact-1',
+            kind: 'managed-file',
+            path: '/workspace/tree.png',
+            fileUrl: 'file:///workspace/tree.png',
+            name: 'tree.png',
+            mimeType: 'image/png',
+            size: 4096,
+            mtimeMs: 1710000002000
+          }
+        ]
+      })
+    ])
+
+    await act(async () => {
+      container
+        .querySelector<HTMLButtonElement>(
+          '[aria-label="Open tree.png in split view beside the session"]'
+        )
+        ?.click()
+    })
+
+    expect(usePreviewWorkbenchStore.getState()).toMatchObject({
+      activeItemId: expect.any(String),
+      panelState: 'open',
+      fileDialogItem: undefined
+    })
+    expect(usePreviewWorkbenchStore.getState().items[0]).toMatchObject({
+      projectId: 'default',
+      sessionId: 'session-1',
+      name: 'tree.png'
+    })
+  })
+
+  it('does not acquire a TIFF thumbnail until its grid tile is near the viewport', async () => {
+    const observed = new Map<Element, IntersectionObserverCallback>()
+    vi.stubGlobal(
+      'IntersectionObserver',
+      class {
+        observe = vi.fn((element: Element) => observed.set(element, this.callback))
+        unobserve = vi.fn()
+        disconnect = vi.fn()
+
+        constructor(private readonly callback: IntersectionObserverCallback) {}
+      }
+    )
+    await renderView([
+      createSession({
+        artifacts: [
+          {
+            id: 'artifact-tiff',
+            kind: 'managed-file',
+            path: '/workspace/chart.tiff',
+            fileUrl: 'file:///workspace/chart.tiff',
+            name: 'chart.tiff',
+            mimeType: 'image/tiff',
+            size: 152,
+            mtimeMs: 1710000002000
+          }
+        ]
+      })
+    ])
+    const artifactSentinel = container.querySelector(
+      '[data-testid="artifact-page-sentinel:session-1"]'
+    )
+    await act(async () => {
+      observed.get(artifactSentinel as Element)?.(
+        [{ isIntersecting: true } as IntersectionObserverEntry],
+        {} as IntersectionObserver
+      )
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    const tile = container.querySelector('[aria-label="Preview generated file chart.tiff"]')
+    expect(tile).not.toBeNull()
+    expect(window.api.previewResources.acquire).not.toHaveBeenCalled()
+
+    await act(async () => {
+      observed.get(tile as Element)?.(
+        [{ isIntersecting: true } as IntersectionObserverEntry],
+        {} as IntersectionObserver
+      )
+      await Promise.resolve()
+    })
+
+    await vi.waitFor(() =>
+      expect(window.api.previewResources.acquire).toHaveBeenCalledWith(
+        expect.objectContaining({ path: '/workspace/chart.tiff' })
+      )
+    )
   })
 
   it('does not restart a pending thumbnail read when another tile becomes visible', async () => {
@@ -2372,7 +3498,7 @@ const createHost = (overrides: Partial<ComputeHost> = {}): ComputeHost => ({
   ...overrides
 })
 
-describe('ProjectFilesView — REMOTE section in source dropdown', () => {
+describe('ProjectFilesView — Remote section in source dropdown', () => {
   let container: HTMLDivElement
   let root: Root
 
@@ -2425,6 +3551,17 @@ describe('ProjectFilesView — REMOTE section in source dropdown', () => {
         bookmarksGet: vi.fn().mockResolvedValue([]),
         bookmarksSet: vi.fn().mockResolvedValue(undefined)
       },
+      localFs: {
+        getRoots: vi.fn().mockResolvedValue({ home: '/Users/roxi', machineName: 'TychoStation' }),
+        listDir: vi.fn().mockResolvedValue({
+          entries: [
+            { name: 'Projects', isDirectory: true, size: 0, mtimeMs: 1710000000000 },
+            { name: 'notes.md', isDirectory: false, size: 2048, mtimeMs: 1710000001000 }
+          ],
+          resolvedPath: '/Users/roxi',
+          truncated: false
+        })
+      },
       projectFiles: {
         getOverview: vi.fn().mockResolvedValue({
           totalCount: 0,
@@ -2464,7 +3601,7 @@ describe('ProjectFilesView — REMOTE section in source dropdown', () => {
     })
   }
 
-  it('shows REMOTE section label in source dropdown when hosts are present', async () => {
+  it('shows the Remote section label in source dropdown when hosts are present', async () => {
     useComputeStore.setState({
       ...createInitialComputeState(),
       isLoaded: true,
@@ -2485,11 +3622,154 @@ describe('ProjectFilesView — REMOTE section in source dropdown', () => {
       filterButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
     })
 
-    expect(document.body.textContent).toContain('REMOTE')
+    expect(document.body.textContent).toContain('Remote')
     expect(document.body.textContent).toContain('biowulf')
   })
 
-  it('disables unreachable hosts in the REMOTE section', async () => {
+  it('swaps the artifacts list for the local browser when the device is picked', async () => {
+    await renderFilesView()
+
+    // Starts on the artifacts container, labelled with the resolved device name in the dropdown.
+    expect(container.querySelector('[data-testid="project-files-scroll"]')).not.toBeNull()
+    expect(container.querySelector('[aria-label="Local file browser"]')).toBeNull()
+
+    const openMenu = async (): Promise<void> => {
+      const filterButton = container.querySelector<HTMLButtonElement>(
+        '[aria-label="Filter project files"]'
+      )
+      await act(async () => {
+        filterButton?.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, button: 0 }))
+        filterButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      })
+    }
+
+    await openMenu()
+    const deviceItem = Array.from(
+      document.querySelectorAll<HTMLElement>('[role="menuitemradio"]')
+    ).find((el) => el.textContent?.includes('TychoStation'))
+    await act(async () => {
+      deviceItem?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    // The local browser replaces the artifacts list inside the same Files tab.
+    expect(container.querySelector('[aria-label="Local file browser"]')).not.toBeNull()
+    expect(container.querySelector('[data-testid="project-files-scroll"]')).toBeNull()
+    expect(window.api.localFs.listDir).toHaveBeenCalledWith('/Users/roxi')
+    expect(container.textContent).toContain('Projects')
+    expect(container.textContent).toContain('notes.md')
+    // Header count follows the visible container.
+    expect(container.textContent).toContain('2 files')
+
+    // Picking an artifact scope returns the body to the artifacts list.
+    await openMenu()
+    const allArtifacts = document.querySelector<HTMLElement>('[data-filter-id="all"]')
+    await act(async () => {
+      allArtifacts?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    expect(container.querySelector('[data-testid="project-files-scroll"]')).not.toBeNull()
+    expect(container.querySelector('[aria-label="Local file browser"]')).toBeNull()
+  })
+
+  it('closes the local browser Go-to menu on an outside click', async () => {
+    await renderFilesView()
+
+    const filterButton = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Filter project files"]'
+    )
+    await act(async () => {
+      filterButton?.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, button: 0 }))
+      filterButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    const deviceItem = Array.from(
+      document.querySelectorAll<HTMLElement>('[role="menuitemradio"]')
+    ).find((el) => el.textContent?.includes('TychoStation'))
+    await act(async () => {
+      deviceItem?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    const goTo = Array.from(container.querySelectorAll<HTMLButtonElement>('button')).find((el) =>
+      el.textContent?.includes('Go to')
+    )
+    await act(async () => {
+      goTo?.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, button: 0 }))
+      goTo?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    expect(document.querySelector('[role="menu"]')).not.toBeNull()
+    expect(document.body.textContent).toContain('Home')
+
+    // Radix dismisses on pointerdown-then-click outside the content.
+    await act(async () => {
+      document.body.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, button: 0 }))
+      document.body.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    expect(document.querySelector('[role="menu"]')).toBeNull()
+  })
+
+  it('only re-lists the directory when the address bar path actually changes', async () => {
+    await renderFilesView()
+
+    const filterButton = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Filter project files"]'
+    )
+    await act(async () => {
+      filterButton?.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, button: 0 }))
+      filterButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    const deviceItem = Array.from(
+      document.querySelectorAll<HTMLElement>('[role="menuitemradio"]')
+    ).find((el) => el.textContent?.includes('TychoStation'))
+    await act(async () => {
+      deviceItem?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    const listDir = window.api.localFs.listDir as ReturnType<typeof vi.fn>
+    const callsAfterLanding = listDir.mock.calls.length
+    const address = container.querySelector<HTMLInputElement>('[aria-label="Directory path"]')
+    expect(address?.value).toBe('/Users/roxi')
+
+    // React tracks the value setter, so drive it natively to make onChange fire.
+    const typePath = async (next: string): Promise<void> => {
+      await act(async () => {
+        if (!address) return
+        const setter = Object.getOwnPropertyDescriptor(
+          HTMLInputElement.prototype,
+          'value'
+        )?.set?.bind(address)
+        setter?.(next)
+        address.dispatchEvent(new Event('input', { bubbles: true }))
+      })
+    }
+
+    // Blurring an untouched path, and a no-op edit (trailing slash), both skip the listing call.
+    await act(async () => {
+      address?.dispatchEvent(new FocusEvent('focusout', { bubbles: true }))
+    })
+    expect(listDir.mock.calls.length).toBe(callsAfterLanding)
+
+    await typePath('/Users/roxi/')
+    await act(async () => {
+      address?.dispatchEvent(new FocusEvent('focusout', { bubbles: true }))
+    })
+    expect(listDir.mock.calls.length).toBe(callsAfterLanding)
+    // The field snaps back to the canonical path rather than keeping the equivalent spelling.
+    expect(address?.value).toBe('/Users/roxi')
+
+    // A genuinely different path does re-read.
+    listDir.mockResolvedValueOnce({
+      entries: [],
+      resolvedPath: '/Users/roxi/Projects',
+      truncated: false
+    })
+    await typePath('/Users/roxi/Projects')
+    await act(async () => {
+      address?.dispatchEvent(new FocusEvent('focusout', { bubbles: true }))
+    })
+    expect(listDir).toHaveBeenLastCalledWith('/Users/roxi/Projects')
+    expect(listDir.mock.calls.length).toBe(callsAfterLanding + 1)
+  })
+
+  it('disables unreachable hosts in the Remote section', async () => {
     useComputeStore.setState({
       ...createInitialComputeState(),
       isLoaded: true,

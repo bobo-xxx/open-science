@@ -87,20 +87,27 @@ const readBounded = async (
 // Parses a GitHub URL into the repo + skill directory it points at. Accepts tree/blob URLs and trims a
 // trailing SKILL.md so a link to the file resolves to its directory. Returns null when unrecognizable.
 const parseGitHubSkillUrl = (input: string): GitHubSkillLocation | null => {
-  const match =
-    /github\.com\/([^/\s]+)\/([^/\s]+)(?:\/(?:tree|blob)\/([^/\s]+)((?:\/[^?#]*)?))?/.exec(
-      input.trim()
-    )
-  if (!match) return null
+  try {
+    const url = new URL(input.trim())
+    if (url.protocol !== 'https:' || url.host !== 'github.com' || url.username || url.password) {
+      return null
+    }
 
-  const owner = match[1]
-  const repo = match[2].replace(/\.git$/, '')
-  const ref = match[3]
-  // Decode so a pasted %20 and a literal space both normalize to a real space; the path may contain spaces.
-  let path = decodeURIComponent(match[4] ?? '').replace(/^\/+|\/+$/g, '')
-  path = path.replace(/\/?SKILL\.md$/i, '')
+    const segments = url.pathname.split('/').filter(Boolean).map(decodeURIComponent)
+    if (segments.length < 2) return null
+    const owner = segments[0]
+    const repo = segments[1].replace(/\.git$/, '')
+    if (!owner || !repo || owner === '.' || owner === '..' || repo === '.' || repo === '..')
+      return null
+    if (segments.length === 2) return { owner, repo, ref: undefined, path: '' }
 
-  return { owner, repo, ref, path }
+    const [kind, ref, ...pathSegments] = segments.slice(2)
+    if ((kind !== 'tree' && kind !== 'blob') || !ref) return null
+    const path = pathSegments.join('/').replace(/\/?SKILL\.md$/i, '')
+    return { owner, repo, ref, path }
+  } catch {
+    return null
+  }
 }
 
 // Builds the GitHub contents API URL for a path within a repo. Percent-encodes each path segment
@@ -112,6 +119,78 @@ const contentsUrl = (location: GitHubSkillLocation, path: string): string => {
 }
 
 type ContentsEntry = { type: string; name: string; path: string; download_url: string | null }
+
+export type FetchedSkillPreview = { skillMd: Buffer; files: string[] }
+
+// Lists one selected skill directory and downloads only its root SKILL.md. Repo scans intentionally
+// return metadata only; opening a candidate calls this helper lazily. Directory depth, file count,
+// and request count share the import caps, while the rendered body uses the smaller IPC preview cap.
+const fetchSkillPreview = async (
+  location: GitHubSkillLocation,
+  fetchImpl: FetchLike
+): Promise<FetchedSkillPreview> => {
+  const rootPrefix = location.path ? `${location.path}/` : ''
+  const files: string[] = []
+  let skillMd: Buffer | undefined
+  let requests = 0
+
+  const request: FetchLike = (url, init) => {
+    requests += 1
+    if (requests > SKILL_IMPORT_LIMITS.maxRequests) {
+      throw new Error(`Skill preview exceeded ${SKILL_IMPORT_LIMITS.maxRequests} requests.`)
+    }
+    return fetchImpl(url, init)
+  }
+
+  const walk = async (path: string, depth: number): Promise<void> => {
+    if (depth > SKILL_IMPORT_LIMITS.maxDepth) {
+      throw new Error(`Skill directory nesting exceeds ${SKILL_IMPORT_LIMITS.maxDepth} levels.`)
+    }
+
+    const response = await request(contentsUrl(location, path), { headers: GITHUB_HEADERS })
+    if (!response.ok) {
+      throw new Error(`GitHub API request failed (${response.status}) for ${path || 'repo root'}`)
+    }
+
+    const payload = (await response.json()) as ContentsEntry | ContentsEntry[]
+    const entries = Array.isArray(payload) ? payload : [payload]
+    for (const entry of entries) {
+      if (entry.type === 'dir') {
+        await walk(entry.path, depth + 1)
+        continue
+      }
+      if (entry.type !== 'file') continue
+      if (files.length >= SKILL_IMPORT_LIMITS.maxFiles) {
+        throw new Error(`Skill has too many files (limit ${SKILL_IMPORT_LIMITS.maxFiles}).`)
+      }
+
+      const relativePath = entry.path.startsWith(rootPrefix)
+        ? entry.path.slice(rootPrefix.length)
+        : entry.name
+      files.push(relativePath)
+
+      if (relativePath.toLowerCase() !== 'skill.md' || !entry.download_url) continue
+      const raw = await request(entry.download_url, { headers: { 'User-Agent': 'open-science' } })
+      if (!raw.ok) throw new Error(`Failed to download ${entry.path} (${raw.status})`)
+
+      const previewTooLarge = (): never => {
+        throw new Error(
+          `GitHub Skill preview exceeds the ${SKILL_IMPORT_LIMITS.maxPreviewContentBytes / (1024 * 1024)} MB limit.`
+        )
+      }
+      const declared = Number(raw.headers?.get('content-length') ?? '')
+      if (Number.isFinite(declared) && declared > SKILL_IMPORT_LIMITS.maxPreviewContentBytes) {
+        previewTooLarge()
+      }
+      skillMd = await readBounded(raw, SKILL_IMPORT_LIMITS.maxPreviewContentBytes, previewTooLarge)
+    }
+  }
+
+  await walk(location.path, 0)
+  if (!skillMd) throw new Error('No SKILL.md found at the linked location.')
+
+  return { skillMd, files: files.sort() }
+}
 
 // Recursively downloads every file under a skill directory via the public GitHub contents API.
 const fetchSkillFiles = async (
@@ -230,7 +309,7 @@ const parseGitHubRepo = (input: string): GitHubRepoRef | null => {
 }
 
 // Scans a repo's git tree for every directory containing a SKILL.md, returning an importable URL for
-// each. Uses the public Git Trees API (recursive); resolves the default branch when no ref is given.
+// each. Resolve branch/tag refs to a commit first so a later preview and import read the same snapshot.
 const scanRepoForSkills = async (
   repo: GitHubRepoRef,
   fetchImpl: FetchLike
@@ -244,8 +323,16 @@ const scanRepoForSkills = async (
     ref = ((await meta.json()) as { default_branch?: string }).default_branch ?? 'main'
   }
 
+  const commitResponse = await fetchImpl(
+    `https://api.github.com/repos/${repo.owner}/${repo.repo}/commits/${encodeURIComponent(ref)}`,
+    { headers: GITHUB_HEADERS }
+  )
+  if (!commitResponse.ok) throw new Error(`GitHub API request failed (${commitResponse.status}).`)
+  const commitSha = ((await commitResponse.json()) as { sha?: string }).sha
+  if (!commitSha) throw new Error('GitHub did not return a commit SHA for that ref.')
+
   const treeResponse = await fetchImpl(
-    `https://api.github.com/repos/${repo.owner}/${repo.repo}/git/trees/${encodeURIComponent(ref)}?recursive=1`,
+    `https://api.github.com/repos/${repo.owner}/${repo.repo}/git/trees/${encodeURIComponent(commitSha)}?recursive=1`,
     { headers: GITHUB_HEADERS }
   )
   if (!treeResponse.ok) throw new Error(`GitHub API request failed (${treeResponse.status}).`)
@@ -258,7 +345,7 @@ const scanRepoForSkills = async (
       const dir = entry.path.replace(/\/?SKILL\.md$/i, '')
       const name = dir.split('/').filter(Boolean).pop() ?? repo.repo
       // Percent-encode each segment so the url round-trips when later imported (e.g. spaces in dir names).
-      const encodedRef = encodeURIComponent(ref)
+      const encodedRef = encodeURIComponent(commitSha)
       const encodedDir = dir.split('/').map(encodeURIComponent).join('/')
       const url = dir
         ? `https://github.com/${repo.owner}/${repo.repo}/tree/${encodedRef}/${encodedDir}`
@@ -270,4 +357,10 @@ const scanRepoForSkills = async (
   return skills
 }
 
-export { parseGitHubSkillUrl, parseGitHubRepo, fetchSkillFiles, scanRepoForSkills }
+export {
+  parseGitHubSkillUrl,
+  parseGitHubRepo,
+  fetchSkillPreview,
+  fetchSkillFiles,
+  scanRepoForSkills
+}

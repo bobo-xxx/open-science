@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 
 import { describe, expect, it, vi, afterEach, beforeEach } from 'vitest'
 
@@ -2053,7 +2053,9 @@ describe('resolveInputs — workspace source', () => {
     )
     expect(entries).toHaveLength(1)
     expect(entries[0]).toMatchObject({ kind: 'upload', dstFilename: 'sample.fa' })
-    expect((entries[0] as { localPath: string }).localPath).toBe('/workspace/root/data/sample.fa')
+    expect((entries[0] as { localPath: string }).localPath).toBe(
+      resolve('/workspace/root', 'data/sample.fa')
+    )
     expect(inputsSummary).toBe('1 input: sample.fa')
   })
 
@@ -2389,6 +2391,37 @@ describe('ComputeService.getJobResult', () => {
     const featIdx = result.output_files.indexOf('hpc/job-result-1/featured/out.result')
     const hidIdx = result.output_files.indexOf('hpc/job-result-1/hidden/debug.log')
     expect(featIdx).toBeLessThan(hidIdx)
+  })
+
+  it('reads attach_job results from the data-root workspace when config and data roots differ', async () => {
+    const configRoot = await mkdtemp(join(tmpdir(), 'job-result-config-root-'))
+    const dataRoot = await mkdtemp(join(tmpdir(), 'job-result-data-root-'))
+    const dataHarvestDir = join(dataRoot, 'notebooks', 'proj-1', 'sess-1', 'hpc', 'job-result-1')
+    const configHarvestDir = join(
+      configRoot,
+      'notebooks',
+      'proj-1',
+      'sess-1',
+      'hpc',
+      'job-result-1'
+    )
+    await mkdir(join(dataHarvestDir, 'featured'), { recursive: true })
+    await mkdir(join(configHarvestDir, 'featured'), { recursive: true })
+    await writeFile(join(dataHarvestDir, 'featured', 'data-root.result'), 'readable by notebook')
+    await writeFile(
+      join(configHarvestDir, 'featured', 'stale-config.result'),
+      'must not be returned'
+    )
+
+    try {
+      const service = makeServiceWithStorageRoot(baseJob({ harvested_at: Date.now() }), dataRoot)
+      const result = await service.getJobResult('job-result-1')
+      expect(result.featured_files).toEqual(['hpc/job-result-1/featured/data-root.result'])
+      expect(result.output_files).toEqual(['hpc/job-result-1/featured/data-root.result'])
+    } finally {
+      await rm(configRoot, { recursive: true, force: true })
+      await rm(dataRoot, { recursive: true, force: true })
+    }
   })
 
   it('harvest_failed: partial files returned, remote_workdir preserved', async () => {

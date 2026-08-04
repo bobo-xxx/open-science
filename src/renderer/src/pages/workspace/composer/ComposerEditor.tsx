@@ -24,7 +24,7 @@ const composerEditorClassName =
 
 // Placeholder overlay aligned to the editor's text start; pointer-events-none lets clicks reach the box.
 const composerPlaceholderClassName =
-  'pointer-events-none absolute inset-x-0 top-0 truncate py-1.5 text-[15px] leading-relaxed text-text-300'
+  'pointer-events-none absolute inset-x-0 top-0 truncate py-1.5 text-[15px] leading-relaxed text-muted-foreground'
 
 type ComposerEditorProps = {
   doc: ComposerDoc
@@ -35,6 +35,8 @@ type ComposerEditorProps = {
   placeholder: string
   className?: string
   ariaLabel: string
+  // Undefined preserves Main Agent behavior; an empty array intentionally hides every Skill.
+  allowedSkillIds?: readonly string[]
 }
 
 // Structural equality over doc nodes; used to decide whether the incoming prop diverges from what
@@ -49,13 +51,21 @@ const nodesEqual = (a: ComposerNode[], b: ComposerNode[]): boolean => {
       return node.id === other.id && node.name === other.name
     }
     if (node.type === 'artifact' && other.type === 'artifact') {
-      return (
-        node.id === other.id &&
-        node.name === other.name &&
-        node.path === other.path &&
-        node.source === other.source &&
-        node.versionId === other.versionId
-      )
+      if (
+        node.id !== other.id ||
+        node.name !== other.name ||
+        node.source !== other.source ||
+        node.mimeType !== other.mimeType
+      ) {
+        return false
+      }
+      if (node.source === 'linked-folder' && other.source === 'linked-folder') {
+        return node.rootId === other.rootId && node.relativePath === other.relativePath
+      }
+      if (node.source !== 'linked-folder' && other.source !== 'linked-folder') {
+        return node.path === other.path && node.versionId === other.versionId
+      }
+      return false
     }
     return false
   })
@@ -113,7 +123,8 @@ export const ComposerEditor = ({
   disabled = false,
   placeholder,
   className,
-  ariaLabel
+  ariaLabel,
+  allowedSkillIds
 }: ComposerEditorProps): React.JSX.Element => {
   const editorRef = useRef<HTMLDivElement>(null)
   // Tracks IME composition so Enter never submits mid-composition.
@@ -201,6 +212,7 @@ export const ComposerEditor = ({
       name: ref.name,
       path: ref.path,
       source: ref.source,
+      mimeType: ref.mimeType,
       versionId: ref.versionId
     })
     artifactMention.cancel()
@@ -238,6 +250,7 @@ export const ComposerEditor = ({
       {mention.active ? (
         <SkillMentionPopup
           query={mention.query}
+          allowedSkillIds={allowedSkillIds}
           onSelect={handleSelectSkill}
           onClose={mention.cancel}
         />

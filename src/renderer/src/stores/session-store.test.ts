@@ -185,14 +185,19 @@ describe('session store', () => {
           uploads: [
             expect.objectContaining({
               id: 'upload-1',
-              sessionId: 'transport-session-1',
-              path: finalizedUpload.path
+              sessionId: 'transport-session-1'
             })
           ]
         })
       ]
     })
     expect(finalizedSession.filesRevision).toBe(1)
+    expect(finalizedSession.messages[0].uploads?.[0]).not.toHaveProperty('path')
+    expect(
+      finalizedSession.conversationGraph?.messages.find(
+        (message) => message.id === pending?.messageId
+      )?.uploads?.[0]
+    ).toMatchObject({ id: 'upload-1', sessionId: 'transport-session-1' })
     expect(useSessionStore.getState().sessions[0]).toBe(finalizedSession)
   })
 
@@ -214,7 +219,23 @@ describe('session store', () => {
 
     useSessionStore.getState().removeMessage('transport-session-1', pending?.messageId ?? '')
 
-    expect(useSessionStore.getState().sessions[0].filesRevision).toBe(2)
+    const session = useSessionStore.getState().sessions[0]
+    expect(session.filesRevision).toBe(2)
+    expect(session.messages.some((message) => message.id === pending?.messageId)).toBe(false)
+    expect(
+      toPersistedSession(session).messages.some((message) => message.id === pending?.messageId)
+    ).toBe(false)
+    expect(
+      session.conversationGraph?.messages.some((message) => message.id === pending?.messageId)
+    ).toBe(true)
+    expect(session.conversationGraph?.branches).toHaveLength(2)
+    const activeFrame = session.conversationGraph?.frames.find(
+      (frame) => frame.id === session.conversationGraph?.activeFrameId
+    )
+    const activeBranch = session.conversationGraph?.branches.find(
+      (branch) => branch.id === activeFrame?.activeBranchId
+    )
+    expect(activeBranch?.headMessageId).toBeUndefined()
   })
 
   it('binds a pending session to the runtime session id without rewriting the prompt', () => {
@@ -285,6 +306,25 @@ describe('session store', () => {
     ])
   })
 
+  it('persists the model selected when each run starts', () => {
+    useSessionStore.getState().appendUserMessage({
+      sessionId: 'transport-session-1',
+      content: 'First run',
+      agentModel: 'model-a'
+    })
+    useSessionStore.getState().finishRun('transport-session-1')
+
+    useSessionStore.getState().appendUserMessage({
+      sessionId: 'transport-session-1',
+      content: 'Second run',
+      agentModel: 'model-b'
+    })
+
+    const session = useSessionStore.getState().sessions[0]
+    expect(session.agentModel).toBe('model-b')
+    expect(toPersistedSession(session).agentModel).toBe('model-b')
+  })
+
   it('merges streamed agent chunks by stream id and completes them when the run stops', () => {
     const result = useSessionStore.getState().appendUserMessage({
       sessionId: 'transport-session-1',
@@ -305,7 +345,12 @@ describe('session store', () => {
       content: ' complete'
     })
 
-    useSessionStore.getState().finishRun('transport-session-1')
+    useSessionStore.getState().finishRun('transport-session-1', {
+      inputTokens: 31,
+      cacheTokens: 15,
+      outputTokens: 14,
+      turnCount: 3
+    })
 
     const session = useSessionStore.getState().sessions[0]
     const agentMessage = session.messages[1]
@@ -318,10 +363,88 @@ describe('session store', () => {
       streamId: 'assistant-message-1',
       responseToMessageId: result?.messageId,
       eventIds: ['event-1', 'event-2'],
-      status: 'complete'
+      status: 'complete',
+      turnUsage: { inputTokens: 31, cacheTokens: 15, outputTokens: 14, turnCount: 3 }
+    })
+    expect(agentMessage.completedAt).toBe(session.updatedAt)
+    expect(
+      session.conversationGraph?.messages.find((message) => message.id === agentMessage.id)
+    ).toMatchObject({
+      completedAt: agentMessage.completedAt,
+      turnUsage: { inputTokens: 31, cacheTokens: 15, outputTokens: 14, turnCount: 3 }
+    })
+    expect(toPersistedSession(session).messages[1]).toMatchObject({
+      completedAt: agentMessage.completedAt,
+      turnUsage: { inputTokens: 31, cacheTokens: 15, outputTokens: 14, turnCount: 3 }
     })
     expect(session.status).toBe('idle')
     expect(session.activeRun).toBeUndefined()
+  })
+
+  it('attaches whole-turn usage only to the final agent message for the active prompt', () => {
+    useSessionStore.getState().appendUserMessage({
+      sessionId: 'transport-session-1',
+      content: 'Explain the analysis'
+    })
+    useSessionStore.getState().appendAgentMessageChunk({
+      sessionId: 'transport-session-1',
+      streamId: 'assistant-message-1',
+      eventId: 'event-1',
+      content: 'I will inspect the data.'
+    })
+    useSessionStore.getState().appendAgentMessageChunk({
+      sessionId: 'transport-session-1',
+      streamId: 'assistant-message-2',
+      eventId: 'event-2',
+      content: 'The analysis is complete.'
+    })
+
+    useSessionStore.getState().finishRun('transport-session-1', {
+      inputTokens: 120,
+      cacheTokens: 30,
+      outputTokens: 45
+    })
+
+    const agentMessages = useSessionStore
+      .getState()
+      .sessions[0].messages.filter((message) => message.role === 'agent')
+    expect(agentMessages[0].turnUsage).toBeUndefined()
+    expect(agentMessages[1].turnUsage).toEqual({
+      inputTokens: 120,
+      cacheTokens: 30,
+      outputTokens: 45
+    })
+  })
+
+  it('marks only the final agent message when whole-turn usage is unavailable', () => {
+    useSessionStore.getState().appendUserMessage({
+      sessionId: 'transport-session-1',
+      content: 'Explain the analysis'
+    })
+    useSessionStore.getState().appendAgentMessageChunk({
+      sessionId: 'transport-session-1',
+      streamId: 'assistant-message-1',
+      eventId: 'event-1',
+      content: 'I will inspect the data.'
+    })
+    useSessionStore.getState().appendAgentMessageChunk({
+      sessionId: 'transport-session-1',
+      streamId: 'assistant-message-2',
+      eventId: 'event-2',
+      content: 'The analysis is complete.'
+    })
+
+    useSessionStore.getState().finishRun('transport-session-1')
+
+    const session = useSessionStore.getState().sessions[0]
+    const agentMessages = session.messages.filter((message) => message.role === 'agent')
+    expect(agentMessages[0].turnUsageUnavailable).toBeUndefined()
+    expect(agentMessages[1].turnUsageUnavailable).toBe(true)
+    expect(
+      session.conversationGraph?.messages.find((message) => message.id === agentMessages[1].id)
+        ?.turnUsageUnavailable
+    ).toBe(true)
+    expect(toPersistedSession(session).messages.at(-1)?.turnUsageUnavailable).toBe(true)
   })
 
   it('merges image-only and text chunks into the same agent message', () => {
@@ -436,14 +559,95 @@ describe('session store', () => {
     useSessionStore.getState().failRun('transport-session-1', 'Permission denied')
 
     const session = useSessionStore.getState().sessions[0]
+    const failedAt = session.messages[1].failedAt
 
     expect(session.status).toBe('error')
     expect(session.error).toBe('Permission denied')
     expect(session.activeRun).toBeUndefined()
+    expect(failedAt).toEqual(expect.any(Number))
     expect(session.messages[1]).toMatchObject({
       content: 'I started',
-      status: 'error'
+      status: 'error',
+      failedAt
     })
+    expect(
+      session.conversationGraph?.messages.find((message) => message.id === session.messages[1].id)
+    ).toMatchObject({ status: 'error', failedAt })
+    expect(toPersistedSession(session).messages[1]).toMatchObject({
+      status: 'error',
+      failedAt
+    })
+  })
+
+  it('derives errorReportable from the message when no explicit flag is passed', () => {
+    useSessionStore.getState().appendUserMessage({
+      sessionId: 'transport-session-1',
+      content: 'Read the files'
+    })
+
+    // An opaque/internal failure with no crafted-message match stays reportable.
+    useSessionStore.getState().failRun('transport-session-1', 'Agent session could not be created.')
+    expect(useSessionStore.getState().sessions[0].errorReportable).toBe(true)
+
+    // An app-crafted reminder is recognized by its exact text and is not reportable.
+    useSessionStore
+      .getState()
+      .failRun('transport-session-1', 'Session workspace is missing; start a new conversation.')
+    expect(useSessionStore.getState().sessions[0].errorReportable).toBe(false)
+  })
+
+  it('honors an explicit reportable flag (the runtime tags a model-provider failure)', () => {
+    useSessionStore.getState().appendUserMessage({
+      sessionId: 'transport-session-1',
+      content: 'Read the files'
+    })
+
+    // A model-provider failure: opaque text that WOULD derive reportable=true, but the ACP layer
+    // structurally tagged it non-reportable, and the explicit flag wins.
+    useSessionStore.getState().failRun('transport-session-1', 'Invalid API key', {
+      reportable: false
+    })
+    expect(useSessionStore.getState().sessions[0].errorReportable).toBe(false)
+  })
+
+  it('clears errorReportable when a new run starts, so a later error cannot inherit it', () => {
+    useSessionStore.getState().appendUserMessage({
+      sessionId: 'transport-session-1',
+      content: 'first turn'
+    })
+    // A model-provider failure hides the report button.
+    useSessionStore.getState().failRun('transport-session-1', 'Invalid API key', {
+      reportable: false
+    })
+    expect(useSessionStore.getState().sessions[0].errorReportable).toBe(false)
+
+    // A new turn clears the prior error + flag.
+    useSessionStore.getState().appendUserMessage({
+      sessionId: 'transport-session-1',
+      content: 'second turn'
+    })
+    expect(useSessionStore.getState().sessions[0].errorReportable).toBeUndefined()
+
+    // A later ACP-layer failure with no explicit flag derives reportable=true — it never inherits the
+    // earlier provider error's false.
+    useSessionStore.getState().failRun('transport-session-1', 'Agent cancellation failed')
+    expect(useSessionStore.getState().sessions[0].errorReportable).toBe(true)
+  })
+
+  it('records an artifact finalization error as reportable (an app-layer failure)', () => {
+    useSessionStore.getState().appendUserMessage({
+      sessionId: 'transport-session-1',
+      content: 'Create a report'
+    })
+    // Simulate a prior provider error's flag lingering, then an artifact error overwriting it.
+    useSessionStore.getState().failRun('transport-session-1', 'Invalid API key', {
+      reportable: false
+    })
+    useSessionStore.getState().recordArtifactError('transport-session-1', 'disk full')
+
+    const session = useSessionStore.getState().sessions[0]
+    expect(session.error).toContain('disk full')
+    expect(session.errorReportable).toBe(true)
   })
 
   it('keeps artifact finalization errors visible when the run later stops', () => {
@@ -527,6 +731,76 @@ describe('session store', () => {
         eventIds: ['event-1', 'event-2']
       })
     ])
+  })
+
+  it('assigns real tool activities to the declared activity group and persists the group', () => {
+    useSessionStore.getState().appendUserMessage({
+      sessionId: 'transport-session-1',
+      content: 'Inspect and update the app'
+    })
+
+    useSessionStore
+      .getState()
+      .beginActivityGroup(
+        'transport-session-1',
+        'group-call-1',
+        'Inspect the current implementation'
+      )
+    useSessionStore.getState().upsertToolActivity({
+      sessionId: 'transport-session-1',
+      toolCallId: 'tool-read-1',
+      eventId: 'event-read-1',
+      toolKind: 'read',
+      status: 'completed'
+    })
+    useSessionStore
+      .getState()
+      .beginActivityGroup('transport-session-1', 'group-call-2', 'Apply the focused change')
+    useSessionStore.getState().upsertToolActivity({
+      sessionId: 'transport-session-1',
+      toolCallId: 'tool-edit-1',
+      eventId: 'event-edit-1',
+      toolKind: 'edit',
+      status: 'completed'
+    })
+    useSessionStore.getState().completeActivityGroup('transport-session-1')
+
+    const session = useSessionStore.getState().sessions[0]
+    expect(session.activities).toEqual([
+      expect.objectContaining({ id: 'tool-read-1', activityGroupId: 'group-call-1' }),
+      expect.objectContaining({ id: 'tool-edit-1', activityGroupId: 'group-call-2' })
+    ])
+    expect(session.activityGroups).toEqual([
+      expect.objectContaining({
+        id: 'group-call-1',
+        title: 'Inspect the current implementation',
+        activityIds: ['tool-read-1'],
+        completedAt: expect.any(Number)
+      }),
+      expect.objectContaining({
+        id: 'group-call-2',
+        title: 'Apply the focused change',
+        activityIds: ['tool-edit-1'],
+        completedAt: expect.any(Number)
+      })
+    ])
+    expect(toPersistedSession(session).activityGroups).toEqual(session.activityGroups)
+  })
+
+  it('does not notify the store when no started activity group can be completed', () => {
+    useSessionStore.getState().appendUserMessage({
+      sessionId: 'transport-session-1',
+      content: 'Answer without tools'
+    })
+    const before = useSessionStore.getState()
+    const listener = vi.fn()
+    const unsubscribe = useSessionStore.subscribe(listener)
+
+    useSessionStore.getState().completeActivityGroup('transport-session-1')
+
+    expect(useSessionStore.getState()).toBe(before)
+    expect(listener).not.toHaveBeenCalled()
+    unsubscribe()
   })
 
   it('preserves tool activity content and locations across updates', () => {
@@ -878,6 +1152,25 @@ describe('session store', () => {
     expect(useSessionStore.getState().selectedSessionId).toBe('transport-session-1')
   })
 
+  it('toggles the pinned flag without disturbing updatedAt, and persists it', () => {
+    useSessionStore.getState().appendUserMessage({
+      sessionId: 'pin-session',
+      content: 'Pin me'
+    })
+    const originalUpdatedAt = useSessionStore.getState().sessions[0].updatedAt
+
+    useSessionStore.getState().togglePinned('pin-session')
+    const pinned = useSessionStore.getState().sessions[0]
+    expect(pinned.pinned).toBe(true)
+    // Pinning is an organizational action, so it must not bump the "last active" timestamp.
+    expect(pinned.updatedAt).toBe(originalUpdatedAt)
+    expect(toPersistedSession(pinned).pinned).toBe(true)
+
+    useSessionStore.getState().togglePinned('pin-session')
+    expect(useSessionStore.getState().sessions[0].pinned).toBe(false)
+    expect(toPersistedSession(useSessionStore.getState().sessions[0]).pinned).toBe(false)
+  })
+
   it("keeps selection within the deleted session's project", () => {
     useSessionStore
       .getState()
@@ -974,17 +1267,19 @@ describe('session store', () => {
       sessionId: 'transport-session-1',
       content: 'Create an image'
     })
+    // A replayed/post-stop Artifact must create its file-only owner directly in the durable graph.
+    useSessionStore.getState().finishRun('transport-session-1')
 
     const attached = useSessionStore.getState().attachRunArtifacts({
       sessionId: 'transport-session-1',
       runId: 'run-1',
+      promptMessageId: userMessage?.messageId,
       eventId: 'artifact-event-1',
       artifacts: [createArtifactFile({ name: 'image.png', mimeType: 'image/png' })]
     })
 
-    useSessionStore.getState().finishRun('transport-session-1')
-
-    const message = useSessionStore.getState().sessions[0].messages[1]
+    const session = useSessionStore.getState().sessions[0]
+    const message = session.messages[1]
 
     expect(attached?.messageId).toBe(message.id)
     expect(message).toMatchObject({
@@ -993,6 +1288,14 @@ describe('session store', () => {
       status: 'complete',
       streamId: 'run-1',
       responseToMessageId: userMessage?.messageId,
+      artifactIds: ['artifact-session-1:run-1:result.txt']
+    })
+    expect(
+      session.conversationGraph?.messages.find((item) => item.id === message.id)
+    ).toMatchObject({
+      role: 'agent',
+      status: 'complete',
+      parentMessageId: userMessage?.messageId,
       artifactIds: ['artifact-session-1:run-1:result.txt']
     })
   })
@@ -1033,6 +1336,10 @@ describe('session store', () => {
     expect(session.artifacts?.map((artifact) => artifact.id)).toEqual([
       'transport-session-1:message-1:result.txt'
     ])
+    expect(
+      session.conversationGraph?.messages.find((item) => item.id === attached?.messageId)
+        ?.artifactIds
+    ).toEqual(['transport-session-1:message-1:result.txt'])
     expect(session.filesRevision).toBe(1)
 
     useSessionStore.getState().replaceMessageArtifacts({
@@ -1268,6 +1575,32 @@ describe('session store', () => {
     expect(persisted).not.toHaveProperty('isPending')
   })
 
+  it('keeps a staged upload path until the main process publishes its immutable Version', () => {
+    const attachment = createUploadAttachment({
+      id: 'staged-upload-1',
+      path: '/Users/example/OpenScience-DEV/uploads/default-project/.pending/staged.csv'
+    })
+    const pending = useSessionStore.getState().appendPendingUserMessage({
+      content: 'Analyze the uploaded file',
+      attachments: [attachment],
+      cwd: '/workspace/project',
+      projectId: 'project-abc'
+    })
+
+    useSessionStore.getState().bindPendingSession({
+      pendingSessionId: pending?.sessionId ?? '',
+      sessionId: 'transport-session-1',
+      cwd: '/workspace/project'
+    })
+
+    const persisted = toPersistedSession(useSessionStore.getState().sessions[0])
+
+    expect(persisted.messages[0].uploads?.[0]).toMatchObject({
+      id: 'staged-upload-1',
+      path: attachment.path
+    })
+  })
+
   describe('fix loop active flag', () => {
     it('setFixLoopActive sets the flag per session', () => {
       useSessionStore.getState().appendUserMessage({
@@ -1390,7 +1723,37 @@ describe('session store', () => {
     })
 
     it('markResumed clears the interrupted state so the composer is usable', () => {
-      hydrateInterrupted()
+      hydrateInterrupted({
+        messages: [
+          {
+            id: 'prompt-1',
+            role: 'user',
+            content: 'Continue the analysis',
+            status: 'complete',
+            eventIds: [],
+            createdAt: 10,
+            completedAt: 11,
+            updatedAt: 11
+          },
+          {
+            id: 'response-1',
+            role: 'agent',
+            content: 'The first turn completed.',
+            status: 'complete',
+            responseToMessageId: 'prompt-1',
+            eventIds: [],
+            turnUsage: {
+              inputTokens: 31,
+              cacheTokens: 15,
+              outputTokens: 14,
+              turnCount: 3
+            },
+            createdAt: 12,
+            completedAt: 13,
+            updatedAt: 13
+          }
+        ]
+      })
 
       useSessionStore.getState().markResumed('resumable-session', 'codex', 'codex:codex-isolated')
       const session = useSessionStore.getState().sessions[0]
@@ -1400,8 +1763,18 @@ describe('session store', () => {
       expect(session.status).toBe('idle')
       expect(session.agentFrameworkId).toBe('codex')
       expect(session.agentBackendId).toBe('codex:codex-isolated')
+      expect(session.messages[1]).toMatchObject({
+        responseToMessageId: 'prompt-1',
+        completedAt: 13,
+        turnUsage: { inputTokens: 31, cacheTokens: 15, outputTokens: 14, turnCount: 3 }
+      })
       expect(toPersistedSession(session).agentFrameworkId).toBe('codex')
       expect(toPersistedSession(session).agentBackendId).toBe('codex:codex-isolated')
+      expect(toPersistedSession(session).messages[1]).toMatchObject({
+        responseToMessageId: 'prompt-1',
+        completedAt: 13,
+        turnUsage: { inputTokens: 31, cacheTokens: 15, outputTokens: 14, turnCount: 3 }
+      })
     })
 
     it('markDisconnected flags a live drop and settles the half-streamed reply, keeping the user turn', () => {
@@ -1522,7 +1895,7 @@ describe('truncateSessionFromMessage', () => {
     useSessionStore.setState(createInitialSessionState())
   })
 
-  it('drops the cut message and every later turn, clearing run and banner state', () => {
+  it('switches the compatibility projection at the cut while retaining the original Branch', () => {
     seedSession({
       status: 'error',
       error: 'previous failure',
@@ -1538,6 +1911,13 @@ describe('truncateSessionFromMessage', () => {
     expect(session.activeRun).toBeUndefined()
     expect(session.error).toBeUndefined()
     expect(session.interrupted).toBeUndefined()
+    expect(session.conversationGraph?.messages.map((message) => message.id)).toEqual([
+      'user-1',
+      'agent-1',
+      'user-2',
+      'agent-2'
+    ])
+    expect(session.conversationGraph?.branches).toHaveLength(2)
   })
 
   it('cuts later activities by creation time and keeps earlier ones', () => {
@@ -1554,6 +1934,42 @@ describe('truncateSessionFromMessage', () => {
     expect(
       useSessionStore.getState().sessions[0].activities?.map((activity) => activity.id)
     ).toEqual(['act-1'])
+  })
+
+  it('prunes activity group references when edited resend removes their activities', () => {
+    seedSession({
+      activities: [
+        { ...createActivity('act-1', baseTime + 150), activityGroupId: 'group-1' },
+        { ...createActivity('act-2', baseTime + 250), activityGroupId: 'group-1' },
+        { ...createActivity('act-3', baseTime + 350), activityGroupId: 'group-2' }
+      ],
+      activityGroups: [
+        {
+          id: 'group-1',
+          title: 'First group',
+          sortIndex: 1,
+          activityIds: ['act-1', 'act-2'],
+          createdAt: baseTime + 140,
+          updatedAt: baseTime + 250,
+          completedAt: baseTime + 260
+        },
+        {
+          id: 'group-2',
+          title: 'Second group',
+          sortIndex: 2,
+          activityIds: ['act-3'],
+          createdAt: baseTime + 340,
+          updatedAt: baseTime + 350,
+          completedAt: baseTime + 360
+        }
+      ]
+    })
+
+    useSessionStore.getState().truncateSessionFromMessage('session-1', 'user-2')
+
+    expect(useSessionStore.getState().sessions[0].activityGroups).toEqual([
+      expect.objectContaining({ id: 'group-1', activityIds: ['act-1'] })
+    ])
   })
 
   it('advances filesRevision only when removed messages carry file references', () => {
@@ -1584,5 +2000,258 @@ describe('truncateSessionFromMessage', () => {
     useSessionStore.getState().truncateSessionFromMessage('session-1', 'message-unknown')
 
     expect(useSessionStore.getState().sessions[0]).toBe(before)
+  })
+
+  it('switches between original and edited downstream histories as one Branch projection', () => {
+    seedSession()
+    useSessionStore.getState().truncateSessionFromMessage('session-1', 'user-2')
+    const edited = useSessionStore.getState().appendUserMessage({
+      sessionId: 'session-1',
+      content: 'edited user-2'
+    })
+    expect(edited).toBeDefined()
+    useSessionStore.getState().finishRun('session-1')
+
+    const editedSession = useSessionStore.getState().sessions[0]
+    const graph = editedSession.conversationGraph
+    expect(graph).toBeDefined()
+    const originalBranchId = graph?.branches[0].id
+    const editedBranchId = graph?.frames[0].activeBranchId
+    expect(editedSession.messages.map((message) => message.content)).toEqual([
+      'user-1 content',
+      'agent-1 content',
+      'edited user-2'
+    ])
+
+    useSessionStore.getState().setBranchSwitchBlocked('session-1', true)
+    useSessionStore.getState().activateMessageBranch('session-1', originalBranchId ?? '')
+    expect(useSessionStore.getState().sessions[0].messages.at(-1)?.id).toBe(edited?.messageId)
+
+    useSessionStore.getState().setBranchSwitchBlocked('session-1', false)
+    useSessionStore.getState().activateMessageBranch('session-1', originalBranchId ?? '')
+    expect(useSessionStore.getState().sessions[0].messages.map((message) => message.id)).toEqual([
+      'user-1',
+      'agent-1',
+      'user-2',
+      'agent-2'
+    ])
+    expect(useSessionStore.getState().sessions[0].branchContextResetRequired).toBe(true)
+
+    useSessionStore.getState().clearBranchContextReset('session-1')
+    useSessionStore.getState().activateMessageBranch('session-1', editedBranchId ?? '')
+    expect(useSessionStore.getState().sessions[0].messages.at(-1)?.id).toBe(edited?.messageId)
+    expect(useSessionStore.getState().sessions[0].branchContextResetRequired).toBe(true)
+  })
+
+  it('does not replay an original Branch event onto an edited Branch', () => {
+    seedSession({
+      messages: [
+        createMessage('user-1', 'user', baseTime),
+        createMessage('agent-1', 'agent', baseTime + 100),
+        createMessage('user-2', 'user', baseTime + 200),
+        createMessage('agent-2', 'agent', baseTime + 300, {
+          streamId: 'assistant-2',
+          responseToMessageId: 'user-2',
+          eventIds: ['event-2']
+        })
+      ]
+    })
+    useSessionStore.getState().truncateSessionFromMessage('session-1', 'user-2')
+    const edited = useSessionStore.getState().appendUserMessage({
+      sessionId: 'session-1',
+      content: 'edited user-2'
+    })
+    const beforeReplay = useSessionStore.getState().sessions[0]
+
+    const replayed = useSessionStore.getState().appendAgentMessageChunk({
+      sessionId: 'session-1',
+      streamId: 'assistant-2',
+      eventId: 'event-2',
+      promptMessageId: 'user-2',
+      content: 'agent-2 content'
+    })
+
+    const afterReplay = useSessionStore.getState().sessions[0]
+    expect(replayed?.messageId).toBe('agent-2')
+    expect(afterReplay).toBe(beforeReplay)
+    expect(afterReplay.messages.map((message) => message.id)).toEqual([
+      'user-1',
+      'agent-1',
+      edited?.messageId
+    ])
+
+    const collidingEvent = useSessionStore.getState().appendAgentMessageChunk({
+      sessionId: 'session-1',
+      streamId: 'assistant-edited',
+      eventId: 'event-2',
+      promptMessageId: edited?.messageId,
+      content: 'edited agent response'
+    })
+    expect(collidingEvent?.messageId).not.toBe('agent-2')
+    expect(useSessionStore.getState().sessions[0].messages.at(-1)).toMatchObject({
+      id: collidingEvent?.messageId,
+      responseToMessageId: edited?.messageId,
+      content: 'edited agent response'
+    })
+  })
+
+  it('retains an edited Branch response when an unchanged finalized Artifact is switched away and back', () => {
+    seedSession()
+    useSessionStore.getState().truncateSessionFromMessage('session-1', 'user-2')
+    const edited = useSessionStore.getState().appendUserMessage({
+      sessionId: 'session-1',
+      content: 'edited user-2'
+    })
+    const response = useSessionStore.getState().appendAgentMessageChunk({
+      sessionId: 'session-1',
+      streamId: 'assistant-edited',
+      eventId: 'assistant-event-edited',
+      content: 'edited agent response'
+    })
+    const artifact = createArtifactFile({
+      id: 'artifact-version-2',
+      projectName: 'default-project',
+      sessionId: 'session-1',
+      runId: 'artifact-run-2',
+      name: 'sin.png',
+      mimeType: 'image/png'
+    })
+    const attached = useSessionStore.getState().attachRunArtifacts({
+      sessionId: 'session-1',
+      runId: 'artifact-run-2',
+      promptMessageId: edited?.messageId,
+      eventId: 'artifact-event-2',
+      artifacts: [artifact]
+    })
+    expect(attached?.messageId).toBe(response?.messageId)
+
+    // Provenance finalization can return the same immutable Version descriptor that was attached by
+    // the pending event. Even when file metadata is unchanged, the new response must enter the Graph.
+    useSessionStore.getState().replaceMessageArtifacts({
+      sessionId: 'session-1',
+      messageId: response?.messageId ?? '',
+      artifacts: [artifact]
+    })
+    useSessionStore.getState().finishRun('session-1')
+
+    const editedSession = useSessionStore.getState().sessions[0]
+    const originalBranchId = editedSession.conversationGraph?.branches[0].id
+    const editedBranchId = editedSession.conversationGraph?.frames[0].activeBranchId
+    useSessionStore.getState().activateMessageBranch('session-1', originalBranchId ?? '')
+    useSessionStore.getState().activateMessageBranch('session-1', editedBranchId ?? '')
+
+    expect(useSessionStore.getState().sessions[0].messages.at(-1)).toMatchObject({
+      id: response?.messageId,
+      content: 'edited agent response',
+      artifactIds: ['artifact-version-2']
+    })
+  })
+
+  it('settles a completed run as an explicit error when its graph projection is inconsistent', () => {
+    seedSession()
+    useSessionStore.getState().truncateSessionFromMessage('session-1', 'user-2')
+    const branched = useSessionStore.getState().sessions[0]
+    const originalGraph = branched.conversationGraph
+    expect(originalGraph).toBeDefined()
+
+    useSessionStore.setState((state) => ({
+      sessions: state.sessions.map((session) =>
+        session.id === 'session-1'
+          ? {
+              ...session,
+              status: 'running',
+              activeRun: { promptMessageId: 'user-2', startedAt: baseTime + 400 },
+              messages: [...session.messages, createMessage('user-2', 'user', baseTime + 200)]
+            }
+          : session
+      )
+    }))
+
+    expect(() => useSessionStore.getState().finishRun('session-1')).not.toThrow()
+
+    const settled = useSessionStore.getState().sessions[0]
+    expect(settled).toMatchObject({
+      status: 'error',
+      activeRun: undefined,
+      errorReportable: true,
+      conversationGraphSyncBlocked: true
+    })
+    expect(settled.error).toContain('Conversation history could not be finalized')
+    expect(settled.conversationGraph).toBe(originalGraph)
+    expect(() => toPersistedSession(settled)).toThrow(
+      'Session persistence is blocked after conversation graph synchronization failed.'
+    )
+  })
+
+  it('preserves the run failure context when graph synchronization also fails', () => {
+    seedSession()
+    useSessionStore.getState().truncateSessionFromMessage('session-1', 'user-2')
+    const branched = useSessionStore.getState().sessions[0]
+    const originalGraph = branched.conversationGraph
+
+    useSessionStore.setState((state) => ({
+      sessions: state.sessions.map((session) =>
+        session.id === 'session-1'
+          ? {
+              ...session,
+              status: 'running',
+              activeRun: { promptMessageId: 'user-2', startedAt: baseTime + 400 },
+              messages: [...session.messages, createMessage('user-2', 'user', baseTime + 200)]
+            }
+          : session
+      )
+    }))
+
+    expect(() => useSessionStore.getState().failRun('session-1', 'Provider failed')).not.toThrow()
+
+    const settled = useSessionStore.getState().sessions[0]
+    expect(settled).toMatchObject({
+      status: 'error',
+      activeRun: undefined,
+      errorReportable: true,
+      conversationGraphSyncBlocked: true
+    })
+    expect(settled.error).toContain('Provider failed')
+    expect(settled.error).toContain('Conversation history could not be finalized')
+    expect(settled.conversationGraph).toBe(originalGraph)
+  })
+
+  it('retains a failed edited Branch response when switched away and back', () => {
+    seedSession()
+    useSessionStore.getState().truncateSessionFromMessage('session-1', 'user-2')
+    useSessionStore.getState().appendUserMessage({
+      sessionId: 'session-1',
+      content: 'edited user-2'
+    })
+    const response = useSessionStore.getState().appendAgentMessageChunk({
+      sessionId: 'session-1',
+      streamId: 'assistant-edited-failed',
+      eventId: 'assistant-event-edited-failed',
+      content: 'partial edited response'
+    })
+    useSessionStore.getState().failRun('session-1', 'Provider failed')
+
+    const failedSession = useSessionStore.getState().sessions[0]
+    const originalBranchId = failedSession.conversationGraph?.branches[0].id
+    const editedBranchId = failedSession.conversationGraph?.frames[0].activeBranchId
+    useSessionStore.getState().activateMessageBranch('session-1', originalBranchId ?? '')
+    useSessionStore.getState().activateMessageBranch('session-1', editedBranchId ?? '')
+
+    expect(useSessionStore.getState().sessions[0].messages.at(-1)).toMatchObject({
+      id: response?.messageId,
+      content: 'partial edited response',
+      status: 'error'
+    })
+  })
+
+  it('marks and clears the specialist switch reset flag', () => {
+    seedSession()
+    expect(useSessionStore.getState().sessions[0].specialistSwitchResetRequired).toBeUndefined()
+
+    useSessionStore.getState().markSpecialistSwitchResetRequired('session-1')
+    expect(useSessionStore.getState().sessions[0].specialistSwitchResetRequired).toBe(true)
+
+    useSessionStore.getState().clearSpecialistSwitchResetRequired('session-1')
+    expect(useSessionStore.getState().sessions[0].specialistSwitchResetRequired).toBeUndefined()
   })
 })

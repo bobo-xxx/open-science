@@ -3,9 +3,14 @@ import type { SessionModeState } from '@agentclientprotocol/sdk'
 
 import type { PermissionProfileApplication } from '../acp/permission-profile-controller'
 import type { PermissionProfileId } from '../../shared/permission-profiles'
-import type { AgentFrameworkId, ChatApiEndpoint, ReasoningEffort } from '../../shared/settings'
+import type { AgentFrameworkId, ChatApiEndpoint } from '../../shared/settings'
+import type { ModelReasoningEffort } from '../../shared/reasoning-effort'
 import type { ResolvedProvider } from '../settings/provider-env'
-import type { ResponsesBridgeConnection } from '../settings/responses-bridge'
+import type {
+  ResponsesBridgeConnection,
+  ResponsesBridgeSkillCandidate,
+  ResponsesBridgeSkillInput
+} from '../settings/responses-bridge'
 
 // The agent frameworks the app can drive over ACP (id union defined in shared settings so the renderer
 // and persisted settings share it). Adding one means implementing AgentFramework.
@@ -17,6 +22,9 @@ export type AgentConfigFile = {
   path: string
   content: string
   mode?: number
+  // The path is derived from the content. Publish it atomically and reuse an existing byte-identical
+  // file so concurrent framework starts can safely share it.
+  contentAddressed?: boolean
 }
 
 // Authentication is sent over ACP after initialize. Keeping it out of the child environment avoids
@@ -45,6 +53,10 @@ export type AgentModelConfig = {
   // Framework-specific model id used for local metadata/configuration. A bridge may keep this
   // separate from the provider's upstream model id.
   sessionModel?: string
+  // Exact stable app guidance delivered through framework-native backend configuration rather than
+  // ordinary ACP prompt content. The runtime uses this for context accounting and to avoid copying
+  // the same text into every user message.
+  persistentSystemPrompt?: string
 }
 
 // Inputs for translating a provider; paths differ per framework (Claude wants its executable + config
@@ -54,30 +66,52 @@ export type ModelConfigContext = {
   storageRoot: string
   // Absolute path to the detected framework executable (claude / opencode).
   executablePath: string
+  // Detected version of the native CLI behind an adapter. Codex uses this to trust bundled model
+  // metadata only when the model/version pair is explicitly known.
+  nativeVersion?: string
   responsesBridge?: ResponsesBridgeConnection
-  // Combined instructions markdown (connector conventions + tools) for frameworks that lack on-demand
-  // skill loading; the adapter writes it and wires it into the agent's instruction mechanism so the
-  // agent learns host.mcp instead of reimplementing connector calls with raw HTTP. Empty ⇒ omitted.
+  // Compact connector conventions for frameworks that need host.mcp guidance in their baseline
+  // instructions. Detailed connector schemas live in on-demand `mcp-*` skills. Empty ⇒ omitted.
   instructions?: string
-  // The user's reasoning-effort preference ('default'/undefined ⇒ don't override; the framework
-  // injects nothing and the agent keeps its own default). Each framework maps the level onto its
-  // native config channel — Codex's model_reasoning_effort, opencode's model options.
-  reasoningEffort?: ReasoningEffort
+  // Stable app guidance that must live at system/developer scope for the backend generation. Claude
+  // delivers the same appends through session metadata instead and may ignore this field.
+  systemPromptAppends?: string[]
+  // The active model's already-resolved API effort. Undefined means don't override. Frameworks encode
+  // this into their valid transport vocabulary without changing the persisted user intent.
+  reasoningEffort?: ModelReasoningEffort
+  // Distinct model-native effort values advertised by the active model profile. Frameworks that
+  // register custom model metadata use this to keep their capability catalog consistent with the
+  // selected effort above.
+  reasoningEfforts?: readonly ModelReasoningEffort[]
 }
 
 // System-prompt guidance the runtime wants appended for a session (artifact routing, notebook, skill
 // privacy). The framework decides HOW it is delivered — see SessionSetup.
 export type SessionSetupContext = {
   systemPromptAppends: string[]
+  // Short, high-priority reminders that must reach each turn when the framework carries the complete
+  // appends only in session metadata. Frameworks whose appends already ride each prompt may omit them.
+  turnPromptReminders?: string[]
+  // Framework-native options resolved with the active backend and applied to every session created
+  // on that connection. Claude uses this to inject app-owned settings/plugins into shared auth mode.
+  sessionOptions?: Record<string, unknown>
+  // undefined is the Main Agent and must omit the native field; [] is an explicit Specialist
+  // zero-skill whitelist and must be preserved verbatim by supporting frameworks.
+  skillWhitelist?: string[]
 }
 
 // Framework-specific session configuration returned to the runtime. `meta` becomes the ACP `_meta`
 // on session/new and session/resume. `promptPrefix` is prepended to prompt content when the framework
-// cannot carry appends in session meta (opencode has no system-prompt preset).
+// cannot carry appends in session meta, or when a session-level append needs a per-turn reminder.
+// `persistentSystemPrompt` exposes the exact transformed text delivered through framework-specific
+// metadata so context accounting never has to inspect that opaque transport shape.
 export type SessionSetup = {
   meta?: Record<string, unknown>
   promptPrefix?: string
+  persistentSystemPrompt?: string
 }
+
+export type ProxyEnvironmentMode = 'inherit' | 'replace'
 
 // Already-resolved spawn inputs: env and args come from prepareModelConfig merged over the base
 // process env; configFiles are written by the runtime before this call.
@@ -85,14 +119,41 @@ export type AgentSpawnInput = {
   executablePath: string
   env: Record<string, string>
   args: string[]
+  // `replace` means the host resolved an explicit proxy or DIRECT decision and inherited proxy
+  // variables must not override it. `inherit` preserves them after a host resolver failure.
+  proxyEnvironmentMode?: ProxyEnvironmentMode
   debug?: boolean
 }
+
+// How a framework keeps long-running sessions inside their context window. A native command makes
+// manual compaction available over ACP session/prompt. `triggerAtPercent` is present only when the host
+// also owns automatic triggering; frameworks that compact automatically themselves omit it.
+export type ContextCompactionStrategy =
+  | {
+      kind: 'native-command'
+      command: string
+      triggerAtPercent?: number
+      // Some ACP adapters report a failed control turn only through assistant output, then return
+      // end_turn. The runtime suppresses that output but uses this prefix to preserve failure state.
+      failureTextPrefix?: string
+    }
+  | { kind: 'framework-managed' }
+
+export type CommandShellDialect = 'posix' | 'powershell'
 
 // One switchable agent backend. The ACP runtime stays generic and delegates only the framework-coupled
 // decisions to this interface. See docs/internal/pluggable-agent-framework-feasibility.md.
 export interface AgentFramework {
   readonly id: AgentFrameworkId
   readonly displayName: string
+
+  // The shell grammar used for provider-native command tools. The permission Broker consumes this
+  // fact when validating remembered command groups; the framework does not make permission decisions.
+  readonly commandShellDialect?: CommandShellDialect
+
+  // Keeps slash-command details at the framework seam so the generic runtime only asks for native
+  // compaction and never branches on framework ids.
+  readonly contextCompaction: ContextCompactionStrategy
 
   // Launch the ACP agent subprocess (stdio JSON-RPC), wrapping the per-framework binary + args.
   spawn(input: AgentSpawnInput): ChildProcessWithoutNullStreams
@@ -139,6 +200,14 @@ export type ResolvedAgentBackend = {
   executablePath: string
   env: Record<string, string>
   args?: string[]
+  proxyEnvironmentMode?: ProxyEnvironmentMode
+  // Framework-native session options retained by the runtime and passed through buildSessionSetup.
+  sessionOptions?: Record<string, unknown>
+  // Backend-resolved guidance appended to every session. Connector conventions use this channel for
+  // Claude and Codex; OpenCode keeps the same guidance in its generated instructions config.
+  systemPromptAppends?: string[]
+  // Exact stable text already installed in the backend's native instructions configuration.
+  persistentSystemPrompt?: string
   // Model to apply per session via the ACP `model` configOption, for frameworks that select the model
   // over the protocol rather than via env (opencode). Undefined ⇒ the framework's env/config drives it
   // (Claude uses ANTHROPIC_MODEL). Applied best-effort: skipped when the agent advertises no match.
@@ -146,9 +215,37 @@ export type ResolvedAgentBackend = {
   // Subscription backends must run the model selected in the UI. When true, a missing/rejected live
   // model option fails session creation instead of silently using the agent's account default.
   sessionModelRequired?: boolean
-  // Reasoning-effort level to apply per session via the ACP `thought_level` configOption, resolved
-  // to the closest level the agent advertises. Undefined ⇒ the agent keeps its own default.
-  sessionEffort?: ReasoningEffort
+  // Model-resolved reasoning effort to apply per session via ACP. The runtime uses exact matching;
+  // undefined leaves the agent default unchanged.
+  sessionEffort?: ModelReasoningEffort
+  // Exact context-window limit for the selected upstream provider model. Framework adapters may
+  // report a fallback or bridge transport model instead, so the runtime treats this as authoritative.
+  contextWindow?: number
+  // Upstream provider model used for local context tokenization. This is deliberately separate from
+  // `sessionModel`: a framework may select its model through env rather than ACP, or use a bridge
+  // transport model whose id differs from the provider model that ultimately tokenizes the request.
+  contextUsageModel?: string
   authentication?: AgentAuthentication
   providerConfiguration?: AgentProviderConfiguration
+  // Authenticated loopback API exposed by the same OpenCode ACP process. The runtime snapshots
+  // assistant messages around a prompt so it can aggregate every model step in that user turn.
+  opencodeUsageApi?: {
+    baseUrl: string
+    authorization: string
+  }
+  // A bridged backend owns one reference to its local loopback bridge. Runtime teardown releases it;
+  // reviewer sessions register their Codex prompt_cache_key here so routing never depends on content.
+  responsesBridgeLease?: {
+    selectSkills: (
+      text: string,
+      catalog: ResponsesBridgeSkillCandidate[],
+      signal?: AbortSignal
+    ) => Promise<ResponsesBridgeSkillInput[]>
+    registerReviewerSession: (promptCacheKey: string) => void
+    unregisterReviewerSession: (promptCacheKey: string) => boolean
+    // Updates the concrete effort on this runtime's own bridged provider/model. Keeping it on the
+    // lease prevents an active-model value from leaking into bridges owned by retiring generations.
+    setReasoningEffort?: (effort?: ModelReasoningEffort) => void
+    release: () => Promise<void>
+  }
 }

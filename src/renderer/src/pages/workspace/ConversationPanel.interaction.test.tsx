@@ -109,24 +109,26 @@ const renderPanel = (props: Partial<Parameters<typeof ConversationPanel>[0]> = {
         draftDoc={emptyDoc}
         canSendMessage={false}
         canEditDraft
+        canResumeSession
         actionError={null}
-        isPreviewPanelCollapsed={false}
         attachments={[]}
+        attachmentTransfers={[]}
         isUploadingAttachments={false}
         notebookReference={undefined}
         pendingPermissions={[]}
         permissionProfile="ask"
         permissionProfileState={undefined}
         permissionGrants={[]}
+        contextUsage={undefined}
         canChangePermissionProfile
         onDraftDocChange={vi.fn()}
         onSendMessage={vi.fn()}
         onStageAttachmentFiles={onStageAttachmentFiles}
         onRemoveAttachment={vi.fn()}
+        onCancelAttachmentTransfer={vi.fn()}
         onCancelRun={vi.fn()}
         onResumeSession={vi.fn().mockResolvedValue(undefined)}
         onOpenNotebook={vi.fn()}
-        onTogglePreviewPanel={vi.fn()}
         onRespondToPermission={vi.fn()}
         onPermissionProfileChange={vi.fn()}
         onRevokePermissionGrant={vi.fn()}
@@ -149,6 +151,12 @@ const getComposerForm = (): HTMLElement => {
   const form = container.querySelector('form')
   if (!form) throw new Error('composer form not found')
   return form as HTMLElement
+}
+
+const getConversationHeader = (): HTMLElement => {
+  const header = container.querySelector('[data-testid="conversation-header"]')
+  if (!header) throw new Error('conversation header not found')
+  return header as HTMLElement
 }
 
 const getComposerEditor = (): HTMLElement => {
@@ -178,6 +186,17 @@ const dispatchDrag = (type: string, dataTransferTypes: string[], files: File[] =
   })
 }
 
+describe('ConversationPanel header spacing', () => {
+  it('keeps stable title spacing independent of sidebar state', () => {
+    renderPanel()
+
+    expect(getConversationHeader().className.split(' ')).toEqual(
+      expect.arrayContaining(['px-4', 'pt-2'])
+    )
+    expect(getConversationHeader().className.split(' ')).not.toContain('pl-8')
+  })
+})
+
 const hasDropOverlay = (): boolean =>
   container.textContent?.includes('Drop files to attach') ?? false
 
@@ -196,6 +215,68 @@ afterEach(() => {
 })
 
 describe('ConversationPanel composer intake', () => {
+  it.each([
+    ['darwin', '⌘K'],
+    ['win32', 'Ctrl+K'],
+    ['linux', 'Ctrl+K']
+  ])('shows the %s global-search shortcut in the placeholder', (platform, shortcut) => {
+    const previousApi = window.api
+    window.api = { platform } as Window['api']
+
+    renderPanel()
+
+    expect(getComposerEditor().getAttribute('data-placeholder')).toBe(
+      `Ask anything — / for skills, @ for files, ${shortcut} to search`
+    )
+    window.api = previousApi
+  })
+
+  it('shows file type and per-file size behavior before selection', () => {
+    renderPanel()
+
+    expect(container.querySelector('[data-testid="attachment-limits"]')?.textContent).toContain(
+      'Any file type · 10 GB per file. Large files are linked, not embedded.'
+    )
+  })
+
+  it('shows per-file progress and cancels only the selected transfer', () => {
+    const onCancelAttachmentTransfer = vi.fn()
+    const transfer = {
+      transferId: 'transfer-1',
+      name: 'large.csv',
+      mimeType: 'text/csv',
+      receivedBytes: 25,
+      totalBytes: 100,
+      status: 'uploading' as const
+    }
+    renderPanel({
+      attachmentTransfers: [transfer],
+      isUploadingAttachments: true,
+      onCancelAttachmentTransfer
+    })
+
+    const progress = container.querySelector('[role="progressbar"]')
+    const cancel = container.querySelector(
+      'button[aria-label="Cancel attachment large.csv"]'
+    ) as HTMLButtonElement | null
+
+    expect(progress?.getAttribute('aria-valuenow')).toBe('25')
+    expect(container.textContent).toContain('25% of 100 B')
+    expect(cancel).not.toBeNull()
+    act(() => cancel?.click())
+    expect(onCancelAttachmentTransfer).toHaveBeenCalledWith(transfer)
+  })
+
+  it('uses a flat border without a card shadow', () => {
+    renderPanel()
+
+    const composerForm = getComposerForm()
+
+    expect(composerForm.classList.contains('border')).toBe(true)
+    expect(composerForm.classList.contains('border-border-200')).toBe(true)
+    expect(composerForm.classList.contains('shadow-card-opaque')).toBe(false)
+  })
+
   it('stages a pasted non-image file', () => {
     renderPanel()
     const pdf = new File(['%PDF'], 'report.pdf', { type: 'application/pdf' })
@@ -269,6 +350,40 @@ describe('ConversationPanel composer intake', () => {
     })
 
     expect(onDraftDocChange).toHaveBeenCalledWith({ nodes: [{ type: 'text', text: 'hello' }] })
+  })
+})
+
+describe('ConversationPanel interrupted Session recovery', () => {
+  it('keeps Resume disabled while Session persistence is unavailable', () => {
+    const onResumeSession = vi.fn().mockResolvedValue(undefined)
+    const interruptedSession: ChatSession = {
+      id: 'session-interrupted',
+      projectId: 'project-a',
+      title: 'Interrupted session',
+      cwd: '/workspace',
+      status: 'idle',
+      interrupted: true,
+      messages: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    }
+
+    renderPanel({
+      activeSession: interruptedSession,
+      canResumeSession: false,
+      onResumeSession
+    })
+
+    const resumeButton = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Resume session"]'
+    )
+    expect(resumeButton?.disabled).toBe(true)
+    expect(resumeButton?.dataset.slot).toBe('button')
+    expect(resumeButton?.className).toContain('focus-visible:ring-3')
+    expect(resumeButton?.className).toContain('disabled:pointer-events-none')
+
+    act(() => resumeButton?.click())
+    expect(onResumeSession).not.toHaveBeenCalled()
   })
 })
 
@@ -483,15 +598,21 @@ describe('ConversationPanel compacting state', () => {
   }
 
   it('shows a neutral compacting note and hides the overflow error during recovery', () => {
+    const onCancelRun = vi.fn()
     // The raw overflow error is still present as a global actionError, but must be suppressed while the
     // session is compacting so the user sees the recovery affordance, not a dead-end.
     renderPanel({
       activeSession: compactingSession,
-      actionError: 'Internal error: Request too large (max 32MB).'
+      actionError: 'Internal error: Request too large (max 32MB).',
+      onCancelRun
     })
 
     expect(container.textContent).toContain('Compacting conversation to fit the context limit')
     expect(container.textContent).not.toContain('Request too large')
+    const cancelButton = container.querySelector('[aria-label="Cancel run"]') as HTMLButtonElement
+    expect(cancelButton).not.toBeNull()
+    act(() => cancelButton.click())
+    expect(onCancelRun).toHaveBeenCalledOnce()
   })
 })
 
@@ -506,6 +627,16 @@ describe('ConversationPanel notebook bar', () => {
     createdAt: Date.now(),
     updatedAt: Date.now()
   }
+  const notebookReference = {
+    notebookId: 'nb-1',
+    sessionId: 'session-bar',
+    projectName: 'proj',
+    workspaceCwd: '/workspace',
+    notebookSessionRoot: '/nb',
+    dataRoot: '/data',
+    runtimeRoot: '/rt',
+    runJsonPath: '/run.json'
+  }
 
   it('hides the notebook bar when there is no notebookReference and no running job', () => {
     mockHasRunningJobs = false
@@ -517,20 +648,28 @@ describe('ConversationPanel notebook bar', () => {
 
   it('shows only the Notebook button when notebookReference exists and no running job', () => {
     mockHasRunningJobs = false
-    const ref = {
-      notebookId: 'nb-1',
-      sessionId: 'session-bar',
-      projectName: 'proj',
-      workspaceCwd: '/workspace',
-      notebookSessionRoot: '/nb',
-      dataRoot: '/data',
-      runtimeRoot: '/rt',
-      runJsonPath: '/run.json'
-    }
-    renderPanel({ activeSession: session, notebookReference: ref })
+    renderPanel({ activeSession: session, notebookReference })
 
     expect(container.querySelector('[aria-label="Open notebook"]')).not.toBeNull()
     expect(container.querySelector('[data-testid="remote-job-badge"]')).toBeNull()
+  })
+
+  it('animates the notebook bar upward when it appears', () => {
+    renderPanel({ activeSession: session, notebookReference })
+
+    const notebookBar = container.querySelector('[aria-label="Open notebook"]')?.parentElement
+
+    expect(notebookBar?.className).toContain('motion-safe:animate-in')
+    expect(notebookBar?.className).toContain('motion-safe:fade-in-0')
+    expect(notebookBar?.className).toContain('motion-safe:slide-in-from-bottom-1')
+  })
+
+  it('shows a pointer cursor over the Notebook button', () => {
+    renderPanel({ activeSession: session, notebookReference })
+
+    const notebookButton = container.querySelector('[aria-label="Open notebook"]')
+
+    expect(notebookButton?.className).toContain('cursor-pointer')
   })
 
   it('shows only the job badge when there is no notebookReference but there are running jobs', () => {
@@ -542,20 +681,43 @@ describe('ConversationPanel notebook bar', () => {
     expect(container.querySelector('[data-testid="remote-job-badge"]')).not.toBeNull()
   })
 
+  it('keeps the job-only bar compact and static', () => {
+    mockAllJobs = [{ job_id: 'job-1', status: 'running', created_at: Date.now() }]
+    renderPanel({ activeSession: session, notebookReference: undefined })
+
+    const jobBar = container.querySelector('[data-testid="remote-job-badge"]')?.parentElement
+
+    expect(jobBar?.classList.contains('min-h-9')).toBe(true)
+    expect(jobBar?.classList.contains('bg-bg-000')).toBe(true)
+    expect(jobBar?.classList.contains('motion-safe:animate-in')).toBe(false)
+  })
+
+  it('remounts the bar when a Notebook appears after jobs', () => {
+    mockAllJobs = [{ job_id: 'job-1', status: 'running', created_at: Date.now() }]
+    renderPanel({ activeSession: session, notebookReference: undefined })
+    const jobBar = container.querySelector('[data-testid="remote-job-badge"]')?.parentElement
+
+    renderPanel({ activeSession: session, notebookReference })
+    const notebookBar = container.querySelector('[aria-label="Open notebook"]')?.parentElement
+
+    expect(notebookBar).not.toBe(jobBar)
+    expect(notebookBar?.classList.contains('motion-safe:animate-in')).toBe(true)
+  })
+
+  it('does not layer card shadows behind the composer border', () => {
+    renderPanel({ activeSession: session, notebookReference })
+
+    const notebookBar = container.querySelector('[aria-label="Open notebook"]')?.parentElement
+    const composerBackdrop = getComposerForm().previousElementSibling
+
+    expect(notebookBar?.classList.contains('shadow-card')).toBe(false)
+    expect(composerBackdrop?.classList.contains('shadow-card')).toBe(false)
+  })
+
   it('shows both the Notebook button and the job badge when both are present', () => {
     mockHasRunningJobs = true
     mockAllJobs = [{ job_id: 'job-1', status: 'running', created_at: Date.now() }]
-    const ref = {
-      notebookId: 'nb-1',
-      sessionId: 'session-bar',
-      projectName: 'proj',
-      workspaceCwd: '/workspace',
-      notebookSessionRoot: '/nb',
-      dataRoot: '/data',
-      runtimeRoot: '/rt',
-      runJsonPath: '/run.json'
-    }
-    renderPanel({ activeSession: session, notebookReference: ref })
+    renderPanel({ activeSession: session, notebookReference })
 
     expect(container.querySelector('[aria-label="Open notebook"]')).not.toBeNull()
     expect(container.querySelector('[data-testid="remote-job-badge"]')).not.toBeNull()
@@ -566,8 +728,8 @@ describe('ConversationPanel notebook bar', () => {
     mockAllJobs = [{ job_id: 'job-1', status: 'done', created_at: Date.now() }]
     renderPanel({ activeSession: session, notebookReference: undefined })
 
-    // Bar should be visible (the container that wraps badge/notebook button)
-    const notebookBar = container.querySelector('.mb-2.flex.min-h-9')
+    // The badge's parent is the shared notebook/job bar.
+    const notebookBar = container.querySelector('[data-testid="remote-job-badge"]')?.parentElement
     expect(notebookBar).not.toBeNull()
     // Badge should be visible even though no jobs are running
     expect(container.querySelector('[data-testid="remote-job-badge"]')).not.toBeNull()
@@ -592,5 +754,137 @@ describe('ConversationPanel notebook bar', () => {
 
     expect(handleOpenJobList).toHaveBeenCalledTimes(1)
     expect(handleOpenJobList).toHaveBeenCalledWith('session-bar')
+  })
+})
+
+describe('ConversationPanel error box + report affordance', () => {
+  const errorSession: ChatSession = {
+    id: 'session-err',
+    projectId: 'project-a',
+    title: 'Error session',
+    cwd: '/workspace',
+    status: 'error',
+    error: 'Run failed: connection reset',
+    messages: [],
+    createdAt: Date.now(),
+    updatedAt: Date.now()
+  }
+
+  const reportButton = (): HTMLElement | null =>
+    container.querySelector('[aria-label="Report this error"]')
+
+  const errorBoxText = (): string => container.querySelector('.border-red-200')?.textContent ?? ''
+
+  it('shows the error and a Report button for a failed run (status === error)', () => {
+    renderPanel({ activeSession: errorSession })
+    expect(errorBoxText()).toContain('Run failed: connection reset')
+    expect(reportButton()).not.toBeNull()
+  })
+
+  it('renders the error box for a failed run even when it has no error text', () => {
+    renderPanel({ activeSession: { ...errorSession, error: undefined } })
+    // The shown fallback equals the text seeded into the report (single RUN_FAILED_FALLBACK_ERROR),
+    // upholding the "shown == reported" invariant when a failed run carries no error message.
+    expect(errorBoxText()).toContain('The run failed with no error message.')
+    // Still reportable — the affordance follows the failure status, not the presence of text.
+    expect(reportButton()).not.toBeNull()
+  })
+
+  it('shows only the transient actionError, without a Report button, for a non-failed session', () => {
+    renderPanel({
+      activeSession: { ...errorSession, status: 'idle', error: undefined },
+      actionError: 'Could not send message'
+    })
+    expect(errorBoxText()).toContain('Could not send message')
+    expect(reportButton()).toBeNull()
+  })
+
+  it('shows both a transient actionError and the run failure, keeping the Report button', () => {
+    // Both present: each error gets its own row, and the run failure keeps its report entry — a
+    // transient error must not suppress the ability to report the actual failure.
+    renderPanel({ activeSession: errorSession, actionError: 'Could not send message' })
+    const text = errorBoxText()
+    expect(text).toContain('Could not send message')
+    expect(text).toContain('Run failed: connection reset')
+    expect(reportButton()).not.toBeNull()
+  })
+
+  it('opens the report dialog when the Report button is clicked', () => {
+    renderPanel({ activeSession: errorSession })
+    act(() => {
+      reportButton()?.click()
+    })
+    // Dialog renders into a portal on document.body.
+    const title = Array.from(document.body.querySelectorAll('*')).find(
+      (el) => el.textContent === 'Report this error' && el.children.length === 0
+    )
+    expect(title).toBeTruthy()
+  })
+
+  it('seeds the dialog with the same fallback text the box shows when a run has no error', () => {
+    // shown == reported: the textarea the user reviews must carry the exact string shown in the box.
+    renderPanel({ activeSession: { ...errorSession, error: undefined } })
+    const shown = errorBoxText()
+    act(() => {
+      reportButton()?.click()
+    })
+    const textarea = document.body.querySelector(
+      'textarea[aria-label="Error details"]'
+    ) as HTMLTextAreaElement | null
+    expect(textarea?.value).toBe('The run failed with no error message.')
+    expect(shown).toContain(textarea?.value ?? '')
+  })
+
+  it('uses the shared fallback for a whitespace-only persisted error', () => {
+    renderPanel({ activeSession: { ...errorSession, error: '   ' } })
+    expect(errorBoxText()).toContain('The run failed with no error message.')
+
+    act(() => {
+      reportButton()?.click()
+    })
+
+    const textarea = document.body.querySelector(
+      'textarea[aria-label="Error details"]'
+    ) as HTMLTextAreaElement | null
+    expect(textarea?.value).toBe('The run failed with no error message.')
+  })
+
+  it('hides the Report button for an app-crafted, actionable failure', () => {
+    // A recognized failure keeps its message but is not a bug worth a GitHub issue.
+    renderPanel({
+      activeSession: {
+        ...errorSession,
+        error: 'Session workspace is missing; start a new conversation.'
+      }
+    })
+    expect(errorBoxText()).toContain('Session workspace is missing')
+    expect(reportButton()).toBeNull()
+  })
+
+  it('hides the Report button for a model-provider error (tagged non-reportable at the ACP layer)', () => {
+    // A provider/model failure is tagged structurally (errorReportable: false), not by its text —
+    // the raw provider message is kept visible but is not a bug worth a GitHub issue.
+    renderPanel({
+      activeSession: {
+        ...errorSession,
+        error: 'Invalid API key',
+        errorReportable: false
+      }
+    })
+    expect(errorBoxText()).toContain('Invalid API key')
+    expect(reportButton()).toBeNull()
+  })
+
+  it('shows the Report button when a persisted error predates the reportable flag (undefined)', () => {
+    // Old sessions have no errorReportable; fall back to classifying the text — an opaque failure
+    // stays reportable, an app-crafted reminder does not.
+    renderPanel({
+      activeSession: {
+        ...errorSession,
+        error: 'Run failed: connection reset',
+        errorReportable: undefined
+      }
+    })
+    expect(reportButton()).not.toBeNull()
   })
 })

@@ -1,15 +1,24 @@
-import { CheckCircle2, FolderInput, RefreshCw } from 'lucide-react'
-import { AlertDialog } from 'radix-ui'
-import { useEffect, useState } from 'react'
+import { CheckCircle2, FolderInput, Package, RefreshCw, Search } from 'lucide-react'
+import { AlertDialog, Dialog } from 'radix-ui'
+import { useEffect, useRef, useState } from 'react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import {
+  dialogDescriptionClassName,
+  dialogOverlayClassName,
+  dialogPanelClassName,
+  dialogTitleClassName
+} from '@/components/ui/dialog-chrome'
+import { Input } from '@/components/ui/input'
+import { useRetainedDialogValue } from '@/components/ui/use-retained-dialog-value'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 import { useNotebookEnvStore } from '@/stores/notebook-env-store'
 import {
   isEnvEnabled,
   type DiscoveredInterpreter,
+  type EnvPackage,
   type RuntimeEnablement,
   type RuntimeUsage
 } from '../../../../shared/notebook-runtime'
@@ -32,6 +41,11 @@ const LANGUAGES: ReadonlyArray<{ id: NotebookLanguage; label: string; icon: Reac
 type EnvLists = { python: DiscoveredInterpreter[]; r: DiscoveredInterpreter[] }
 type Enablements = Partial<Record<NotebookLanguage, RuntimeEnablement>>
 
+type RuntimesPanelProps = {
+  title: string
+  description: React.ReactNode
+}
+
 // Human provider/type for the card badge (provenance + conda env name), e.g. "App-managed",
 // "Conda: bio", "System".
 const providerType = (env: DiscoveredInterpreter): string => {
@@ -52,7 +66,7 @@ const managedLine = (runnable: boolean, preparing: boolean, message?: string): s
   return runnable ? 'Installed and ready' : 'Managed runtime is not set up yet'
 }
 
-const RuntimesPanel = (): React.JSX.Element => {
+const RuntimesPanel = ({ title, description }: RuntimesPanelProps): React.JSX.Element => {
   const [envs, setEnvs] = useState<EnvLists | null>(null)
   const [enablement, setEnablement] = useState<Enablements>({})
   const [loaded, setLoaded] = useState(false)
@@ -65,6 +79,22 @@ const RuntimesPanel = (): React.JSX.Element => {
     env: DiscoveredInterpreter
     usage: RuntimeUsage
   } | null>(null)
+  const dialogDisableImpact = useRetainedDialogValue(disableImpact)
+  // The env whose installed-packages dialog is open (null = closed).
+  const [packagesEnv, setPackagesEnv] = useState<DiscoveredInterpreter | null>(null)
+  const dialogPackagesEnv = useRetainedDialogValue(packagesEnv)
+  // Dialog content: the fetched list, or a load error with a Retry affordance. retryNonce re-runs
+  // the fetch effect without closing/reopening the dialog.
+  const [packages, setPackages] = useState<EnvPackage[] | null>(null)
+  const [packagesError, setPackagesError] = useState<string | null>(null)
+  const [packagesRetryNonce, setPackagesRetryNonce] = useState(0)
+  const [packagesFilter, setPackagesFilter] = useState('')
+  // Per-env package counts for the card button badges, fetched lazily AFTER the panel loads.
+  // countsRef is the source of truth (readable inside effects without re-triggering them); the
+  // state mirror drives rendering. A present null entry means "fetch attempted, unavailable" —
+  // the card simply omits the badge (a count failure is never surfaced as card-level error UI).
+  const countsRef = useRef<Record<string, number | null>>({})
+  const [packageCounts, setPackageCounts] = useState<Record<string, number | null>>({})
   const initEnv = useNotebookEnvStore((state) => state.init)
   const provisionEnv = useNotebookEnvStore((state) => state.provision)
   const cancelEnv = useNotebookEnvStore((state) => state.cancel)
@@ -87,6 +117,8 @@ const RuntimesPanel = (): React.JSX.Element => {
       window.api.runtime.getEnablement('r').catch(() => undefined)
     ]).then(([nextEnvs, python, r]) => [nextEnvs, { python, r }])
 
+  // Commit discovery and persisted permissions as one snapshot. Mixing a fresh interpreter list
+  // with stale enablement could briefly expose the wrong toggle or package-install authorization.
   const applyAll = ([nextEnvs, nextEnablement]: [EnvLists, Enablements]): void => {
     setEnvs(nextEnvs)
     setEnablement(nextEnablement)
@@ -97,9 +129,65 @@ const RuntimesPanel = (): React.JSX.Element => {
     void fetchAll().then(applyAll)
   }, [])
 
+  // Lazy package-count fetch: runs AFTER the env list lands (never blocks fetchAll). One bulk
+  // listPackageCounts call per language (the main process does ONE discovery sweep per call and
+  // bounds listing concurrency itself), so filling N badges costs 2 IPC calls — not N per-env calls
+  // that each re-run full discovery. A failed bulk call (or a null per-env count) simply leaves the
+  // badge absent; Recheck clears countsRef so the badges refetch against the new env list.
+  useEffect(() => {
+    if (envs === null) return
+    let cancelled = false
+    for (const language of LANGUAGES) {
+      // No runnable envs for the language -> nothing to count; skip the IPC call entirely.
+      if (!envs[language.id].some((env) => env.runnable)) continue
+      void window.api.runtime
+        .listPackageCounts(language.id)
+        .then((counts) => {
+          if (cancelled) return
+          Object.assign(countsRef.current, counts)
+          setPackageCounts({ ...countsRef.current })
+        })
+        .catch(() => {
+          // Best-effort badges: a bulk failure is not surfaced as card-level error UI.
+        })
+    }
+    return () => {
+      cancelled = true
+    }
+  }, [envs])
+
+  // Fetches the open dialog's package list; re-runs on Retry via packagesRetryNonce. A successful
+  // fetch also refreshes the card's count badge (the dialog shows the same truth). The loading/error
+  // reset happens in the open/retry click handlers, not synchronously here (react-hooks lint).
+  useEffect(() => {
+    if (packagesEnv === null) return
+    const env = packagesEnv
+    let cancelled = false
+    window.api.runtime
+      .listPackages(env.language, env.envId)
+      .then((list) => {
+        if (cancelled) return
+        setPackages(list)
+        countsRef.current[env.envId] = list.length
+        setPackageCounts({ ...countsRef.current })
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return
+        setPackagesError(e instanceof Error ? e.message : 'Could not list packages.')
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [packagesEnv, packagesRetryNonce])
+
+  // Recheck refreshes both halves of the runtime registry together for the same reason as initial
+  // loading: cards and their permissions must describe one coherent backend snapshot. Counts are
+  // cleared too so every badge refetches against the new env list.
   const recheck = async (): Promise<void> => {
     setBusy(true)
     setError(null)
+    countsRef.current = {}
+    setPackageCounts({})
     try {
       applyAll(await fetchAll())
     } catch (e) {
@@ -199,11 +287,11 @@ const RuntimesPanel = (): React.JSX.Element => {
   }
 
   const addInterpreter = async (language: NotebookLanguage): Promise<void> => {
-    const path = await window.api.runtime.pickInterpreter()
-    if (!path) return
     setBusy(true)
     setError(null)
     try {
+      const path = await window.api.runtime.pickInterpreter()
+      if (!path) return
       // Add the picked path to the discovery catalog; it then surfaces as a (user-own) card once
       // discovery probes it. It starts DISABLED (user-own default) — the user enables it explicitly.
       await window.api.runtime.registerInterpreter(language, path)
@@ -223,14 +311,13 @@ const RuntimesPanel = (): React.JSX.Element => {
   }
 
   const provisionManaged = async (language: NotebookLanguage): Promise<void> => {
-    // Don't hold the shared `busy` flag for the whole download — that would keep Cancel disabled for
-    // the entire setup. `provisioningLang` (+ the store's preparing state) drives the button instead,
-    // leaving Cancel clickable throughout.
+    // Provisioning deliberately avoids the panel-wide busy flag. Per-language store state marks only
+    // the active runtime as preparing and leaves its Cancel action available throughout the download.
     setError(null)
-    // The store tracks preparing per-language (byLang), so no local per-language flag is needed and
-    // Cancel stays clickable throughout without holding the shared `busy` flag.
     try {
       await provisionEnv(language)
+      // The provisioner updates files and registry metadata in the main process; reload both the
+      // discovered environments and persisted enablement before rendering the completed card.
       applyAll(await fetchAll())
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Could not refresh runtime readiness.')
@@ -304,6 +391,31 @@ const RuntimesPanel = (): React.JSX.Element => {
           />
         </div>
 
+        {env.runnable ? (
+          <div className="mt-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              data-testid="runtime-packages-button"
+              onClick={() => {
+                setPackages(null)
+                setPackagesError(null)
+                setPackagesFilter('')
+                setPackagesEnv(env)
+              }}
+            >
+              <Package aria-hidden="true" />
+              Packages
+              {typeof packageCounts[env.envId] === 'number' ? (
+                <Badge variant="secondary" data-testid="runtime-packages-count">
+                  {packageCounts[env.envId]}
+                </Badge>
+              ) : null}
+            </Button>
+          </div>
+        ) : null}
+
         {external && enabled ? (
           <div className="mt-3 border-t border-border pt-3">
             <SettingsRow
@@ -328,201 +440,214 @@ const RuntimesPanel = (): React.JSX.Element => {
 
   const loading = !loaded || envs === null
 
+  // Dialog table derivations. Build/Channel columns appear only for conda-style listings (any
+  // package carrying build/channel); pip/CRAN listings get just Name/Version.
+  const visiblePackages = (packages ?? []).filter((pkg) =>
+    pkg.name.toLowerCase().includes(packagesFilter.trim().toLowerCase())
+  )
+  const hasCondaFields = (packages ?? []).some(
+    (pkg) => pkg.build !== undefined || pkg.channel !== undefined
+  )
+  const condaPackageCount = (packages ?? []).filter(
+    (pkg) => pkg.build !== undefined || pkg.channel !== undefined
+  ).length
+
   return (
-    <div className="space-y-5 p-5" data-testid="runtimes-panel">
-      <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0">
-          <p className="text-xs leading-relaxed text-muted-foreground">
-            Enable the environments each notebook language may run in. The app-managed environment
-            is on by default; enable your own interpreters to make them available to the agent.
+    <div className="p-5" data-testid="runtimes-panel">
+      <SettingsSection
+        title={title}
+        description={description}
+        aria-label={title}
+        contentClassName="space-y-5"
+        actionClassName="ml-auto"
+        action={
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => void recheck()}
+            disabled={busy}
+          >
+            <RefreshCw className={cn(busy && 'animate-spin')} aria-hidden="true" />
+            Recheck
+          </Button>
+        }
+      >
+        {error !== null && (
+          <p role="alert" className="text-sm text-destructive" data-testid="runtimes-error">
+            {error}
           </p>
-        </div>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          onClick={() => void recheck()}
-          disabled={busy}
-        >
-          <RefreshCw className={cn(busy && 'animate-spin')} aria-hidden="true" />
-          Recheck
-        </Button>
-      </div>
+        )}
+        {loading ? (
+          <p className="text-sm text-muted-foreground">Detecting runtimes…</p>
+        ) : (
+          LANGUAGES.map(({ id, label, icon }) => {
+            const list = envs[id]
+            // Per-language provisioning state — set immediately on click and cleared when THIS language's
+            // run settles, independent of the other language (fixes the concurrent python/R phantom-cancel).
+            const langState = byLang[id]
+            const preparing = langState?.preparing ?? false
+            const langProgress = langState?.progress
+            const langError = langState?.error
+            const managedRunnable = managedRunnableFor(id)
 
-      {error !== null && (
-        <p role="alert" className="text-sm text-destructive" data-testid="runtimes-error">
-          {error}
-        </p>
-      )}
-      {loading ? (
-        <p className="text-sm text-muted-foreground">Detecting runtimes…</p>
-      ) : (
-        LANGUAGES.map(({ id, label, icon }) => {
-          const list = envs[id]
-          // Per-language provisioning state — set immediately on click and cleared when THIS language's
-          // run settles, independent of the other language (fixes the concurrent python/R phantom-cancel).
-          const langState = byLang[id]
-          const preparing = langState?.preparing ?? false
-          const langProgress = langState?.progress
-          const langError = langState?.error
-          const managedRunnable = managedRunnableFor(id)
+            // App-managed goes FIRST; the user's own detected interpreters follow. A provisioned
+            // app-managed env appears in `list` (provenance app-managed) and renders as a normal card;
+            // when it isn't set up yet there is no such entry, so a setup card is shown in its place.
+            const managedEnv = list.find((env) => env.provenance === 'app-managed')
+            const ownEnvs = list.filter((env) => env.provenance !== 'app-managed')
 
-          // App-managed goes FIRST; the user's own detected interpreters follow. A provisioned
-          // app-managed env appears in `list` (provenance app-managed) and renders as a normal card;
-          // when it isn't set up yet there is no such entry, so a setup card is shown in its place.
-          const managedEnv = list.find((env) => env.provenance === 'app-managed')
-          const ownEnvs = list.filter((env) => env.provenance !== 'app-managed')
-
-          return (
-            <SettingsSection
-              key={id}
-              title={label}
-              icon={icon}
-              aria-label={`${label} runtime`}
-              separated
-              action={
-                <TooltipProvider>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Button
-                        type="button"
-                        variant="outline"
-                        size="sm"
-                        disabled={busy}
-                        onClick={() => void addInterpreter(id)}
-                      >
-                        <FolderInput aria-hidden="true" />
-                        Add interpreter…
-                      </Button>
-                    </TooltipTrigger>
-                    <TooltipContent className="max-w-xs">
-                      {id === 'r'
-                        ? 'Pick your Rscript executable — e.g. Rscript.exe (Windows) or bin/Rscript (macOS/Linux). Choose the file, not a folder.'
-                        : 'Pick your Python interpreter executable — e.g. python.exe (Windows) or bin/python (macOS/Linux). Choose the file, not a folder.'}
-                    </TooltipContent>
-                  </Tooltip>
-                </TooltipProvider>
-              }
-            >
-              <div className="space-y-2" data-testid={`runtimes-cards-${id}`}>
-                {/* App-managed FIRST: a real card once provisioned, else a setup card in the same frame. */}
-                {managedEnv ? (
-                  <>
-                    {renderEnvCard(id, managedEnv)}
-                    {/* An interrupted upgrade/install usually leaves the interpreter present (so the
-                        card above still renders), but recovery may have quarantined its prefix. Surface
-                        the block + Reset here too, or the recovery entry would be unreachable whenever a
-                        runnable managed env exists. */}
-                    {!preparing && langError?.includes('RUNTIME_RECOVERY_BLOCKED') ? (
-                      <div
-                        data-testid={`runtimes-recovery-blocked-${id}`}
-                        className="flex items-start justify-between gap-4 rounded-lg border border-destructive/40 bg-card p-3"
-                      >
-                        <p
-                          role="alert"
-                          className="text-[13px] text-destructive"
-                          data-testid={`runtimes-provision-error-${id}`}
-                        >
-                          {langError}
-                        </p>
+            return (
+              <SettingsSection
+                key={id}
+                title={label}
+                icon={icon}
+                aria-label={`${label} runtime`}
+                separated
+                action={
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
                         <Button
                           type="button"
                           variant="outline"
                           size="sm"
-                          className="shrink-0"
                           disabled={busy}
-                          onClick={() => void resetManaged(id)}
+                          onClick={() => void addInterpreter(id)}
                         >
-                          Reset runtime
+                          <FolderInput aria-hidden="true" />
+                          Add interpreter…
                         </Button>
-                      </div>
-                    ) : null}
-                  </>
-                ) : (
-                  <div
-                    data-testid="runtime-card"
-                    className="rounded-lg border border-border bg-card p-3"
-                  >
-                    <div className="flex items-start justify-between gap-4">
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2">
-                          <span className="text-sm font-medium text-foreground">
-                            App-managed environment
-                          </span>
-                          <Badge variant="secondary">App-managed</Badge>
-                        </div>
-                        <div className="mt-0.5 text-[13px] text-muted-foreground">
-                          {managedLine(managedRunnable, preparing, langProgress?.message)}
-                        </div>
-                        {preparing ? (
-                          <div
-                            className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-muted"
-                            role="progressbar"
-                            aria-label={`Setting up ${label} runtime`}
-                            aria-valuenow={Math.round((langProgress?.progress ?? 0) * 100)}
-                            aria-valuemin={0}
-                            aria-valuemax={100}
-                          >
-                            <div
-                              className="h-full rounded-full bg-primary transition-[width] duration-300"
-                              style={{
-                                width: `${Math.max(2, Math.min(100, Math.round((langProgress?.progress ?? 0) * 100)))}%`
-                              }}
-                            />
-                          </div>
-                        ) : null}
-                        {!preparing && langError ? (
+                      </TooltipTrigger>
+                      <TooltipContent className="max-w-xs">
+                        {id === 'r'
+                          ? 'Pick your Rscript executable — e.g. Rscript.exe (Windows) or bin/Rscript (macOS/Linux). Choose the file, not a folder.'
+                          : 'Pick your Python interpreter executable — e.g. python.exe (Windows) or bin/python (macOS/Linux). Choose the file, not a folder.'}
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                }
+              >
+                <div className="space-y-2" data-testid={`runtimes-cards-${id}`}>
+                  {/* App-managed FIRST: a real card once provisioned, else a setup card in the same frame. */}
+                  {managedEnv ? (
+                    <>
+                      {renderEnvCard(id, managedEnv)}
+                      {/* An interrupted upgrade/install usually leaves the interpreter present (so the
+                        card above still renders), but recovery may have quarantined its prefix. Surface
+                        the block + Reset here too, or the recovery entry would be unreachable whenever a
+                        runnable managed env exists. */}
+                      {!preparing && langError?.includes('RUNTIME_RECOVERY_BLOCKED') ? (
+                        <div
+                          data-testid={`runtimes-recovery-blocked-${id}`}
+                          className="flex items-start justify-between gap-4 rounded-lg border border-destructive/40 bg-card p-3"
+                        >
                           <p
                             role="alert"
-                            className="mt-1 text-[13px] text-destructive"
+                            className="text-[13px] text-destructive"
                             data-testid={`runtimes-provision-error-${id}`}
                           >
                             {langError}
                           </p>
-                        ) : null}
+                          <Button
+                            type="button"
+                            variant="default"
+                            size="sm"
+                            className="shrink-0"
+                            disabled={busy}
+                            onClick={() => void resetManaged(id)}
+                          >
+                            Reset runtime
+                          </Button>
+                        </div>
+                      ) : null}
+                    </>
+                  ) : (
+                    <div
+                      data-testid="runtime-card"
+                      className="rounded-lg border border-border bg-card p-3"
+                    >
+                      <div className="flex items-start justify-between gap-4">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-medium text-foreground">
+                              App-managed environment
+                            </span>
+                            <Badge variant="secondary">App-managed</Badge>
+                          </div>
+                          <div className="mt-0.5 text-[13px] text-muted-foreground">
+                            {managedLine(managedRunnable, preparing, langProgress?.message)}
+                          </div>
+                          {preparing ? (
+                            <div
+                              className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-muted"
+                              role="progressbar"
+                              aria-label={`Setting up ${label} runtime`}
+                              aria-valuenow={Math.round((langProgress?.progress ?? 0) * 100)}
+                              aria-valuemin={0}
+                              aria-valuemax={100}
+                            >
+                              <div
+                                className="h-full rounded-full bg-primary transition-[width] duration-300"
+                                style={{
+                                  width: `${Math.max(2, Math.min(100, Math.round((langProgress?.progress ?? 0) * 100)))}%`
+                                }}
+                              />
+                            </div>
+                          ) : null}
+                          {!preparing && langError ? (
+                            <p
+                              role="alert"
+                              className="mt-1 text-[13px] text-destructive"
+                              data-testid={`runtimes-provision-error-${id}`}
+                            >
+                              {langError}
+                            </p>
+                          ) : null}
+                        </div>
+                        {preparing ? (
+                          // A download/setup in progress is cancelable — never a locked, un-abortable state.
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="shrink-0"
+                            disabled={busy}
+                            onClick={() => void cancelProvision(id)}
+                          >
+                            Cancel
+                          </Button>
+                        ) : (
+                          <Button
+                            type="button"
+                            variant="default"
+                            size="sm"
+                            className="shrink-0"
+                            disabled={busy}
+                            onClick={() =>
+                              langError?.includes('RUNTIME_RECOVERY_BLOCKED')
+                                ? void resetManaged(id)
+                                : void provisionManaged(id)
+                            }
+                          >
+                            {langError?.includes('RUNTIME_RECOVERY_BLOCKED')
+                              ? 'Reset runtime'
+                              : langError
+                                ? 'Retry setup'
+                                : 'Download and set up'}
+                          </Button>
+                        )}
                       </div>
-                      {preparing ? (
-                        // A download/setup in progress is cancelable — never a locked, un-abortable state.
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="sm"
-                          className="shrink-0"
-                          disabled={busy}
-                          onClick={() => void cancelProvision(id)}
-                        >
-                          Cancel
-                        </Button>
-                      ) : (
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="sm"
-                          className="shrink-0"
-                          disabled={busy}
-                          onClick={() =>
-                            langError?.includes('RUNTIME_RECOVERY_BLOCKED')
-                              ? void resetManaged(id)
-                              : void provisionManaged(id)
-                          }
-                        >
-                          {langError?.includes('RUNTIME_RECOVERY_BLOCKED')
-                            ? 'Reset runtime'
-                            : langError
-                              ? 'Retry setup'
-                              : 'Download and set up'}
-                        </Button>
-                      )}
                     </div>
-                  </div>
-                )}
+                  )}
 
-                {ownEnvs.map((env) => renderEnvCard(id, env))}
-              </div>
-            </SettingsSection>
-          )
-        })
-      )}
+                  {ownEnvs.map((env) => renderEnvCard(id, env))}
+                </div>
+              </SettingsSection>
+            )
+          })
+        )}
+      </SettingsSection>
 
       <AlertDialog.Root
         open={disableImpact !== null}
@@ -531,20 +656,20 @@ const RuntimesPanel = (): React.JSX.Element => {
         }}
       >
         <AlertDialog.Portal>
-          <AlertDialog.Overlay className="fixed inset-0 z-50 bg-black/25 backdrop-blur-[2px]" />
+          <AlertDialog.Overlay className={dialogOverlayClassName} />
           <AlertDialog.Content
             data-testid="disable-impact-dialog"
-            className="fixed left-1/2 top-1/2 z-50 w-[min(440px,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 rounded-2xl bg-card p-6 text-foreground shadow-lg"
+            className={dialogPanelClassName('w-[min(440px,calc(100vw-2rem))]')}
           >
-            <AlertDialog.Title className="text-base font-semibold text-foreground">
-              Disable {disableImpact?.env.label}?
+            <AlertDialog.Title className={dialogTitleClassName}>
+              Disable {dialogDisableImpact?.env.label}?
             </AlertDialog.Title>
-            <AlertDialog.Description className="mt-2 text-sm leading-relaxed text-muted-foreground">
+            <AlertDialog.Description className={dialogDescriptionClassName}>
               It is in use by{' '}
-              {(disableImpact?.usage.running ?? 0) + (disableImpact?.usage.idle ?? 0)} active
-              session(s) — {disableImpact?.usage.running ?? 0} running,{' '}
-              {disableImpact?.usage.idle ?? 0} idle. Disabling lets any running cell finish, then
-              closes its kernel; those sessions must switch to another runtime to keep working.
+              {(dialogDisableImpact?.usage.running ?? 0) + (dialogDisableImpact?.usage.idle ?? 0)}{' '}
+              active session(s) — {dialogDisableImpact?.usage.running ?? 0} running,{' '}
+              {dialogDisableImpact?.usage.idle ?? 0} idle. Disabling lets any running cell finish,
+              then closes its kernel; those sessions must switch to another runtime to keep working.
             </AlertDialog.Description>
             <div className="mt-6 flex justify-end gap-2">
               <AlertDialog.Cancel asChild>
@@ -552,7 +677,7 @@ const RuntimesPanel = (): React.JSX.Element => {
                   Cancel
                 </Button>
               </AlertDialog.Cancel>
-              {(disableImpact?.usage.running ?? 0) > 0 ? (
+              {(dialogDisableImpact?.usage.running ?? 0) > 0 ? (
                 <AlertDialog.Action asChild>
                   <Button
                     type="button"
@@ -572,6 +697,163 @@ const RuntimesPanel = (): React.JSX.Element => {
           </AlertDialog.Content>
         </AlertDialog.Portal>
       </AlertDialog.Root>
+
+      <Dialog.Root
+        open={packagesEnv !== null}
+        onOpenChange={(open) => {
+          if (!open) setPackagesEnv(null)
+        }}
+      >
+        <Dialog.Portal>
+          <Dialog.Overlay className={dialogOverlayClassName} />
+          <Dialog.Content
+            data-testid="runtime-packages-dialog"
+            className={dialogPanelClassName(
+              'flex max-h-[85vh] w-[min(760px,calc(100vw-2rem))] flex-col'
+            )}
+          >
+            {dialogPackagesEnv ? (
+              <>
+                <Dialog.Title className={dialogTitleClassName}>
+                  Packages in {dialogPackagesEnv.label}
+                  {dialogPackagesEnv.version ? ` · ${dialogPackagesEnv.version}` : ''}
+                </Dialog.Title>
+                <Dialog.Description className={dialogDescriptionClassName}>
+                  Installed packages in this environment.
+                </Dialog.Description>
+
+                <div className="mt-2 flex flex-wrap items-center gap-2 text-[13px] text-muted-foreground">
+                  <Badge variant="secondary">{providerType(dialogPackagesEnv)}</Badge>
+                  {/* Conda env name badge — but only when the provenance badge doesn't already carry
+                      it: providerType() returns `Conda: <name>` for user-own conda envs, so the name
+                      badge is added just for app-owned (app-managed/agent-created) conda envs. */}
+                  {dialogPackagesEnv.condaEnv &&
+                  providerType(dialogPackagesEnv) !== `Conda: ${dialogPackagesEnv.condaEnv}` ? (
+                    <Badge variant="secondary">Conda: {dialogPackagesEnv.condaEnv}</Badge>
+                  ) : null}
+                  <Badge variant={dialogPackagesEnv.runnable ? 'secondary' : 'destructive'}>
+                    {dialogPackagesEnv.runnable ? 'Ready' : 'Not runnable'}
+                  </Badge>
+                  <code className="truncate text-xs">{dialogPackagesEnv.interpreterPath}</code>
+                </div>
+
+                <div className="mt-3 flex items-center gap-3">
+                  <div className="relative max-w-sm flex-1">
+                    <Search
+                      aria-hidden="true"
+                      className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground"
+                    />
+                    <Input
+                      value={packagesFilter}
+                      onChange={(event) => setPackagesFilter(event.target.value)}
+                      placeholder="Filter packages…"
+                      aria-label="Filter packages"
+                      data-testid="runtime-packages-filter"
+                      className="pl-8"
+                    />
+                  </div>
+                  {packages !== null ? (
+                    <span className="text-xs text-muted-foreground">
+                      {visiblePackages.length} of {packages.length}
+                      {hasCondaFields
+                        ? ` · ${condaPackageCount} conda, ${packages.length - condaPackageCount} pypi`
+                        : ''}
+                    </span>
+                  ) : null}
+                </div>
+
+                <div className="mt-2 min-h-0 flex-1 overflow-y-auto rounded-md border border-border">
+                  {packagesError !== null ? (
+                    <div className="flex flex-col items-center gap-2 px-3 py-6">
+                      <p role="alert" className="text-sm text-destructive">
+                        {packagesError}
+                      </p>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => {
+                          setPackages(null)
+                          setPackagesError(null)
+                          setPackagesRetryNonce((nonce) => nonce + 1)
+                        }}
+                      >
+                        Retry
+                      </Button>
+                    </div>
+                  ) : packages === null ? (
+                    <p className="px-3 py-6 text-center text-sm text-muted-foreground">
+                      Listing packages…
+                    </p>
+                  ) : (
+                    <table className="w-full border-collapse text-[13px]">
+                      <thead className="sticky top-0 bg-card">
+                        <tr className="border-b border-border text-left text-xs text-muted-foreground">
+                          <th className="py-2 pl-3 pr-3 font-medium">Name</th>
+                          <th className="py-2 pr-3 font-medium">Version</th>
+                          {hasCondaFields ? (
+                            <>
+                              <th className="py-2 pr-3 font-medium">Build</th>
+                              <th className="py-2 pr-3 font-medium">Channel</th>
+                            </>
+                          ) : null}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {visiblePackages.map((pkg) => (
+                          <tr
+                            key={pkg.name}
+                            data-testid="runtime-package-row"
+                            className="border-b border-border last:border-b-0"
+                          >
+                            <td className="py-1.5 pl-3 pr-3 text-foreground">{pkg.name}</td>
+                            <td className="py-1.5 pr-3">
+                              <code className="text-xs text-muted-foreground">{pkg.version}</code>
+                            </td>
+                            {hasCondaFields ? (
+                              <>
+                                <td className="py-1.5 pr-3">
+                                  <code className="text-xs text-muted-foreground">
+                                    {pkg.build ?? '—'}
+                                  </code>
+                                </td>
+                                <td className="py-1.5 pr-3 text-xs text-muted-foreground">
+                                  {pkg.channel ?? '—'}
+                                </td>
+                              </>
+                            ) : null}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                  {packages !== null &&
+                  packagesError === null &&
+                  packages.length > 0 &&
+                  visiblePackages.length === 0 ? (
+                    <p className="px-3 py-6 text-center text-sm text-muted-foreground">
+                      No packages match “{packagesFilter}”.
+                    </p>
+                  ) : null}
+                  {packages !== null && packagesError === null && packages.length === 0 ? (
+                    <p className="px-3 py-6 text-center text-sm text-muted-foreground">
+                      No packages installed.
+                    </p>
+                  ) : null}
+                </div>
+
+                <div className="mt-4 flex justify-end">
+                  <Dialog.Close asChild>
+                    <Button type="button" variant="outline" size="sm">
+                      Close
+                    </Button>
+                  </Dialog.Close>
+                </div>
+              </>
+            ) : null}
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
     </div>
   )
 }

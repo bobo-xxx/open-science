@@ -7,12 +7,21 @@ import {
   CODEX_BRIDGE_MODEL,
   buildCodexConfig,
   createCodexFramework,
+  isOfficialOpenAiResponsesBase,
   normalizeResponsesBaseUrl
 } from './codex'
+import { CODEX_VERSION } from '../settings/managed-codex'
 
 const fakeChild = {} as ChildProcessWithoutNullStreams
 
 describe('codexFramework', () => {
+  it.each([
+    ['darwin', 'posix'],
+    ['win32', 'powershell']
+  ] as const)('reports the %s command shell as %s', (platform, shellDialect) => {
+    expect(createCodexFramework({ platform }).commandShellDialect).toBe(shellDialect)
+  })
+
   it('configures an isolated Responses provider without serializing its key', () => {
     const framework = createCodexFramework()
     const config = framework.prepareModelConfig(
@@ -23,10 +32,15 @@ describe('codexFramework', () => {
         model: 'gpt-coding',
         key: 'sk-plaintext-secret'
       },
-      { storageRoot: '/data', executablePath: '/runtime/codex-acp' }
+      {
+        storageRoot: '/data',
+        executablePath: '/runtime/codex-acp',
+        nativeVersion: CODEX_VERSION
+      }
     )
 
     expect(config.env).toMatchObject({
+      HOME: join('/data', 'codex'),
       CODEX_HOME: join('/data', 'codex'),
       MODEL_PROVIDER: 'open-science',
       NO_BROWSER: '1'
@@ -36,19 +50,24 @@ describe('codexFramework', () => {
       methodId: 'api-key',
       _meta: { 'api-key': { apiKey: 'sk-plaintext-secret' } }
     })
-    expect(config.configFiles).toEqual([
-      {
-        path: join('/data', 'codex', 'config.toml'),
-        content: 'cli_auth_credentials_store = "ephemeral"\n',
-        mode: 0o600
-      }
-    ])
+    expect(config.configFiles?.[0]).toEqual({
+      path: join('/data', 'codex', 'config.toml'),
+      content: 'cli_auth_credentials_store = "ephemeral"\n',
+      mode: 0o600
+    })
+    const modelCatalogFile = config.configFiles?.[1]
+    expect(modelCatalogFile).toMatchObject({
+      path: expect.stringMatching(/[/\\]codex[/\\]model-catalog-[a-f0-9]{64}\.json$/),
+      mode: 0o600,
+      contentAddressed: true
+    })
 
     const serialized = config.env?.CODEX_CONFIG ?? ''
     expect(serialized).not.toContain('sk-plaintext-secret')
     expect(JSON.parse(serialized)).toMatchObject({
       model: 'gpt-coding',
       model_provider: 'open-science',
+      model_catalog_json: modelCatalogFile?.path,
       model_providers: {
         'open-science': {
           base_url: 'https://gateway.example/v1',
@@ -59,6 +78,127 @@ describe('codexFramework', () => {
     })
   })
 
+  it('keeps Codex bundled model metadata for a trusted official OpenAI model', () => {
+    const framework = createCodexFramework()
+    const config = framework.prepareModelConfig(
+      {
+        type: 'official',
+        vendorId: 'openai',
+        apiEndpoints: ['responses'],
+        baseUrl: 'https://gateway.example/v1',
+        model: 'gpt-5.4',
+        key: 'sk-plaintext-secret'
+      },
+      {
+        storageRoot: '/data',
+        executablePath: '/runtime/codex-acp',
+        nativeVersion: CODEX_VERSION
+      }
+    )
+
+    expect(JSON.parse(config.env?.CODEX_CONFIG ?? '')).not.toHaveProperty('model_catalog_json')
+    expect(config.configFiles).toEqual([
+      {
+        path: join('/data', 'codex', 'config.toml'),
+        content: 'cli_auth_credentials_store = "ephemeral"\n',
+        mode: 0o600
+      }
+    ])
+  })
+
+  it('keeps bundled metadata for a custom Responses provider on the official OpenAI API host', () => {
+    const framework = createCodexFramework()
+    const config = framework.prepareModelConfig(
+      {
+        type: 'custom',
+        apiEndpoints: ['responses'],
+        baseUrl: 'https://api.openai.com/v1/responses',
+        model: 'gpt-5.4',
+        key: 'sk-plaintext-secret'
+      },
+      {
+        storageRoot: '/data',
+        executablePath: '/runtime/codex-acp',
+        nativeVersion: CODEX_VERSION
+      }
+    )
+
+    expect(JSON.parse(config.env?.CODEX_CONFIG ?? '')).not.toHaveProperty('model_catalog_json')
+    expect(config.configFiles).toEqual([
+      {
+        path: join('/data', 'codex', 'config.toml'),
+        content: 'cli_auth_credentials_store = "ephemeral"\n',
+        mode: 0o600
+      }
+    ])
+  })
+
+  it('uses conservative local metadata for an unrecognized native Codex version', () => {
+    const framework = createCodexFramework()
+    const config = framework.prepareModelConfig(
+      {
+        type: 'official',
+        vendorId: 'openai',
+        apiEndpoints: ['responses'],
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'gpt-5.4',
+        key: 'sk-plaintext-secret'
+      },
+      {
+        storageRoot: '/data',
+        executablePath: '/runtime/codex-acp',
+        nativeVersion: '0.144.2'
+      }
+    )
+
+    const codexConfig = JSON.parse(config.env?.CODEX_CONFIG ?? '')
+    const modelCatalogFile = config.configFiles?.find(
+      (file) => file.path === codexConfig.model_catalog_json
+    )
+
+    expect(JSON.parse(modelCatalogFile?.content ?? '').models[0]).toMatchObject({
+      slug: 'gpt-5.4',
+      apply_patch_tool_type: null,
+      supports_parallel_tool_calls: false,
+      supports_search_tool: false
+    })
+    expect(JSON.parse(modelCatalogFile?.content ?? '').models[0]).not.toHaveProperty(
+      'web_search_tool_type'
+    )
+  })
+
+  it('uses conservative local metadata when a custom gateway reuses a bundled model slug', () => {
+    const framework = createCodexFramework()
+    const config = framework.prepareModelConfig(
+      {
+        type: 'custom',
+        apiEndpoints: ['responses'],
+        baseUrl: 'https://gateway.example/v1',
+        model: 'gpt-5.4',
+        key: 'sk-plaintext-secret'
+      },
+      {
+        storageRoot: '/data',
+        executablePath: '/runtime/codex-acp',
+        nativeVersion: CODEX_VERSION
+      }
+    )
+
+    const codexConfig = JSON.parse(config.env?.CODEX_CONFIG ?? '')
+    const modelCatalogFile = config.configFiles?.find(
+      (file) => file.path === codexConfig.model_catalog_json
+    )
+    const modelMetadata = JSON.parse(modelCatalogFile?.content ?? '').models[0]
+
+    expect(modelMetadata).toMatchObject({
+      slug: 'gpt-5.4',
+      apply_patch_tool_type: null,
+      supports_parallel_tool_calls: false,
+      supports_search_tool: false
+    })
+    expect(modelMetadata).not.toHaveProperty('web_search_tool_type')
+  })
+
   it('routes Chat Completions providers through the main-process Responses bridge', () => {
     const framework = createCodexFramework()
     const config = framework.prepareModelConfig(
@@ -67,17 +207,22 @@ describe('codexFramework', () => {
         apiEndpoints: ['openai'],
         baseUrl: 'https://gateway.example/v1',
         model: 'chat-model',
+        contextWindow: 128_000,
         key: 'upstream-secret'
       },
       {
         storageRoot: '/data',
         executablePath: '/runtime/codex-acp',
-        responsesBridge: { baseUrl: 'http://127.0.0.1:43123/v1', token: 'local-token' }
+        responsesBridge: { baseUrl: 'http://127.0.0.1:43123/v1', token: 'local-token' },
+        systemPromptAppends: ['Stable bridge guidance.']
       }
     )
 
     expect(JSON.parse(config.env?.CODEX_CONFIG ?? '')).toMatchObject({
       model: CODEX_BRIDGE_MODEL,
+      developer_instructions: 'Stable bridge guidance.',
+      model_context_window: 128_000,
+      model_auto_compact_token_limit: 121_600,
       model_provider: 'open-science',
       model_providers: {
         'open-science': {
@@ -98,6 +243,7 @@ describe('codexFramework', () => {
       headers: { authorization: 'Bearer local-token' }
     })
     expect(config.env?.CODEX_CONFIG).not.toContain('upstream-secret')
+    expect(config.persistentSystemPrompt).toBe('Stable bridge guidance.')
   })
 
   it('drives a native-Responses vendor directly on its OpenAI /v1 base, ignoring the bridge', () => {
@@ -112,17 +258,24 @@ describe('codexFramework', () => {
         baseUrl: 'https://api.minimaxi.com/anthropic',
         openaiBaseUrl: 'https://api.minimaxi.com/v1',
         model: 'MiniMax-M3',
+        contextWindow: 1_000_000,
         key: 'mm-secret'
       },
       {
         storageRoot: '/data',
         executablePath: '/runtime/codex-acp',
+        reasoningEffort: 'none',
+        reasoningEfforts: ['none', 'high'],
         responsesBridge: { baseUrl: 'http://127.0.0.1:43123/v1', token: 'local-token' }
       }
     )
 
-    expect(JSON.parse(config.env?.CODEX_CONFIG ?? '')).toMatchObject({
+    const codexConfig = JSON.parse(config.env?.CODEX_CONFIG ?? '')
+    expect(codexConfig).toMatchObject({
       model: 'MiniMax-M3',
+      model_reasoning_effort: 'none',
+      model_context_window: 1_000_000,
+      model_auto_compact_token_limit: 950_000,
       model_providers: {
         'open-science': {
           base_url: 'https://api.minimaxi.com/v1',
@@ -139,26 +292,168 @@ describe('codexFramework', () => {
     expect(config.providerConfiguration).toBeUndefined()
     expect(config.sessionModel).toBeUndefined()
     expect(config.env?.CODEX_CONFIG).not.toContain('127.0.0.1:43123')
+
+    const modelCatalogFile = config.configFiles?.find(
+      (file) => file.path === codexConfig.model_catalog_json
+    )
+    expect(modelCatalogFile).toMatchObject({
+      path: expect.stringMatching(/[/\\]codex[/\\]model-catalog-[a-f0-9]{64}\.json$/),
+      mode: 0o600
+    })
+    expect(codexConfig.model_catalog_json).toBe(modelCatalogFile?.path)
+    const modelCatalog = JSON.parse(modelCatalogFile?.content ?? '')
+    expect(modelCatalog).toMatchObject({
+      models: [
+        {
+          slug: 'MiniMax-M3',
+          display_name: 'MiniMax-M3',
+          shell_type: 'shell_command',
+          visibility: 'list',
+          supported_in_api: true,
+          base_instructions: expect.stringContaining(
+            'inside Open Science through the Agent Client Protocol'
+          ),
+          include_skills_usage_instructions: true,
+          default_reasoning_level: 'none',
+          supported_reasoning_levels: [
+            { effort: 'none', description: 'None reasoning effort' },
+            { effort: 'high', description: 'High reasoning effort' }
+          ],
+          apply_patch_tool_type: null,
+          supports_parallel_tool_calls: false,
+          supports_image_detail_original: false,
+          context_window: 1_000_000,
+          max_context_window: 1_000_000,
+          input_modalities: ['text'],
+          supports_search_tool: false,
+          use_responses_lite: false
+        }
+      ]
+    })
+    expect(modelCatalog.models[0]).not.toHaveProperty('web_search_tool_type')
+    expect(modelCatalogFile?.content).not.toContain('used_fallback_model_metadata')
+    expect(modelCatalog.models[0].base_instructions).not.toContain('update_plan')
+    expect(modelCatalog.models[0].base_instructions).not.toContain('apply_patch')
   })
 
-  it('reuses the normal Codex profile for a shared subscription without overriding it', () => {
+  it('preserves native model metadata through the Responses compatibility proxy', () => {
     const framework = createCodexFramework()
+    const config = framework.prepareModelConfig(
+      {
+        type: 'custom',
+        apiEndpoints: ['responses'],
+        baseUrl: 'https://api.minimaxi.com/v1',
+        model: 'MiniMax-M3',
+        contextWindow: 1_000_000,
+        key: 'mm-secret'
+      },
+      {
+        storageRoot: '/data',
+        executablePath: '/runtime/codex-acp',
+        responsesBridge: {
+          baseUrl: 'http://127.0.0.1:43123/v1',
+          token: 'local-token',
+          kind: 'responses-compatibility'
+        }
+      }
+    )
+
+    const codexConfig = JSON.parse(config.env?.CODEX_CONFIG ?? '')
+    expect(codexConfig).toMatchObject({
+      model: 'MiniMax-M3',
+      model_provider: 'open-science',
+      model_providers: {
+        'open-science': {
+          base_url: 'http://127.0.0.1:43123/v1',
+          wire_api: 'responses'
+        }
+      },
+      model_catalog_json: expect.stringMatching(/model-catalog-[a-f0-9]{64}\.json$/)
+    })
+    expect(codexConfig.model_providers['open-science']).not.toHaveProperty('requires_openai_auth')
+    expect(config.authentication).toBeUndefined()
+    expect(config.sessionModel).toBeUndefined()
+    expect(config.providerConfiguration).toEqual({
+      providerId: 'custom-gateway',
+      apiType: 'openai',
+      baseUrl: 'http://127.0.0.1:43123/v1',
+      headers: { authorization: 'Bearer local-token' }
+    })
+    expect(config.env?.CODEX_CONFIG).not.toContain('mm-secret')
+    const modelCatalogFile = config.configFiles?.find(
+      (file) => file.path === codexConfig.model_catalog_json
+    )
+    expect(JSON.parse(modelCatalogFile?.content ?? '').models[0].slug).toBe('MiniMax-M3')
+  })
+
+  it('keeps concurrent native model metadata in distinct immutable catalogs', () => {
+    const framework = createCodexFramework()
+    const prepare = (model: string): ReturnType<typeof framework.prepareModelConfig> =>
+      framework.prepareModelConfig(
+        {
+          type: 'custom',
+          apiEndpoints: ['responses'],
+          baseUrl: 'https://gateway.example/v1',
+          model,
+          key: 'secret'
+        },
+        { storageRoot: '/data', executablePath: '/runtime/codex-acp' }
+      )
+
+    const first = prepare('vendor-model-a')
+    const second = prepare('vendor-model-b')
+    const firstCatalog = first.configFiles?.[1]
+    const secondCatalog = second.configFiles?.[1]
+
+    expect(firstCatalog?.path).not.toBe(secondCatalog?.path)
+    expect(JSON.parse(firstCatalog?.content ?? '').models[0].slug).toBe('vendor-model-a')
+    expect(JSON.parse(secondCatalog?.content ?? '').models[0].slug).toBe('vendor-model-b')
+    expect(JSON.parse(first.env?.CODEX_CONFIG ?? '').model_catalog_json).toBe(firstCatalog?.path)
+    expect(JSON.parse(second.env?.CODEX_CONFIG ?? '').model_catalog_json).toBe(secondCatalog?.path)
+  })
+
+  it('maps the legacy shared subscription to the app-owned subscription home', () => {
+    const framework = createCodexFramework({ platform: 'darwin' })
     const config = framework.prepareModelConfig(
       { type: 'codex-shared', apiEndpoints: ['responses'] },
       { storageRoot: '/data', executablePath: '/runtime/codex-acp' }
     )
 
-    expect(config).toEqual({ env: {} })
+    expect(config).toEqual({
+      env: {
+        HOME: join('/data', 'codex-subscription'),
+        CODEX_HOME: join('/data', 'codex-subscription')
+      }
+    })
   })
 
   it('uses persistent app-owned storage for an isolated Codex subscription', () => {
-    const framework = createCodexFramework()
+    const framework = createCodexFramework({ platform: 'darwin' })
     const config = framework.prepareModelConfig(
       { type: 'codex-isolated', apiEndpoints: ['responses'] },
       { storageRoot: '/data', executablePath: '/runtime/codex-acp' }
     )
 
-    expect(config).toEqual({ env: { CODEX_HOME: join('/data', 'codex-subscription') } })
+    expect(config).toEqual({
+      env: {
+        HOME: join('/data', 'codex-subscription'),
+        CODEX_HOME: join('/data', 'codex-subscription')
+      }
+    })
+  })
+
+  it('isolates the native Windows home used for user-installed Skills', () => {
+    const framework = createCodexFramework({ platform: 'win32' })
+    const config = framework.prepareModelConfig(
+      { type: 'codex-isolated', apiEndpoints: ['responses'] },
+      { storageRoot: 'C:\\OpenScience', executablePath: 'C:\\runtime\\codex-acp.exe' }
+    )
+
+    expect(config.env).toMatchObject({
+      HOME: join('C:\\OpenScience', 'codex-subscription'),
+      USERPROFILE: join('C:\\OpenScience', 'codex-subscription'),
+      CODEX_HOME: join('C:\\OpenScience', 'codex-subscription')
+    })
   })
 
   it('seeds the selected model into CODEX_CONFIG for an isolated Codex subscription', () => {
@@ -250,6 +545,17 @@ describe('codexFramework', () => {
     expect(normalizeResponsesBaseUrl(input)).toBe(expected)
   })
 
+  it.each([
+    ['https://api.openai.com', true],
+    ['https://API.OPENAI.COM/v1/responses', true],
+    ['https://api.openai.com.proxy.example/v1', false],
+    ['https://openai.com/v1', false],
+    ['not a URL', false],
+    [undefined, false]
+  ])('classifies %s as an official OpenAI Responses base: %s', (input, expected) => {
+    expect(isOfficialOpenAiResponsesBase(input)).toBe(expected)
+  })
+
   it('appends /v1 to a bare official OpenAI base URL in the serialized Codex config', () => {
     const framework = createCodexFramework()
     const config = framework.prepareModelConfig(
@@ -273,12 +579,51 @@ describe('codexFramework', () => {
     })
   })
 
-  it('delivers Open Science session guidance as a prompt prefix', () => {
+  it('delivers Open Science session guidance as persistent developer instructions', () => {
     const framework = createCodexFramework()
 
-    expect(framework.buildSessionSetup({ systemPromptAppends: ['one', 'two'] })).toEqual({
-      promptPrefix: 'one\n\ntwo'
+    const config = framework.prepareModelConfig(
+      {
+        type: 'custom',
+        apiEndpoints: ['responses'],
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'gpt-5.6-sol'
+      },
+      {
+        storageRoot: '/data',
+        executablePath: '/runtime/codex-acp',
+        systemPromptAppends: ['one', 'two']
+      }
+    )
+
+    expect(JSON.parse(config.env?.CODEX_CONFIG ?? '{}').developer_instructions).toBe('one\n\ntwo')
+    expect(config.persistentSystemPrompt).toBe('one\n\ntwo')
+    expect(
+      framework.buildSessionSetup({
+        systemPromptAppends: [],
+        turnPromptReminders: ['turn-only reminder']
+      })
+    ).toEqual({
+      promptPrefix: 'turn-only reminder'
     })
+  })
+
+  it('persists app guidance for a subscription backend', () => {
+    const framework = createCodexFramework()
+    const config = framework.prepareModelConfig(
+      { type: 'codex-isolated', apiEndpoints: ['responses'], model: 'gpt-5.6-terra' },
+      {
+        storageRoot: '/data',
+        executablePath: '/runtime/codex-acp',
+        systemPromptAppends: ['Stable subscription guidance.']
+      }
+    )
+
+    expect(JSON.parse(config.env?.CODEX_CONFIG ?? '{}')).toMatchObject({
+      model: 'gpt-5.6-terra',
+      developer_instructions: 'Stable subscription guidance.'
+    })
+    expect(config.persistentSystemPrompt).toBe('Stable subscription guidance.')
   })
 
   it.each([
@@ -398,21 +743,94 @@ describe('codexFramework', () => {
     expect(env.OPENAI_API_KEY).toBeUndefined()
     expect(env.CODEX_PATH).toBeUndefined()
   })
+
+  it('replaces every inherited proxy shape for a subscription spawn', () => {
+    const spawnProcess = vi.fn().mockReturnValue(fakeChild)
+    const framework = createCodexFramework({
+      sourceEnv: {
+        PATH: '/parent-bin',
+        ALL_PROXY: 'socks5://stale-proxy.example.test:9050',
+        HTTPS_PROXY: 'http://stale-proxy.example.test:3128',
+        NO_PROXY: 'stale-bypass.example.test'
+      },
+      spawnProcess
+    })
+
+    framework.spawn({
+      executablePath: '/usr/local/bin/codex-acp',
+      proxyEnvironmentMode: 'replace',
+      env: {
+        CODEX_HOME: '/data/codex-subscription',
+        HTTP_PROXY: 'http://system-proxy.example.test:3128',
+        HTTPS_PROXY: 'http://system-proxy.example.test:3128',
+        NO_PROXY: 'localhost,127.0.0.1,::1'
+      },
+      args: []
+    })
+
+    const env = spawnProcess.mock.calls[0][2].env as NodeJS.ProcessEnv
+    expect(env).toMatchObject({
+      HTTP_PROXY: 'http://system-proxy.example.test:3128',
+      HTTPS_PROXY: 'http://system-proxy.example.test:3128',
+      NO_PROXY: 'localhost,127.0.0.1,::1'
+    })
+    expect(env.ALL_PROXY).toBeUndefined()
+    expect(env.NO_PROXY).not.toContain('stale-bypass.example.test')
+
+    framework.spawn({
+      executablePath: '/usr/local/bin/codex-acp',
+      proxyEnvironmentMode: 'replace',
+      env: { CODEX_HOME: '/data/codex-subscription' },
+      args: []
+    })
+    const directEnv = spawnProcess.mock.calls[1][2].env as NodeJS.ProcessEnv
+    expect(directEnv.HTTP_PROXY).toBeUndefined()
+    expect(directEnv.HTTPS_PROXY).toBeUndefined()
+    expect(directEnv.ALL_PROXY).toBeUndefined()
+    expect(directEnv.NO_PROXY).toBeUndefined()
+  })
+
+  it('preserves inherited proxies when subscription proxy resolution fails', () => {
+    const spawnProcess = vi.fn().mockReturnValue(fakeChild)
+    const framework = createCodexFramework({
+      sourceEnv: {
+        PATH: '/parent-bin',
+        HTTPS_PROXY: 'http://inherited-proxy.example.test:3128',
+        NO_PROXY: 'inherited-bypass.example.test'
+      },
+      spawnProcess
+    })
+
+    framework.spawn({
+      executablePath: '/usr/local/bin/codex-acp',
+      proxyEnvironmentMode: 'inherit',
+      env: { CODEX_HOME: '/data/codex-subscription' },
+      args: []
+    })
+
+    expect(spawnProcess.mock.calls[0][2].env).toMatchObject({
+      HTTPS_PROXY: 'http://inherited-proxy.example.test:3128',
+      NO_PROXY: 'inherited-bypass.example.test'
+    })
+  })
 })
 
 describe('buildCodexConfig reasoning effort', () => {
   it.each([
+    ['none', 'none'],
+    ['minimal', 'minimal'],
     ['low', 'low'],
     ['medium', 'medium'],
     ['high', 'high'],
-    // Codex config tops out at xhigh; the app's top level 'max' maps onto it.
-    ['max', 'xhigh']
-  ] as const)('maps the %s level to model_reasoning_effort %s', (effort, expected) => {
+    ['xhigh', 'xhigh'],
+    ['max', 'max'],
+    ['ultra', 'ultra']
+  ] as const)('preserves the %s level as model_reasoning_effort %s', (effort, expected) => {
     expect(buildCodexConfig({ reasoningEffort: effort }).model_reasoning_effort).toBe(expected)
   })
 
-  it.each([undefined, 'default'] as const)('omits model_reasoning_effort for %s', (effort) => {
-    expect(buildCodexConfig({ reasoningEffort: effort })).not.toHaveProperty(
+  it('omits model_reasoning_effort when no model value is resolved', () => {
+    expect(buildCodexConfig({ reasoningEffort: undefined })).not.toHaveProperty(
       'model_reasoning_effort'
     )
   })
@@ -430,6 +848,6 @@ describe('buildCodexConfig reasoning effort', () => {
       { storageRoot: '/data', executablePath: '/runtime/codex-acp', reasoningEffort: 'max' }
     )
 
-    expect(JSON.parse(config.env?.CODEX_CONFIG ?? '').model_reasoning_effort).toBe('xhigh')
+    expect(JSON.parse(config.env?.CODEX_CONFIG ?? '').model_reasoning_effort).toBe('max')
   })
 })

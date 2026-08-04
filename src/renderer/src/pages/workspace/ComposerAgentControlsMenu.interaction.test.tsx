@@ -13,8 +13,13 @@ import { createInitialSettingsState, useSettingsStore } from '@/stores/settings-
 
 // Select events fired through the mocked menu items, so tests can assert preventDefault
 // (i.e. the row keeps the real menu open instead of closing it).
-const { selectEvents } = vi.hoisted(() => ({
+const { mediaState, selectEvents } = vi.hoisted(() => ({
+  mediaState: { mobile: false },
   selectEvents: [] as Array<{ preventDefault: () => void; prevented: boolean }>
+}))
+
+vi.mock('@/hooks/useMediaQuery', () => ({
+  useMediaQuery: (): boolean => mediaState.mobile
 }))
 
 vi.mock('@/components/ui/dropdown-menu', () => ({
@@ -31,23 +36,28 @@ vi.mock('@/components/ui/dropdown-menu', () => ({
     <div data-testid="dropdown-group">{children}</div>
   ),
   DropdownMenuSub: ({ children }: PropsWithChildren): React.JSX.Element => <div>{children}</div>,
+  // testids let tests tell a hover submenu trigger/content apart from an inline label/group,
+  // so a regression that flattens a submenu into the primary panel is caught.
   DropdownMenuSubTrigger: ({ children }: PropsWithChildren): React.JSX.Element => (
-    <div>{children}</div>
+    <div data-testid="submenu-trigger">{children}</div>
   ),
   DropdownMenuSubContent: ({ children }: PropsWithChildren): React.JSX.Element => (
-    <div>{children}</div>
+    <div data-testid="submenu-content">{children}</div>
   ),
   DropdownMenuItem: ({
     children,
     disabled,
-    onSelect
+    onSelect,
+    'data-testid': testId
   }: PropsWithChildren<{
     disabled?: boolean
     onSelect?: (event: { preventDefault: () => void }) => void
+    'data-testid'?: string
   }>): React.JSX.Element => (
     <button
       type="button"
       disabled={disabled}
+      data-testid={testId}
       onClick={() => {
         const event = {
           prevented: false,
@@ -75,13 +85,49 @@ vi.mock('radix-ui', () => ({
     Root: ({ open, children }: PropsWithChildren<{ open?: boolean }>): React.JSX.Element | null =>
       open ? <div>{children}</div> : null,
     Portal: ({ children }: PropsWithChildren): React.JSX.Element => <>{children}</>,
-    Overlay: (): React.JSX.Element => <div />,
-    Content: ({ children }: PropsWithChildren): React.JSX.Element => <div>{children}</div>,
-    Title: ({ children }: PropsWithChildren): React.JSX.Element => <h2>{children}</h2>,
-    Description: ({ children }: PropsWithChildren): React.JSX.Element => <p>{children}</p>,
+    Overlay: ({ className }: { className?: string }): React.JSX.Element => (
+      <div data-testid="full-access-overlay" className={className} />
+    ),
+    Content: ({
+      children,
+      className
+    }: PropsWithChildren<{ className?: string }>): React.JSX.Element => (
+      <div data-testid="full-access-dialog" className={className}>
+        {children}
+      </div>
+    ),
+    Title: ({
+      children,
+      className
+    }: PropsWithChildren<{ className?: string }>): React.JSX.Element => (
+      <h2 className={className}>{children}</h2>
+    ),
+    Description: ({
+      children,
+      className
+    }: PropsWithChildren<{ className?: string }>): React.JSX.Element => (
+      <p className={className}>{children}</p>
+    ),
     Cancel: ({ children }: PropsWithChildren): React.JSX.Element => <>{children}</>,
     Action: ({ children }: PropsWithChildren): React.JSX.Element => <>{children}</>
   }
+}))
+
+// Stub the specialist submenu so its store/catalog wiring stays out of this menu-level suite.
+// The marker surfaces whether the menu included it and forwards key props as data attributes.
+vi.mock('./SpecialistSubmenu', () => ({
+  SpecialistSubmenu: (props: {
+    selectedId?: string
+    unavailable?: boolean
+    readOnly?: boolean
+  }): React.JSX.Element => (
+    <div
+      data-testid="specialist-submenu-stub"
+      data-selected-id={props.selectedId ?? ''}
+      data-unavailable={String(props.unavailable ?? false)}
+      data-read-only={String(props.readOnly ?? false)}
+    />
+  )
 }))
 
 const createHost = (overrides: Partial<ComputeHost> = {}): ComputeHost => ({
@@ -107,6 +153,7 @@ let container: HTMLDivElement
 let root: Root
 
 beforeEach(() => {
+  mediaState.mobile = false
   selectEvents.length = 0
   container = document.createElement('div')
   document.body.appendChild(container)
@@ -176,6 +223,42 @@ describe('ComposerAgentControlsMenu', () => {
     expect(container.textContent).not.toContain('Enable Full access?')
   })
 
+  it('opens permission choices inside the same menu on mobile and can return', () => {
+    mediaState.mobile = true
+
+    act(() => {
+      root.render(
+        <ComposerAgentControlsMenu
+          profile="ask"
+          autoReviewEnabled={false}
+          onProfileChange={vi.fn()}
+          onAutoReviewChange={vi.fn()}
+        />
+      )
+    })
+
+    expect(container.textContent).not.toContain('Auto-approve edits')
+
+    const permissionTrigger = container.querySelector<HTMLButtonElement>(
+      '[data-testid="mobile-permission-trigger"]'
+    )
+    if (!permissionTrigger) throw new Error('mobile permission trigger not found')
+    act(() => permissionTrigger.click())
+
+    expect(container.textContent).toContain('Auto-approve edits')
+    expect(container.textContent).not.toContain('Auto-review')
+    expect(selectEvents.at(-1)?.prevented).toBe(true)
+
+    const backButton = container.querySelector<HTMLButtonElement>(
+      '[data-testid="mobile-permission-back"]'
+    )
+    if (!backButton) throw new Error('mobile permission back button not found')
+    act(() => backButton.click())
+
+    expect(container.textContent).toContain('Auto-review')
+    expect(container.textContent).not.toContain('Auto-approve edits')
+  })
+
   it('requires explicit confirmation before enabling Full access', () => {
     const onProfileChange = vi.fn()
 
@@ -200,6 +283,20 @@ describe('ComposerAgentControlsMenu', () => {
     expect(findButton('Cancel').getAttribute('data-slot')).toBe('button')
     expect(findButton('Cancel').getAttribute('data-variant')).toBe('outline')
     expect(findButton('Enable').getAttribute('data-slot')).toBe('button')
+    expect(findButton('Enable').className).toContain('bg-amber-600')
+
+    const overlay = container.querySelector<HTMLElement>('[data-testid="full-access-overlay"]')
+    const dialog = container.querySelector<HTMLElement>('[data-testid="full-access-dialog"]')
+
+    expect(overlay?.className).toContain('bg-black/50')
+    expect(overlay?.className).toContain('data-[state=open]:fade-in-0')
+    expect(overlay?.className).not.toContain('backdrop-blur')
+    expect(dialog?.className).toContain('rounded-xl')
+    expect(dialog?.className).toContain('border-border')
+    expect(dialog?.className).toContain('bg-card')
+    expect(dialog?.className).toContain('shadow-dialog')
+    expect(dialog?.className).toContain('data-[state=open]:zoom-in-95')
+    expect(dialog?.querySelector('[aria-label="Close"]')).not.toBeNull()
 
     act(() => findButton('Enable').click())
     expect(onProfileChange).toHaveBeenCalledWith('full')
@@ -238,8 +335,8 @@ describe('ComposerAgentControlsMenu', () => {
           profile="ask"
           autoReviewEnabled={false}
           grants={[
-            { categoryKey: 'shell:git', label: 'git status', kind: 'shell' },
-            { categoryKey: 'mcp:search', label: 'search papers', kind: 'mcp' }
+            { categoryKey: 'shell:git', label: 'git status', kind: 'shell', scope: 'session' },
+            { categoryKey: 'mcp:search', label: 'search papers', kind: 'mcp', scope: 'session' }
           ]}
           onProfileChange={vi.fn()}
           onAutoReviewChange={vi.fn()}
@@ -248,11 +345,11 @@ describe('ComposerAgentControlsMenu', () => {
       )
     })
 
-    expect(container.textContent).toContain('Always allowed this session')
+    expect(container.textContent).toContain('Allowed this session')
     expect(container.textContent).toContain('git status')
 
     const revokeButton = Array.from(container.querySelectorAll('button')).find(
-      (candidate) => candidate.getAttribute('aria-label') === 'Revoke always-allow for git status'
+      (candidate) => candidate.getAttribute('aria-label') === 'Revoke session grant for git status'
     )
 
     if (!revokeButton) throw new Error('revoke button not found')
@@ -261,6 +358,33 @@ describe('ComposerAgentControlsMenu', () => {
 
     expect(onRevokeGrant).toHaveBeenCalledWith('shell:git')
   })
+
+  it.each(['auto', 'full'] as const)(
+    'keeps Ask conversation grants visible while the %s profile is selected',
+    (profile) => {
+      act(() => {
+        root.render(
+          <ComposerAgentControlsMenu
+            profile={profile}
+            autoReviewEnabled={false}
+            grants={[
+              {
+                categoryKey: 'mcp:notebook/python',
+                label: 'Notebook REPL (Python)',
+                kind: 'mcp',
+                scope: 'session'
+              }
+            ]}
+            onProfileChange={vi.fn()}
+            onAutoReviewChange={vi.fn()}
+          />
+        )
+      })
+
+      expect(container.textContent).toContain('Allowed this session')
+      expect(container.textContent).toContain('Notebook REPL (Python)')
+    }
+  )
 
   it('clears all grants when Clear all is clicked', () => {
     const onClearGrants = vi.fn()
@@ -271,8 +395,8 @@ describe('ComposerAgentControlsMenu', () => {
           profile="ask"
           autoReviewEnabled={false}
           grants={[
-            { categoryKey: 'shell:git', label: 'git status', kind: 'shell' },
-            { categoryKey: 'tool:Write', label: 'Write', kind: 'tool' }
+            { categoryKey: 'shell:git', label: 'git status', kind: 'shell', scope: 'session' },
+            { categoryKey: 'tool:Write', label: 'Write', kind: 'tool', scope: 'session' }
           ]}
           onProfileChange={vi.fn()}
           onAutoReviewChange={vi.fn()}
@@ -282,7 +406,7 @@ describe('ComposerAgentControlsMenu', () => {
     })
 
     const clearButton = Array.from(container.querySelectorAll('button')).find(
-      (candidate) => candidate.getAttribute('aria-label') === 'Clear all always-allow grants'
+      (candidate) => candidate.getAttribute('aria-label') === 'Clear all session grants'
     )
 
     if (!clearButton) throw new Error('clear button not found')
@@ -440,7 +564,9 @@ describe('ComposerAgentControlsMenu', () => {
           profile="ask"
           autoReviewEnabled={false}
           readOnly={true}
-          grants={[{ categoryKey: 'shell:git', label: 'git status', kind: 'shell' }]}
+          grants={[
+            { categoryKey: 'shell:git', label: 'git status', kind: 'shell', scope: 'session' }
+          ]}
           onProfileChange={vi.fn()}
           onAutoReviewChange={vi.fn()}
         />
@@ -461,13 +587,61 @@ describe('ComposerAgentControlsMenu', () => {
     ).toBe(true)
 
     const clearButton = Array.from(container.querySelectorAll('button')).find(
-      (candidate) => candidate.getAttribute('aria-label') === 'Clear all always-allow grants'
+      (candidate) => candidate.getAttribute('aria-label') === 'Clear all session grants'
     )
     const revokeButton = Array.from(container.querySelectorAll('button')).find(
-      (candidate) => candidate.getAttribute('aria-label') === 'Revoke always-allow for git status'
+      (candidate) => candidate.getAttribute('aria-label') === 'Revoke session grant for git status'
     )
     expect(clearButton?.disabled).toBe(true)
     expect(revokeButton?.disabled).toBe(true)
+  })
+
+  it('keeps conversation grant actions available while profile controls are read-only', () => {
+    const onRevokeGrant = vi.fn()
+    const onClearGrants = vi.fn()
+
+    act(() => {
+      root.render(
+        <ComposerAgentControlsMenu
+          profile="ask"
+          autoReviewEnabled={false}
+          readOnly={true}
+          grantActionsReadOnly={false}
+          grants={[
+            {
+              categoryKey: 'shell:execute',
+              label: 'Shell commands',
+              kind: 'shell',
+              scope: 'session'
+            }
+          ]}
+          onProfileChange={vi.fn()}
+          onAutoReviewChange={vi.fn()}
+          onRevokeGrant={onRevokeGrant}
+          onClearGrants={onClearGrants}
+        />
+      )
+    })
+
+    expect(
+      findButton('Ask for approvalAsk before file edits, commands, network, and MCP tools.')
+        .disabled
+    ).toBe(true)
+
+    const clearButton = Array.from(container.querySelectorAll('button')).find(
+      (candidate) => candidate.getAttribute('aria-label') === 'Clear all session grants'
+    )
+    const revokeButton = Array.from(container.querySelectorAll('button')).find(
+      (candidate) =>
+        candidate.getAttribute('aria-label') === 'Revoke session grant for Shell commands'
+    )
+    expect(clearButton?.disabled).toBe(false)
+    expect(revokeButton?.disabled).toBe(false)
+
+    act(() => clearButton?.click())
+    act(() => revokeButton?.click())
+    expect(onClearGrants).toHaveBeenCalledTimes(1)
+    expect(onRevokeGrant).toHaveBeenCalledWith('shell:execute')
   })
 
   it('renders SSH hosts from the compute store under the compute section', () => {
@@ -563,5 +737,137 @@ describe('ComposerAgentControlsMenu', () => {
     })
 
     expect(findButton('cluster-1').disabled).toBe(true)
+  })
+
+  it('renders a Compute submenu trigger above the SSH hosts', () => {
+    act(() => {
+      root.render(
+        <ComposerAgentControlsMenu
+          profile="ask"
+          autoReviewEnabled={false}
+          enabledComputeHosts={[]}
+          onProfileChange={vi.fn()}
+          onAutoReviewChange={vi.fn()}
+          onComputeHostToggle={vi.fn()}
+        />
+      )
+    })
+
+    expect(container.textContent).toContain('Compute')
+    // SSH hosts + Manage compute stay nested under that single Compute submenu.
+    expect(container.textContent).toContain('SSH')
+    expect(container.textContent).toContain('Manage compute...')
+  })
+
+  it('folds Compute into a hover submenu that holds the SSH hosts and Manage compute', () => {
+    // Regression guard (#545 flattened Compute into the primary panel): Compute must be a
+    // single hover-expandable row whose content holds the host list, and the top-level order
+    // stays permission mode -> auto-review -> specialist -> compute.
+    act(() => {
+      root.render(
+        <ComposerAgentControlsMenu
+          profile="ask"
+          autoReviewEnabled={false}
+          enabledComputeHosts={[]}
+          showSpecialist
+          onProfileChange={vi.fn()}
+          onAutoReviewChange={vi.fn()}
+          onComputeHostToggle={vi.fn()}
+        />
+      )
+    })
+
+    // The Compute row is a hover submenu trigger, never a static label in the primary panel.
+    const computeTriggers = Array.from(
+      container.querySelectorAll('[data-testid="submenu-trigger"]')
+    ).filter((el) => el.textContent?.includes('Compute'))
+    expect(computeTriggers).toHaveLength(1)
+
+    // SSH hosts and Manage compute live inside that submenu's content, reached on hover.
+    const computeSubContents = Array.from(
+      container.querySelectorAll('[data-testid="submenu-content"]')
+    ).filter((el) => el.textContent?.includes('cluster-1'))
+    expect(computeSubContents).toHaveLength(1)
+    expect(computeSubContents[0]?.textContent).toContain('Manage compute...')
+
+    // Top-level order: permission mode -> auto-review -> specialist -> compute.
+    const orderAnchor = (needle: string): Element => {
+      const match = Array.from(container.querySelectorAll('[data-testid="submenu-trigger"]')).find(
+        (el) => el.textContent?.includes(needle)
+      )
+      if (!match) throw new Error(`submenu trigger not found: ${needle}`)
+      return match
+    }
+    const permissionTrigger = orderAnchor('Permission mode')
+    const computeTrigger = computeTriggers[0] as Element
+    const autoReviewRow = findButton(
+      'Auto-reviewA reviewer agent checks every change before it lands.'
+    )
+    const specialistStub = container.querySelector('[data-testid="specialist-submenu-stub"]')
+    expect(specialistStub).not.toBeNull()
+
+    const precedes = (a: Element, b: Element): boolean =>
+      (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0
+    expect(precedes(permissionTrigger, autoReviewRow)).toBe(true)
+    expect(precedes(autoReviewRow, specialistStub as Element)).toBe(true)
+    expect(precedes(specialistStub as Element, computeTrigger)).toBe(true)
+  })
+
+  it('does not render the specialist submenu when showSpecialist is false', () => {
+    act(() => {
+      root.render(
+        <ComposerAgentControlsMenu
+          profile="ask"
+          autoReviewEnabled={false}
+          onProfileChange={vi.fn()}
+          onAutoReviewChange={vi.fn()}
+        />
+      )
+    })
+
+    expect(container.querySelector('[data-testid="specialist-submenu-stub"]')).toBeNull()
+  })
+
+  it('renders the specialist submenu and forwards its props when showSpecialist is true', () => {
+    const onSpecialistChange = vi.fn()
+    act(() => {
+      root.render(
+        <ComposerAgentControlsMenu
+          profile="ask"
+          autoReviewEnabled={false}
+          showSpecialist
+          specialistId="uuid-1"
+          specialistUnavailable={false}
+          specialistReadOnly={false}
+          onSpecialistChange={onSpecialistChange}
+          onProfileChange={vi.fn()}
+          onAutoReviewChange={vi.fn()}
+        />
+      )
+    })
+
+    const stub = container.querySelector('[data-testid="specialist-submenu-stub"]')
+    expect(stub).not.toBeNull()
+    expect(stub?.getAttribute('data-selected-id')).toBe('uuid-1')
+  })
+
+  it('locks the specialist submenu down while a session is running', () => {
+    act(() => {
+      root.render(
+        <ComposerAgentControlsMenu
+          profile="ask"
+          autoReviewEnabled={false}
+          readOnly // session running -> mutating controls frozen
+          showSpecialist
+          specialistId="uuid-1"
+          onSpecialistChange={vi.fn()}
+          onProfileChange={vi.fn()}
+          onAutoReviewChange={vi.fn()}
+        />
+      )
+    })
+
+    const stub = container.querySelector('[data-testid="specialist-submenu-stub"]')
+    expect(stub?.getAttribute('data-read-only')).toBe('true')
   })
 })

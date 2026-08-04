@@ -4,28 +4,47 @@ import { extname, resolve, sep } from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import type { ReadableStream as NodeReadableStream } from 'node:stream/web'
+import { promisify } from 'node:util'
+import { gzip } from 'node:zlib'
 
 import { net } from 'electron'
 import { WebSocket, WebSocketServer } from 'ws'
 
-import { addRendererBroadcastSink } from '../renderer-broadcast'
+import {
+  ClientLeaseRegistry,
+  createTaskCallerContext,
+  createWebCallerContext,
+  type CallerContext
+} from '../caller-context'
+import { createApplicationCommandClient } from '../application-command-client'
+import type { ApplicationCommandComposition } from '../application-command-composition'
+import type { ApplicationEventSource } from '../application-events'
+import {
+  isWebRpcChannel,
+  WEB_RPC_PROTOCOL_VERSION,
+  webRpcRequestSchema
+} from '../../shared/web-rpc-contract'
+import { RENDERER_CONTRACT_CATALOG } from '../../shared/renderer-contract-catalog'
+import { projectPublicTaskEvent, projectWebRendererEvent } from './application-event-projections'
 import { authenticateRequest, persistAuthCookie } from './auth'
-import type { RpcCapture } from './rpc-capture'
 import type { StartTaskRunRequest } from '../../shared/task-api'
 import { TaskApiError, type HeadlessTaskApi } from './task-api'
 
 const MAX_RPC_BODY_BYTES = 64 * 1024 * 1024
+const MIN_GZIP_BYTES = 1_024
+const gzipAsync = promisify(gzip)
 
-// Channels the web client reimplements in the browser (see src/renderer/web/bootstrap.ts) because
-// their main handlers require a real Electron WebContents: file:save-* open a native save dialog
-// parented to a window, and window:close resolves a BrowserWindow from the sender. The synthetic
-// RPC sender has neither, so a direct /rpc call would pop a desktop dialog or silently no-op. The
-// browser never routes these through /rpc, so reject them outright rather than expose that behavior.
-const WEB_CLIENT_OVERRIDDEN_CHANNELS = new Set([
-  'file:save-blob',
-  'file:save-managed',
-  'window:close'
-])
+// Remote Browser access is an application session, not authority over native host lifecycle and
+// shell integration. The catalog keeps that authority decision aligned with renderer installation.
+export const REMOTE_LOCAL_ONLY_RPC_CHANNELS = new Set(
+  RENDERER_CONTRACT_CATALOG.flatMap(({ channel, surfaceInstallation }) =>
+    channel !== null &&
+    surfaceInstallation.localWeb === 'web-rpc' &&
+    surfaceInstallation.remoteWeb === 'rejecting-stub'
+      ? [channel]
+      : []
+  )
+)
 
 const MIME_TYPES: Record<string, string> = {
   '.css': 'text/css; charset=utf-8',
@@ -39,12 +58,16 @@ const MIME_TYPES: Record<string, string> = {
   '.woff2': 'font/woff2'
 }
 
+const COMPRESSIBLE_EXTENSIONS = new Set(['.css', '.html', '.js', '.json', '.svg'])
+
 type WebServerOptions = {
   host: string
   port: number
   token: string
   staticRoot: string
-  rpc: RpcCapture
+  applicationCommands: Pick<ApplicationCommandComposition, 'localWeb' | 'remoteWeb'>
+  applicationEvents: ApplicationEventSource
+  externalAccess?: ExternalWebAccess
   tasks?: Pick<
     HeadlessTaskApi,
     | 'listProjects'
@@ -56,28 +79,52 @@ type WebServerOptions = {
     | 'listArtifacts'
     | 'acquireArtifact'
     | 'releaseArtifact'
+    | 'runWithCallerContext'
   >
   onShutdownRequest?: () => void
   bootstrap: {
     appName: string
     appVersion: string
+    configRoot: string
     platform: string
     versions: { electron: string; chrome: string; node: string }
   }
 }
 
+export type ExternalWebAccessAuthorization = {
+  kind: 'authorized' | 'authorized-pairing-manager'
+  isCurrent: () => boolean
+}
+
+export type ExternalWebAccessDecision = ExternalWebAccessAuthorization | 'handled' | 'denied'
+
+export type ExternalWebSocketAccess = {
+  sessionId?: string
+}
+
+// Optional authentication boundary for a loopback reverse proxy. The normal localhost token path
+// remains unchanged; an isolated remote-access adapter can authenticate its own origin/cookies or
+// render a pairing page without coupling the web server to a tunnel provider.
+export type ExternalWebAccess = {
+  authorizeHttp: (
+    request: IncomingMessage,
+    response: ServerResponse,
+    url: URL
+  ) => Promise<ExternalWebAccessDecision>
+  authorizeWebSocket: (
+    request: IncomingMessage,
+    url: URL
+  ) => Promise<ExternalWebSocketAccess | undefined>
+}
+
 export type RunningWebServer = {
   port: number
+  closeExternalConnections: (sessionId?: string) => void
   close: () => Promise<void>
 }
 
 const json = (response: ServerResponse, status: number, value: unknown): void => {
-  response.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'cache-control': 'no-store',
-    'x-content-type-options': 'nosniff'
-  })
-  response.end(
+  const content = Buffer.from(
     JSON.stringify(value ?? null, (_key, child) => {
       if (child instanceof ArrayBuffer || ArrayBuffer.isView(child)) {
         const bytes =
@@ -89,6 +136,26 @@ const json = (response: ServerResponse, status: number, value: unknown): void =>
       return child
     })
   )
+  response.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': String(content.byteLength),
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff'
+  })
+  response.end(content)
+}
+
+const webRpcError = (
+  response: ServerResponse,
+  status: number,
+  code: 'invalid_request' | 'method_not_found' | 'handler_error',
+  message: string
+): void => {
+  json(response, status, {
+    protocolVersion: WEB_RPC_PROTOCOL_VERSION,
+    ok: false,
+    error: { code, message }
+  })
 }
 
 const readJsonBody = async (request: IncomingMessage): Promise<unknown> => {
@@ -120,10 +187,31 @@ const taskErrorStatus = (error: TaskApiError): number => {
   return 404
 }
 
+class ExternalAuthorizationExpiredError extends Error {
+  constructor() {
+    super('Remote authorization expired before the request was executed.')
+    this.name = 'ExternalAuthorizationExpiredError'
+  }
+}
+
+const assertExternalAuthorizationCurrent = (
+  authorization: ExternalWebAccessAuthorization | undefined
+): void => {
+  if (authorization && !authorization.isCurrent()) {
+    throw new ExternalAuthorizationExpiredError()
+  }
+}
+
 const taskError = (response: ServerResponse, error: unknown): void => {
   if (error instanceof SyntaxError) {
     json(response, 400, {
       error: { code: 'invalid_request', message: 'Request body must be valid JSON.' }
+    })
+    return
+  }
+  if (error instanceof ExternalAuthorizationExpiredError) {
+    json(response, 401, {
+      error: { code: 'unauthorized', message: error.message }
     })
     return
   }
@@ -210,69 +298,81 @@ const handleTaskApiRequest = async (
   request: IncomingMessage,
   response: ServerResponse,
   url: URL,
-  tasks: NonNullable<WebServerOptions['tasks']>
-): Promise<boolean> => {
-  try {
-    if (url.pathname === '/api/v1/projects' && request.method === 'GET') {
-      json(response, 200, { data: await tasks.listProjects() })
-      return true
-    }
-    if (url.pathname === '/api/v1/projects' && request.method === 'POST') {
-      const body = (await readJsonBody(request)) as { name?: string; description?: string }
-      json(response, 201, {
-        data: await tasks.createProject({ name: body.name ?? '', description: body.description })
-      })
-      return true
-    }
-    if (url.pathname === '/api/v1/sessions' && request.method === 'GET') {
-      json(response, 200, {
-        data: await tasks.listSessions(url.searchParams.get('project') ?? undefined)
-      })
-      return true
-    }
-    if (url.pathname === '/api/v1/runs' && request.method === 'POST') {
-      const body = (await readJsonBody(request)) as StartTaskRunRequest
-      json(response, 202, { data: await tasks.startRun(body) })
-      return true
-    }
-
-    const runMatch = url.pathname.match(/^\/api\/v1\/runs\/([^/]+)$/)
-    if (runMatch && request.method === 'GET') {
-      json(response, 200, { data: tasks.getRun(decodeURIComponent(runMatch[1])) })
-      return true
-    }
-    const sessionArtifactsMatch = url.pathname.match(/^\/api\/v1\/sessions\/([^/]+)\/artifacts$/)
-    if (sessionArtifactsMatch && request.method === 'GET') {
-      json(response, 200, {
-        data: await tasks.listArtifacts(decodeURIComponent(sessionArtifactsMatch[1]))
-      })
-      return true
-    }
-    const sessionMatch = url.pathname.match(/^\/api\/v1\/sessions\/([^/]+)$/)
-    if (sessionMatch && request.method === 'GET') {
-      json(response, 200, { data: await tasks.getSession(decodeURIComponent(sessionMatch[1])) })
-      return true
-    }
-    const artifactMatch = url.pathname.match(/^\/api\/v1\/artifacts\/([^/]+)\/content$/)
-    if (artifactMatch && (request.method === 'GET' || request.method === 'HEAD')) {
-      const artifact = await tasks.acquireArtifact(decodeURIComponent(artifactMatch[1]))
-      try {
-        await streamPreviewResource(request, response, artifact.url, {
-          'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(artifact.name)}`
-        })
-      } finally {
-        await tasks.releaseArtifact(artifact.resourceId)
+  tasks: NonNullable<WebServerOptions['tasks']>,
+  callerContext: CallerContext,
+  externalAuthorization?: ExternalWebAccessAuthorization
+): Promise<boolean> =>
+  tasks.runWithCallerContext(callerContext, async () => {
+    try {
+      if (url.pathname === '/api/v1/projects' && request.method === 'GET') {
+        assertExternalAuthorizationCurrent(externalAuthorization)
+        json(response, 200, { data: await tasks.listProjects() })
+        return true
       }
+      if (url.pathname === '/api/v1/projects' && request.method === 'POST') {
+        const body = (await readJsonBody(request)) as { name?: string; description?: string }
+        assertExternalAuthorizationCurrent(externalAuthorization)
+        json(response, 201, {
+          data: await tasks.createProject({ name: body.name ?? '', description: body.description })
+        })
+        return true
+      }
+      if (url.pathname === '/api/v1/sessions' && request.method === 'GET') {
+        assertExternalAuthorizationCurrent(externalAuthorization)
+        json(response, 200, {
+          data: await tasks.listSessions(url.searchParams.get('project') ?? undefined)
+        })
+        return true
+      }
+      if (url.pathname === '/api/v1/runs' && request.method === 'POST') {
+        const body = (await readJsonBody(request)) as StartTaskRunRequest
+        assertExternalAuthorizationCurrent(externalAuthorization)
+        json(response, 202, { data: await tasks.startRun(body) })
+        return true
+      }
+
+      const runMatch = url.pathname.match(/^\/api\/v1\/runs\/([^/]+)$/)
+      if (runMatch && request.method === 'GET') {
+        assertExternalAuthorizationCurrent(externalAuthorization)
+        json(response, 200, { data: tasks.getRun(decodeURIComponent(runMatch[1])) })
+        return true
+      }
+      const sessionArtifactsMatch = url.pathname.match(/^\/api\/v1\/sessions\/([^/]+)\/artifacts$/)
+      if (sessionArtifactsMatch && request.method === 'GET') {
+        assertExternalAuthorizationCurrent(externalAuthorization)
+        json(response, 200, {
+          data: await tasks.listArtifacts(decodeURIComponent(sessionArtifactsMatch[1]))
+        })
+        return true
+      }
+      const sessionMatch = url.pathname.match(/^\/api\/v1\/sessions\/([^/]+)$/)
+      if (sessionMatch && request.method === 'GET') {
+        assertExternalAuthorizationCurrent(externalAuthorization)
+        json(response, 200, { data: await tasks.getSession(decodeURIComponent(sessionMatch[1])) })
+        return true
+      }
+      const artifactMatch = url.pathname.match(/^\/api\/v1\/artifacts\/([^/]+)\/content$/)
+      if (artifactMatch && (request.method === 'GET' || request.method === 'HEAD')) {
+        assertExternalAuthorizationCurrent(externalAuthorization)
+        const artifact = await tasks.acquireArtifact(decodeURIComponent(artifactMatch[1]))
+        try {
+          await streamPreviewResource(request, response, artifact.url, {
+            'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(artifact.name)}`
+          })
+        } finally {
+          await tasks.releaseArtifact(artifact.resourceId)
+        }
+        return true
+      }
+    } catch (error) {
+      taskError(response, error)
       return true
     }
-  } catch (error) {
-    taskError(response, error)
-    return true
-  }
-  return false
-}
+    return false
+  })
 
 const serveStatic = async (
+  request: IncomingMessage,
   response: ServerResponse,
   staticRoot: string,
   pathname: string
@@ -293,35 +393,61 @@ const serveStatic = async (
 
   try {
     const content = await readFile(filePath)
+    const extension = extname(filePath).toLowerCase()
+    const canCompress =
+      content.byteLength >= MIN_GZIP_BYTES && COMPRESSIBLE_EXTENSIONS.has(extension)
+    const acceptsGzip = /\bgzip\b/i.test(String(request.headers['accept-encoding'] ?? ''))
+    const body = canCompress && acceptsGzip ? await gzipAsync(content) : content
     response.writeHead(200, {
-      'content-type': MIME_TYPES[extname(filePath).toLowerCase()] ?? 'application/octet-stream',
+      'content-type': MIME_TYPES[extension] ?? 'application/octet-stream',
+      'content-length': String(body.byteLength),
       'cache-control': filePath.endsWith('index.html') ? 'no-store' : 'public, max-age=31536000',
-      'x-content-type-options': 'nosniff'
+      'x-content-type-options': 'nosniff',
+      ...(canCompress ? { vary: 'Accept-Encoding' } : {}),
+      ...(body !== content ? { 'content-encoding': 'gzip' } : {})
     })
-    response.end(content)
+    response.end(request.method === 'HEAD' ? undefined : body)
   } catch {
-    response.writeHead(503, { 'content-type': 'text/plain; charset=utf-8' })
-    response.end('Web UI is not built. Run npm run build:web first.')
+    const message = 'Web UI is not built. Run npm run build:web first.'
+    response.writeHead(503, {
+      'content-type': 'text/plain; charset=utf-8',
+      'content-length': String(Buffer.byteLength(message))
+    })
+    response.end(request.method === 'HEAD' ? undefined : message)
   }
 }
 
 const startWebHttpServer = async (options: WebServerOptions): Promise<RunningWebServer> => {
   const sockets = new Set<WebSocket>()
+  const externalSockets = new Map<WebSocket, string | undefined>()
   const publicEventSockets = new Set<WebSocket>()
-  const clientConnections = new Map<string, number>()
+  const commandClient = createApplicationCommandClient()
+  const clientLeases = new ClientLeaseRegistry((clientId) => {
+    commandClient.releaseClient('web', clientId)
+  })
   const wsServer = new WebSocketServer({ noServer: true })
 
   const server = createServer(async (request, response) => {
     try {
       const url = new URL(request.url ?? '/', `http://${request.headers.host ?? '127.0.0.1'}`)
       const auth = authenticateRequest(request, url, options.token)
-      if (!auth.ok) {
+      let authorized = auth.ok
+      let externalAuthorization: ExternalWebAccessAuthorization | undefined
+      if (!authorized && options.externalAccess) {
+        const decision = await options.externalAccess.authorizeHttp(request, response, url)
+        if (decision === 'handled') return
+        authorized = typeof decision === 'object'
+        if (typeof decision === 'object') {
+          externalAuthorization = decision
+        }
+      }
+      if (!authorized) {
         response.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' })
         response.end('Unauthorized')
         return
       }
 
-      if (auth.queryToken && request.method === 'GET' && url.pathname === '/') {
+      if (auth.ok && auth.queryToken && request.method === 'GET' && url.pathname === '/') {
         persistAuthCookie(response, options.token)
         url.searchParams.delete('token')
         response.writeHead(302, { location: `${url.pathname}${url.search}${url.hash}` })
@@ -330,11 +456,26 @@ const startWebHttpServer = async (options: WebServerOptions): Promise<RunningWeb
       }
 
       if (url.pathname === '/api/bootstrap' && request.method === 'GET') {
-        json(response, 200, { ...options.bootstrap, rpcChannels: options.rpc.channels() })
+        const rpcChannels = auth.ok
+          ? options.applicationCommands.localWeb.commandNames()
+          : options.applicationCommands.remoteWeb.commandNames()
+        const restrictedRpcChannels = auth.ok
+          ? []
+          : options.applicationCommands.remoteWeb.rejectedCommandNames()
+        json(response, 200, {
+          ...options.bootstrap,
+          rpcProtocolVersion: WEB_RPC_PROTOCOL_VERSION,
+          rpcChannels,
+          restrictedRpcChannels
+        })
         return
       }
 
       if (url.pathname === '/api/shutdown' && request.method === 'POST') {
+        if (!auth.ok) {
+          json(response, 403, { ok: false, error: 'Shutdown is only available locally.' })
+          return
+        }
         if (!options.onShutdownRequest) {
           json(response, 404, { ok: false, error: 'Shutdown is not available.' })
           return
@@ -347,7 +488,21 @@ const startWebHttpServer = async (options: WebServerOptions): Promise<RunningWeb
       if (
         url.pathname.startsWith('/api/v1/') &&
         options.tasks &&
-        (await handleTaskApiRequest(request, response, url, options.tasks))
+        (await handleTaskApiRequest(
+          request,
+          response,
+          url,
+          options.tasks,
+          createTaskCallerContext({
+            ...(externalAuthorization
+              ? {
+                  location: 'remote' as const,
+                  isAuthorizationCurrent: externalAuthorization.isCurrent
+                }
+              : {})
+          }),
+          externalAuthorization
+        ))
       ) {
         return
       }
@@ -360,20 +515,95 @@ const startWebHttpServer = async (options: WebServerOptions): Promise<RunningWeb
 
       if (url.pathname.startsWith('/rpc/') && request.method === 'POST') {
         const channel = decodeURIComponent(url.pathname.slice('/rpc/'.length))
-        if (WEB_CLIENT_OVERRIDDEN_CHANNELS.has(channel)) {
-          json(response, 403, { ok: false, error: `Channel not available over web: ${channel}` })
+        if (!isWebRpcChannel(channel)) {
+          webRpcError(response, 404, 'method_not_found', 'Web RPC method not found.')
           return
         }
-        const body = (await readJsonBody(request)) as { args?: unknown[] }
-        const clientId = String(request.headers['x-open-science-client'] ?? 'web')
+        let body: unknown
         try {
-          const result = await options.rpc.invoke(channel, clientId, body.args ?? [])
-          json(response, 200, { ok: true, result })
+          body = await readJsonBody(request)
         } catch (error) {
-          json(response, 500, {
-            ok: false,
-            error: error instanceof Error ? error.message : String(error)
+          webRpcError(
+            response,
+            400,
+            'invalid_request',
+            error instanceof SyntaxError ? 'Request body must be valid JSON.' : String(error)
+          )
+          return
+        }
+        if (
+          body &&
+          typeof body === 'object' &&
+          'protocolVersion' in body &&
+          body.protocolVersion !== WEB_RPC_PROTOCOL_VERSION
+        ) {
+          webRpcError(
+            response,
+            426,
+            'invalid_request',
+            `Unsupported Web RPC protocol version. Expected ${WEB_RPC_PROTOCOL_VERSION}.`
+          )
+          return
+        }
+        const parsed = webRpcRequestSchema.safeParse(body)
+        if (!parsed.success) {
+          webRpcError(
+            response,
+            400,
+            'invalid_request',
+            'Request does not match the Web RPC schema.'
+          )
+          return
+        }
+        if (!auth.ok && REMOTE_LOCAL_ONLY_RPC_CHANNELS.has(channel)) {
+          webRpcError(
+            response,
+            403,
+            'method_not_found',
+            `Channel only available from the local app: ${channel}`
+          )
+          return
+        }
+        const clientId = String(request.headers['x-open-science-client'] ?? 'web')
+        const callerContext = createWebCallerContext(clientId, {
+          ...(externalAuthorization
+            ? {
+                location: 'remote' as const,
+                authorities:
+                  externalAuthorization.kind === 'authorized-pairing-manager'
+                    ? (['manage-remote-pairing'] as const)
+                    : [],
+                isAuthorizationCurrent: externalAuthorization.isCurrent
+              }
+            : {})
+        })
+        try {
+          assertExternalAuthorizationCurrent(externalAuthorization)
+          const dispatcher = auth.ok
+            ? options.applicationCommands.localWeb
+            : options.applicationCommands.remoteWeb
+          const result = await commandClient.invoke(
+            dispatcher,
+            channel,
+            callerContext,
+            parsed.data.args
+          )
+          json(response, 200, {
+            protocolVersion: WEB_RPC_PROTOCOL_VERSION,
+            ok: true,
+            result: result ?? null
           })
+        } catch (error) {
+          if (error instanceof ExternalAuthorizationExpiredError) {
+            webRpcError(response, 401, 'invalid_request', error.message)
+            return
+          }
+          webRpcError(
+            response,
+            500,
+            'handler_error',
+            error instanceof Error ? error.message : String(error)
+          )
         }
         return
       }
@@ -387,7 +617,7 @@ const startWebHttpServer = async (options: WebServerOptions): Promise<RunningWeb
       }
 
       if (request.method === 'GET' || request.method === 'HEAD') {
-        await serveStatic(response, options.staticRoot, url.pathname)
+        await serveStatic(request, response, options.staticRoot, url.pathname)
         return
       }
 
@@ -400,73 +630,104 @@ const startWebHttpServer = async (options: WebServerOptions): Promise<RunningWeb
   })
 
   server.on('upgrade', (request, socket, head) => {
-    const url = new URL(request.url ?? '/', `http://${request.headers.host ?? '127.0.0.1'}`)
-    const auth = authenticateRequest(request, url, options.token)
-    if (!auth.ok || !['/events', '/api/v1/events'].includes(url.pathname)) {
-      socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n')
-      socket.destroy()
-      return
-    }
-    wsServer.handleUpgrade(request, socket, head, (webSocket) => {
-      wsServer.emit('connection', webSocket, request)
-    })
+    void (async () => {
+      try {
+        const url = new URL(request.url ?? '/', `http://${request.headers.host ?? '127.0.0.1'}`)
+        const auth = authenticateRequest(request, url, options.token)
+        const externalAuthorization =
+          !auth.ok && options.externalAccess
+            ? await options.externalAccess.authorizeWebSocket(request, url)
+            : undefined
+        if (
+          (!auth.ok && !externalAuthorization) ||
+          !['/events', '/api/v1/events'].includes(url.pathname)
+        ) {
+          socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n')
+          socket.destroy()
+          return
+        }
+        wsServer.handleUpgrade(request, socket, head, (webSocket) => {
+          if (externalAuthorization) {
+            externalSockets.set(webSocket, externalAuthorization.sessionId)
+          }
+          wsServer.emit('connection', webSocket, request)
+        })
+      } catch {
+        socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n')
+        socket.destroy()
+      }
+    })()
   })
 
   wsServer.on('connection', (socket, request) => {
     const url = new URL(request.url ?? '/', `http://${request.headers.host ?? '127.0.0.1'}`)
     const clientId = url.searchParams.get('client') ?? 'web'
+    const lease = clientLeases.acquire(clientId)
     sockets.add(socket)
     if (url.pathname === '/api/v1/events') publicEventSockets.add(socket)
-    clientConnections.set(clientId, (clientConnections.get(clientId) ?? 0) + 1)
     socket.on('close', () => {
       sockets.delete(socket)
+      externalSockets.delete(socket)
       publicEventSockets.delete(socket)
-      const remaining = (clientConnections.get(clientId) ?? 1) - 1
-      if (remaining <= 0) {
-        clientConnections.delete(clientId)
-        options.rpc.releaseClient(clientId)
-      } else {
-        clientConnections.set(clientId, remaining)
-      }
+      lease.release()
     })
   })
 
-  const removeBroadcastSink = addRendererBroadcastSink((channel, payload) => {
-    const internalMessage = JSON.stringify({ channel, payload })
-    const publicMessage =
-      channel === 'acp:event'
-        ? JSON.stringify({ type: 'run.event', data: payload })
-        : channel === 'acp:permission-request'
-          ? JSON.stringify({ type: 'permission.requested', data: payload })
-          : undefined
+  const removeBroadcastSink = options.applicationEvents.subscribe((event) => {
+    const internalProjection = projectWebRendererEvent(event)
+    const publicProjection = projectPublicTaskEvent(event)
+    const internalMessage = internalProjection ? JSON.stringify(internalProjection) : undefined
+    const publicMessage = publicProjection ? JSON.stringify(publicProjection) : undefined
     for (const socket of sockets) {
       if (socket.readyState !== WebSocket.OPEN) continue
       if (publicEventSockets.has(socket)) {
         if (publicMessage) socket.send(publicMessage)
-      } else {
+      } else if (internalMessage) {
         socket.send(internalMessage)
       }
     }
   })
 
-  await new Promise<void>((resolveListening, reject) => {
-    server.once('error', reject)
-    server.listen(options.port, options.host, () => {
-      server.off('error', reject)
-      resolveListening()
+  try {
+    await new Promise<void>((resolveListening, reject) => {
+      server.once('error', reject)
+      server.listen(options.port, options.host, () => {
+        server.off('error', reject)
+        resolveListening()
+      })
     })
-  })
+  } catch (error) {
+    removeBroadcastSink()
+    try {
+      clientLeases.dispose()
+    } finally {
+      commandClient.dispose()
+    }
+    throw error
+  }
 
   const address = server.address()
   const port = typeof address === 'object' && address ? address.port : options.port
 
   return {
     port,
+    closeExternalConnections: (sessionId) => {
+      for (const [socket, externalSessionId] of externalSockets) {
+        if (sessionId === undefined || externalSessionId === sessionId) {
+          socket.close(1008, 'Remote access revoked')
+        }
+      }
+    },
     close: async () => {
       removeBroadcastSink()
       for (const socket of sockets) socket.close()
       wsServer.close()
       await new Promise<void>((resolveClose) => server.close(() => resolveClose()))
+      try {
+        clientLeases.dispose()
+      } finally {
+        commandClient.dispose()
+      }
     }
   }
 }

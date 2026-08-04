@@ -1,11 +1,19 @@
 export type ProjectFileSource = 'artifact' | 'upload'
 
+export type ProjectFileOriginSession = {
+  state: 'active' | 'deleting' | 'deleted'
+  title?: string
+  deletedAt?: string
+}
+
 // Renderer-facing metadata projection. File bytes remain on disk and are read lazily through the
 // existing source-specific preview IPC only after this DTO has been paged into the Files view.
 export type ProjectFileItem = {
   id: string
   source: ProjectFileSource
   sourceFileId: string
+  sourceVersionId?: string
+  checksum?: string
   projectId: string
   sessionId: string
   messageId?: string
@@ -15,13 +23,27 @@ export type ProjectFileItem = {
   size: number
   mtimeMs?: number
   sortAtMs: number
+  originSession?: ProjectFileOriginSession
+}
+
+export type ProjectFilesSearch = {
+  // Filename substring search is ASCII case-insensitive; non-ASCII characters match literally.
+  filenameContains: string
+}
+
+export type GetProjectFilesOverviewRequest = {
+  projectId: string
+  search?: ProjectFilesSearch
 }
 
 export type ListProjectFilesRequest = {
   projectId: string
   // Uploads and each session's artifacts are deliberately separate collections with independent
-  // cursors; flattening them would break uploads-first and session-grouped rendering.
-  collection: { kind: 'uploads' } | { kind: 'sessionArtifacts'; sessionId: string }
+  // cursors for the Files page. The flat `all` collection is reserved for cross-session file pickers
+  // that need one canonical Project Files read model rather than reconstructing Session metadata.
+  collection:
+    { kind: 'all' } | { kind: 'uploads' } | { kind: 'sessionArtifacts'; sessionId: string }
+  search?: ProjectFilesSearch
   cursor?: string
   limit: number
 }
@@ -32,8 +54,26 @@ export type ProjectFilesPage = {
   totalCount: number
 }
 
+// Bounded global-search projection. The primary Project is independently paged; Other Projects
+// deliberately return only a small combined sample so the command palette remains responsive.
+export type SearchArtifactsRequest = {
+  primaryProjectId: string
+  otherProjectIds: string[]
+  filenameContains?: string
+  primaryLimit: number
+  primaryCursor?: string
+  otherLimit: 0 | 1
+}
+
+export type SearchArtifactsResult = {
+  primary: ProjectFilesPage
+  other: ProjectFileItem[]
+  isIndexComplete: boolean
+}
+
 export type ListArtifactGroupsRequest = {
   projectId: string
+  search?: ProjectFilesSearch
   cursor?: string
   limit: number
 }
@@ -41,6 +81,7 @@ export type ListArtifactGroupsRequest = {
 export type ArtifactGroupItem = {
   sessionId: string
   artifactCount: number
+  originSession?: ProjectFileOriginSession
 }
 
 export type ArtifactGroupPage = {

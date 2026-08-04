@@ -1,4 +1,16 @@
-import { mkdtemp, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import {
+  chmod,
+  mkdtemp,
+  mkdir,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  stat,
+  symlink,
+  truncate,
+  writeFile
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { deflateRawSync } from 'node:zlib'
@@ -325,6 +337,32 @@ describe('UserSkillRepository', () => {
     expect(await new UserSkillRepository(await makeStorage()).list()).toEqual([])
   })
 
+  it('previews one selected GitHub skill without importing it', async () => {
+    const repo = new UserSkillRepository(await makeStorage())
+    const preview = await repo.previewGitHubSkill(
+      SKILL_URL,
+      fakeFetch(
+        [
+          '---',
+          'name: Foo',
+          'description: A remote skill.',
+          'license: MIT',
+          '---',
+          '# Preview body'
+        ].join('\n')
+      )
+    )
+
+    expect(preview).toEqual({
+      name: 'Foo',
+      description: 'A remote skill.',
+      metadata: { license: 'MIT' },
+      body: '# Preview body',
+      files: ['SKILL.md']
+    })
+    expect(await repo.list()).toEqual([])
+  })
+
   it('imports a .zip bundle (SKILL.md + files) and dedups an identical re-import', async () => {
     const storage = await makeStorage()
     const repo = new UserSkillRepository(storage)
@@ -478,6 +516,8 @@ describe('UserSkillRepository', () => {
         {
           name: 'Bundled',
           description: 'A test bundle.',
+          metadata: {},
+          body: 'body',
           files: ['SKILL.md', 'scripts/run.py'],
           alreadyImported: false,
           replaceableId: undefined,
@@ -492,6 +532,69 @@ describe('UserSkillRepository', () => {
     // After importing, the same bundle previews as already imported.
     await repo.importFromZip(zip)
     expect((await repo.previewZip(zip)).previews[0].alreadyImported).toBe(true)
+  })
+
+  it('bounds cumulative preview content without making later bundle skills unimportable', async () => {
+    const repo = new UserSkillRepository(await makeStorage())
+    const largeBody = Buffer.alloc(3 * 1024 * 1024, 0x61)
+    const skillMd = (name: string): Buffer =>
+      Buffer.concat([
+        Buffer.from(`---\nname: ${name}\ndescription: Large preview\n---\n`),
+        largeBody
+      ])
+    const zip = buildZip([
+      { path: 'alpha/SKILL.md', content: skillMd('Alpha') },
+      { path: 'beta/SKILL.md', content: skillMd('Beta') }
+    ])
+
+    const { previews, skipped } = await repo.previewZip(zip)
+
+    expect(previews.map((preview) => preview.name)).toEqual(['Alpha', 'Beta'])
+    expect(previews[0]).toMatchObject({ previewError: undefined })
+    expect(previews[1]).toMatchObject({
+      body: '',
+      previewError: expect.stringMatching(/preview content.*limit/i)
+    })
+    expect(skipped).toEqual([])
+
+    await expect(
+      repo.importFromZipBatch(
+        zip,
+        previews.map((preview) => ({ subPath: preview.subPath }))
+      )
+    ).resolves.toMatchObject([
+      { subPath: 'alpha', outcome: { status: 'imported' } },
+      { subPath: 'beta', outcome: { status: 'imported' } }
+    ])
+  })
+
+  it('omits oversized frontmatter fields from a still-importable bundle preview', async () => {
+    const repo = new UserSkillRepository(await makeStorage())
+    const oversizedDescription = 'x'.repeat(SKILL_IMPORT_LIMITS.maxPreviewContentBytes)
+    const zip = buildZip([
+      {
+        path: 'large-frontmatter/SKILL.md',
+        content: Buffer.from(
+          `---\nname: Large frontmatter\ndescription: ${oversizedDescription}\nauthor: Ada\n---\n# Body`
+        )
+      }
+    ])
+
+    const { previews, skipped } = await repo.previewZip(zip)
+
+    expect(previews).toEqual([
+      expect.objectContaining({
+        name: 'Large frontmatter',
+        description: '',
+        metadata: {},
+        body: '',
+        previewError: expect.stringMatching(/preview content.*limit/i)
+      })
+    ])
+    expect(skipped).toEqual([])
+    await expect(
+      repo.importFromZipBatch(zip, [{ subPath: 'large-frontmatter' }])
+    ).resolves.toMatchObject([{ outcome: { status: 'imported' } }])
   })
 
   it('skips a preview whose SKILL.md has no name (instead of failing the bundle)', async () => {
@@ -1220,7 +1323,9 @@ describe('UserSkillRepository', () => {
               { path: 'bar/SKILL.md', type: 'blob' }
             ]
           }
-        : { default_branch: 'main' }
+        : url.includes('/commits/')
+          ? { sha: '0123456789abcdef0123456789abcdef01234567' }
+          : { default_branch: 'main' }
       return {
         ok: true,
         status: 200,
@@ -1238,7 +1343,19 @@ describe('UserSkillRepository', () => {
   it('writes frontmatter that the reader can parse back', async () => {
     const storage = await makeStorage()
     const repo = new UserSkillRepository(storage)
-    const id = await repo.createPersonal({ name: 'Round Trip', description: 'desc', body: 'hello' })
+    const id = await repo.createPersonal({
+      name: 'Round Trip',
+      description: 'desc',
+      metadata: {
+        author: 'Ada',
+        license: 'MIT',
+        name: 'Untrusted override',
+        description: 'Untrusted override',
+        Name: 'Case-insensitive override',
+        DESCRIPTION: 'Case-insensitive override'
+      },
+      body: 'hello'
+    })
 
     const raw = await readFile(
       join(storage, 'skills', 'personal', 'round-trip', 'SKILL.md'),
@@ -1246,6 +1363,478 @@ describe('UserSkillRepository', () => {
     )
     expect(raw).toContain('name: Round Trip')
     expect(raw).toContain('description: desc')
+    expect(parseFrontmatter(raw).fields).toMatchObject({
+      name: 'Round Trip',
+      description: 'desc',
+      author: 'Ada',
+      license: 'MIT'
+    })
     expect(await repo.body(id)).toBe('hello')
   })
+})
+
+describe('UserSkillRepository: agent-home import', () => {
+  // Round 5 of the AI review (the agent-home import path). The listAgentHomeSkills + importAgentHomeSkill
+  // pair is the new "From your agent home" source on the Skills panel. The repository layer owns
+  // the file-system work; the service layer wraps it with framework routing. These tests cover the
+  // copy/conflict/failure paths the repository is responsible for.
+
+  // The agent-home directory layout is `<home>/skills/<slug>/SKILL.md`, mirroring what the renderer
+  // sees as the user's `~/.claude/skills/` (or `~/.codex/skills/`) tree.
+  const seedSkill = async (agentHome: string, slug: string): Promise<string> => {
+    const dir = join(agentHome, 'skills', slug)
+    await mkdir(dir, { recursive: true })
+    await writeFile(
+      join(dir, 'SKILL.md'),
+      `---\nname: ${slug}\ndescription: Test skill ${slug}\n---\nBody of ${slug}.\n`
+    )
+    return dir
+  }
+
+  it('lists skills under the agent home with alreadyImported=false for fresh skills', async () => {
+    const storage = await makeStorage()
+    const repo = new UserSkillRepository(storage)
+    const home = await mkdtemp(join(tmpdir(), 'os-list-agent-'))
+    await seedSkill(home, 'alpha')
+    await seedSkill(home, 'beta')
+
+    const items = await repo.listAgentHomeSkills(join(home, 'skills'), 'agents')
+
+    expect(items.map((i) => i.slug).sort()).toEqual(['alpha', 'beta'])
+    expect(items.every((i) => i.alreadyImported === false)).toBe(true)
+    expect(items[0].path).toBe(join(home, 'skills', items[0].slug))
+  })
+
+  it('previews an installed skill body, metadata, and file names without importing it', async () => {
+    const repo = new UserSkillRepository(await makeStorage())
+    const home = await mkdtemp(join(tmpdir(), 'os-preview-agent-'))
+    const source = await seedSkill(home, 'alpha')
+    await writeFile(
+      join(source, 'SKILL.md'),
+      [
+        '---',
+        'name: Alpha',
+        'description: Installed preview.',
+        'license: Apache-2.0',
+        '---',
+        '# Installed body'
+      ].join('\n')
+    )
+    await mkdir(join(source, 'references'))
+    await writeFile(join(source, 'references', 'guide.md'), 'Guide')
+
+    await expect(repo.previewAgentHomeSkill(source)).resolves.toEqual({
+      name: 'Alpha',
+      description: 'Installed preview.',
+      metadata: { license: 'Apache-2.0' },
+      body: '# Installed body',
+      files: ['SKILL.md', 'references/guide.md']
+    })
+    expect(await repo.list()).toEqual([])
+  })
+
+  it('bounds installed preview content without preventing import', async () => {
+    const storage = await makeStorage()
+    const repo = new UserSkillRepository(storage)
+    const home = await mkdtemp(join(tmpdir(), 'os-preview-agent-content-large-'))
+    const source = await seedSkill(home, 'alpha')
+    await writeFile(
+      join(source, 'SKILL.md'),
+      `---\nname: alpha\ndescription: Large preview\n---\n${'x'.repeat(SKILL_IMPORT_LIMITS.maxPreviewContentBytes)}`
+    )
+
+    const previewError = await repo.previewAgentHomeSkill(source).then(
+      () => null,
+      (error: unknown) => error
+    )
+    expect(previewError).toBeInstanceOf(Error)
+    expect((previewError as Error).message).toMatch(/preview exceeds the 4 MB limit/i)
+    await expect(
+      repo.importAgentHomeSkill(source, { source: 'agents', slug: 'alpha' })
+    ).resolves.toMatchObject({ status: 'imported', id: 'imported-alpha' })
+  })
+
+  it('rejects an installed preview whose declared file sizes exceed the skill cap', async () => {
+    const repo = new UserSkillRepository(await makeStorage())
+    const home = await mkdtemp(join(tmpdir(), 'os-preview-agent-large-'))
+    const source = await seedSkill(home, 'alpha')
+    const largeReference = join(source, 'large.bin')
+    await writeFile(largeReference, '')
+    await truncate(largeReference, SKILL_IMPORT_LIMITS.maxFileBytes + 1)
+
+    await expect(repo.previewAgentHomeSkill(source)).rejects.toThrow(/file over/)
+  })
+
+  it.skipIf(process.platform === 'win32')(
+    'rejects a nested symlink while previewing an installed skill',
+    async () => {
+      const repo = new UserSkillRepository(await makeStorage())
+      const home = await mkdtemp(join(tmpdir(), 'os-preview-agent-link-'))
+      const source = await seedSkill(home, 'alpha')
+      const outside = join(home, 'outside.md')
+      await writeFile(outside, 'outside')
+      await mkdir(join(source, 'references'))
+      await symlink(outside, join(source, 'references', 'outside.md'))
+
+      await expect(repo.previewAgentHomeSkill(source)).rejects.toThrow(/symbolic link/)
+    }
+  )
+
+  it('marks a skill as alreadyImported when the same source identity exists', async () => {
+    // The renderer uses alreadyImported to flip the row to a "Imported" badge and hide the action
+    // button. The match is by source plus slug and the current content signature.
+    const storage = await makeStorage()
+    const repo = new UserSkillRepository(storage)
+    const home = await mkdtemp(join(tmpdir(), 'os-list-agent-'))
+    await seedSkill(home, 'alpha')
+
+    await repo.importAgentHomeSkill(join(home, 'skills', 'alpha'), {
+      source: 'agents',
+      slug: 'alpha'
+    })
+
+    const items = await repo.listAgentHomeSkills(join(home, 'skills'), 'agents')
+    expect(items[0].alreadyImported).toBe(true)
+  })
+
+  it('skips loose files and directories without a readable SKILL.md', async () => {
+    const storage = await makeStorage()
+    const repo = new UserSkillRepository(storage)
+    const home = await mkdtemp(join(tmpdir(), 'os-list-agent-'))
+    await mkdir(join(home, 'skills'), { recursive: true })
+    await writeFile(join(home, 'skills', 'stray-file.txt'), 'not a skill')
+    await mkdir(join(home, 'skills', 'empty-directory'))
+    await seedSkill(home, 'alpha')
+
+    const items = await repo.listAgentHomeSkills(join(home, 'skills'), 'agents')
+    expect(items.map((i) => i.slug)).toEqual(['alpha'])
+  })
+
+  it.skipIf(process.platform === 'win32')(
+    'lists directory symlinks that resolve to a readable skill',
+    async () => {
+      const storage = await makeStorage()
+      const repo = new UserSkillRepository(storage)
+      const home = await mkdtemp(join(tmpdir(), 'os-list-agent-link-'))
+      const target = await seedSkill(home, 'real-skill')
+      await symlink(target, join(home, 'skills', 'linked-skill'))
+
+      const items = await repo.listAgentHomeSkills(join(home, 'skills'), 'agents')
+
+      expect(items.map((item) => item.slug)).toEqual(['linked-skill', 'real-skill'])
+    }
+  )
+
+  it('returns an empty list for a missing agent-home skills dir (no error)', async () => {
+    const storage = await makeStorage()
+    const repo = new UserSkillRepository(storage)
+    const home = await mkdtemp(join(tmpdir(), 'os-list-agent-'))
+
+    const items = await repo.listAgentHomeSkills(join(home, 'skills'), 'agents')
+    expect(items).toEqual([])
+  })
+
+  it('imports a skill and lists the imported record under the new slug', async () => {
+    const storage = await makeStorage()
+    const repo = new UserSkillRepository(storage)
+    const home = await mkdtemp(join(tmpdir(), 'os-import-agent-'))
+    await seedSkill(home, 'alpha')
+
+    const outcome = await repo.importAgentHomeSkill(join(home, 'skills', 'alpha'), {
+      source: 'agents',
+      slug: 'alpha'
+    })
+
+    expect(outcome).toEqual({ status: 'imported', id: 'imported-alpha' })
+    const skills = await repo.list()
+    expect(skills.find((s) => s.id === 'imported-alpha')).toBeDefined()
+  })
+
+  it('throws when the source path does not exist (no half-copied state)', async () => {
+    const storage = await makeStorage()
+    const repo = new UserSkillRepository(storage)
+    const home = await mkdtemp(join(tmpdir(), 'os-import-agent-'))
+    // No seedSkill — the path resolves to a non-existent directory.
+
+    await expect(
+      repo.importAgentHomeSkill(join(home, 'skills', 'missing'), {
+        source: 'agents',
+        slug: 'missing'
+      })
+    ).rejects.toThrow(/not available/)
+    // No record should have been created on the failure path.
+    expect(await repo.list()).toEqual([])
+  })
+
+  it('throws when the basename is not a safe slug (the SAFE_SLUG guard)', async () => {
+    const storage = await makeStorage()
+    const repo = new UserSkillRepository(storage)
+    const home = await mkdtemp(join(tmpdir(), 'os-import-agent-'))
+    // Create a directory whose name fails the SAFE_SLUG regex.
+    await mkdir(join(home, 'skills', 'has spaces'), { recursive: true })
+
+    await expect(
+      repo.importAgentHomeSkill(join(home, 'skills', 'has spaces'), {
+        source: 'agents',
+        slug: 'has spaces'
+      })
+    ).rejects.toThrow(/unsafe slug/)
+  })
+
+  it('deduplicates the same installed skill identity while suffixing a cross-source collision', async () => {
+    const storage = await makeStorage()
+    const repo = new UserSkillRepository(storage)
+    const home = await mkdtemp(join(tmpdir(), 'os-import-agent-'))
+    await seedSkill(home, 'alpha')
+
+    const first = await repo.importAgentHomeSkill(join(home, 'skills', 'alpha'), {
+      source: 'agents',
+      slug: 'alpha'
+    })
+    const repeated = await repo.importAgentHomeSkill(join(home, 'skills', 'alpha'), {
+      source: 'agents',
+      slug: 'alpha'
+    })
+    const secondSource = await repo.importAgentHomeSkill(join(home, 'skills', 'alpha'), {
+      source: 'claude',
+      slug: 'alpha'
+    })
+
+    expect(first.id).toBe('imported-alpha')
+    expect(repeated).toEqual({ status: 'unchanged', id: 'imported-alpha' })
+    expect(secondSource.id).toBe('imported-alpha-2')
+    const skills = await repo.list()
+    expect(skills.find((s) => s.id === 'imported-alpha')).toBeDefined()
+    expect(skills.find((s) => s.id === 'imported-alpha-2')).toBeDefined()
+  })
+
+  it('revalidates legacy fallback content during import', async () => {
+    const storage = await makeStorage()
+    const repo = new UserSkillRepository(storage)
+    const home = await mkdtemp(join(tmpdir(), 'os-import-agent-stale-fallback-'))
+    const source = await seedSkill(home, 'alpha')
+    const importedDir = join(storage, 'skills', 'imported', 'alpha')
+    await mkdir(importedDir, { recursive: true })
+    await writeFile(
+      join(importedDir, 'SKILL.md'),
+      '---\nname: alpha\ndescription: Different import\n---\nDifferent body.\n'
+    )
+
+    const outcome = await repo.importAgentHomeSkill(
+      source,
+      { source: 'agents', slug: 'alpha' },
+      { fallbackSlugs: ['alpha'] }
+    )
+
+    expect(outcome).toEqual({ status: 'imported', id: 'imported-alpha-2' })
+  })
+
+  it('does not update skill content during a stale canonical identity migration', async () => {
+    const storage = await makeStorage()
+    const repo = new UserSkillRepository(storage)
+    const home = await mkdtemp(join(tmpdir(), 'os-import-agent-stale-migration-'))
+    const source = await seedSkill(home, 'alpha')
+    await repo.importAgentHomeSkill(source, { source: 'claude', slug: 'linked-skill' })
+    const importedDir = join(storage, 'skills', 'imported', 'linked-skill')
+    const originalManifest = JSON.parse(
+      await readFile(join(importedDir, '.source.json'), 'utf8')
+    ) as { signature: string }
+
+    await writeFile(
+      join(source, 'SKILL.md'),
+      '---\nname: alpha\ndescription: Changed during scan\n---\nChanged body.\n'
+    )
+
+    await expect(
+      repo.importAgentHomeSkill(
+        source,
+        { source: 'agents', slug: 'alpha' },
+        {
+          aliases: [{ source: 'claude', slug: 'linked-skill' }],
+          expectedSignature: originalManifest.signature
+        }
+      )
+    ).rejects.toThrow(/changed during canonical identity migration/)
+    expect(await readFile(join(importedDir, 'SKILL.md'), 'utf8')).toContain('Body of alpha.')
+  })
+
+  it('does not recreate an imported alias deleted after canonical identity matching', async () => {
+    const storage = await makeStorage()
+    const repo = new UserSkillRepository(storage)
+    const home = await mkdtemp(join(tmpdir(), 'os-import-agent-deleted-migration-'))
+    const source = await seedSkill(home, 'alpha')
+    await repo.importAgentHomeSkill(source, { source: 'claude', slug: 'linked-skill' })
+
+    const [match] = await repo.matchImportedAgentHomeSkills([
+      {
+        sourcePath: source,
+        canonical: { source: 'agents', slug: 'alpha' },
+        aliases: [{ source: 'claude', slug: 'linked-skill' }]
+      }
+    ])
+    await repo.delete('imported-linked-skill')
+
+    await expect(
+      repo.importAgentHomeSkill(
+        source,
+        { source: 'agents', slug: 'alpha' },
+        {
+          aliases: [{ source: 'claude', slug: 'linked-skill' }],
+          expectedSignature: match.matchedIdentitySignature,
+          expectedImportedIdentity: match.matchedImportedIdentity
+        }
+      )
+    ).rejects.toThrow(/changed during canonical identity migration/)
+    expect(await repo.list()).toEqual([])
+  })
+
+  it('does not overwrite an imported alias changed after canonical identity matching', async () => {
+    const storage = await makeStorage()
+    const repo = new UserSkillRepository(storage)
+    const home = await mkdtemp(join(tmpdir(), 'os-import-agent-changed-migration-'))
+    const source = await seedSkill(home, 'alpha')
+    await repo.importAgentHomeSkill(source, { source: 'claude', slug: 'linked-skill' })
+
+    const [match] = await repo.matchImportedAgentHomeSkills([
+      {
+        sourcePath: source,
+        canonical: { source: 'agents', slug: 'alpha' },
+        aliases: [{ source: 'claude', slug: 'linked-skill' }]
+      }
+    ])
+    const importedDir = join(storage, 'skills', 'imported', 'linked-skill')
+    await writeFile(
+      join(importedDir, 'SKILL.md'),
+      '---\nname: linked-skill\ndescription: Concurrent edit\n---\nKeep this body.\n'
+    )
+
+    await expect(
+      repo.importAgentHomeSkill(
+        source,
+        { source: 'agents', slug: 'alpha' },
+        {
+          aliases: [{ source: 'claude', slug: 'linked-skill' }],
+          expectedSignature: match.matchedIdentitySignature,
+          expectedImportedIdentity: match.matchedImportedIdentity
+        }
+      )
+    ).rejects.toThrow(/changed during canonical identity migration/)
+    expect(await readFile(join(importedDir, 'SKILL.md'), 'utf8')).toContain('Keep this body.')
+  })
+
+  it('refreshes an installed skill when the same source identity changes', async () => {
+    const storage = await makeStorage()
+    const repo = new UserSkillRepository(storage)
+    const home = await mkdtemp(join(tmpdir(), 'os-import-agent-refresh-'))
+    const source = await seedSkill(home, 'alpha')
+    const skill = { source: 'agents', slug: 'alpha' } as const
+
+    await repo.importAgentHomeSkill(source, skill)
+    await writeFile(
+      join(source, 'SKILL.md'),
+      '---\nname: alpha\ndescription: Updated\n---\nUpdated body.\n'
+    )
+
+    expect((await repo.listAgentHomeSkills(join(home, 'skills'), 'agents'))[0]).toMatchObject({
+      alreadyImported: false
+    })
+
+    const updated = await repo.importAgentHomeSkill(source, skill)
+    const unchanged = await repo.importAgentHomeSkill(source, skill)
+
+    expect(updated).toEqual({ status: 'updated', id: 'imported-alpha' })
+    expect(unchanged).toEqual({ status: 'unchanged', id: 'imported-alpha' })
+    expect(
+      await readFile(join(storage, 'skills', 'imported', 'alpha', 'SKILL.md'), 'utf8')
+    ).toContain('Updated body.')
+    expect(
+      JSON.parse(
+        await readFile(join(storage, 'skills', 'imported', 'alpha', '.source.json'), 'utf8')
+      )
+    ).toMatchObject({ agentHome: skill, signature: expect.any(String) })
+  })
+
+  it('refreshes installed-skill directory structure and portable permission changes', async () => {
+    const storage = await makeStorage()
+    const repo = new UserSkillRepository(storage)
+    const home = await mkdtemp(join(tmpdir(), 'os-import-agent-structure-'))
+    const source = await seedSkill(home, 'alpha')
+    const skill = { source: 'agents', slug: 'alpha' } as const
+    await repo.importAgentHomeSkill(source, skill)
+
+    await mkdir(join(source, 'empty-reference-dir'))
+    expect(await repo.importAgentHomeSkill(source, skill)).toMatchObject({ status: 'updated' })
+    expect(
+      (
+        await stat(join(storage, 'skills', 'imported', 'alpha', 'empty-reference-dir'))
+      ).isDirectory()
+    ).toBe(true)
+
+    if (process.platform !== 'win32') {
+      await chmod(join(source, 'SKILL.md'), 0o744)
+      expect(await repo.importAgentHomeSkill(source, skill)).toMatchObject({ status: 'updated' })
+      expect(
+        (await stat(join(storage, 'skills', 'imported', 'alpha', 'SKILL.md'))).mode & 0o777
+      ).toBe(0o744)
+    }
+  })
+
+  it('preserves the prior imported copy when an installed-skill refresh fails validation', async () => {
+    const storage = await makeStorage()
+    const repo = new UserSkillRepository(storage)
+    const home = await mkdtemp(join(tmpdir(), 'os-import-agent-refresh-failure-'))
+    const source = await seedSkill(home, 'alpha')
+    const skill = { source: 'agents', slug: 'alpha' } as const
+    await repo.importAgentHomeSkill(source, skill)
+    const importedDir = join(storage, 'skills', 'imported', 'alpha')
+    const originalManifest = await readFile(join(importedDir, '.source.json'), 'utf8')
+
+    await writeFile(
+      join(source, 'SKILL.md'),
+      '---\nname: alpha\ndescription: Invalid refresh\n---\nReplacement body.\n'
+    )
+    await writeFile(join(source, '.source.json'), '{}')
+
+    await expect(repo.importAgentHomeSkill(source, skill)).rejects.toThrow(/reserved file/)
+    expect(await readFile(join(importedDir, 'SKILL.md'), 'utf8')).toContain('Body of alpha.')
+    expect(await readFile(join(importedDir, '.source.json'), 'utf8')).toBe(originalManifest)
+    expect(
+      (await readdir(join(storage, 'skills', 'imported'))).filter((entry) =>
+        entry.startsWith('.alpha.import-')
+      )
+    ).toEqual([])
+  })
+
+  it.skipIf(process.platform === 'win32')('rejects a symlink used as the Skill root', async () => {
+    const storage = await makeStorage()
+    const repo = new UserSkillRepository(storage)
+    const home = await mkdtemp(join(tmpdir(), 'os-import-agent-symlink-root-'))
+    const target = await seedSkill(home, 'real-skill')
+    const link = join(home, 'skills', 'linked-skill')
+    await symlink(target, link)
+
+    await expect(
+      repo.importAgentHomeSkill(link, { source: 'agents', slug: 'linked-skill' })
+    ).rejects.toThrow(/symbolic link/)
+    expect(await repo.list()).toEqual([])
+  })
+
+  it.skipIf(process.platform === 'win32')(
+    'rejects a nested symlink in the Skill tree',
+    async () => {
+      const storage = await makeStorage()
+      const repo = new UserSkillRepository(storage)
+      const home = await mkdtemp(join(tmpdir(), 'os-import-agent-symlink-nested-'))
+      const source = await seedSkill(home, 'alpha')
+      const outside = join(home, 'outside.md')
+      await writeFile(outside, 'outside')
+      await mkdir(join(source, 'references'), { recursive: true })
+      await symlink(outside, join(source, 'references', 'outside.md'))
+
+      await expect(
+        repo.importAgentHomeSkill(source, { source: 'agents', slug: 'alpha' })
+      ).rejects.toThrow(/symbolic link/)
+      expect(await repo.list()).toEqual([])
+    }
+  )
 })

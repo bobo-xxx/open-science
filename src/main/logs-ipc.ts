@@ -1,15 +1,19 @@
-import { ipcMain, shell } from 'electron'
+import { shell } from 'electron'
+
+import { ipcMainHandle } from './ipc-handler-registry'
 
 import { getLogFilePath } from './logger'
 import type { OpenLogFileResult, RevealLogFileResult } from '../shared/logs'
 
-// Renderer-callable diagnostics surface. Logs live only on this device and are never transmitted; the
-// renderer can read the file path (to show it), open the file, or reveal it in its folder (to grab and
-// attach when reporting a bug). "Open" targets the log file itself; "reveal" selects it in the folder.
-const registerLogsIpcHandlers = (): void => {
-  ipcMain.handle('logs:get-path', () => getLogFilePath() ?? null)
+type LogsCommandOwner = Readonly<{
+  getPath: () => string | null
+  openFile: () => Promise<OpenLogFileResult>
+  revealInFolder: () => RevealLogFileResult
+}>
 
-  ipcMain.handle('logs:open-file', async (): Promise<OpenLogFileResult> => {
+const createLogsCommandOwner = (): LogsCommandOwner => ({
+  getPath: () => getLogFilePath() ?? null,
+  openFile: async (): Promise<OpenLogFileResult> => {
     const path = getLogFilePath()
 
     if (!path) return { opened: false, error: 'No log file is available yet.' }
@@ -18,9 +22,8 @@ const registerLogsIpcHandlers = (): void => {
     const error = await shell.openPath(path)
 
     return error ? { opened: false, error } : { opened: true }
-  })
-
-  ipcMain.handle('logs:reveal-in-folder', (): RevealLogFileResult => {
+  },
+  revealInFolder: (): RevealLogFileResult => {
     const path = getLogFilePath()
 
     if (!path) return { revealed: false, error: 'No log file is available yet.' }
@@ -29,7 +32,19 @@ const registerLogsIpcHandlers = (): void => {
     shell.showItemInFolder(path)
 
     return { revealed: true }
-  })
+  }
+})
+
+// Renderer-callable diagnostics surface. Local-only Host gates remain in the Host router; this
+// adapter only shares the same injectable command owner with Electron IPC.
+const registerLogsIpcHandlers = (
+  owner: LogsCommandOwner = createLogsCommandOwner()
+): LogsCommandOwner => {
+  ipcMainHandle('logs:get-path', () => owner.getPath())
+  ipcMainHandle('logs:open-file', () => owner.openFile())
+  ipcMainHandle('logs:reveal-in-folder', () => owner.revealInFolder())
+  return owner
 }
 
-export { registerLogsIpcHandlers }
+export type { LogsCommandOwner }
+export { registerLogsIpcHandlers, createLogsCommandOwner }

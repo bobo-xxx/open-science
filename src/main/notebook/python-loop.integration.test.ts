@@ -3,7 +3,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, existsSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 
 // Run with: RUN_KERNEL=1 OPEN_SCIENCE_TEST_PY_ENV=/path/to/env/bin/python \
@@ -23,6 +23,10 @@ type LoopResponse = {
   result: string | null
   cwd: string
   figures: { mime: string; path: string }[]
+  environment: {
+    runtime_version: string
+    packages: Array<{ name: string; version_status: string; loaded_state: string }>
+  }
 }
 
 // Minimal one-shot client over the loop's stdio protocol for the test.
@@ -60,6 +64,10 @@ gate('python_loop.py', () => {
     try {
       const a = await send('x = 41')
       expect(a.error).toBeNull()
+      expect(a.environment.runtime_version).toMatch(/^3\./)
+      expect(a.environment.packages).toEqual(
+        expect.arrayContaining([expect.objectContaining({ name: 'sys', loaded_state: 'loaded' })])
+      )
 
       // State survives across requests; a trailing bare expression echoes as a repr result.
       const b = await send('x + 1')
@@ -102,6 +110,71 @@ gate('python_loop.py', () => {
       rmSync(figuresDir, { recursive: true, force: true })
     }
   }, 60_000)
+
+  it('allows reading pyvenv.cfg metadata but still blocks writing it', async () => {
+    const runtimeRoot = mkdtempSync(join(tmpdir(), 'os-python-runtime-guard-'))
+    const workspace = mkdtempSync(join(tmpdir(), 'os-python-pyvenv-read-'))
+    const configPath = join(workspace, 'pyvenv.cfg')
+    writeFileSync(configPath, 'home = /usr/bin\n')
+    const { child, send } = startLoop(pyBin as string, {
+      OPEN_SCIENCE_RUNTIME_DIR: runtimeRoot
+    })
+    try {
+      const read = await send(
+        `print(open(${JSON.stringify(configPath)}, 'r', encoding='utf-8').read(), end='')`
+      )
+      expect(read.error).toBeNull()
+      expect(read.stdout).toBe('home = /usr/bin\n')
+
+      const write = await send(`open(${JSON.stringify(configPath)}, 'w').write('changed')`)
+      expect(write.error).toMatch(/manage_packages/)
+      expect(readFileSync(configPath, 'utf8')).toBe('home = /usr/bin\n')
+    } finally {
+      child.kill()
+      rmSync(runtimeRoot, { recursive: true, force: true })
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  }, 60_000)
+
+  it.skipIf(process.platform === 'win32')(
+    'uses subprocess write targets so copy-out and workspace writes remain allowed',
+    async () => {
+      const runtimeRoot = mkdtempSync(join(tmpdir(), 'os-python-child-runtime-'))
+      const workspace = mkdtempSync(join(tmpdir(), 'os-python-child-output-'))
+      const source = join(runtimeRoot, 'source.txt')
+      const copied = join(workspace, 'copied.txt')
+      const outputDir = join(workspace, 'created')
+      writeFileSync(source, 'runtime input')
+      const { child, send } = startLoop(pyBin as string, {
+        OPEN_SCIENCE_RUNTIME_DIR: runtimeRoot
+      })
+      try {
+        const copyOut = await send(
+          `import subprocess; subprocess.run(["cp", ${JSON.stringify(source)}, ${JSON.stringify(copied)}], check=True)`
+        )
+        expect(copyOut.error).toBeNull()
+        expect(readFileSync(copied, 'utf8')).toBe('runtime input')
+
+        const workspaceWrite = await send(
+          `subprocess.run(["sh", "-c", ` +
+            `${JSON.stringify(`printf '%s' "$OPEN_SCIENCE_RUNTIME_DIR" >/dev/null; mkdir ${JSON.stringify(outputDir)}`)}], check=True)`
+        )
+        expect(workspaceWrite.error).toBeNull()
+        expect(existsSync(outputDir)).toBe(true)
+
+        const blocked = await send(
+          `subprocess.run(["cp", ${JSON.stringify(copied)}, ` +
+            `${JSON.stringify(join(runtimeRoot, 'blocked.txt'))}], check=True)`
+        )
+        expect(blocked.error).toMatch(/manage_packages/)
+      } finally {
+        child.kill()
+        rmSync(runtimeRoot, { recursive: true, force: true })
+        rmSync(workspace, { recursive: true, force: true })
+      }
+    },
+    60_000
+  )
 })
 
 gate('python_loop.py data-kernel isolation', () => {

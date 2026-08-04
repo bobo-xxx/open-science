@@ -1,26 +1,51 @@
 import {
   app,
   BrowserWindow,
+  dialog,
   ipcMain,
   shell,
+  WebContentsView,
   type BrowserWindowConstructorOptions,
   type IpcMainEvent
 } from 'electron'
 import { join } from 'path'
 import { is } from '@electron-toolkit/utils'
-import icon from '../../resources/icon.png?asset'
+import iconPng from '../../resources/icon.png?asset'
+import iconWindows from '../../resources/icon-light.ico?asset'
 import { isAllowedExternalNavigation, isAllowedFrameNavigation } from './navigation-policy'
+import { createFindOverlayManager, type FindOverlayDeps } from './find-overlay'
+import { registerFindOverlayOwner } from './find-overlay-registry'
+import { createLogger } from './logger'
 import {
   CLOSE_ACTIVE_PANE_CHANNEL,
   CLOSE_ACTIVE_PANE_READY_CHANNEL,
   CLOSE_ACTIVE_PANE_UNREADY_CHANNEL,
+  WINDOW_FIND_APPEARANCE_CHANGED_CHANNEL,
+  WINDOW_FIND_READY_CHANNEL,
+  WINDOW_FIND_UNREADY_CHANNEL,
   isCloseWindowChord,
+  isFindInPageChord,
+  isWindowFindAppearance,
   type CloseClassification,
   type CloseConfirmChoice
 } from '../shared/window-controls'
 
 const rendererEntry = join(__dirname, '../renderer/index.html')
 const preloadEntry = join(__dirname, '../preload/index.js')
+const icon = process.platform === 'win32' ? iconWindows : iconPng
+// The find overlay is a static page (no bundler entry) shipped under resources/, so it resolves the
+// same way in dev (project root) and packaged (asar root) via app.getAppPath().
+const findOverlayEntry = join(app.getAppPath(), 'resources/find-overlay/index.html')
+const log = createLogger('window')
+const RENDERER_RECOVERY_WINDOW_MS = 60_000
+const MAX_AUTOMATIC_RENDERER_RECOVERIES = 2
+const RECOVERABLE_RENDERER_EXIT_REASONS = new Set([
+  'abnormal-exit',
+  'crashed',
+  'oom',
+  'launch-failed',
+  'integrity-failure'
+])
 
 const loadRenderer = (window: BrowserWindow): void => {
   if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
@@ -66,12 +91,13 @@ const createAppWindow = (options: BrowserWindowConstructorOptions): BrowserWindo
 }
 
 // How the main window resolves a close: classifyClose decides synchronously at close time
-// ('close' = let it close, 'hide' = minimize to tray, 'confirm' = ask via resolveCloseAction).
+// ('close' = let it close, 'hide' = minimize to tray, 'quit' = retain the renderer while app quit
+// flushes it, 'confirm' = ask via resolveCloseAction).
 // resolveCloseAction is awaited only for 'confirm'; requestQuit is called when the choice is quit.
 type MainWindowCloseOptions = {
   classifyClose: () => CloseClassification
   resolveCloseAction: () => Promise<CloseConfirmChoice>
-  requestQuit: () => void
+  requestQuit: (confirmed?: boolean) => void
 }
 
 const createMainWindow = (opts?: MainWindowCloseOptions): BrowserWindow => {
@@ -97,7 +123,15 @@ const createMainWindow = (opts?: MainWindowCloseOptions): BrowserWindow => {
   //     its subscription instead of having to re-handshake.
   // When either fails, main closes the window itself so the chord always does something.
   let rendererListenerReady = false
+  let windowFindListenerReady = false
   let rendererResponsive = true
+  let rendererUnresponsiveAt: number | undefined
+  let rendererRecoveryTimes: number[] = []
+  let rendererRecoveryDialogOpen = false
+  const clearRendererHangState = (): void => {
+    rendererResponsive = true
+    rendererUnresponsiveAt = undefined
+  }
   const onListenerReady = (event: IpcMainEvent): void => {
     if (event.sender !== window.webContents) return
     rendererListenerReady = true
@@ -105,32 +139,161 @@ const createMainWindow = (opts?: MainWindowCloseOptions): BrowserWindow => {
     // unresponsive state here too: after unresponsive -> render-process-gone -> reload, the fresh
     // process never emits 'responsive' (that only fires as recovery on the *same* process), so READY
     // is the only signal that the new renderer can act on the chord.
-    rendererResponsive = true
+    clearRendererHangState()
   }
   const onListenerGone = (event: IpcMainEvent): void => {
     if (event.sender === window.webContents) rendererListenerReady = false
   }
+  const onWindowFindReady = (event: IpcMainEvent): void => {
+    if (event.sender !== window.webContents) return
+    windowFindListenerReady = true
+    clearRendererHangState()
+  }
+  const onWindowFindGone = (event: IpcMainEvent): void => {
+    if (event.sender !== window.webContents) return
+    windowFindListenerReady = false
+    findOverlay.close()
+  }
+  const onWindowFindAppearanceChanged = (event: IpcMainEvent, appearance: unknown): void => {
+    if (event.sender !== window.webContents || !isWindowFindAppearance(appearance)) return
+    findOverlay.updateAppearance(appearance)
+  }
   ipcMain.on(CLOSE_ACTIVE_PANE_READY_CHANNEL, onListenerReady)
   ipcMain.on(CLOSE_ACTIVE_PANE_UNREADY_CHANNEL, onListenerGone)
+  ipcMain.on(WINDOW_FIND_READY_CHANNEL, onWindowFindReady)
+  ipcMain.on(WINDOW_FIND_UNREADY_CHANNEL, onWindowFindGone)
+  ipcMain.on(WINDOW_FIND_APPEARANCE_CHANGED_CHANNEL, onWindowFindAppearanceChanged)
   // A top-level document swap replaces the mounted hook, which must re-subscribe; a dead render process
   // took its listener with it. Both revoke readiness until the next READY handshake. Gate on the main
   // frame and a real document change so a dynamic preview iframe loading (or a same-document hash /
   // pushState navigation) — neither of which remounts the hook — does not falsely disarm the forward.
   window.webContents.on('did-start-navigation', (details) => {
-    if (details.isMainFrame && !details.isSameDocument) rendererListenerReady = false
+    if (details.isMainFrame && !details.isSameDocument) {
+      rendererListenerReady = false
+      windowFindListenerReady = false
+      findOverlay.close()
+    }
   })
-  window.webContents.on('render-process-gone', () => {
+  // Keep renderer bootstrap failures diagnosable without persisting the failed URL, preload path, or
+  // error message (all of which can contain local paths or Session-derived data).
+  window.webContents.on(
+    'did-fail-load',
+    (_event, errorCode, errorDescription, _validatedURL, isMainFrame) => {
+      if (!isMainFrame) return
+      log.error('renderer document failed to load', { errorCode, errorDescription })
+    }
+  )
+  window.webContents.on('preload-error', (_event, _preloadPath, error) => {
+    log.error('renderer preload failed', { errorName: error.name })
+  })
+  // Persist only fixed Electron lifecycle vocabulary and numeric timing/exit metadata. Current URLs,
+  // Session content, renderer console output, process arguments, and local paths stay out of main.log.
+  window.webContents.on('render-process-gone', (_event, details) => {
+    const wasUnresponsive = !rendererResponsive
+    log.error('renderer process gone', {
+      reason: details.reason,
+      exitCode: details.exitCode,
+      wasUnresponsive,
+      ...(rendererUnresponsiveAt === undefined
+        ? {}
+        : { unresponsiveDurationMs: Math.max(0, Date.now() - rendererUnresponsiveAt) })
+    })
     rendererListenerReady = false
+    windowFindListenerReady = false
+    clearRendererHangState()
+    findOverlay.close()
+
+    if (!RECOVERABLE_RENDERER_EXIT_REASONS.has(details.reason) || window.isDestroyed()) return
+
+    const now = Date.now()
+    rendererRecoveryTimes = rendererRecoveryTimes.filter(
+      (recoveryAt) => now - recoveryAt < RENDERER_RECOVERY_WINDOW_MS
+    )
+    if (rendererRecoveryTimes.length < MAX_AUTOMATIC_RENDERER_RECOVERIES) {
+      rendererRecoveryTimes.push(now)
+      log.warn('reloading renderer after process exit', {
+        reason: details.reason,
+        automaticRecoveryAttempt: rendererRecoveryTimes.length
+      })
+      loadRenderer(window)
+      return
+    }
+
+    if (rendererRecoveryDialogOpen) return
+    rendererRecoveryDialogOpen = true
+    log.error('renderer automatic recovery paused after repeated exits', {
+      reason: details.reason,
+      automaticRecoveries: rendererRecoveryTimes.length,
+      recoveryWindowMs: RENDERER_RECOVERY_WINDOW_MS
+    })
+    void dialog
+      .showMessageBox(window, {
+        type: 'error',
+        buttons: ['Reload', 'Close window'],
+        defaultId: 0,
+        cancelId: 1,
+        title: 'Open Science',
+        message: 'The app window stopped responding repeatedly.',
+        detail:
+          'Automatic recovery has been paused. Reloading returns this window to the home screen; background work may still be running.'
+      })
+      .then(
+        ({ response }) => {
+          rendererRecoveryDialogOpen = false
+          if (window.isDestroyed()) return
+          if (response === 0) {
+            rendererRecoveryTimes = []
+            log.warn('reloading renderer after user confirmation')
+            loadRenderer(window)
+            return
+          }
+          // Bypass the normal Windows close-to-tray interception: the user explicitly chose to close
+          // this unrecoverable blank window, not leave it hidden and alive in the tray.
+          window.destroy()
+        },
+        () => {
+          rendererRecoveryDialogOpen = false
+          log.error('renderer recovery dialog failed')
+          if (!window.isDestroyed()) window.destroy()
+        }
+      )
   })
   window.webContents.on('unresponsive', () => {
+    if (rendererResponsive) {
+      rendererUnresponsiveAt = Date.now()
+      log.warn('renderer became unresponsive')
+    }
     rendererResponsive = false
+    findOverlay.close()
   })
   window.webContents.on('responsive', () => {
-    rendererResponsive = true
+    if (!rendererResponsive && rendererUnresponsiveAt !== undefined) {
+      log.info('renderer became responsive', {
+        unresponsiveDurationMs: Math.max(0, Date.now() - rendererUnresponsiveAt)
+      })
+    }
+    clearRendererHangState()
   })
   window.on('closed', () => {
     ipcMain.removeListener(CLOSE_ACTIVE_PANE_READY_CHANNEL, onListenerReady)
     ipcMain.removeListener(CLOSE_ACTIVE_PANE_UNREADY_CHANNEL, onListenerGone)
+    ipcMain.removeListener(WINDOW_FIND_READY_CHANNEL, onWindowFindReady)
+    ipcMain.removeListener(WINDOW_FIND_UNREADY_CHANNEL, onWindowFindGone)
+    ipcMain.removeListener(WINDOW_FIND_APPEARANCE_CHANGED_CHANNEL, onWindowFindAppearanceChanged)
+    findOverlay.destroy()
+  })
+
+  // The whole-window find bar lives in its own WebContentsView overlay, so its own query text is never
+  // part of the main window's page search. The overlay talks to main via the window-find IPC channels;
+  // main opens/closes it here in response to the chord and Escape.
+  const findOverlay = createFindOverlayManager({
+    // The structural dep narrows BrowserWindow to just the find-overlay surface; Electron's
+    // contentView.addChildView is typed against the base View (no webContents), so bridge the gap here.
+    mainWindow: window as unknown as FindOverlayDeps['mainWindow'],
+    createView: (opts) => new WebContentsView(opts),
+    preloadPath: preloadEntry,
+    overlayHtmlPath: findOverlayEntry,
+    registerOwner: registerFindOverlayOwner
   })
 
   // Intercept Cmd+W / Ctrl+W before the default menu "Close" role fires. preventDefault here also
@@ -144,6 +307,22 @@ const createMainWindow = (opts?: MainWindowCloseOptions): BrowserWindow => {
   // the pane and its ack lands after the timeout, main would then also close the window. We accept one
   // lost keystroke during a renderer crash over that regression.
   window.webContents.on('before-input-event', (event, input) => {
+    if (isFindInPageChord(input, process.platform)) {
+      if (windowFindListenerReady && rendererResponsive) {
+        event.preventDefault()
+        findOverlay.open()
+      }
+      return
+    }
+
+    // Escape closes an open find bar even when focus has wandered into the main content — the overlay's
+    // own handler covers the input-focused case, this covers the rest.
+    if (input.type === 'keyDown' && input.key === 'Escape' && findOverlay.isOpen()) {
+      event.preventDefault()
+      findOverlay.close()
+      return
+    }
+
     if (!isCloseWindowChord(input, process.platform)) return
 
     event.preventDefault()
@@ -156,8 +335,9 @@ const createMainWindow = (opts?: MainWindowCloseOptions): BrowserWindow => {
     }
   })
 
-  // Close handling. classifyClose decides synchronously so darwin / no-tray / mid-quit still close
-  // instantly; 'hide' minimizes to tray (Linux); 'confirm' (Windows X) asks the user. The
+  // Close handling. classifyClose decides synchronously: darwin and mid-quit close instantly; 'hide'
+  // minimizes to tray (Linux); 'quit' retains a no-tray renderer through app teardown; 'confirm'
+  // (Windows X) asks the user. The
   // Cmd/Ctrl+W fallback window.close() routes through here unchanged.
   let awaitingChoice = false
   window.on('close', (event) => {
@@ -166,6 +346,10 @@ const createMainWindow = (opts?: MainWindowCloseOptions): BrowserWindow => {
     event.preventDefault()
     if (action === 'hide') {
       window.hide()
+      return
+    }
+    if (action === 'quit') {
+      opts!.requestQuit(false)
       return
     }
     if (awaitingChoice) return

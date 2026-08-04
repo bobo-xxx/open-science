@@ -1,4 +1,13 @@
-import { ChevronDown, Download, FileUp, Pencil, Plus, Search, Trash2 } from 'lucide-react'
+import {
+  ChevronDown,
+  Download,
+  FileUp,
+  FolderInput,
+  Pencil,
+  Plus,
+  Search,
+  Trash2
+} from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 
 import type { SkillSource } from '../../../../shared/settings'
@@ -16,7 +25,8 @@ import { SkillDetailView } from './SkillDetailView'
 import { SkillEditor, SkillEditLoader } from './SkillEditor'
 import { SkillImportView } from './SkillImportView'
 import { SkillUploadView } from './SkillUploadView'
-import { SettingsIconAction, SettingsToggle } from './SettingsLayout'
+import { AgentHomeImportView } from './AgentHomeImportView'
+import { SettingsIconAction, SettingsRow, SettingsSection, SettingsToggle } from './SettingsLayout'
 
 // The skills panel sub-view, driven by the settings navigation history so each is a breadcrumb page.
 export type SkillsView =
@@ -25,6 +35,7 @@ export type SkillsView =
   | { kind: 'create' }
   | { kind: 'edit'; id: string }
   | { kind: 'import' }
+  | { kind: 'import-agent-home' }
   | { kind: 'upload' }
 
 type SourceFilter = 'all' | SkillSource
@@ -45,15 +56,26 @@ const SOURCE_GROUPS: ReadonlyArray<{ source: SkillSource; label: string; subtitl
 type SkillsPanelProps = {
   view: SkillsView
   onNavigate: (view: SkillsView) => void
+  canImportInstalledSkills?: boolean
 }
 
-const SkillsPanel = ({ view, onNavigate }: SkillsPanelProps): React.JSX.Element => {
+const SkillsPanel = ({
+  view,
+  onNavigate,
+  canImportInstalledSkills = true
+}: SkillsPanelProps): React.JSX.Element => {
   const skills = useSettingsStore((state) => state.skills)
   const loadSkills = useSettingsStore((state) => state.loadSkills)
   const setSkillEnabled = useSettingsStore((state) => state.setSkillEnabled)
   const createSkill = useSettingsStore((state) => state.createSkill)
   const deleteSkill = useSettingsStore((state) => state.deleteSkill)
-
+  const conversationSkillImportEnabled = useSettingsStore(
+    (state) => state.conversationSkillImportEnabled
+  )
+  const setConversationSkillImportEnabled = useSettingsStore(
+    (state) => state.setConversationSkillImportEnabled
+  )
+  const agentFrameworkId = useSettingsStore((state) => state.agentFrameworkId)
   const [filter, setFilter] = useState<SourceFilter>('all')
   const [query, setQuery] = useState('')
   const [collapsed, setCollapsed] = useState<Partial<Record<SkillSource, boolean>>>({})
@@ -86,6 +108,7 @@ const SkillsPanel = ({ view, onNavigate }: SkillsPanelProps): React.JSX.Element 
             name: draft.name,
             description: draft.description,
             body: draft.body,
+            ...(draft.metadata === undefined ? {} : { metadata: draft.metadata }),
             slug: draft.slug,
             references: draft.references
           })
@@ -100,6 +123,15 @@ const SkillsPanel = ({ view, onNavigate }: SkillsPanelProps): React.JSX.Element 
   if (view.kind === 'import') {
     return <SkillImportView onImported={() => undefined} />
   }
+  if (view.kind === 'import-agent-home') {
+    return canImportInstalledSkills ? (
+      <AgentHomeImportView key={agentFrameworkId} onImported={() => undefined} />
+    ) : (
+      <div className="p-5 text-sm text-muted-foreground">
+        Installed-skill import is available in the desktop app.
+      </div>
+    )
+  }
   if (view.kind === 'upload') {
     return (
       <SkillUploadView
@@ -113,6 +145,34 @@ const SkillsPanel = ({ view, onNavigate }: SkillsPanelProps): React.JSX.Element 
 
   return (
     <div className="p-5">
+      <SettingsSection
+        title="Conversation imports"
+        description="Choose what conversations can import into Open Science."
+        aria-label="Conversation imports"
+        className="mb-4 border-b border-border pb-4"
+        contentClassName="mt-1"
+      >
+        <SettingsRow
+          label="Skill packages"
+          description={
+            <span className="line-clamp-2">
+              Let the agent detect attached .zip and .skill packages and ask before importing them.
+            </span>
+          }
+          className="min-h-0 py-1.5"
+        >
+          <div className="flex justify-end">
+            <SettingsToggle
+              enabled={conversationSkillImportEnabled}
+              aria-label="Toggle conversation Skill imports"
+              onToggle={() =>
+                void setConversationSkillImportEnabled(!conversationSkillImportEnabled)
+              }
+            />
+          </div>
+        </SettingsRow>
+      </SettingsSection>
+
       <div className="mb-4 flex items-center gap-2">
         <Select value={filter} onValueChange={(value) => setFilter(value as SourceFilter)}>
           <SelectTrigger aria-label="Filter skills by source" className="w-36">
@@ -169,6 +229,18 @@ const SkillsPanel = ({ view, onNavigate }: SkillsPanelProps): React.JSX.Element 
                 <span className="text-xs text-muted-foreground">Add a skill from a repo</span>
               </span>
             </DropdownMenuItem>
+            {canImportInstalledSkills ? (
+              <DropdownMenuItem
+                className="gap-2.5"
+                onSelect={() => onNavigate({ kind: 'import-agent-home' })}
+              >
+                <FolderInput className="size-4 shrink-0" aria-hidden="true" />
+                <span className="flex flex-col">
+                  <span>Import installed skills</span>
+                  <span className="text-xs text-muted-foreground">Scan global skill folders</span>
+                </span>
+              </DropdownMenuItem>
+            ) : null}
           </DropdownMenuContent>
         </DropdownMenu>
       </div>

@@ -1,4 +1,7 @@
 import type { Project } from '../../shared/projects'
+import type { ProjectSessionDeletionResult } from '../session-persistence/coordinator'
+import type { ProjectSessionDeletionState } from '../session-persistence/repository'
+import { withDataRootWrite } from '../storage/migration-state'
 
 type ProjectDeletionRepository = {
   get(id: string): Promise<Project | null>
@@ -9,7 +12,15 @@ type ProjectDeletionRepository = {
 }
 
 type ProjectSessionDeletion = {
-  deleteProjectSessions(projectId: string): Promise<void>
+  // This capability is intentionally wired only into the durable whole-Project intent coordinator;
+  // ordinary Session IPC must use the strict per-Session deletion path instead.
+  deleteProjectSessions(
+    projectId: string,
+    options?: { requireExistingUploadAuthority?: boolean }
+  ): Promise<ProjectSessionDeletionResult>
+  getProjectSessionDeletionState(projectId: string): Promise<ProjectSessionDeletionState>
+  completeProjectSessionDeletion(projectId: string): Promise<void>
+  listLegacyProjectSessionTombstones(): Promise<string[]>
 }
 
 type PreviewDeletion = {
@@ -18,6 +29,15 @@ type PreviewDeletion = {
 
 type ProjectReviewDeletion = {
   deleteReviewsForProject(projectId: string): Promise<void>
+}
+
+type ProjectProvenanceDeletion = {
+  deleteProjectProvenance(projectId: string): Promise<void>
+}
+
+type ProjectPermissionGrantDeletion = {
+  prune(owner: { kind: 'project'; projectId: string }): Promise<unknown>
+  finalizeOwnerDeletion?(owner: { kind: 'project'; projectId: string }): Promise<void>
 }
 
 // Persists deletion intent so a crash cannot strand an absent project with active session data. The
@@ -31,23 +51,27 @@ class ProjectDeletionCoordinator {
     private readonly projects: ProjectDeletionRepository,
     private readonly sessions: ProjectSessionDeletion,
     private readonly preview: PreviewDeletion,
-    private readonly reviews?: ProjectReviewDeletion
+    private readonly reviews?: ProjectReviewDeletion,
+    private readonly provenance?: ProjectProvenanceDeletion,
+    private readonly permissionGrants?: ProjectPermissionGrantDeletion
   ) {}
 
   // Enqueues before yielding so two callers in the same event-loop turn cannot publish competing
   // recovery promises. The queue tail swallows failures only to keep later recovery work runnable.
   deleteProject(projectId: string): Promise<void> {
-    const deletion = this.operationQueue.then(async () => {
-      await this.recoverPendingDeletionsNow()
-      this.isRecoveryComplete = false
-      try {
-        await this.runDeletion(projectId)
-        this.isRecoveryComplete = true
-      } catch (error) {
+    const deletion = this.operationQueue.then(() =>
+      withDataRootWrite(async () => {
+        await this.recoverPendingDeletionsNow()
         this.isRecoveryComplete = false
-        throw error
-      }
-    })
+        try {
+          await this.runDeletion(projectId)
+          this.isRecoveryComplete = true
+        } catch (error) {
+          this.isRecoveryComplete = false
+          throw error
+        }
+      })
+    )
     this.operationQueue = deletion.catch(() => undefined)
     return deletion
   }
@@ -56,7 +80,7 @@ class ProjectDeletionCoordinator {
   // Newly requested deletions enqueue synchronously, so later callers cannot bypass active work.
   async recoverPendingDeletions(): Promise<void> {
     await this.operationQueue
-    return this.recoverPendingDeletionsNow()
+    return withDataRootWrite(() => this.recoverPendingDeletionsNow())
   }
 
   // Deduplicates concurrent intent scans. Completion remains sticky until queued deletion work starts,
@@ -65,7 +89,9 @@ class ProjectDeletionCoordinator {
     if (this.recoveryPromise) return this.recoveryPromise
     if (this.isRecoveryComplete) return
 
-    const recovery = this.runPendingDeletionRecovery()
+    const recovery = this.runPendingDeletionRecovery().then((retainedProjectIds) =>
+      this.adoptLegacyProjectSessionTombstones(retainedProjectIds)
+    )
     this.recoveryPromise = recovery
     try {
       await recovery
@@ -88,7 +114,14 @@ class ProjectDeletionCoordinator {
     try {
       await this.sessions.deleteProjectSessions(projectId)
     } catch (error) {
-      await this.projects.deleteDeletionIntent(projectId)
+      try {
+        const state = await this.sessions.getProjectSessionDeletionState(projectId)
+        if (state === 'live' || state === 'absent') {
+          await this.projects.deleteDeletionIntent(projectId)
+        }
+      } catch {
+        // Unknown durable Session state is fail-closed; retain the intent for recovery.
+      }
       throw error
     }
 
@@ -96,18 +129,87 @@ class ProjectDeletionCoordinator {
   }
 
   // Replays intents serially so crash recovery follows the same ordering as an online deletion.
-  private async runPendingDeletionRecovery(): Promise<void> {
+  private async runPendingDeletionRecovery(): Promise<Set<string>> {
     const projectIds = await this.projects.listDeletionIntents()
+    const retainedProjectIds = new Set<string>()
     for (const projectId of projectIds) {
-      await this.sessions.deleteProjectSessions(projectId)
+      let result: ProjectSessionDeletionResult
+      try {
+        // An absent Project plus an unmarked tombstone identifies a cross-version orphan adoption.
+        // Re-derive its conservative policy from durable state so a crash immediately after intent
+        // creation cannot turn the next retry into authority-creating normal deletion.
+        const requireExistingUploadAuthority =
+          !(await this.projects.get(projectId)) &&
+          (await this.sessions.getProjectSessionDeletionState(projectId)) === 'legacy-committed'
+        if (requireExistingUploadAuthority) {
+          result = await this.sessions.deleteProjectSessions(projectId, {
+            requireExistingUploadAuthority: true
+          })
+        } else {
+          result = await this.sessions.deleteProjectSessions(projectId)
+        }
+      } catch (error) {
+        // A visible Project row is insufficient evidence of a pre-commit failure: a crash may occur
+        // after the atomic Session rename but before deleting that row. Clear the intent only when
+        // the durable tombstone positively proves the Session phase never committed. Unknown marker
+        // state and committed state both retain the intent and retry the irreversible tail.
+        let sessionState: ProjectSessionDeletionState
+        try {
+          sessionState = await this.sessions.getProjectSessionDeletionState(projectId)
+        } catch {
+          throw error
+        }
+        if (sessionState === 'live' && (await this.projects.get(projectId))) {
+          await this.projects.deleteDeletionIntent(projectId)
+          continue
+        }
+        throw error
+      }
+      if (result.status === 'orphan-retained') {
+        await this.projects.deleteDeletionIntent(projectId)
+        retainedProjectIds.add(projectId)
+        continue
+      }
+      await this.finishDeletion(projectId)
+    }
+    return retainedProjectIds
+  }
+
+  // Older releases could remove the Project row and intent before their best-effort physical
+  // tombstone cleanup. Adopt every surviving unmarked tombstone into the durable intent protocol
+  // before its Session migration can write a prepared marker or create new Version authority.
+  private async adoptLegacyProjectSessionTombstones(
+    retainedProjectIds: ReadonlySet<string>
+  ): Promise<void> {
+    const projectIds = await this.sessions.listLegacyProjectSessionTombstones()
+    for (const projectId of projectIds) {
+      if (retainedProjectIds.has(projectId)) continue
+      await this.projects.createDeletionIntent(projectId)
+      const result = await this.sessions.deleteProjectSessions(projectId, {
+        requireExistingUploadAuthority: true
+      })
+      if (result.status === 'orphan-retained') {
+        await this.projects.deleteDeletionIntent(projectId)
+        continue
+      }
       await this.finishDeletion(projectId)
     }
   }
 
-  // The project row is removed only after session/index deletion succeeds; deleting the intent last
-  // makes this tail idempotent if the app crashes between either statement.
+  // The Project row is removed only after every fallible authority cleanup succeeds. Keeping both
+  // the row and deletion intent through Permission Grant pruning lets the renderer contract report
+  // the failure without publishing a false success; replaying this tail is idempotent.
   private async finishDeletion(projectId: string): Promise<void> {
+    // Prune is transactional and idempotent. Run it before the hard delete so a Registry/database
+    // failure retains the visible Project plus its durable intent for an explicit or startup retry.
+    await this.permissionGrants?.prune({ kind: 'project', projectId })
     if (await this.projects.get(projectId)) await this.projects.delete(projectId)
+    // The Project FK cascade commits outside the Registry mutation queue. A remember/restore that
+    // was already in flight may have updated its cache around that commit, so enqueue one non-failing
+    // cache barrier after the hard delete. Later mutations fail owner-liveness validation.
+    await this.permissionGrants
+      ?.finalizeOwnerDeletion?.({ kind: 'project', projectId })
+      .catch(() => undefined)
 
     // Preview state is derived UI state; a cleanup failure must not resurrect deleted chat data.
     await this.preview.delete(projectId).catch(() => undefined)
@@ -116,7 +218,16 @@ class ProjectDeletionCoordinator {
     // deletion and crash recovery remove the same orphan rows without risking review loss on failure.
     await this.reviews?.deleteReviewsForProject(projectId).catch(() => undefined)
 
-    // Keep the intent until all derived cleanup has been attempted so a crash replays the full tail.
+    // Session deletion retains provenance, but Project deletion is terminal. This tail is replayed
+    // from the durable intent after a crash, so both SQLite rows and immutable bytes are eventually
+    // removed even if the Project row is already gone.
+    await this.provenance?.deleteProjectProvenance(projectId)
+
+    // The marked Session tombstone is the durable phase boundary. Remove it only after every Project
+    // tail has completed, and keep the intent if physical cleanup fails so recovery retries it.
+    await this.sessions.completeProjectSessionDeletion(projectId)
+
+    // Keep the intent until all derived and tombstone cleanup has completed.
     await this.projects.deleteDeletionIntent(projectId)
   }
 }
@@ -126,5 +237,7 @@ export type {
   PreviewDeletion,
   ProjectDeletionRepository,
   ProjectReviewDeletion,
+  ProjectProvenanceDeletion,
+  ProjectPermissionGrantDeletion,
   ProjectSessionDeletion
 }

@@ -11,6 +11,8 @@ import {
 } from './base-url'
 import type { ResolvedProvider } from './provider-env'
 import { ResponsesBridge, responsesToChatRequest } from './responses-bridge'
+import { NativeResponsesCompatibilityProxy } from './native-responses-compatibility'
+import { normalizeResponsesBaseUrl } from '../agent-framework/codex'
 
 // Runs a real connectivity/auth probe for a provider and classifies the outcome into an actionable
 // category. Request construction and classification are pure so the branch matrix is unit-testable;
@@ -19,6 +21,11 @@ import { ResponsesBridge, responsesToChatRequest } from './responses-bridge'
 // Default probe timeout; a stuck gateway should fail fast rather than hang the wizard.
 const DEFAULT_VALIDATE_TIMEOUT_MS = 20_000
 const ANTHROPIC_VERSION = '2023-06-01'
+// Reasoning providers may spend the first few output tokens on an internal block. With a one-token
+// budget Kimi k3 returns a 200 response whose message envelope is incomplete (`type`/`role` empty),
+// even though normal Claude Code requests work. Sixteen tokens is still a cheap probe while allowing
+// the provider to finish the Anthropic envelope that validation checks below.
+const ANTHROPIC_PROBE_MAX_TOKENS = 16
 // Keep an unmodified loopback fetch for the temporary local bridge. Tests and callers may inject/mock
 // the upstream fetch, but that must not intercept the request from the validator into 127.0.0.1.
 const loopbackFetch = globalThis.fetch.bind(globalThis)
@@ -28,10 +35,13 @@ type ValidationHttpRequest = {
   url: string
   headers: Record<string, string>
   body: string
+  endpoint: ChatApiEndpoint
   requiresBridgeToolCall?: boolean
 }
 
 const BRIDGE_PROBE_TOOL = 'open_science_bridge_probe'
+const NATIVE_RESPONSES_PROBE_NAMESPACE = 'open_science'
+const NATIVE_RESPONSES_PROBE_TOOL = 'bridge_probe'
 
 const bridgeProbeResponsesBody = (model: string): Record<string, unknown> => ({
   model,
@@ -49,6 +59,28 @@ const bridgeProbeResponsesBody = (model: string): Record<string, unknown> => ({
   ],
   // Match Codex's real bridge requests. Some compatible providers reject a forced-function object even
   // though they correctly choose and stream the function under `auto`.
+  tool_choice: 'auto',
+  stream: true
+})
+
+const nativeResponsesCompatibilityProbeBody = (model: string): Record<string, unknown> => ({
+  model,
+  input: 'Call the validation tool now. Do not answer with text.',
+  max_output_tokens: 512,
+  tools: [
+    {
+      type: 'namespace',
+      name: NATIVE_RESPONSES_PROBE_NAMESPACE,
+      description: 'Validates namespace tool support through the Responses compatibility proxy.',
+      tools: [
+        {
+          type: 'function',
+          name: NATIVE_RESPONSES_PROBE_TOOL,
+          parameters: { type: 'object', properties: {}, additionalProperties: false }
+        }
+      ]
+    }
+  ],
   tool_choice: 'auto',
   stream: true
 })
@@ -104,11 +136,11 @@ const buildAnthropicValidationRequest = (provider: ResolvedProvider): Validation
 
   const body = JSON.stringify({
     model: provider.model ?? '',
-    max_tokens: 1,
+    max_tokens: ANTHROPIC_PROBE_MAX_TOKENS,
     messages: [{ role: 'user', content: 'ping' }]
   })
 
-  return { url, headers, body }
+  return { url, headers, body, endpoint: 'anthropic' }
 }
 
 // A bridge contract probe for /v1/chat/completions. Codex depends on function calls, so a plain text
@@ -153,6 +185,7 @@ const buildOpenAiValidationRequest = (
     url,
     headers,
     body,
+    endpoint: 'openai',
     ...(requireBridgeToolCall ? { requiresBridgeToolCall: true } : {})
   }
 }
@@ -181,6 +214,7 @@ const buildResponsesValidationRequest = (provider: ResolvedProvider): Validation
   return {
     url,
     headers,
+    endpoint: 'responses',
     body: JSON.stringify({
       model: provider.model ?? '',
       input: 'ping',
@@ -189,12 +223,35 @@ const buildResponsesValidationRequest = (provider: ResolvedProvider): Validation
   }
 }
 
+const hasValidAnthropicMessage = (bodyText: string): boolean => {
+  try {
+    const parsed = JSON.parse(bodyText) as {
+      type?: unknown
+      role?: unknown
+      content?: unknown
+      usage?: { input_tokens?: unknown; output_tokens?: unknown }
+    }
+
+    return (
+      parsed.type === 'message' &&
+      parsed.role === 'assistant' &&
+      Array.isArray(parsed.content) &&
+      typeof parsed.usage?.input_tokens === 'number' &&
+      typeof parsed.usage?.output_tokens === 'number'
+    )
+  } catch {
+    return false
+  }
+}
+
 // Maps an HTTP status to a validation category. 2xx is success; auth/model errors are distinguished
-// so the UI can point the user at the credential vs. the model field.
+// so the UI can point the user at the credential vs. the model field. 5xx server errors are surfaced
+// as a distinct category so users can distinguish gateway/upstream issues from client-side problems.
 const classifyStatus = (status: number): ValidationCategory => {
   if (status >= 200 && status < 300) return 'ok'
   if (status === 401 || status === 403) return 'auth'
   if (status === 404) return 'model-not-found'
+  if (status >= 500 && status < 600) return 'server-error'
 
   return 'unknown'
 }
@@ -341,7 +398,10 @@ const hasBridgeProbeToolCall = (bodyText: string): boolean => {
   )
 }
 
-const hasResponsesBridgeProbeToolCall = (bodyText: string): boolean => {
+const hasResponsesProbeToolCall = (
+  bodyText: string,
+  expected: { name: string; namespace?: string }
+): boolean => {
   let completed = false
   let found = false
 
@@ -353,8 +413,15 @@ const hasResponsesBridgeProbeToolCall = (bodyText: string): boolean => {
     try {
       const event = JSON.parse(data) as {
         type?: unknown
-        item?: { type?: unknown; name?: unknown; arguments?: unknown }
-        response?: { output?: Array<{ type?: unknown; name?: unknown; arguments?: unknown }> }
+        item?: { type?: unknown; namespace?: unknown; name?: unknown; arguments?: unknown }
+        response?: {
+          output?: Array<{
+            type?: unknown
+            namespace?: unknown
+            name?: unknown
+            arguments?: unknown
+          }>
+        }
       }
       if (event.type === 'response.completed') completed = true
       const items = [event.item, ...(event.response?.output ?? [])].filter(Boolean)
@@ -362,7 +429,8 @@ const hasResponsesBridgeProbeToolCall = (bodyText: string): boolean => {
         items.some(
           (item) =>
             item?.type === 'function_call' &&
-            item.name === BRIDGE_PROBE_TOOL &&
+            item.name === expected.name &&
+            (expected.namespace === undefined || item.namespace === expected.namespace) &&
             typeof item.arguments === 'string'
         )
       ) {
@@ -376,23 +444,80 @@ const hasResponsesBridgeProbeToolCall = (bodyText: string): boolean => {
   return completed && found
 }
 
-// Outcome of the one-shot claude-default probe. `timedOut` lets the UI show a timeout message instead
-// of a misleading auth failure when the local claude never responds.
-export type ClaudeProbeResult = {
-  ok: boolean
-  timedOut?: boolean
-  message?: string
-}
+const hasResponsesBridgeProbeToolCall = (bodyText: string): boolean =>
+  hasResponsesProbeToolCall(bodyText, { name: BRIDGE_PROBE_TOOL })
+
+const hasNativeResponsesCompatibilityProbeToolCall = (bodyText: string): boolean =>
+  hasResponsesProbeToolCall(bodyText, {
+    namespace: NATIVE_RESPONSES_PROBE_NAMESPACE,
+    name: NATIVE_RESPONSES_PROBE_TOOL
+  })
 
 export type ValidateProviderDeps = {
   fetchImpl?: typeof fetch
   timeoutMs?: number
   requireBridgeToolCall?: boolean
+  requireNativeResponsesCompatibility?: boolean
   // The routes the active agent framework can drive; the probe targets the endpoint shared with the
   // provider so the test exercises the route the agent will actually use. Omitted → framework-agnostic.
   frameworkEndpoints?: readonly ChatApiEndpoint[]
-  // Runs a one-shot `claude -p "ok"` probe for claude-default providers.
-  runClaudeProbe?: () => Promise<ClaudeProbeResult>
+}
+
+type LocalResponsesValidationAdapter = {
+  start: () => Promise<{ baseUrl: string; token: string }>
+  close: () => Promise<void>
+  body: Record<string, unknown>
+  hasRequiredToolCall: (bodyText: string) => boolean
+  missingToolCallMessage: string
+}
+
+const validateProviderThroughLocalResponsesAdapter = async (
+  adapter: LocalResponsesValidationAdapter,
+  timeoutMs: number
+): Promise<ValidateProviderResult> => {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+
+  try {
+    const connection = await adapter.start()
+    const response = await loopbackFetch(`${connection.baseUrl}/responses`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${connection.token}`
+      },
+      body: JSON.stringify(adapter.body),
+      signal: controller.signal
+    })
+    let category = classifyStatus(response.status)
+    const bodyText = await response.text()
+    const providerMessage = extractProviderErrorMessage(bodyText)
+
+    if ((response.status === 400 || response.status === 404) && providerMessage) {
+      category = isModelNotFoundMessage(providerMessage) ? 'model-not-found' : 'unknown'
+    }
+    if (category !== 'ok') {
+      return toResult(category, {
+        status: response.status,
+        ...(category === 'unknown' || category === 'server-error' ? { message: providerMessage } : {})
+      })
+    }
+    if (!adapter.hasRequiredToolCall(bodyText)) {
+      return toResult('unknown', {
+        status: response.status,
+        message: adapter.missingToolCallMessage
+      })
+    }
+
+    return toResult('ok', { status: response.status })
+  } catch (error) {
+    return toResult(classifyFetchError(error), {
+      message: error instanceof Error ? error.message : String(error)
+    })
+  } finally {
+    clearTimeout(timer)
+    await adapter.close().catch(() => undefined)
+  }
 }
 
 const validateProviderThroughResponsesBridge = async (
@@ -406,50 +531,47 @@ const validateProviderThroughResponsesBridge = async (
     { baseUrl: targetBaseUrl, key: provider.key, model: provider.model },
     fetchImpl
   )
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  return validateProviderThroughLocalResponsesAdapter(
+    {
+      start: () => bridge.start(),
+      close: () => bridge.close(),
+      body: bridgeProbeResponsesBody(provider.model ?? ''),
+      hasRequiredToolCall: hasResponsesBridgeProbeToolCall,
+      missingToolCallMessage:
+        'The provider answered through the bridge, but did not complete the required streaming function tool call.'
+    },
+    timeoutMs
+  )
+}
+
+const validateProviderThroughNativeResponsesCompatibility = async (
+  provider: ResolvedProvider,
+  { fetchImpl = fetch, timeoutMs = DEFAULT_VALIDATE_TIMEOUT_MS }: ValidateProviderDeps
+): Promise<ValidateProviderResult> => {
+  const targetBaseUrl = normalizeResponsesBaseUrl(provider.openaiBaseUrl ?? provider.baseUrl)
+  if (!targetBaseUrl) return toResult('bad-url', { message: 'Missing base URL.' })
 
   try {
-    const connection = await bridge.start()
-    const response = await loopbackFetch(`${connection.baseUrl}/responses`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        authorization: `Bearer ${connection.token}`
-      },
-      body: JSON.stringify(bridgeProbeResponsesBody(provider.model ?? '')),
-      signal: controller.signal
-    })
-    let category = classifyStatus(response.status)
-    const bodyText = await response.text()
-    const providerMessage = extractProviderErrorMessage(bodyText)
-
-    if ((response.status === 400 || response.status === 404) && providerMessage) {
-      category = isModelNotFoundMessage(providerMessage) ? 'model-not-found' : 'unknown'
-    }
-    if (category !== 'ok') {
-      return toResult(category, {
-        status: response.status,
-        ...(category === 'unknown' ? { message: providerMessage } : {})
-      })
-    }
-    if (!hasResponsesBridgeProbeToolCall(bodyText)) {
-      return toResult('unknown', {
-        status: response.status,
-        message:
-          'The provider answered through the bridge, but did not complete the required streaming function tool call.'
-      })
-    }
-
-    return toResult('ok', { status: response.status })
-  } catch (error) {
-    return toResult(classifyFetchError(error), {
-      message: error instanceof Error ? error.message : String(error)
-    })
-  } finally {
-    clearTimeout(timer)
-    await bridge.close().catch(() => undefined)
+    void new URL(targetBaseUrl)
+  } catch {
+    return toResult('bad-url', { message: 'Invalid base URL.' })
   }
+
+  const proxy = new NativeResponsesCompatibilityProxy(
+    { baseUrl: targetBaseUrl, key: provider.key, model: provider.model },
+    fetchImpl
+  )
+  return validateProviderThroughLocalResponsesAdapter(
+    {
+      start: () => proxy.start(),
+      close: () => proxy.close(),
+      body: nativeResponsesCompatibilityProbeBody(provider.model ?? ''),
+      hasRequiredToolCall: hasNativeResponsesCompatibilityProbeToolCall,
+      missingToolCallMessage:
+        'The provider answered through the compatibility proxy, but did not complete the required namespace function tool call.'
+    },
+    timeoutMs
+  )
 }
 
 // Validates a custom provider by hitting its Messages endpoint with a 1-token request.
@@ -459,9 +581,18 @@ const validateCustomProvider = async (
     fetchImpl = fetch,
     timeoutMs = DEFAULT_VALIDATE_TIMEOUT_MS,
     requireBridgeToolCall = false,
+    requireNativeResponsesCompatibility = false,
     frameworkEndpoints
   }: ValidateProviderDeps
 ): Promise<ValidateProviderResult> => {
+  if (requireNativeResponsesCompatibility) {
+    return validateProviderThroughNativeResponsesCompatibility(provider, {
+      fetchImpl,
+      timeoutMs,
+      requireNativeResponsesCompatibility
+    })
+  }
+
   if (requireBridgeToolCall) {
     return validateProviderThroughResponsesBridge(provider, {
       fetchImpl,
@@ -500,15 +631,30 @@ const validateCustomProvider = async (
       }
     }
 
-    // Only the catch-all 'unknown' status (402 billing, 429 rate limit, 5xx, …) lacks guidance of its
-    // own, so surface the gateway's error text there — whatever it actually says — rather than an
-    // assumed meaning. auth/model-not-found already map to targeted advice, so their raw bodies would
-    // only muddy it.
-    if (category === 'unknown') {
+    // Only the catch-all 'unknown' status (402 billing, 429 rate limit, …) and 'server-error' (5xx)
+    // lack guidance of their own, so surface the gateway's error text there — whatever it actually
+    // says — rather than an assumed meaning. auth/model-not-found already map to targeted advice, so
+    // their raw bodies would only muddy it.
+    if (category === 'unknown' || category === 'server-error') {
       return toResult(category, {
         status: response.status,
         message: providerMessage
       })
+    }
+
+    if (category === 'ok' && request.endpoint === 'anthropic') {
+      let bodyText = ''
+      try {
+        bodyText = await response.text()
+      } catch {
+        // An unreadable success body cannot prove the Messages contract.
+      }
+      if (!hasValidAnthropicMessage(bodyText)) {
+        return toResult('unknown', {
+          status: response.status,
+          message: 'The provider returned success without a valid Anthropic message.'
+        })
+      }
     }
 
     if (category === 'ok' && request.requiresBridgeToolCall) {
@@ -537,41 +683,11 @@ const validateCustomProvider = async (
   }
 }
 
-// Validates a claude-default provider by running a one-shot claude probe against the user's auth.
-const validateClaudeDefaultProvider = async (
-  deps: ValidateProviderDeps
-): Promise<ValidateProviderResult> => {
-  if (!deps.runClaudeProbe) {
-    return toResult('unknown', { message: 'Claude probe is not configured.' })
-  }
-
-  try {
-    const probe = await deps.runClaudeProbe()
-
-    if (probe.ok) return toResult('ok')
-
-    return toResult(probe.timedOut ? 'timeout' : 'auth', {
-      message:
-        probe.message ??
-        (probe.timedOut
-          ? 'Local claude did not respond in time.'
-          : 'Local claude could not complete a request.')
-    })
-  } catch (error) {
-    return toResult('unknown', {
-      message: error instanceof Error ? error.message : String(error)
-    })
-  }
-}
-
 // Dispatches validation by provider type.
 const validateProvider = (
   provider: ResolvedProvider,
   deps: ValidateProviderDeps = {}
-): Promise<ValidateProviderResult> =>
-  provider.type === 'claude-default'
-    ? validateClaudeDefaultProvider(deps)
-    : validateCustomProvider(provider, deps)
+): Promise<ValidateProviderResult> => validateCustomProvider(provider, deps)
 
 export {
   ANTHROPIC_VERSION,

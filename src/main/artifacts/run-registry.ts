@@ -4,6 +4,14 @@ type ArtifactRunClaim = {
   artifactSessionId: string
   sessionId: string
   runId: string
+  artifactVersionIds?: string[]
+  rootFrameId?: string
+  agentFrameId?: string
+  messageBranchId?: string
+  messageBranchAncestry?: string[]
+  messageAncestry?: string[]
+  runtimeSegmentId?: string
+  promptMessageId?: string
   finalizedMessageId?: string
 }
 
@@ -12,6 +20,14 @@ type RegisterArtifactRunClaimRequest = {
   artifactSessionId: string
   sessionId: string
   runId: string
+  artifactVersionIds?: string[]
+  rootFrameId?: string
+  agentFrameId?: string
+  messageBranchId?: string
+  messageBranchAncestry?: string[]
+  messageAncestry?: string[]
+  runtimeSegmentId?: string
+  promptMessageId?: string
 }
 
 // Keeps short-lived artifact run ownership in memory until the renderer finalizes a message.
@@ -26,7 +42,8 @@ class ArtifactRunRegistry {
 
     this.claims.set(claimId, {
       claimId,
-      ...request
+      ...request,
+      artifactVersionIds: request.artifactVersionIds ? [...request.artifactVersionIds] : undefined
     })
 
     return claimId

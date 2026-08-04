@@ -1,6 +1,9 @@
 import type {
+  AppIconVariant,
   ChatApiEndpoint,
+  ClaudeSubscriptionProviderId,
   ClaudeInfo,
+  CodexSubscriptionAuthMode,
   CodexInfo,
   ProviderType,
   ProviderValidationFailure,
@@ -8,9 +11,14 @@ import type {
 } from '../../shared/settings'
 import { SETTINGS_FILE_VERSION } from '../../shared/settings'
 import type { OfficialVendorId } from '../../shared/provider-registry'
+import type {
+  CustomReasoningEffortTransport,
+  ReasoningEffortPresetSetting
+} from '../../shared/reasoning-effort'
 import type { PackageMirror } from '../../shared/mirror'
 import type { NotebookLanguage } from '../../shared/notebook'
 import type { RuntimeEnablement, RuntimeSelection } from '../../shared/notebook-runtime'
+import type { CloseActionPreference } from '../../shared/window-controls'
 import type { AgentFrameworkId } from '../agent-framework'
 
 // Main-process-only stored shapes for settings.json. These carry the encrypted key reference and a
@@ -22,6 +30,9 @@ import type { AgentFrameworkId } from '../agent-framework'
 export type StoredProvider = {
   id: string
   type: ProviderType
+  // Records whether the app-owned Codex profile came from an import or an in-app sign-in. Runtime
+  // behavior still keys on the normalized codex-isolated provider type.
+  codexAuthMode?: CodexSubscriptionAuthMode
   name: string
   // Which chat APIs a custom gateway speaks. Official providers derive it from the registry; absent
   // means ['anthropic'] (all pre-existing providers). Legacy records may carry the removed scalar
@@ -29,7 +40,13 @@ export type StoredProvider = {
   apiEndpoints?: ChatApiEndpoint[]
   baseUrl?: string
   model?: string
+  // Optional custom-model override. Absence is meaningful and resolves to the shared 200k default.
+  contextWindow?: number
   supportsImageInput?: boolean
+  // Custom-model effort capability. Absence resolves to the standard five-level preset.
+  reasoningEffortPreset?: ReasoningEffortPresetSetting
+  // Custom-gateway request shape. Absence resolves to the literal `reasoning_effort` field.
+  reasoningEffortTransport?: CustomReasoningEffortTransport
   // Set for official-vendor providers only.
   vendorId?: OfficialVendorId
   region?: string
@@ -40,9 +57,18 @@ export type StoredProvider = {
   keyMask?: string
   // Timestamp of the last successful connectivity/key check on the provider's first model.
   lastValidatedAt?: number
+  // Estimated expiry of a stored credential, used to surface "expires <date>" on the Settings card.
+  // Only set for credential types that have a known bounded lifetime: today that is the Claude
+  // `claude setup-token` (Anthropic documents a one-year lifetime) and a codex subscription sign-in
+  // (whose expiry Anthropic / OpenAI surface on the auth status). Stored in epoch ms.
+  expiresAt?: number
   // Recorded when a validation fails; cleared on the next success or a credential change. Kept so the
   // "unverified" warning survives a restart.
   lastValidationFailure?: ProviderValidationFailure
+  // claude-shared credentials live in the user's global profile and cannot be removed safely by the
+  // app. This timestamp records an app-local disconnect so Open Science stops using that profile
+  // until the user explicitly signs in again.
+  disconnectedAt?: number
 }
 
 // A user-added custom MCP server. Phase 1 = stdio (local command). Phase 2 adds the remote
@@ -78,7 +104,7 @@ export type StoredConnectors = {
   // Fully-qualified "<connector>/<method>" ids denied by policy; allow by default otherwise.
   blockedToolIds?: string[]
   // Fully-qualified "<connector>/<method>" ids that require per-call approval (opt-in). Tools default
-  // to allow (no prompt); this is the set the user switched to "Ask each time".
+  // to allow (no prompt); this is the set the user switched to "Require approval".
   askToolIds?: string[]
   // Ids of bundled connectors the user turned OFF. Absent/empty means every bundled connector is
   // enabled (default-on), mirroring disabledSkillIds. This is the authoritative bundled gate.
@@ -101,12 +127,21 @@ export type StoredSettings = {
   reasoningEffort?: ReasoningEffort
   // Desktop-notification preference for finished/failed agent tasks. Absent means enabled.
   notificationsEnabled?: boolean
+  // Conversation-driven Skill package import. Absent means enabled.
+  conversationSkillImportEnabled?: boolean
+  // Windows titlebar-close behavior. Absent means ask every time.
+  closePreference?: CloseActionPreference
+  // Selected built-in app-icon look. Absent means the default ('light').
+  appIconVariant?: AppIconVariant
   // Detected opencode executable path + reported version (for the status card). Absent = detect on PATH.
   opencodePath?: string
   opencodeVersion?: string
   // codex-acp adapter plus the native Codex runtime it launches.
   codex?: StoredCodexInfo
   activeProviderId?: string
+  // Last explicitly configured Claude subscription mode. Kept separately from activeProviderId so
+  // switching to a custom provider does not make the collapsed Claude card fall back to list order.
+  claudeSubscriptionProviderId?: ClaudeSubscriptionProviderId
   // Active model within the active provider; backfilled from the provider's own model on load when a
   // pre-v2 settings file (which had no per-model selection) is read.
   activeModel?: string
@@ -145,14 +180,12 @@ export type StoredSettings = {
   // Pinned bookmark folders for the remote file browser, keyed by provider_id.
   // Each value is an ordered array of absolute paths the user has pinned via Go-to.
   computeBookmarks?: Record<string, string[]>
-  // Persisted project-scope compute approval grants (design.md §6). Each grant means
-  // calls matching (projectId, operation, providerId) skip the approval card for that project.
-  // Conversation-scope grants are session-only (in-memory broker) and are NOT stored here.
+  // Legacy project-scope compute grants, read only for one-time migration into PermissionGrant.
+  // Production authorization never appends to this field; it is removed after a successful import.
   computeGrants?: StoredComputeGrant[]
 }
 
-// A single project-scope compute approval grant. The key is the triple (projectId, operation, providerId).
-// Stored in settings.json rather than the DB so it does not require a schema migration.
+// Legacy settings.json shape retained only so existing installations can migrate without data loss.
 export type StoredComputeGrant = {
   projectId: string
   operation: string

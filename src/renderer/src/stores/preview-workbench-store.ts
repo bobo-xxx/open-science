@@ -1,11 +1,14 @@
 import { create } from 'zustand'
 
 import type { NotebookSessionReference } from '../../../shared/notebook'
+import type { ProjectFileOriginSession } from '../../../shared/project-files'
 import type { FindingLocator } from '../../../shared/reviewer'
 import type { UploadedAttachment } from '../../../shared/uploads'
+import { getUploadedAttachmentPath } from '../../../shared/uploads'
 
 export type PreviewPanelState = 'open' | 'collapsed'
 export type PreviewFileFormat =
+  | 'code'
   | 'markdown'
   | 'text'
   | 'json'
@@ -13,16 +16,23 @@ export type PreviewFileFormat =
   | 'fasta'
   | 'html'
   | 'image'
+  | 'tiff'
   | 'pdb'
   | 'molecule'
   | 'pdf'
+  | 'word'
+  | 'spreadsheet'
+  | 'presentation'
   | 'unknown'
-// Distinguishes generated artifacts from user uploads when preview readers and actions differ.
-export type PreviewFileSource = 'artifact' | 'upload'
+// Distinguishes generated artifacts from user uploads, notebook inputs, and local ("This computer")
+// files when preview readers and header actions differ. 'local' files live outside app storage:
+// their path is an absolute filesystem path read via window.api.localFs.
+export type PreviewFileSource = 'artifact' | 'upload' | 'notebook-input' | 'local'
 export const PROJECT_FILES_PREVIEW_ID = 'tool:project:files'
 
 type PreviewItemBase = {
   id: string
+  projectId?: string
   sessionId: string
   title: string
 }
@@ -36,6 +46,10 @@ export type PreviewFileItem = PreviewItemBase & {
   mimeType?: string
   size?: number
   mtimeMs?: number
+  artifactId?: string
+  selectedVersionId?: string
+  versionNumber?: number
+  originSession?: ProjectFileOriginSession
 }
 
 // Tool previews share the workbench chrome with files, but keep their own render path.
@@ -76,6 +90,11 @@ export type RestoredPreviewSlice = {
 type PreviewWorkbenchStoreData = PreviewSlice & {
   activeProjectId: string | undefined
   byProject: Record<string, PreviewSlice>
+  // Tool tab currently shown as a large modal instead of inline panel content (files tab only).
+  expandedToolItemId: string | null
+  // A one-off file preview stays outside the tab list so Files and Global Search can open the same
+  // dialog without creating a durable workbench tab.
+  fileDialogItem: PreviewFileItem | undefined
 }
 
 type PreviewWorkbenchStore = PreviewWorkbenchStoreData & {
@@ -86,6 +105,9 @@ type PreviewWorkbenchStore = PreviewWorkbenchStoreData & {
   activateItem: (itemId: string) => void
   removeItem: (itemId: string) => void
   removeSessionItems: (sessionId: string) => void
+  setToolItemExpanded: (itemId: string | null) => void
+  openFileDialog: (item: PreviewFileItem) => void
+  closeFileDialog: () => void
   openPanel: () => void
   collapsePanel: () => void
   togglePanel: () => void
@@ -99,7 +121,9 @@ export const createInitialPreviewWorkbenchState = (): PreviewWorkbenchStoreData 
   panelState: 'collapsed',
   openRequestVersion: 0,
   activeProjectId: undefined,
-  byProject: {}
+  byProject: {},
+  expandedToolItemId: null,
+  fileDialogItem: undefined
 })
 
 // The empty slice a project starts from before any preview tabs are opened.
@@ -109,6 +133,11 @@ const createEmptyPreviewSlice = (): PreviewSlice => ({
   panelState: 'collapsed',
   openRequestVersion: 0
 })
+
+// Preview capabilities are project-scoped. Persisted tabs created before project scope was stored
+// are repaired from the owning workbench slice, and callers cannot accidentally omit that scope.
+const withProjectScope = (item: PreviewItem, projectId: string | undefined): PreviewItem =>
+  item.type === 'file' && !item.projectId && projectId ? { ...item, projectId } : item
 
 // Normalizes incoming preview items so callers never persist or manage timestamps themselves.
 const createStoredPreviewItem = (
@@ -125,8 +154,10 @@ const createStoredPreviewItem = (
 }
 
 // Rebuilds a project's live slice from its persisted durable subset, repairing a dangling active tab.
-const restoredToSlice = (restored: RestoredPreviewSlice): PreviewSlice => {
-  const items = (restored.items ?? []).map((item) => createStoredPreviewItem(item))
+const restoredToSlice = (restored: RestoredPreviewSlice, projectId: string): PreviewSlice => {
+  const items = (restored.items ?? []).map((item) =>
+    createStoredPreviewItem(withProjectScope(item, projectId))
+  )
   const activeItemId = items.some((item) => item.id === restored.activeItemId)
     ? restored.activeItemId
     : items[0]?.id
@@ -134,7 +165,7 @@ const restoredToSlice = (restored: RestoredPreviewSlice): PreviewSlice => {
   return {
     items,
     activeItemId,
-    panelState: restored.panelState ?? 'collapsed',
+    panelState: items.length > 0 ? (restored.panelState ?? 'collapsed') : 'collapsed',
     openRequestVersion: 0
   }
 }
@@ -200,10 +231,12 @@ const reconcileUploadPreviewItems = (
     if (item.type !== 'file' || item.source !== 'upload') return item
 
     const upload = uploadByPreviewId.get(item.id)
-    if (!upload || (upload.path === item.path && upload.sessionId === item.sessionId)) return item
+    if (!upload) return item
+    const path = getUploadedAttachmentPath(upload, item.projectId)
+    if (path === item.path && upload.sessionId === item.sessionId) return item
 
     changed = true
-    return { ...item, sessionId: upload.sessionId, path: upload.path, updatedAt }
+    return { ...item, sessionId: upload.sessionId, path, updatedAt }
   })
 
   return changed ? reconciledItems : items
@@ -231,12 +264,22 @@ export const usePreviewWorkbenchStore = create<PreviewWorkbenchStore>((set, get)
       }
 
       const targetSlice =
-        byProject[projectId] ?? (restored ? restoredToSlice(restored) : createEmptyPreviewSlice())
+        byProject[projectId] ??
+        (restored ? restoredToSlice(restored, projectId) : createEmptyPreviewSlice())
 
       // The active slice lives at top level, never duplicated in the stash.
       delete byProject[projectId]
 
-      return { ...targetSlice, activeProjectId: projectId, byProject }
+      // The expanded files surface is tied to the outgoing project's workbench layout.
+      return {
+        ...targetSlice,
+        panelState: targetSlice.items.length > 0 ? targetSlice.panelState : 'collapsed',
+        activeProjectId: projectId,
+        byProject,
+        expandedToolItemId: null,
+        fileDialogItem:
+          state.fileDialogItem?.projectId === projectId ? state.fileDialogItem : undefined
+      }
     })
   },
 
@@ -273,19 +316,26 @@ export const usePreviewWorkbenchStore = create<PreviewWorkbenchStore>((set, get)
   // Inserts a preview item or refreshes the existing tab without changing focus.
   upsertItem: (item) => {
     set((state) => {
-      const existingIndex = state.items.findIndex((previewItem) => previewItem.id === item.id)
+      const scopedItem = withProjectScope(item, state.activeProjectId)
+      const existingIndex = state.items.findIndex((previewItem) => previewItem.id === scopedItem.id)
 
       // New items append to the horizontal preview list in discovery order.
       if (existingIndex === -1) {
+        const hasActiveItem = state.items.some(
+          (previewItem) => previewItem.id === state.activeItemId
+        )
+
         return {
-          items: [...state.items, createStoredPreviewItem(item)]
+          items: [...state.items, createStoredPreviewItem(scopedItem)],
+          // Passive discovery selects a fallback tab without opening the collapsed panel.
+          activeItemId: hasActiveItem ? state.activeItemId : (state.items[0]?.id ?? scopedItem.id)
         }
       }
 
       // Existing items keep their original position and creation time.
       return {
         items: state.items.map((previewItem, index) =>
-          index === existingIndex ? createStoredPreviewItem(item, previewItem) : previewItem
+          index === existingIndex ? createStoredPreviewItem(scopedItem, previewItem) : previewItem
         )
       }
     })
@@ -323,7 +373,10 @@ export const usePreviewWorkbenchStore = create<PreviewWorkbenchStore>((set, get)
 
       return {
         items,
-        activeItemId
+        activeItemId,
+        panelState: items.length > 0 ? state.panelState : 'collapsed',
+        expandedToolItemId: state.expandedToolItemId === itemId ? null : state.expandedToolItemId,
+        fileDialogItem: itemId === PROJECT_FILES_PREVIEW_ID ? undefined : state.fileDialogItem
       }
     })
   },
@@ -342,13 +395,29 @@ export const usePreviewWorkbenchStore = create<PreviewWorkbenchStore>((set, get)
 
       return {
         items,
-        activeItemId
+        activeItemId,
+        // A session-scoped tool tab could own the expanded surface; clear it when its tab is gone.
+        panelState: items.length > 0 ? state.panelState : 'collapsed',
+        expandedToolItemId: items.some((item) => item.id === state.expandedToolItemId)
+          ? state.expandedToolItemId
+          : null
       }
     })
   },
 
+  // Expands a tool tab (files) into a large modal surface, or restores the inline panel layout.
+  setToolItemExpanded: (itemId) => {
+    set({ expandedToolItemId: itemId })
+  },
+
+  openFileDialog: (item) => set({ fileDialogItem: item }),
+
+  closeFileDialog: () => set({ fileDialogItem: undefined }),
+
   // Records an explicit open request so the resizable panel can expand even if it is already open.
   openPanel: () => {
+    if (get().items.length === 0) return
+
     set((state) => ({
       panelState: 'open',
       openRequestVersion: state.openRequestVersion + 1
@@ -372,7 +441,9 @@ export const usePreviewWorkbenchStore = create<PreviewWorkbenchStore>((set, get)
 
   // Mirrors resize-library state into the store after drag or imperative panel changes.
   syncPanelState: (panelState) => {
-    set({ panelState })
+    set((state) => ({
+      panelState: panelState === 'open' && state.items.length === 0 ? 'collapsed' : panelState
+    }))
   }
 }))
 

@@ -1,14 +1,19 @@
-import { X } from 'lucide-react'
-import { useRef, useState } from 'react'
+import { BookOpen, File, FolderOpen, X } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { PanelImperativeHandle, PanelSize } from 'react-resizable-panels'
 
+import { dialogOverlayClassName, dialogPanelClassName } from '@/components/ui/dialog-chrome'
 import { ResizablePanel } from '@/components/ui/resizable'
 import { cn } from '@/lib/utils'
-import type { PreviewFileItem, PreviewItem } from '@/stores/preview-workbench-store'
+import type {
+  PreviewFileItem,
+  PreviewItem,
+  PreviewToolItem
+} from '@/stores/preview-workbench-store'
 import { usePreviewWorkbenchStore } from '@/stores/preview-workbench-store'
 
-import { FilePreviewDialog } from './FilePreviewDialog'
-import { MiddleEllipsisFileName, PreviewFileSurface } from './PreviewFileSurface'
+import { ExtensionPreservingFileName } from './ExtensionPreservingFileName'
+import { PreviewFileSurface } from './PreviewFileSurface'
 import { PreviewFileContent } from './previews/PreviewFileContent'
 import { PreviewToolContent } from './previews/PreviewToolContent'
 
@@ -17,6 +22,10 @@ type PreviewPanelProps = {
   defaultSize: string
   minSize: string
   onResize: (panelSize: PanelSize, previousPanelSize: PanelSize | undefined) => void
+}
+
+type PreviewPanelSurfaceProps = {
+  className?: string
 }
 
 // Renders the active tab's content, or an empty state when nothing is previewed yet.
@@ -43,11 +52,36 @@ const previewTabClassName =
 
 const getPreviewTabId = (itemId: string): string => `preview-tab-${encodeURIComponent(itemId)}`
 const getPreviewPanelId = (itemId: string): string => `preview-panel-${encodeURIComponent(itemId)}`
+const PREVIEW_MODAL_FOCUSABLE_SELECTOR =
+  'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+const PREVIEW_TAB_EDGE_INSET = 8
+
+// Scrolls only when the complete tab falls outside the tab list's padded visible bounds.
+const scrollPreviewTabIntoView = (
+  tabList: HTMLElement,
+  tab: HTMLElement,
+  behavior: ScrollBehavior
+): void => {
+  const tabListRect = tabList.getBoundingClientRect()
+  if (tabListRect.width <= PREVIEW_TAB_EDGE_INSET * 2) return
+
+  const tabRect = tab.getBoundingClientRect()
+  const visibleLeft = tabListRect.left + PREVIEW_TAB_EDGE_INSET
+  const visibleRight = tabListRect.right - PREVIEW_TAB_EDGE_INSET
+  let offset = 0
+
+  if (tabRect.left < visibleLeft) offset = tabRect.left - visibleLeft
+  else if (tabRect.right > visibleRight) offset = tabRect.right - visibleRight
+  if (offset === 0) return
+
+  tabList.scrollTo({ left: tabList.scrollLeft + offset, behavior })
+}
 
 // One tab owns activation/keyboard behavior while its sibling close button preserves quick removal.
 const PreviewTab = ({
   tab,
   isActive,
+  containerRef,
   tabRef,
   onActivate,
   onClose,
@@ -55,12 +89,14 @@ const PreviewTab = ({
 }: {
   tab: PreviewItem
   isActive: boolean
+  containerRef: (element: HTMLDivElement | null) => void
   tabRef: (element: HTMLButtonElement | null) => void
   onActivate: (id: string) => void
   onClose: (id: string) => void
   onKeyDown: (event: React.KeyboardEvent<HTMLButtonElement>) => void
 }): React.JSX.Element => (
   <div
+    ref={containerRef}
     role="presentation"
     className={cn(
       previewTabClassName,
@@ -75,13 +111,20 @@ const PreviewTab = ({
       aria-controls={getPreviewPanelId(tab.id)}
       aria-selected={isActive}
       tabIndex={isActive ? 0 : -1}
-      className="flex min-w-0 flex-1 self-stretch items-center text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/50"
+      className="flex min-w-0 flex-1 items-center gap-1 self-stretch text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/50"
       onClick={() => onActivate(tab.id)}
       onKeyDown={onKeyDown}
       title={tab.title}
     >
       {tab.type === 'file' ? (
-        <MiddleEllipsisFileName name={tab.name} />
+        <File className="size-3.5 shrink-0" aria-hidden="true" />
+      ) : tab.toolKind === 'files' ? (
+        <FolderOpen className="size-3.5 shrink-0" aria-hidden="true" />
+      ) : tab.toolKind === 'notebook' ? (
+        <BookOpen className="size-3.5 shrink-0" strokeWidth={2} aria-hidden="true" />
+      ) : null}
+      {tab.type === 'file' ? (
+        <ExtensionPreservingFileName name={tab.name} className="flex-1" />
       ) : (
         <span className="min-w-0 truncate">{tab.title}</span>
       )}
@@ -113,7 +156,45 @@ const PreviewTabBar = ({
   onActivate: (id: string) => void
   onClose: (id: string) => void
 }): React.JSX.Element => {
+  const tabListRef = useRef<HTMLDivElement | null>(null)
+  const tabContainerRefs = useRef<Array<HTMLDivElement | null>>([])
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([])
+
+  const scrollActiveTabIntoView = useCallback(
+    (behavior: ScrollBehavior): void => {
+      const tabList = tabListRef.current
+      if (!tabList) return
+
+      const activeIndex = tabs.findIndex((tab) => tab.id === activeItemId)
+      const activeTab = activeIndex === -1 ? null : tabContainerRefs.current[activeIndex]
+      if (activeTab) scrollPreviewTabIntoView(tabList, activeTab, behavior)
+    },
+    [activeItemId, tabs]
+  )
+
+  // External activation keeps the selected tab visible without moving keyboard focus.
+  useEffect(() => {
+    const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true
+    scrollActiveTabIntoView(reduceMotion ? 'auto' : 'smooth')
+  }, [scrollActiveTabIntoView])
+
+  // Panel expansion and drag-resizing can clip an unchanged active tab, so recheck on width changes.
+  useEffect(() => {
+    const tabList = tabListRef.current
+    if (!tabList || typeof ResizeObserver === 'undefined') return
+
+    let previousWidth = tabList.getBoundingClientRect().width
+    const observer = new ResizeObserver(() => {
+      const nextWidth = tabList.getBoundingClientRect().width
+      if (nextWidth === previousWidth) return
+
+      previousWidth = nextWidth
+      scrollActiveTabIntoView('auto')
+    })
+    observer.observe(tabList)
+
+    return () => observer.disconnect()
+  }, [scrollActiveTabIntoView])
 
   const moveToTab = (index: number): void => {
     const tab = tabs[index]
@@ -150,16 +231,20 @@ const PreviewTabBar = ({
 
   return (
     <div
+      ref={tabListRef}
       role="tablist"
       aria-label="Open previews"
       aria-orientation="horizontal"
-      className="flex shrink-0 items-center gap-1 overflow-x-auto px-2 pb-2"
+      className="flex min-w-0 flex-1 basis-0 shrink-0 items-center gap-1 overflow-x-auto pb-2"
     >
       {tabs.map((tab, index) => (
         <PreviewTab
           key={tab.id}
           tab={tab}
           isActive={tab.id === activeItemId}
+          containerRef={(element) => {
+            tabContainerRefs.current[index] = element
+          }}
           tabRef={(element) => {
             tabRefs.current[index] = element
           }}
@@ -172,8 +257,74 @@ const PreviewTabBar = ({
   )
 }
 
-// Keep dialog state local to the active file panel. While the dialog owns the preview, unmount the
-// compact renderer so large files are not acquired and rendered twice at the same time.
+// Shared modal behavior for surfaces that switch between panel and modal layout without
+// remounting: Escape closes, Tab traps focus inside, body scroll locks, and closing returns
+// focus to the owning tab. Escape is ignored while focus lives outside the surface (e.g. a
+// portaled dialog above it) so nested overlays close one layer at a time.
+const usePreviewModalSurface = ({
+  isOpen,
+  onClose,
+  surfaceRef,
+  itemId
+}: {
+  isOpen: boolean
+  onClose: () => void
+  surfaceRef: React.RefObject<HTMLElement | null>
+  itemId: string
+}): void => {
+  useEffect(() => {
+    if (!isOpen) return
+
+    const surface = surfaceRef.current
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    surface?.focus()
+
+    const handleKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') {
+        if (
+          surface &&
+          document.activeElement !== surface &&
+          !surface.contains(document.activeElement)
+        ) {
+          return
+        }
+        event.preventDefault()
+        onClose()
+        return
+      }
+      if (event.key !== 'Tab' || !surface) return
+
+      const focusable = Array.from(
+        surface.querySelectorAll<HTMLElement>(PREVIEW_MODAL_FOCUSABLE_SELECTOR)
+      )
+      if (focusable.length === 0) {
+        event.preventDefault()
+        surface.focus()
+        return
+      }
+
+      const first = focusable[0]
+      const last = focusable.at(-1)
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last?.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first?.focus()
+      }
+    }
+
+    document.addEventListener('keydown', handleKeyDown, true)
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown, true)
+      document.body.style.overflow = previousOverflow
+      document.getElementById(getPreviewTabId(itemId))?.focus()
+    }
+  }, [isOpen, onClose, surfaceRef, itemId])
+}
+
+// The same surface switches between panel and modal layout so stateful renderers never remount.
 const PreviewFilePanel = ({
   item,
   contentKey,
@@ -184,40 +335,135 @@ const PreviewFilePanel = ({
   onClose: (id: string) => void
 }): React.JSX.Element => {
   const [isFullScreenOpen, setIsFullScreenOpen] = useState(false)
+  const surfaceRef = useRef<HTMLElement | null>(null)
+
+  const closeFullScreen = useCallback((): void => {
+    setIsFullScreenOpen(false)
+  }, [])
+
+  const openFullScreen = (): void => {
+    setIsFullScreenOpen(true)
+  }
+
+  usePreviewModalSurface({
+    isOpen: isFullScreenOpen,
+    onClose: closeFullScreen,
+    surfaceRef,
+    itemId: item.id
+  })
 
   return (
     <>
+      {isFullScreenOpen ? (
+        <div
+          aria-hidden="true"
+          data-state="open"
+          className={`${dialogOverlayClassName} z-[60] cursor-default`}
+          onClick={closeFullScreen}
+        />
+      ) : null}
       <section
+        ref={surfaceRef}
         data-testid="preview-card"
-        role="tabpanel"
-        id={getPreviewPanelId(item.id)}
-        aria-labelledby={getPreviewTabId(item.id)}
-        tabIndex={0}
-        className="flex h-full min-h-0 w-full flex-col overflow-hidden rounded-md bg-bg-000 shadow-card"
+        role={isFullScreenOpen ? 'dialog' : 'tabpanel'}
+        aria-modal={isFullScreenOpen || undefined}
+        aria-label={isFullScreenOpen ? `Preview ${item.title}` : undefined}
+        id={isFullScreenOpen ? undefined : getPreviewPanelId(item.id)}
+        aria-labelledby={isFullScreenOpen ? undefined : getPreviewTabId(item.id)}
+        tabIndex={isFullScreenOpen ? -1 : 0}
+        data-state={isFullScreenOpen ? 'open' : undefined}
+        className={
+          isFullScreenOpen
+            ? dialogPanelClassName(
+                'z-[61] flex h-[90vh] w-[90vw] max-w-none min-h-0 flex-col overflow-hidden overscroll-contain p-0'
+              )
+            : cn(
+                'flex h-full min-h-0 w-full flex-col overflow-hidden rounded-md bg-bg-000 shadow-card'
+              )
+        }
       >
         <PreviewFileSurface
           item={item}
           contentKey={contentKey}
-          renderContent={!isFullScreenOpen}
-          onClose={() => onClose(item.id)}
-          onOpenFullScreen={() => setIsFullScreenOpen(true)}
+          // Full-screen mode floats above the modal panel (z-[61]); tooltips must follow.
+          tooltipClassName={isFullScreenOpen ? 'z-[70]' : undefined}
+          onClose={isFullScreenOpen ? closeFullScreen : () => onClose(item.id)}
+          onOpenFullScreen={isFullScreenOpen ? undefined : openFullScreen}
+          provenanceEntry={isFullScreenOpen ? 'trailing' : 'menu'}
         />
       </section>
-      <FilePreviewDialog
-        item={isFullScreenOpen ? item : undefined}
-        onClose={() => setIsFullScreenOpen(false)}
-      />
     </>
   )
 }
 
-// Right-side workbench: a tab strip over every previewed file, plus content for the active tab.
-const PreviewPanel = ({
-  panelRef,
-  defaultSize,
-  minSize,
-  onResize
-}: PreviewPanelProps): React.JSX.Element => {
+// Tool tabs (files/notebook/reviewer) reuse the same panel/modal layout switch as file previews.
+// The expanded state lives in the workbench store because the expand button is rendered by the
+// tool content itself (ProjectFilesView), not by this chrome. Overlay/panel stay below z-[60] so
+// workspace-level dialogs such as FilePreviewDialog stack above the modal.
+// Rendered for every tool tab, active or not, so component state (e.g. the local file browser's
+// current directory) survives switching to another tab and back. Inactive panels only get `hidden`;
+// returning a different element from this map position would let React unmount the subtree.
+const PreviewToolPanel = ({
+  item,
+  isActive
+}: {
+  item: PreviewToolItem
+  isActive: boolean
+}): React.JSX.Element => {
+  const isExpanded = usePreviewWorkbenchStore(
+    (state) => state.expandedToolItemId === item.id && isActive
+  )
+  const setToolItemExpanded = usePreviewWorkbenchStore((state) => state.setToolItemExpanded)
+  const surfaceRef = useRef<HTMLElement | null>(null)
+
+  const closeExpanded = useCallback((): void => {
+    setToolItemExpanded(null)
+  }, [setToolItemExpanded])
+
+  usePreviewModalSurface({
+    isOpen: isExpanded,
+    onClose: closeExpanded,
+    surfaceRef,
+    itemId: item.id
+  })
+
+  return (
+    <>
+      {isExpanded ? (
+        <div
+          aria-hidden="true"
+          data-state="open"
+          className={`${dialogOverlayClassName} z-[55] cursor-default`}
+          onClick={closeExpanded}
+        />
+      ) : null}
+      <section
+        ref={surfaceRef}
+        role={isExpanded ? 'dialog' : 'tabpanel'}
+        aria-modal={isExpanded || undefined}
+        aria-label={isExpanded ? item.title : undefined}
+        id={isExpanded ? undefined : getPreviewPanelId(item.id)}
+        aria-labelledby={isExpanded ? undefined : getPreviewTabId(item.id)}
+        tabIndex={isExpanded ? -1 : 0}
+        hidden={!isActive && !isExpanded}
+        data-state={isExpanded ? 'open' : undefined}
+        className={
+          isExpanded
+            ? dialogPanelClassName(
+                'z-[56] flex h-[90vh] w-[90vw] max-w-none min-h-0 flex-col overflow-hidden overscroll-contain p-0'
+              )
+            : 'h-full min-h-0 w-full overflow-y-auto'
+        }
+      >
+        <PreviewActiveContent item={item} />
+      </section>
+    </>
+  )
+}
+
+// Shared workbench surface. Desktop wraps it in a resizable panel; mobile presents the exact same
+// tabs and active content inside a bottom sheet.
+const PreviewPanelSurface = ({ className }: PreviewPanelSurfaceProps): React.JSX.Element => {
   const items = usePreviewWorkbenchStore((state) => state.items)
   const activeItemId = usePreviewWorkbenchStore((state) => state.activeItemId)
   const panelState = usePreviewWorkbenchStore((state) => state.panelState)
@@ -237,6 +483,67 @@ const PreviewPanel = ({
         ])
       : (activeItem?.id ?? 'empty')
 
+  return (
+    <aside
+      id="right-panel"
+      className={cn(
+        'relative flex h-full w-full flex-col overflow-hidden bg-bg-10 py-[10px]',
+        className
+      )}
+    >
+      {items.length > 0 ? (
+        <div
+          data-testid="preview-panel-top-bar"
+          className="flex min-w-0 w-full shrink-0 items-start pl-2 pr-14"
+        >
+          <PreviewTabBar
+            tabs={items}
+            activeItemId={activeItemId}
+            onActivate={activateItem}
+            onClose={removeItem}
+          />
+        </div>
+      ) : null}
+      <div className={cn('min-h-0 flex-1', activeItem?.type === 'file' && 'pl-2 pr-1')}>
+        {!activeItem ? <PreviewActiveContent key={activeContentKey} item={activeItem} /> : null}
+        {items.map((item) => {
+          const isActivePanel = item.id === activeItemId && panelState === 'open'
+          // Tool panels render at this map position whether active or not, so React keeps the
+          // subtree mounted across tab switches. File panels re-create on activation anyway
+          // (contentKey encodes path+mtime), so an inactive one collapses to an empty region.
+          if (item.type === 'tool') {
+            return <PreviewToolPanel key={item.id} item={item} isActive={isActivePanel} />
+          }
+
+          return isActivePanel ? (
+            <PreviewFilePanel
+              key={item.id}
+              item={item}
+              contentKey={activeContentKey}
+              onClose={removeItem}
+            />
+          ) : (
+            <section
+              key={item.id}
+              role="tabpanel"
+              id={getPreviewPanelId(item.id)}
+              aria-labelledby={getPreviewTabId(item.id)}
+              hidden
+            />
+          )
+        })}
+      </div>
+    </aside>
+  )
+}
+
+// Desktop right-side workbench: a tab strip over every previewed file, plus active content.
+const PreviewPanel = ({
+  panelRef,
+  defaultSize,
+  minSize,
+  onResize
+}: PreviewPanelProps): React.JSX.Element => {
   const handleResize = (
     panelSize: PanelSize,
     _panelId: string | number | undefined,
@@ -247,7 +554,7 @@ const PreviewPanel = ({
 
   return (
     <ResizablePanel
-      id="right-panel"
+      id="right-panel-resizable"
       // The parent drives expand/collapse in response to store open requests and header toggles.
       panelRef={panelRef}
       defaultSize={defaultSize}
@@ -256,55 +563,10 @@ const PreviewPanel = ({
       collapsedSize="0%"
       onResize={handleResize}
     >
-      <aside className="flex h-full w-full flex-col overflow-hidden bg-bg-10 py-[10px]">
-        {items.length > 0 ? (
-          <PreviewTabBar
-            tabs={items}
-            activeItemId={activeItemId}
-            onActivate={activateItem}
-            onClose={removeItem}
-          />
-        ) : null}
-        <div className={cn('min-h-0 flex-1', activeItem?.type === 'file' && 'pl-2 pr-1')}>
-          {!activeItem ? <PreviewActiveContent key={activeContentKey} item={activeItem} /> : null}
-          {items.map((item) => {
-            const isActivePanel = item.id === activeItemId && panelState === 'open'
-            if (!isActivePanel) {
-              return (
-                <section
-                  key={item.id}
-                  role="tabpanel"
-                  id={getPreviewPanelId(item.id)}
-                  aria-labelledby={getPreviewTabId(item.id)}
-                  hidden
-                />
-              )
-            }
-
-            return item.type === 'file' ? (
-              <PreviewFilePanel
-                key={item.id}
-                item={item}
-                contentKey={activeContentKey}
-                onClose={removeItem}
-              />
-            ) : (
-              <section
-                key={item.id}
-                role="tabpanel"
-                id={getPreviewPanelId(item.id)}
-                aria-labelledby={getPreviewTabId(item.id)}
-                tabIndex={0}
-                className="h-full min-h-0 w-full overflow-y-auto"
-              >
-                <PreviewActiveContent key={activeContentKey} item={item} />
-              </section>
-            )
-          })}
-        </div>
-      </aside>
+      <PreviewPanelSurface />
     </ResizablePanel>
   )
 }
 
 export { PreviewPanel }
+export { PreviewPanelSurface }

@@ -4,7 +4,11 @@ import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ProvisionStatus } from '../../../../shared/notebook-env'
-import type { DiscoveredInterpreter, RuntimeEnablement } from '../../../../shared/notebook-runtime'
+import type {
+  DiscoveredInterpreter,
+  EnvPackage,
+  RuntimeEnablement
+} from '../../../../shared/notebook-runtime'
 import { createInitialNotebookEnvState, useNotebookEnvStore } from '../../stores/notebook-env-store'
 import { RuntimesPanel } from './RuntimesPanel'
 
@@ -47,6 +51,8 @@ const rEnvs: DiscoveredInterpreter[] = [
 ]
 
 let listEnvironments: ReturnType<typeof vi.fn>
+let listPackages: ReturnType<typeof vi.fn>
+let listPackageCounts: ReturnType<typeof vi.fn>
 let getEnablement: ReturnType<typeof vi.fn>
 let describeUsage: ReturnType<typeof vi.fn>
 let setEnvironmentEnabled: ReturnType<typeof vi.fn>
@@ -69,6 +75,25 @@ const enablement: RuntimeEnablement = { enabled: {}, installAuthorized: {} }
 beforeEach(() => {
   useNotebookEnvStore.setState(createInitialNotebookEnvState())
   listEnvironments = vi.fn().mockResolvedValue({ python: pythonEnvs, r: rEnvs })
+  listPackages = vi
+    .fn()
+    .mockImplementation(async (_language: string, envId: string): Promise<EnvPackage[]> => {
+      if (envId === '/usr/bin/python3') return [{ name: 'requests', version: '2.32.3' }]
+      return [
+        { name: 'numpy', version: '2.1.3', build: 'py312hb2f4e1b_0', channel: 'conda-forge' },
+        { name: 'pandas', version: '2.2.3', build: 'py312h1234567_0', channel: 'conda-forge' }
+      ]
+    })
+  listPackageCounts = vi
+    .fn()
+    .mockImplementation(async (language: string): Promise<Record<string, number | null>> =>
+      language === 'python'
+        ? {
+            '/data/runtime/envs/default-python-3.12/bin/python': 2,
+            '/usr/bin/python3': 1
+          }
+        : {}
+    )
   getEnablement = vi.fn().mockResolvedValue(enablement)
   describeUsage = vi.fn().mockResolvedValue({ running: 0, idle: 0, dormant: 0 })
   setEnvironmentEnabled = vi
@@ -91,6 +116,8 @@ beforeEach(() => {
   ;(window as unknown as { api: unknown }).api = {
     runtime: {
       listEnvironments,
+      listPackages,
+      listPackageCounts,
       getEnablement,
       describeUsage,
       setEnvironmentEnabled,
@@ -118,9 +145,12 @@ afterEach(() => {
   delete (window as unknown as { api?: unknown }).api
 })
 
-const render = async (): Promise<void> => {
+const render = async (
+  title = 'Notebook runtimes',
+  description = 'Enable the environments each notebook language may run in.'
+): Promise<void> => {
   await act(async () => {
-    root.render(<RuntimesPanel />)
+    root.render(<RuntimesPanel title={title} description={description} />)
   })
   // Flush the listEnvironments()/survey() microtasks.
   await act(async () => {})
@@ -134,6 +164,17 @@ const click = async (el: Element | null): Promise<void> => {
 }
 
 describe('RuntimesPanel', () => {
+  it('renders caller-provided heading copy with Recheck in the same top section', async () => {
+    await render('Custom runtime title', 'Custom runtime description')
+
+    const section = container.querySelector('section[aria-label="Custom runtime title"]')
+    expect(section?.querySelector('h3')?.textContent).toBe('Custom runtime title')
+    expect(section?.textContent).toContain('Custom runtime description')
+    const recheck = section?.querySelector<HTMLButtonElement>('button')
+    expect(recheck?.textContent).toContain('Recheck')
+    expect(recheck?.parentElement?.className).toContain('ml-auto')
+  })
+
   it('renders a card per detected env with version and interpreter path', async () => {
     await render()
     const text = container.textContent ?? ''
@@ -150,6 +191,21 @@ describe('RuntimesPanel', () => {
     // managed env is not provisioned yet (R here): python (managed 3.12 + System) + R (managed setup +
     // R 4.4.1) = 4 cards.
     expect(container.querySelectorAll('[data-testid="runtime-card"]').length).toBe(4)
+  })
+
+  it('uses the theme color for Python and R managed-runtime actions', async () => {
+    // Remove both managed interpreters so each language exposes the same setup action.
+    listEnvironments.mockResolvedValue({ python: pythonEnvs.slice(1), r: rEnvs })
+    await render()
+
+    for (const language of ['Python', 'R']) {
+      const section = container.querySelector(`section[aria-label="${language} runtime"]`)
+      const setupButton = Array.from(section?.querySelectorAll('button') ?? []).find((button) =>
+        /download and set up/i.test(button.textContent ?? '')
+      )
+
+      expect(setupButton?.getAttribute('data-variant')).toBe('default')
+    }
   })
 
   it('enable toggle calls setEnvironmentEnabled with the env id', async () => {
@@ -193,8 +249,19 @@ describe('RuntimesPanel', () => {
 
     // The impact dialog is shown and the disable is NOT applied yet.
     const dialog = document.querySelector('[data-testid="disable-impact-dialog"]')
+    const overlay = Array.from(document.body.querySelectorAll<HTMLElement>('div')).find((element) =>
+      element.className.includes('bg-black/50')
+    )
     expect(dialog).not.toBeNull()
     expect(dialog?.textContent).toContain('1 running')
+    expect(overlay?.className).toContain('data-[state=open]:fade-in-0')
+    expect(overlay?.className).toContain('data-[state=closed]:fill-mode-forwards')
+    expect(overlay?.className).not.toContain('backdrop-blur')
+    expect(dialog?.className).toContain('rounded-xl')
+    expect(dialog?.className).toContain('border-border')
+    expect(dialog?.className).toContain('bg-card')
+    expect(dialog?.className).toContain('shadow-dialog')
+    expect(dialog?.className).toContain('data-[state=open]:zoom-in-95')
     expect(setEnvironmentEnabled).not.toHaveBeenCalled()
 
     // Confirming applies the disable to the bound runtime.
@@ -242,7 +309,10 @@ describe('RuntimesPanel', () => {
     expect(
       container.querySelector('[data-testid="runtimes-provision-error-r"]')?.textContent
     ).toContain('runtime CDN unavailable')
-    expect(container.textContent).toContain('Retry setup')
+    const retryButton = Array.from(container.querySelectorAll('button')).find((button) =>
+      /^retry setup$/i.test((button.textContent ?? '').trim())
+    )
+    expect(retryButton?.getAttribute('data-variant')).toBe('default')
   })
 
   it('adds an interpreter via the picker and enables the new external env', async () => {
@@ -257,6 +327,25 @@ describe('RuntimesPanel', () => {
     expect(registerInterpreter).toHaveBeenCalledWith('python', '/usr/bin/python3')
     // The picked path matches a detected env, so it is enabled (Add-interpreter's direct 3-arg call).
     expect(setEnvironmentEnabled).toHaveBeenCalledWith('python', '/usr/bin/python3', true)
+  })
+
+  it('shows a clear local-desktop message when remote runtime management is restricted', async () => {
+    pickInterpreter.mockRejectedValueOnce(
+      new Error(
+        'This action is only available in the local desktop app (runtime:pick-interpreter).'
+      )
+    )
+    await render()
+    const addBtn = Array.from(container.querySelectorAll('button')).find((button) =>
+      /add interpreter/i.test(button.textContent ?? '')
+    )
+
+    await click(addBtn ?? null)
+
+    expect(container.querySelector('[data-testid="runtimes-error"]')?.textContent).toContain(
+      'only available in the local desktop app'
+    )
+    expect(registerInterpreter).not.toHaveBeenCalled()
   })
 
   it('shows a determinate progress bar + Cancel in the app-managed setup card while downloading', async () => {
@@ -309,6 +398,7 @@ describe('RuntimesPanel', () => {
       /^reset runtime$/i.test((b.textContent ?? '').trim())
     )
     expect(resetBtn).toBeDefined()
+    expect(resetBtn?.getAttribute('data-variant')).toBe('default')
     await click(resetBtn ?? null)
     expect(repairBridge).toHaveBeenCalledWith('r')
   })
@@ -334,6 +424,7 @@ describe('RuntimesPanel', () => {
       /^reset runtime$/i.test((b.textContent ?? '').trim())
     )
     expect(resetBtn).toBeDefined()
+    expect(resetBtn?.getAttribute('data-variant')).toBe('default')
     await click(resetBtn ?? null)
     expect(repairBridge).toHaveBeenCalledWith('python')
   })
@@ -363,5 +454,191 @@ describe('RuntimesPanel', () => {
     expect(cancelBridge).toHaveBeenCalled()
 
     resolveProvision?.()
+  })
+})
+
+describe('RuntimesPanel packages dialog', () => {
+  const setInputValue = (input: HTMLInputElement, value: string): void => {
+    // React's onChange reads value via the synthetic event; the native setter bypasses its tracking.
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+    if (setter) setter.call(input, value)
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+  }
+
+  const flush = async (): Promise<void> => {
+    await act(async () => {})
+    await act(async () => {})
+  }
+
+  const cardWith = (text: string): Element | undefined =>
+    Array.from(container.querySelectorAll('[data-testid="runtime-card"]')).find((card) =>
+      card.textContent?.includes(text)
+    )
+
+  it('shows a Packages button on runnable env cards only, then a count badge per env', async () => {
+    await render()
+    // Runnable: managed python + System Python. The non-runnable R conda card has no button.
+    expect(
+      cardWith('Python 3.12 (managed)')?.querySelector('[data-testid="runtime-packages-button"]')
+    ).not.toBeNull()
+    expect(
+      cardWith('System Python')?.querySelector('[data-testid="runtime-packages-button"]')
+    ).not.toBeNull()
+    expect(cardWith('R 4.4.1')?.querySelector('[data-testid="runtime-packages-button"]')).toBeNull()
+
+    // Counts land lazily after the panel loads: ONE bulk listPackageCounts call for python (the
+    // only language with runnable envs here) — no per-env listPackages calls for badges.
+    await flush()
+    expect(listPackageCounts).toHaveBeenCalledWith('python')
+    expect(listPackageCounts).toHaveBeenCalledTimes(1)
+    expect(listPackageCounts).not.toHaveBeenCalledWith('r')
+    expect(listPackages).not.toHaveBeenCalled()
+    const managedBadge = cardWith('Python 3.12 (managed)')?.querySelector(
+      '[data-testid="runtime-packages-count"]'
+    )
+    const systemBadge = cardWith('System Python')?.querySelector(
+      '[data-testid="runtime-packages-count"]'
+    )
+    expect(managedBadge?.textContent).toBe('2')
+    expect(systemBadge?.textContent).toBe('1')
+  })
+
+  it('omits the count badge when the bulk count fetch fails (no card-level error UI)', async () => {
+    listPackageCounts.mockRejectedValue(new Error('discovery failed'))
+    await render()
+    await flush()
+    expect(container.querySelector('[data-testid="runtime-packages-count"]')).toBeNull()
+    expect(container.querySelector('[data-testid="runtimes-error"]')).toBeNull()
+  })
+
+  it('omits a badge for envs whose count came back null in the bulk response', async () => {
+    listPackageCounts.mockResolvedValue({
+      '/data/runtime/envs/default-python-3.12/bin/python': 2,
+      '/usr/bin/python3': null
+    })
+    await render()
+    await flush()
+    expect(
+      cardWith('Python 3.12 (managed)')?.querySelector('[data-testid="runtime-packages-count"]')
+        ?.textContent
+    ).toBe('2')
+    expect(
+      cardWith('System Python')?.querySelector('[data-testid="runtime-packages-count"]')
+    ).toBeNull()
+  })
+
+  it('opens the dialog with package rows and conda columns, and the filter narrows rows', async () => {
+    await render()
+    await flush()
+    const button = cardWith('Python 3.12 (managed)')?.querySelector(
+      '[data-testid="runtime-packages-button"]'
+    )
+    await click(button ?? null)
+
+    const dialog = document.querySelector('[data-testid="runtime-packages-dialog"]')
+    expect(dialog).not.toBeNull()
+    expect(dialog?.textContent).toContain('Packages in Python 3.12 (managed)')
+    expect(dialog?.textContent).toContain('/data/runtime/envs/default-python-3.12/bin/python')
+    expect(document.querySelectorAll('[data-testid="runtime-package-row"]').length).toBe(2)
+    // Conda-style listing: Build/Channel columns + the conda/pypi summary.
+    expect(dialog?.textContent).toContain('Build')
+    expect(dialog?.textContent).toContain('Channel')
+    expect(dialog?.textContent).toContain('py312hb2f4e1b_0')
+    expect(dialog?.textContent).toContain('2 of 2 · 2 conda, 0 pypi')
+
+    const filter = document.querySelector<HTMLInputElement>(
+      '[data-testid="runtime-packages-filter"]'
+    )
+    expect(filter).not.toBeNull()
+    await act(async () => setInputValue(filter!, 'nump'))
+    expect(document.querySelectorAll('[data-testid="runtime-package-row"]').length).toBe(1)
+    expect(dialog?.textContent).toContain('1 of 2 · 2 conda, 0 pypi')
+  })
+
+  it('shows name/version only (no conda columns or summary) for pip-style listings', async () => {
+    await render()
+    await flush()
+    const button = cardWith('System Python')?.querySelector(
+      '[data-testid="runtime-packages-button"]'
+    )
+    await click(button ?? null)
+
+    const dialog = document.querySelector('[data-testid="runtime-packages-dialog"]')
+    expect(document.querySelectorAll('[data-testid="runtime-package-row"]').length).toBe(1)
+    expect(dialog?.textContent).toContain('requests')
+    expect(dialog?.textContent).not.toContain('Build')
+    expect(dialog?.textContent).toContain('1 of 1')
+    expect(dialog?.textContent).not.toContain('conda')
+  })
+
+  it('shows an error with retry when the dialog fetch fails, and recovers on retry', async () => {
+    await render()
+    await flush()
+    listPackages.mockRejectedValueOnce(new Error('micromamba list failed'))
+    const button = cardWith('Python 3.12 (managed)')?.querySelector(
+      '[data-testid="runtime-packages-button"]'
+    )
+    await click(button ?? null)
+
+    const dialog = document.querySelector('[data-testid="runtime-packages-dialog"]')
+    expect(dialog?.textContent).toContain('micromamba list failed')
+    const retry = Array.from(document.querySelectorAll('button')).find((b) =>
+      /^retry$/i.test((b.textContent ?? '').trim())
+    )
+    await click(retry ?? null)
+    await flush()
+    expect(document.querySelectorAll('[data-testid="runtime-package-row"]').length).toBe(2)
+  })
+
+  it('shows the conda env name badge for app-owned conda envs, without duplicating it for user-own', async () => {
+    const condaEnvs: DiscoveredInterpreter[] = [
+      {
+        language: 'python',
+        provenance: 'app-managed',
+        envId: '/data/runtime/envs/default-python/bin/python',
+        interpreterPath: '/data/runtime/envs/default-python/bin/python',
+        label: 'Python 3.12 (managed)',
+        version: '3.12.4',
+        runnable: true,
+        condaEnv: 'default-python'
+      },
+      {
+        language: 'python',
+        provenance: 'user-own',
+        envId: '/opt/conda/envs/bio/bin/python',
+        interpreterPath: '/opt/conda/envs/bio/bin/python',
+        label: 'conda: bio',
+        version: '3.11.2',
+        runnable: true,
+        condaEnv: 'bio'
+      }
+    ]
+    listEnvironments.mockResolvedValue({ python: condaEnvs, r: [] })
+    await render()
+    await flush()
+
+    const occurrences = (dialog: Element | null, text: string): number =>
+      (dialog?.textContent ?? '').split(text).length - 1
+
+    // App-owned conda env: provenance badge is "App-managed", so the conda name gets its own badge.
+    await click(
+      cardWith('Python 3.12 (managed)')?.querySelector('[data-testid="runtime-packages-button"]') ??
+        null
+    )
+    let dialog = document.querySelector('[data-testid="runtime-packages-dialog"]')
+    expect(dialog?.textContent).toContain('App-managed')
+    expect(occurrences(dialog, 'Conda: default-python')).toBe(1)
+
+    // Close, then the user-own conda env: providerType() already yields "Conda: bio" as the
+    // provenance badge — the name must appear exactly once (no duplicate second badge).
+    const closeBtn = Array.from(document.querySelectorAll('button')).find((b) =>
+      /^close$/i.test((b.textContent ?? '').trim())
+    )
+    await click(closeBtn ?? null)
+    await click(
+      cardWith('conda: bio')?.querySelector('[data-testid="runtime-packages-button"]') ?? null
+    )
+    dialog = document.querySelector('[data-testid="runtime-packages-dialog"]')
+    expect(occurrences(dialog, 'Conda: bio')).toBe(1)
   })
 })

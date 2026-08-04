@@ -14,6 +14,8 @@ describe('preview support format detection', () => {
     ['gif', undefined, 'image'],
     ['webp', undefined, 'image'],
     ['svg', undefined, 'image'],
+    ['tif', undefined, 'tiff'],
+    ['tiff', undefined, 'tiff'],
     ['iqtree', undefined, 'text'],
     ['nwk', undefined, 'text'],
     ['state', undefined, 'text'],
@@ -36,8 +38,20 @@ describe('preview support format detection', () => {
     ['smi', undefined, 'molecule'],
     ['smiles', undefined, 'molecule'],
     ['rxn', undefined, 'molecule'],
+    ['docx', undefined, 'word'],
+    ['xls', undefined, 'spreadsheet'],
+    ['xlsx', undefined, 'spreadsheet'],
+    ['pptx', undefined, 'presentation'],
     ['html', undefined, 'html'],
-    ['htm', undefined, 'html']
+    ['htm', undefined, 'html'],
+    ['py', undefined, 'code'],
+    ['r', undefined, 'code'],
+    ['js', undefined, 'code'],
+    ['ts', undefined, 'code'],
+    ['tsx', undefined, 'code'],
+    ['css', undefined, 'code'],
+    ['sh', undefined, 'code'],
+    ['bash', undefined, 'code']
   ])('maps .%s files to %s previews', (extension, mimeType, expectedFormat) => {
     expect(getPreviewFormat(extension, mimeType)).toBe(expectedFormat)
   })
@@ -47,9 +61,15 @@ describe('preview support format detection', () => {
     ['text/html', 'html'],
     ['text/csv', 'csv'],
     ['image/png', 'image'],
+    ['image/tiff', 'tiff'],
+    ['image/x-tiff', 'tiff'],
     ['text/markdown', 'markdown'],
     ['chemical/x-pdb', 'pdb'],
     ['chemical/x-mdl-rxnfile', 'molecule'],
+    ['application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'word'],
+    ['application/vnd.ms-excel', 'spreadsheet'],
+    ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'spreadsheet'],
+    ['application/vnd.openxmlformats-officedocument.presentationml.presentation', 'presentation'],
     ['application/xml', 'text'],
     ['application/atom+xml', 'text'],
     ['text/plain', 'text']
@@ -57,21 +77,40 @@ describe('preview support format detection', () => {
     expect(getPreviewFormat('', mimeType)).toBe(expectedFormat)
   })
 
-  it('falls back to unknown for unsupported extensions and mime types', () => {
+  it('falls back to unknown for unsupported extensions and legacy Word documents', () => {
     expect(getPreviewFormat('zip', 'application/zip')).toBe('unknown')
+    expect(getPreviewFormat('doc')).toBe('unknown')
+    expect(
+      getPreviewFormat(
+        'doc',
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+      )
+    ).toBe('unknown')
+    expect(getPreviewFormat('', 'application/msword')).toBe('unknown')
+    expect(
+      getPreviewFormat(
+        'ppt',
+        'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+      )
+    ).toBe('unknown')
   })
 
   it('derives the preview format from source-neutral file metadata', () => {
     expect(getPreviewFormatForFile({ name: 'results.csv', mimeType: 'text/plain' })).toBe('csv')
     expect(getPreviewFormatForFile({ name: 'analysis.treefile' })).toBe('text')
+    expect(getPreviewFormatForFile({ name: 'analysis.R' })).toBe('code')
   })
 
   it.each([
     ['image', undefined],
     ['csv', 'utf8'],
     ['fasta', 'utf8'],
+    ['code', 'utf8'],
     ['text', 'utf8'],
     ['pdf', undefined],
+    ['word', undefined],
+    ['spreadsheet', undefined],
+    ['presentation', undefined],
     ['unknown', undefined]
   ] as const)('uses %s preview encoding %s', (format, expectedEncoding) => {
     expect(getPreviewThumbnailReadEncoding(format)).toBe(expectedEncoding)

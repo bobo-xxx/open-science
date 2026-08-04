@@ -5,21 +5,49 @@
 // only while the user is actively typing one in.
 
 import type { OfficialVendorId } from './provider-registry'
+import type {
+  CustomReasoningEffortTransport,
+  ReasoningEffortPresetSetting
+} from './reasoning-effort'
 import type { PackageMirror } from './mirror'
+import type { CloseActionPreference } from './window-controls'
 
 // Settings file schema version; bumped when the on-disk shape changes. v2 adds official-vendor
 // providers (vendorId/region) and a per-selection activeModel alongside activeProviderId.
 export const SETTINGS_FILE_VERSION = 2
 
-// A provider targets a custom gateway, a built-in official vendor, a local Claude login, or one of
-// Codex's two subscription profiles. Codex shared uses the machine's normal CODEX_HOME; isolated uses
-// the app-owned profile.
+// A provider targets a custom gateway, a built-in official vendor, an app-owned Claude
+// subscription, or a Codex subscription. `codex-shared` remains a legacy Provider/import
+// discriminator; both Codex variants use the app-owned profile at runtime. claude-shared uses ~/.claude (browser
+// OAuth login via `claude auth login`); claude-isolated uses an app-owned CLAUDE_CONFIG_DIR
+// (setup-token paste, no ~/.claude touch).
 export type ProviderType =
-  'custom' | 'claude-default' | 'official' | 'codex-shared' | 'codex-isolated'
+  'custom' | 'claude-shared' | 'claude-isolated' | 'official' | 'codex-shared' | 'codex-isolated'
+
+// The stored Codex subscription always uses the app-owned runtime type. This discriminator preserves
+// which setup choice produced it so editing an imported profile does not masquerade as an isolated
+// sign-in and accidentally discard its imported loopback route.
+export type CodexSubscriptionAuthMode = 'imported' | 'isolated'
+
+// Stored Codex subscriptions share one runtime type, while renderer surfaces still need the setup
+// choice. Legacy codex-shared views have no discriminator, so their type remains the fallback.
+export const resolveCodexSubscriptionType = (provider: {
+  type: ProviderType
+  codexAuthMode?: CodexSubscriptionAuthMode
+}): 'codex-shared' | 'codex-isolated' =>
+  provider.codexAuthMode === 'imported' ||
+  (provider.codexAuthMode === undefined && provider.type === 'codex-shared')
+    ? 'codex-shared'
+    : 'codex-isolated'
 
 export const CODEX_SHARED_PROVIDER_ID = 'builtin-codex-shared'
 export const CODEX_ISOLATED_PROVIDER_ID = 'builtin-codex-isolated'
 export const CODEX_SUBSCRIPTION_PROVIDER_ID = 'builtin-codex-subscription'
+
+export const CLAUDE_SHARED_PROVIDER_ID = 'builtin-claude-shared'
+export const CLAUDE_ISOLATED_PROVIDER_ID = 'builtin-claude-isolated'
+export type ClaudeSubscriptionProviderId =
+  typeof CLAUDE_SHARED_PROVIDER_ID | typeof CLAUDE_ISOLATED_PROVIDER_ID
 
 export const isCodexSubscriptionProvider = (
   type: ProviderType
@@ -34,6 +62,46 @@ export const isCodexSubscriptionProviderId = (id: string): boolean =>
   id === CODEX_SUBSCRIPTION_PROVIDER_ID ||
   id === CODEX_SHARED_PROVIDER_ID ||
   id === CODEX_ISOLATED_PROVIDER_ID
+
+export const isClaudeSubscriptionProvider = (
+  type: ProviderType
+): type is 'claude-shared' | 'claude-isolated' =>
+  type === 'claude-shared' || type === 'claude-isolated'
+
+// The claude-isolated record's fixed identity. Every isolated lookup (repository upsert,
+// service login/edit/validation) keys on CLAUDE_ISOLATED_PROVIDER_ID.
+export const claudeIsolatedProviderIdentity = (): { id: string; name: string } => ({
+  id: CLAUDE_ISOLATED_PROVIDER_ID,
+  name: 'Claude subscription'
+})
+
+// The claude-shared record's fixed identity. Every shared lookup keys on CLAUDE_SHARED_PROVIDER_ID.
+export const claudeSharedProviderIdentity = (): { id: string; name: string } => ({
+  id: CLAUDE_SHARED_PROVIDER_ID,
+  name: 'Claude subscription'
+})
+
+export const isClaudeSubscriptionProviderId = (id: string): id is ClaudeSubscriptionProviderId =>
+  id === CLAUDE_SHARED_PROVIDER_ID || id === CLAUDE_ISOLATED_PROVIDER_ID
+
+// Chooses the single Claude subscription record projected by collapsed UI surfaces. An active Claude
+// record wins; otherwise the last explicitly configured mode wins, with list order only as a legacy
+// fallback for settings written before the preference existed.
+export const selectClaudeSubscriptionProvider = <T extends { id: string; type: ProviderType }>(
+  providers: readonly T[],
+  activeProviderId?: string,
+  preferredProviderId?: ClaudeSubscriptionProviderId
+): T | undefined => {
+  const claudeProviders = providers.filter((provider) =>
+    isClaudeSubscriptionProvider(provider.type)
+  )
+
+  return (
+    claudeProviders.find((provider) => provider.id === activeProviderId) ??
+    claudeProviders.find((provider) => provider.id === preferredProviderId) ??
+    claudeProviders[0]
+  )
+}
 
 // The chat API a model endpoint speaks: `anthropic` = /v1/messages, `openai` =
 // /v1/chat/completions, and `responses` = /v1/responses. Keep the two OpenAI-shaped protocols
@@ -58,24 +126,40 @@ export const isProviderCompatibleWith = (
   frameworkEndpoints: readonly ChatApiEndpoint[]
 ): boolean => endpoints.some((endpoint) => frameworkEndpoints.includes(endpoint))
 
+// Codex can drive a Chat Completions-only provider through the app's local Responses bridge. Keep
+// this contract in one module so compatibility, validation, and runtime setup cannot disagree about
+// which provider/framework pairs depend on bridge behavior.
+export const requiresChatCompletionsBridge = (
+  provider: { apiEndpoints?: readonly ChatApiEndpoint[] },
+  framework: { id: AgentFrameworkId; supportedApiTypes: readonly ChatApiEndpoint[] }
+): boolean => {
+  const endpoints = providerEndpoints(provider)
+
+  return (
+    framework.id === 'codex' &&
+    framework.supportedApiTypes.includes('responses') &&
+    endpoints.includes('openai') &&
+    !endpoints.includes('responses')
+  )
+}
+
 // Whether a provider can actually drive a given framework. Two axes: endpoint compatibility (above),
-// AND provider-type — a `claude-default` provider reuses the machine's own Claude login (Claude-specific
-// OAuth/config), which no other framework can consume, so it is only usable by Claude Code regardless
-// of endpoint. Enforced both in the renderer gates and main-side (preflight + spawn).
+// AND provider-type — a `claude-isolated` provider carries an app-owned Anthropic OAuth token
+// that no other framework can consume, so it is only usable by Claude Code regardless of endpoint.
+// Codex subscription providers carry their own login and can only drive Codex regardless of
+// endpoint. Enforced both in the renderer gates and main-side (preflight + spawn).
 export const isProviderUsableByFramework = (
   provider: { apiEndpoints?: readonly ChatApiEndpoint[]; type: ProviderType },
   framework: { id: AgentFrameworkId; supportedApiTypes: readonly ChatApiEndpoint[] }
 ): boolean => {
   if (isCodexSubscriptionProvider(provider.type)) return framework.id === 'codex'
-  if (provider.type === 'claude-default' && framework.id !== 'claude-code') return false
+  // Both Claude subscription modes rely on the ~/.claude or app-owned credential that only
+  // claude-code knows how to read; OpenCode receives neither an endpoint nor a token.
+  if (isClaudeSubscriptionProvider(provider.type) && framework.id !== 'claude-code') return false
 
   const endpoints = providerEndpoints(provider)
 
-  if (
-    framework.id === 'codex' &&
-    framework.supportedApiTypes.includes('responses') &&
-    endpoints.includes('openai')
-  ) {
+  if (requiresChatCompletionsBridge(provider, framework)) {
     return true
   }
 
@@ -155,18 +239,26 @@ export type ProviderValidationFailure = {
 export type ProviderView = {
   id: string
   type: ProviderType
+  codexAuthMode?: CodexSubscriptionAuthMode
   name: string
   // Which chat APIs this provider's endpoint speaks; drives per-framework availability. Absent ⇒
   // treat as ['anthropic'] (every legacy provider).
   apiEndpoints?: ChatApiEndpoint[]
   baseUrl?: string
   model?: string
+  // User-configured context-window size for a custom model. Omitted means the runtime uses 200k.
+  contextWindow?: number
   supportsImageInput: boolean
+  // Custom-model effort declaration. Absence intentionally means the standard five-level preset.
+  reasoningEffortPreset?: ReasoningEffortPresetSetting
+  // Request-body shape used to deliver the selected effort to a custom model endpoint. Absence uses
+  // the broadly compatible `reasoning_effort` field for existing settings.
+  reasoningEffortTransport?: CustomReasoningEffortTransport
   // Set for official-vendor providers: which vendor and (where applicable) which regional endpoint.
   vendorId?: OfficialVendorId
   region?: string
   // Models selectable for this provider in the composer: the vendor catalog for official providers,
-  // or the single configured model for custom/claude-default. Derived from the registry in main.
+  // or the single configured model for custom. Derived from the registry in main.
   models: string[]
   // A short, non-secret hint like "sk-…abcd" for display only.
   maskedKey?: string
@@ -180,6 +272,10 @@ export type ProviderView = {
   // Present when the most recent validation failed and no later one has succeeded. Drives the
   // "unverified" warning in the provider list.
   lastValidationFailure?: ProviderValidationFailure
+  // Estimated credential expiry (epoch ms). Set for credential types that have a known bounded
+  // lifetime — today that is `claude setup-token` (Anthropic documents a one-year lifetime).
+  // The Settings card surfaces this as "Expires <date>".
+  expiresAt?: number
 }
 
 // True when a provider's most recent validation failed (and no later one succeeded). A failed
@@ -199,9 +295,9 @@ export type AgentFrameworkId = 'claude-code' | 'opencode' | 'codex'
 
 // How much reasoning effort the user asks the agent to spend. 'default' means "don't override": the
 // agent keeps its own default and nothing is sent. The concrete levels form a relative scale
-// (low < medium < high < max): each agent/model maps the level onto its own supported rungs, using
-// the closest one it has (e.g. 'max' becomes the model's top level).
-export type ReasoningEffort = 'default' | 'low' | 'medium' | 'high' | 'max'
+// (low < medium < high < xhigh < max): the active model's static profile maps the level onto its
+// concrete supported rungs (e.g. 'max' becomes the model's top level).
+export type ReasoningEffort = 'default' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 
 export const DEFAULT_REASONING_EFFORT: ReasoningEffort = 'default'
 
@@ -209,11 +305,49 @@ export const DEFAULT_REASONING_EFFORT: ReasoningEffort = 'default'
 // is unfocused, so the default surprises no one staring at the window.
 export const DEFAULT_NOTIFICATIONS_ENABLED = true
 
-const REASONING_EFFORTS: readonly ReasoningEffort[] = ['default', 'low', 'medium', 'high', 'max']
+// Conversation-driven Skill package import is opt-out. When disabled, the runtime omits both the
+// app-owned import MCP server and its prompt/attachment guidance from subsequent conversations.
+export const DEFAULT_CONVERSATION_SKILL_IMPORT_ENABLED = true
+
+const REASONING_EFFORTS: readonly ReasoningEffort[] = [
+  'default',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max'
+]
 
 // Runtime guard for untrusted values (IPC payloads, settings.json): only the known levels pass.
 export const isReasoningEffort = (value: unknown): value is ReasoningEffort =>
   typeof value === 'string' && (REASONING_EFFORTS as readonly string[]).includes(value)
+
+// The selectable app-icon look. 'light' is the shipped default; 'dark' is its matching dark variant.
+// Both are built-in assets; the choice is applied at runtime to the app window icon (all platforms),
+// the macOS Dock, and the Windows tray glyph (the static installed icon in Finder/Explorer/taskbar is
+// baked into the build and never changes).
+export type AppIconVariant = 'light' | 'dark'
+
+export const DEFAULT_APP_ICON_VARIANT: AppIconVariant = 'light'
+
+const APP_ICON_VARIANTS: readonly AppIconVariant[] = ['light', 'dark']
+
+// Runtime guard for untrusted values (IPC payloads, settings.json): only the known variants pass.
+export const isAppIconVariant = (value: unknown): value is AppIconVariant =>
+  typeof value === 'string' && (APP_ICON_VARIANTS as readonly string[]).includes(value)
+
+// Static, non-secret descriptor for one selectable icon variant, driving the Appearance picker.
+export type AppIconVariantInfo = {
+  id: AppIconVariant
+  label: string
+  description: string
+}
+
+// The ordered icon variants shown in Settings. The default (light) leads.
+export const APP_ICON_VARIANT_INFOS: readonly AppIconVariantInfo[] = [
+  { id: 'light', label: 'Light', description: 'The light Open Science logo.' },
+  { id: 'dark', label: 'Dark', description: 'The dark Open Science logo.' }
+]
 
 // Renderer-facing descriptor for one selectable agent framework (built from the main registry).
 export type AgentFrameworkView = {
@@ -234,8 +368,10 @@ export type SettingsSnapshot = {
   // Detected codex-acp adapter and its paired native Codex runtime.
   codex: CodexInfo
   activeProviderId?: string
-  // The active model within the active provider. For custom/claude-default this mirrors the provider's
-  // own model; for official providers it's the chosen catalog entry. Undefined until a provider exists.
+  // Last explicitly configured Claude subscription mode, used when another provider is active.
+  claudeSubscriptionProviderId?: ClaudeSubscriptionProviderId
+  // The active model within the active provider. For custom this mirrors the provider's own model;
+  // for official providers it's the chosen catalog entry. Undefined until a provider exists.
   activeModel?: string
   providers: ProviderView[]
   // The selected agent backend, and the frameworks available to choose from.
@@ -256,6 +392,12 @@ export type SettingsSnapshot = {
   reasoningEffort: ReasoningEffort
   // Whether the app posts an OS notification when an agent task finishes or fails while unfocused.
   notificationsEnabled: boolean
+  // Whether conversations may detect attached Skill packages and request an app-owned import flow.
+  conversationSkillImportEnabled: boolean
+  // Saved Windows titlebar-close behavior. Undefined means ask every time.
+  closePreference?: CloseActionPreference
+  // The selected built-in app-icon look, applied to the window icon and macOS Dock. Defaults to 'light'.
+  appIconVariant: AppIconVariant
 }
 
 // Request to set (or clear, via omitted fields) the package-mirror configuration.
@@ -271,6 +413,25 @@ export type SetReasoningEffortRequest = {
 
 export type SetNotificationsEnabledRequest = {
   enabled: boolean
+}
+
+export type SetConversationSkillImportEnabledRequest = {
+  enabled: boolean
+}
+
+export type SetClosePreferenceRequest = {
+  preference?: CloseActionPreference
+}
+
+export type SetAppIconVariantRequest = {
+  variant: AppIconVariant
+}
+
+// A built-in icon variant plus a small preview image (data URL) generated in the main process from the
+// bundled asset, so the renderer shows exactly what will be applied without shipping the asset twice.
+export type AppIconPreview = AppIconVariantInfo & {
+  // A small PNG data URL of the variant's icon, sized for the settings preview tile.
+  previewDataUrl: string
 }
 
 // The hard startup gates. Kept as plain booleans so the wizard can target the first unmet step.
@@ -293,7 +454,14 @@ export type ProviderDraft = {
   name?: string
   baseUrl?: string
   model?: string
+  // Custom model context-window size in tokens. `null` explicitly clears a saved override; omitted
+  // leaves it unchanged on partial edits. A provider with no override resolves to 200k at runtime.
+  contextWindow?: number | null
   supportsImageInput?: boolean
+  // Optional custom-model effort declaration. Absence defaults to the standard five-level preset.
+  reasoningEffortPreset?: ReasoningEffortPresetSetting
+  // Optional custom-gateway request shape. Absence defaults to the literal `reasoning_effort` field.
+  reasoningEffortTransport?: CustomReasoningEffortTransport
   // Which chat APIs a custom gateway speaks (form selector). Official providers take it from the
   // registry; omitted defaults to ['anthropic'].
   apiEndpoints?: ChatApiEndpoint[]
@@ -307,6 +475,9 @@ export type ProviderDraft = {
 // Create/update request: an existing `id` edits in place, otherwise a new provider is created.
 export type UpsertProviderRequest = ProviderDraft & {
   id?: string
+  // Explicitly refreshes an existing imported Codex subscription from the user's CLI profile.
+  // Ordinary edits remain app-owned and never cross that external profile boundary.
+  reimportCodexAuthentication?: boolean
 }
 
 export type DeleteProviderRequest = {
@@ -331,7 +502,15 @@ export type ValidateProviderRequest = {
 // 'incompatible' is decided before any network probe: the provider's API format can't drive the
 // active agent framework, so a raw auth probe would only mislead (the key is fine; the pairing isn't).
 export type ValidationCategory =
-  'ok' | 'network' | 'auth' | 'model-not-found' | 'bad-url' | 'timeout' | 'incompatible' | 'unknown'
+  | 'ok'
+  | 'network'
+  | 'auth'
+  | 'model-not-found'
+  | 'bad-url'
+  | 'timeout'
+  | 'incompatible'
+  | 'server-error'
+  | 'unknown'
 
 export type ValidateProviderResult = {
   ok: boolean
@@ -344,6 +523,9 @@ export type ValidateProviderResult = {
   // must treat `applied === false` as "do not advance": the stored provider does not reflect it.
   // Absent means applied (the ordinary synchronous path).
   applied?: boolean
+  // Set when the user explicitly cancelled a browser sign-in. Distinct from applied:false (provider
+  // changed): the login was intentionally stopped, not invalidated by a concurrent edit.
+  cancelled?: boolean
 }
 
 // Request to refresh a saved provider's model list from the vendor's live API (fills the bundled
@@ -549,6 +731,9 @@ export type ClaudeInstallResult = {
   // The official installer returned a region-block HTML page instead of the script (common in
   // regions where claude.ai is unavailable); the installer auto-falls-back to npm when it can.
   regionBlocked?: boolean
+  // The install failed with output matching a transient network fault (registry timeout, connection
+  // reset); the runner retries the same source a few times before surfacing the failure.
+  retryableNetworkFailure?: boolean
 }
 
 // Availability of npm on the host, used to gate the npm source.
@@ -614,6 +799,7 @@ export type SkillView = {
 // `references/` directory, for the detail/edit view.
 export type SkillDetailView = SkillView & {
   body: string
+  metadata?: Record<string, string>
   references: SkillReferenceInfo[]
 }
 
@@ -640,6 +826,7 @@ export type CreateSkillRequest = {
   name: string
   description: string
   body: string
+  metadata?: Record<string, string>
   slug?: string
   references?: SkillReference[]
 }
@@ -650,6 +837,7 @@ export type UpdateSkillRequest = {
   name: string
   description: string
   body: string
+  metadata?: Record<string, string>
   references?: SkillReference[]
 }
 
@@ -675,6 +863,22 @@ export type ImportSkillZipRequest = {
 // Parse an uploaded .zip / .skill bundle without importing it, for a confirm-before-import preview.
 export type PreviewSkillZipRequest = {
   dataBase64: string
+}
+
+// Read-only SKILL.md content shown before import. Every source adapter returns this renderer-safe
+// shape: sourceLabel is a display path/URL (never an absolute host path), metadata contains parsed
+// frontmatter fields other than name/description, and files contains relative names only.
+export type SkillImportPreviewContent = {
+  name: string
+  description: string
+  sourceLabel: string
+  metadata: Record<string, string>
+  body: string
+  files: string[]
+}
+
+export type PreviewGitHubSkillRequest = {
+  url: string
 }
 
 // Import several skills from ONE uploaded bundle in a single call, so a bundle holding many skills is
@@ -706,9 +910,15 @@ export type SkillBundlePreview = {
   subPath: string
   name: string
   description: string
+  metadata: Record<string, string>
+  body: string
+  previewError?: string
   files: string[]
   alreadyImported: boolean
   replaceableId?: string
+  // Present only for candidates discovered from a public GitHub repo. The approval dialog uses it
+  // to load the same lazy candidate preview as Settings; the main process still owns import URLs.
+  githubUrl?: string
 }
 
 // One skill the bundle contained but that couldn't be imported (too large, no SKILL.md, no name, an
@@ -727,9 +937,90 @@ export type SkillBundlePreviewResult = {
   skipped: SkippedSkill[]
 }
 
+// A Skill package import requested by an agent tool. The main process owns the archive bytes and
+// sends only the parsed, bounded preview to the renderer for an explicit user decision.
+export type ConversationSkillImportApprovalRequest = SkillBundlePreviewResult & {
+  id: string
+  sessionId: string
+  source: {
+    kind: 'attachment' | 'github'
+    label: string
+  }
+}
+
+export type ConversationSkillImportSelection = {
+  subPath: string
+  replaceId?: string
+}
+
+export type ConversationSkillImportApprovalResponse =
+  | { id: string; cancelled: true; items?: undefined }
+  | { id: string; cancelled?: false; items: ConversationSkillImportSelection[] }
+
+export type ConversationSkillImportResult = {
+  status: 'imported' | 'unchanged' | 'partial' | 'cancelled'
+  skills: Array<{
+    id: string
+    name: string
+    status: 'imported' | 'unchanged' | 'updated'
+  }>
+  errors?: Array<{ name: string; error: string }>
+}
+
 // Scan a GitHub repo (owner/repo, owner/repo@ref, or a URL) for skill directories.
 export type ScanRepoRequest = {
   repo: string
+}
+
+// A known user-level source that may contain installed skills. The shared Agents directory is
+// available for every framework; Claude and Codex directories are available only while that
+// framework is active.
+export type AgentHomeSkillSource = 'agents' | 'claude' | 'codex'
+
+// One skill found in a user-level source. Main returns renderer-safe metadata only: the source id and
+// slug are sufficient to request an import, while the absolute host path remains in the main process.
+export type AgentHomeSkillView = {
+  source: AgentHomeSkillSource
+  // The directory name under the agent's skills/ dir. Used as the candidate slug and as the
+  // identifier on disk; not a renderer-visible name (the SKILL.md frontmatter supplies that).
+  slug: string
+  // Parsed from SKILL.md frontmatter; falls back to the slug when the name is absent or unparseable.
+  name: string
+  description: string
+  // True when either the same source, slug, and content are already represented by an imported-skill
+  // record, or a controlled legacy slug fallback claims this row, so the UI can disable its checkbox.
+  alreadyImported: boolean
+}
+
+export type AgentHomeSkillRef = {
+  source: AgentHomeSkillSource
+  slug: string
+}
+
+export type PreviewAgentHomeSkillRequest = AgentHomeSkillRef
+
+// Batch import selected user-level skills. Main re-derives every absolute path from the trusted
+// source id + slug pair, so the renderer cannot use this interface to read arbitrary host paths.
+export type ImportAgentHomeSkillsRequest = {
+  skills: AgentHomeSkillRef[]
+}
+
+// One bad or concurrently removed source does not abort the rest of a checked batch.
+export type ImportAgentHomeSkillItemResult =
+  | (AgentHomeSkillRef & {
+      status: 'imported' | 'unchanged' | 'updated'
+      id: string
+      error?: undefined
+    })
+  | (Partial<AgentHomeSkillRef> & {
+      status?: undefined
+      id?: undefined
+      error: string
+    })
+
+export type ImportAgentHomeSkillsResult = {
+  results: ImportAgentHomeSkillItemResult[]
+  skills: SkillView[]
 }
 
 // One skill directory found by a repo scan, with an importable URL and whether it's already imported.
@@ -754,8 +1045,7 @@ export type ImportSkillResult = {
 
 // --- Connectors ---------------------------------------------------------------------------------
 
-// Per-tool permission. 'ask' is reserved for the future per-call approval flow and is not yet
-// functional — the UI renders it disabled and only 'allow'/'block' persist (to blockedToolIds).
+// Per-tool Connector policy. `ask` requires a matching Broker grant or a scoped approval prompt.
 export type ToolPermission = 'allow' | 'ask' | 'block'
 
 // One tool within a connector, with its current permission (derived: 'block' if blocklisted).
@@ -801,6 +1091,9 @@ export type CustomServerView = {
   description?: string
   transport: CustomServerTransport
   enabled: boolean
+  // Physical availability is independent of Main's enabled toggle. An invalid persisted server may
+  // remain visible to a Specialist but can never be selected or dispatched.
+  availability?: 'unavailable' | 'unauthenticated'
   // Display-only config summary (the command that runs, its args, or the remote URL). env/headers
   // are intentionally omitted — they may hold secrets and stay write-only from the UI.
   command?: string
@@ -858,8 +1151,11 @@ export type ConnectorApprovalRequest = {
   // The session that triggered the connector call, so a desktop notification can surface and open
   // that conversation. Absent for call paths that don't carry one.
   sessionId?: string
+  // Missing only when talking to an older main process during development; renderer falls back to Once.
+  availableScopes?: ConnectorApprovalScope[]
 }
-export type ApprovalDecision = 'allow' | 'deny'
+export type ConnectorApprovalScope = 'once' | 'session' | 'project' | 'global'
+export type ApprovalDecision = ConnectorApprovalScope | 'deny'
 export type RespondApprovalRequest = { id: string; decision: ApprovalDecision }
 
 // Minimal settings slice the remote-file-browser bookmark helpers depend on. Declared here in

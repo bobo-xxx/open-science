@@ -1,10 +1,16 @@
-import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { describe, expect, it, vi } from 'vitest'
 
-import { killAndConfirmExit, md5File, runMicromamba, verifyExecutable } from './provisioner-runtime'
+import {
+  killAndConfirmExit,
+  md5File,
+  micromambaDiagnosticText,
+  runMicromamba,
+  verifyExecutable
+} from './provisioner-runtime'
 import { condaActivatedPath } from './runtime-paths'
 
 describe('verifyExecutable', () => {
@@ -17,6 +23,26 @@ describe('verifyExecutable', () => {
     await expect(verifyExecutable('/no/such/binary-xyz')).rejects.toThrow()
   })
 
+  it('rejects an executable R whose home and libraries still resolve to a previous prefix', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'os-relocated-r-'))
+    const prefix = join(dir, 'runtime', 'envs', 'default-r')
+    const bin = join(prefix, 'bin', 'R')
+    const oldPrefix = join(dir, 'old-runtime', 'envs', 'default-r')
+    mkdirSync(join(prefix, 'bin'), { recursive: true })
+    writeFileSync(
+      bin,
+      `#!${process.execPath}\n` +
+        `process.stdout.write([` +
+        `'OPEN_SCIENCE_R_HOME=${join(oldPrefix, 'lib', 'R')}',` +
+        `'OPEN_SCIENCE_R_BASE_LIBRARY=${join(oldPrefix, 'lib', 'R', 'library')}',` +
+        `'OPEN_SCIENCE_R_LIBRARY=${join(oldPrefix, 'lib', 'R', 'library')}'` +
+        `].join('\\n') + '\\n')\n`
+    )
+    chmodSync(bin, 0o755)
+
+    await expect(verifyExecutable(bin, { prefix })).rejects.toThrow(/outside.*prefix|relocat/i)
+  })
+
   it.skipIf(process.platform === 'win32')(
     'passes the activated Windows conda PATH to the interpreter process',
     async () => {
@@ -26,7 +52,13 @@ describe('verifyExecutable', () => {
       const expectedPath = condaActivatedPath(prefix, 'C:\\Windows', 'win32')
       writeFileSync(
         bin,
-        `#!${process.execPath}\nprocess.exit(process.env.PATH === process.env.EXPECTED_PATH ? 0 : 19)\n`
+        `#!${process.execPath}\n` +
+          `if (process.env.PATH !== process.env.EXPECTED_PATH) process.exit(19)\n` +
+          `process.stdout.write([` +
+          `'OPEN_SCIENCE_R_HOME=C:\\\\runtime\\\\envs\\\\default-r\\\\lib\\\\R',` +
+          `'OPEN_SCIENCE_R_BASE_LIBRARY=C:\\\\runtime\\\\envs\\\\default-r\\\\lib\\\\R\\\\library',` +
+          `'OPEN_SCIENCE_R_LIBRARY=C:\\\\runtime\\\\envs\\\\default-r\\\\lib\\\\R\\\\library'` +
+          `].join('\\n') + '\\n')\n`
       )
       chmodSync(bin, 0o755)
 
@@ -59,7 +91,9 @@ describe('runMicromamba', () => {
     ).resolves.toBeUndefined()
   })
 
-  it('rejects with a stderr summary on non-zero exit', async () => {
+  it('rejects with a short stderr excerpt on non-zero exit, keeping full tails in data', async () => {
+    // The user-facing message prefers the stderr reason (not the package-plan stdout) so the
+    // provisioning banner never floods; both full tails stay on the error's structured `data`.
     await expect(
       runMicromamba(
         [
@@ -69,7 +103,45 @@ describe('runMicromamba', () => {
         ],
         { MM_STDOUT: 'stdout-only-token', MM_STDERR: 'stderr-only-token' }
       )
-    ).rejects.toThrow(/exit 3[^]*stdout-only-token[^]*stderr-only-token/)
+    ).rejects.toMatchObject({
+      code: 'MICROMAMBA_EXIT',
+      message: expect.stringMatching(/exit 3[^]*stderr-only-token/),
+      data: {
+        exitCode: 3,
+        stderrTail: 'stderr-only-token',
+        stdoutTail: 'stdout-only-token'
+      }
+    })
+  })
+
+  it('omits the stdout package plan from the exit message when stderr carries the reason', async () => {
+    await expect(
+      runMicromamba(
+        [
+          process.execPath,
+          '-e',
+          'process.stdout.write(process.env.MM_STDOUT); process.stderr.write(process.env.MM_STDERR); process.exit(1)'
+        ],
+        { MM_STDOUT: 'plan-noise-token', MM_STDERR: 'the-real-reason' }
+      )
+    ).rejects.toThrow(/^(?:(?!plan-noise-token)[^])*the-real-reason(?:(?!plan-noise-token)[^])*$/)
+  })
+
+  it('caps the exit message excerpt while retaining the full stderr tail in data', async () => {
+    // 2 KB of stderr must not reach the message verbatim (the banner-flood bug); the excerpt is
+    // bounded and prefixed with an ellipsis, but the full tail is preserved on `data`.
+    await expect(
+      runMicromamba([
+        process.execPath,
+        '-e',
+        "process.stderr.write('X'.repeat(2048)); process.exit(2)"
+      ])
+    ).rejects.toMatchObject({
+      code: 'MICROMAMBA_EXIT',
+      // The ellipsis-prefixed excerpt ends in EXACTLY 500 X's — proof the 2048-char tail was capped.
+      message: expect.stringMatching(/…X{500}$/),
+      data: { stderrTail: 'X'.repeat(2048) }
+    })
   })
 
   it('distinguishes timeout from an ordinary non-zero exit and keeps output tails', async () => {
@@ -87,6 +159,42 @@ describe('runMicromamba', () => {
         200
       )
     ).rejects.toThrow(/timed out[^]*timeout-stderr-token/i)
+  })
+
+  it('attaches structured offline-create diagnostics to a timeout', async () => {
+    const argv = [
+      process.execPath,
+      '-e',
+      'process.stdout.write(process.env.MM_TIMEOUT_TOKEN); setInterval(() => {}, 1000)',
+      '--',
+      '--offline'
+    ]
+
+    await expect(
+      runMicromamba(
+        argv,
+        {
+          MM_TIMEOUT_TOKEN: 'timeout-stdout-token',
+          CONDA_PKGS_DIRS: 'C:\\Users\\test\\os12345678'
+        },
+        undefined,
+        undefined,
+        undefined,
+        200
+      )
+    ).rejects.toMatchObject({
+      code: 'MICROMAMBA_TIMEOUT',
+      data: {
+        argv,
+        cachePath: 'C:\\Users\\test\\os12345678',
+        durationMs: expect.any(Number),
+        offline: true,
+        pid: expect.any(Number),
+        stderrTail: '',
+        stdoutTail: 'timeout-stdout-token',
+        timeoutMs: 200
+      }
+    })
   })
 
   it('distinguishes user cancellation from timeout and non-zero exit', async () => {
@@ -178,5 +286,33 @@ describe('killAndConfirmExit', () => {
       once: () => undefined // never fires exit
     } as never
     expect(await killAndConfirmExit(fake, 40)).toBe(false)
+  })
+})
+
+describe('micromambaDiagnosticText', () => {
+  it('reconstructs the FULL diagnostics from data tails so recovery parsing survives the short message', () => {
+    // The UI message is a capped excerpt; a cache-corruption / MAX_PATH signature or over-budget path
+    // can sit only in the full stdout/stderr tails. The reconstructed text must expose both.
+    const error = Object.assign(new Error('micromamba failed (exit 1; mm create): …tail-excerpt'), {
+      code: 'MICROMAMBA_EXIT',
+      data: {
+        argv: ['mm', 'create'],
+        exitCode: 1,
+        stderrTail: "Invalid package cache, 'C:/very/long/path/pkg.conda' is missing",
+        stdoutTail: 'plan-line-1\nplan-line-2'
+      }
+    })
+    const text = micromambaDiagnosticText(error)
+    expect(text).toContain('micromamba failed (exit 1')
+    expect(text).toContain('Invalid package cache')
+    expect(text).toContain("'C:/very/long/path/pkg.conda' is missing")
+    expect(text).toContain('plan-line-1')
+  })
+
+  it('falls back to the plain message for an error without structured data (e.g. spawn failure)', () => {
+    expect(micromambaDiagnosticText(new Error('micromamba failed to start (mm): ENOENT'))).toBe(
+      'micromamba failed to start (mm): ENOENT'
+    )
+    expect(micromambaDiagnosticText('not-an-error')).toBe('not-an-error')
   })
 })

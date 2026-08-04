@@ -1,5 +1,7 @@
 import {
+  claudeIsolatedProviderIdentity,
   codexSubscriptionProviderIdentity,
+  preferredEndpoint,
   type AgentFrameworkId,
   type ChatApiEndpoint,
   type ProviderType
@@ -7,8 +9,13 @@ import {
 import {
   OFFICIAL_VENDORS,
   getOfficialVendor,
+  resolveVendorApiEndpoints,
   type OfficialVendorId
 } from '../../../../shared/provider-registry'
+import type {
+  CustomReasoningEffortTransport,
+  ReasoningEffortPresetSetting
+} from '../../../../shared/reasoning-effort'
 
 // Editable value for the provider form, kept in its own module so the component file only exports a
 // component (satisfying react-refresh) while the wizard and settings page share this shape/factory.
@@ -17,11 +24,20 @@ export type ProviderFormValue = {
   name: string
   baseUrl: string
   model: string
+  // Kept as text so an empty optional numeric input remains distinct from the 200k runtime default.
+  contextWindow: string
   // Which chat API a custom gateway speaks; drives which agent frameworks can use it. Defaults to
   // 'anthropic'. A custom provider serves exactly one endpoint (official providers take theirs from
   // the registry); it is stored as the single-entry apiEndpoints array.
   apiEndpoint: ChatApiEndpoint
+  // Form-only state: protects any user-edited onboarding draft when the step remounts or the active
+  // framework changes. It is intentionally omitted from the persisted provider request.
+  providerFormTouched: boolean
   supportsImageInput: boolean
+  // Optional at rest for backwards compatibility; the form always materializes the five-level default.
+  reasoningEffortPreset: ReasoningEffortPresetSetting
+  // The request-body shape used by the custom gateway for model effort.
+  reasoningEffortTransport: CustomReasoningEffortTransport
   // Set when type is 'official': the chosen vendor and (for multi-region vendors) the endpoint. Base
   // URL and the model catalog then come from the registry rather than these free-text fields.
   vendorId?: OfficialVendorId
@@ -38,11 +54,29 @@ export const createEmptyProviderFormValue = (
   name: '',
   baseUrl: '',
   model: '',
+  contextWindow: '',
   apiEndpoint: 'anthropic',
+  providerFormTouched: false,
   supportsImageInput: false,
+  reasoningEffortPreset: 'standard-5',
+  reasoningEffortTransport: 'reasoning-effort',
   key: '',
   ...overrides
 })
+
+// Chooses the framework's preferred wire protocol for a new custom gateway. This mirrors runtime
+// endpoint selection: Responses wins when available, then Chat Completions, then Messages. The
+// legacy Messages default remains the safe fallback while framework capabilities are still loading.
+export const defaultCustomApiEndpoint = (
+  frameworkEndpoints: readonly ChatApiEndpoint[]
+): ChatApiEndpoint => preferredEndpoint(frameworkEndpoints, frameworkEndpoints) ?? 'anthropic'
+
+// Official providers expose the registry's complete protocol set; `apiEndpoint` only represents the
+// single format selected for a custom gateway and may be stale after switching provider kinds.
+export const providerFormApiEndpoints = (value: ProviderFormValue): ChatApiEndpoint[] =>
+  value.type === 'official' && value.vendorId
+    ? resolveVendorApiEndpoints(value.vendorId)
+    : [value.apiEndpoint]
 
 // The provider kind pre-selected when the Add provider form opens, matched to the active agent
 // framework's most common official vendor: Claude Code → Anthropic, Codex → OpenAI,
@@ -70,9 +104,10 @@ export const defaultProviderKindKey = (
 }
 
 // Per-field validation errors. Custom needs base URL/model/key; official needs only a key (base URL
-// and model come from the registry); claude-default has no required fields.
+// and model come from the registry).
 export type ProviderFormErrors = {
   baseUrl?: string
+  contextWindow?: string
   key?: string
   model?: string
 }
@@ -88,10 +123,20 @@ export const getProviderFormErrors = (
   if (value.type === 'custom') {
     if (!value.baseUrl.trim()) errors.baseUrl = 'Base URL is required.'
     if (!value.model.trim()) errors.model = 'Model is required.'
+    if (value.contextWindow.trim()) {
+      const contextWindow = Number(value.contextWindow)
+      if (!Number.isSafeInteger(contextWindow) || contextWindow <= 0) {
+        errors.contextWindow = 'Context window must be a positive whole number of tokens.'
+      }
+    }
     if (!value.key.trim() && !options.hasStoredKey) errors.key = 'API key is required.'
   } else if (value.type === 'official') {
     // No model is chosen at add time: the vendor catalog + the global model selection cover that.
     if (!value.key.trim() && !options.hasStoredKey) errors.key = 'API key is required.'
+  } else if (value.type === 'claude-isolated') {
+    // claude-isolated has no add-time fields: the type alone provisions the provider card, and the
+    // token paste lives in a separate sign-in modal (loginIsolatedClaude). Rejecting here would
+    // block the renderer from even creating the record, which contradicts the UX.
   }
 
   return errors
@@ -101,15 +146,16 @@ export const getProviderFormErrors = (
 export const hasProviderFormErrors = (errors: ProviderFormErrors): boolean =>
   Object.keys(errors).length > 0
 
-// Grouping for the provider-type picker. 'api' = official vendors via their standard API key;
-// 'other' = the custom gateway and local Claude. ('coding' — subscription coding plans — is reserved
-// for once those endpoints are wired up.)
-export type ProviderKindGroup = 'coding' | 'api' | 'other'
+// Grouping for the provider-type picker. 'codex' / 'claude' = each vendor's own subscription
+// sign-in, surfaced as its own section (only one is shown at a time, gated on the active
+// framework); 'api' = official vendors via their standard API key; 'other' = the custom gateway.
+export type ProviderKindGroup = 'codex' | 'claude' | 'api' | 'other'
 
-// Group headers shown in the provider-type picker and dropdown, in display order. ('coding' is
-// reserved for subscription coding-plan endpoints once those are wired up.)
+// Group headers shown in the provider-type picker and dropdown, in display order. The two
+// subscription groups mirror each other: only the one matching the active framework is rendered.
 export const PROVIDER_KIND_GROUPS: { id: ProviderKindGroup; label: string }[] = [
-  { id: 'coding', label: 'Codex subscription' },
+  { id: 'codex', label: 'Codex subscription' },
+  { id: 'claude', label: 'Claude subscription' },
   { id: 'api', label: 'Official API' },
   { id: 'other', label: 'Other' }
 ]
@@ -127,7 +173,16 @@ export const PROVIDER_KINDS: ProviderKind[] = [
     key: 'codex-subscription',
     label: codexSubscriptionProviderIdentity().name,
     description: 'Use an existing Codex profile or sign in with a separate Open Science profile.',
-    group: 'coding'
+    group: 'codex'
+  },
+  {
+    // Gets its own subscription section, mirroring the Codex subscription. Supports both shared
+    // (browser OAuth via `claude auth login`, uses ~/.claude) and isolated (setup-token paste, uses
+    // app-owned config dir). Surfaced only when Claude Code is the active framework.
+    key: 'claude-subscription',
+    label: claudeIsolatedProviderIdentity().name,
+    description: 'Use an existing Claude profile or sign in with a separate Open Science profile.',
+    group: 'claude'
   },
   ...OFFICIAL_VENDORS.map((vendor): ProviderKind => ({
     key: `official:${vendor.id}`,
@@ -140,18 +195,16 @@ export const PROVIDER_KINDS: ProviderKind[] = [
     label: 'Custom Gateway',
     description: 'Base URL, key, and model for a Messages or Chat Completions endpoint',
     group: 'other'
-  },
-  {
-    key: 'claude-default',
-    label: 'Local Claude',
-    description: "Reuse this machine's Claude login",
-    group: 'other'
   }
 ]
 
 // The patch applied to the form value when a provider-kind is picked. Switching to an official vendor
-// seeds its default region + model; switching away clears vendor-only fields.
-export const providerKindPatch = (key: string): Partial<ProviderFormValue> => {
+// seeds its default region + model; switching to custom clears vendor-only fields and applies the
+// active framework's preferred endpoint.
+export const providerKindPatch = (
+  key: string,
+  customApiEndpoint: ChatApiEndpoint = 'anthropic'
+): Partial<ProviderFormValue> => {
   if (key === 'codex-subscription') {
     const identity = codexSubscriptionProviderIdentity()
     return {
@@ -160,14 +213,26 @@ export const providerKindPatch = (key: string): Partial<ProviderFormValue> => {
       apiEndpoint: 'responses',
       baseUrl: '',
       model: '',
+      contextWindow: '',
       key: '',
       vendorId: undefined,
       region: undefined
     }
   }
 
-  if (key === 'claude-default') {
-    return { type: 'claude-default', vendorId: undefined, region: undefined, model: '' }
+  if (key === 'claude-subscription') {
+    const identity = claudeIsolatedProviderIdentity()
+    return {
+      type: 'claude-shared',
+      name: identity.name,
+      apiEndpoint: 'anthropic',
+      baseUrl: '',
+      model: '',
+      contextWindow: '',
+      key: '',
+      vendorId: undefined,
+      region: undefined
+    }
   }
 
   if (key.startsWith('official:')) {
@@ -180,11 +245,19 @@ export const providerKindPatch = (key: string): Partial<ProviderFormValue> => {
       name: vendor?.label,
       vendorId,
       region: vendor?.regions?.[0]?.id,
-      model: ''
+      model: '',
+      contextWindow: ''
     }
   }
 
-  return { type: 'custom', vendorId: undefined, region: undefined, model: '' }
+  return {
+    type: 'custom',
+    apiEndpoint: customApiEndpoint,
+    vendorId: undefined,
+    region: undefined,
+    model: '',
+    contextWindow: ''
+  }
 }
 
 // Maps the current form value back to its provider-kind key (the dropdown's selected value).
@@ -192,7 +265,9 @@ export const selectedKindKey = (value: ProviderFormValue): string => {
   if (value.type === 'custom') {
     return 'custom'
   }
-  if (value.type === 'claude-default') return 'claude-default'
+  if (value.type === 'claude-shared' || value.type === 'claude-isolated') {
+    return 'claude-subscription'
+  }
   if (value.type === 'codex-shared' || value.type === 'codex-isolated') {
     return 'codex-subscription'
   }
@@ -200,10 +275,12 @@ export const selectedKindKey = (value: ProviderFormValue): string => {
   return value.vendorId ? `official:${value.vendorId}` : 'custom'
 }
 
-// Maps a provider's type + vendor to its icon key ('custom' | 'claude-default' | 'official:<id>').
+// Maps a provider's type + vendor to its icon key ('custom' | 'official:<id>').
 export const providerKindKey = (type: ProviderType, vendorId?: OfficialVendorId): string =>
   type === 'official' && vendorId
     ? `official:${vendorId}`
     : type === 'codex-shared' || type === 'codex-isolated'
       ? 'codex-subscription'
-      : type
+      : type === 'claude-shared' || type === 'claude-isolated'
+        ? 'claude-subscription'
+        : type

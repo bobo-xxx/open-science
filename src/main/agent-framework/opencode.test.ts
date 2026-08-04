@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest'
 import { buildOpencodeConfig, opencodeFramework } from './opencode'
 
 describe('opencodeFramework.prepareModelConfig', () => {
-  it('writes the connector instructions file and wires it into opencode.json instructions', () => {
+  it('writes connector conventions and wires them into opencode.json instructions', () => {
     const config = opencodeFramework.prepareModelConfig(
       { type: 'custom', baseUrl: 'https://gw/v1', model: 'm', key: 'k' },
       {
@@ -21,6 +21,36 @@ describe('opencodeFramework.prepareModelConfig', () => {
     const opencodeJson = config.configFiles?.find((file) => file.path.endsWith('opencode.json'))
     const parsed = JSON.parse(opencodeJson?.content ?? '{}')
     expect(parsed.instructions).toContain(instructionsFile?.path)
+  })
+
+  it('writes stable app guidance to native instructions instead of a user prompt', () => {
+    const config = opencodeFramework.prepareModelConfig(
+      { type: 'custom', baseUrl: 'https://gw/v1', model: 'm', key: 'k' },
+      {
+        storageRoot: '/data',
+        executablePath: '/bin/opencode',
+        systemPromptAppends: [
+          'Use `notebook_execute` from `open-science-notebook`.',
+          'Then call `write_artifact_file`.'
+        ]
+      }
+    )
+
+    const instructionsFile = config.configFiles?.find((file) =>
+      file.path.endsWith('open-science.md')
+    )
+    expect(instructionsFile?.content).toBe(
+      'Use `open_science_notebook_notebook_execute` from `open_science_notebook`.\n\nThen call `open_science_artifacts_write_artifact_file`.'
+    )
+    const opencodeJson = config.configFiles?.find((file) => file.path.endsWith('opencode.json'))
+    expect(JSON.parse(opencodeJson?.content ?? '{}').instructions).toContain(instructionsFile?.path)
+    expect(config.persistentSystemPrompt).toBe(instructionsFile?.content)
+    expect(
+      opencodeFramework.buildSessionSetup({
+        systemPromptAppends: [],
+        turnPromptReminders: ['turn-only reminder']
+      })
+    ).toEqual({ promptPrefix: 'turn-only reminder' })
   })
 
   it('omits instructions when none are provided', () => {
@@ -53,7 +83,7 @@ describe('opencodeFramework.prepareModelConfig', () => {
 
   it('does not set the key env var when the provider carries no key', () => {
     const config = opencodeFramework.prepareModelConfig(
-      { type: 'claude-default' },
+      { type: 'custom', baseUrl: 'https://g/v1' },
       { storageRoot: '/data', executablePath: '/bin/opencode' }
     )
     expect(config.env && 'OPENCODE_APP_API_KEY' in config.env).toBe(false)
@@ -67,18 +97,10 @@ describe('opencodeFramework.prepareModelConfig', () => {
 
     const rules = JSON.parse(config.env?.OPENCODE_CONFIG_CONTENT ?? '{}').permission
     expect(rules['*']).toBe('ask')
-    for (const tool of ['read', 'glob', 'grep', 'list', 'lsp']) {
+    for (const tool of ['read', 'glob', 'grep', 'list', 'lsp', 'skill']) {
       expect(rules[tool]).toBe('allow')
     }
-    for (const tool of [
-      'edit',
-      'bash',
-      'task',
-      'skill',
-      'webfetch',
-      'websearch',
-      'external_directory'
-    ]) {
+    for (const tool of ['edit', 'bash', 'task', 'webfetch', 'websearch', 'external_directory']) {
       expect(rules[tool]).toBe('ask')
     }
   })
@@ -98,6 +120,19 @@ describe('opencodeFramework.prepareModelConfig', () => {
     expect(config.env?.OPENCODE_CONFIG_CONTENT).toBeTruthy()
   })
 
+  it('disables external skill discovery so host-global skills cannot enter the app catalog', () => {
+    const config = opencodeFramework.prepareModelConfig(
+      { type: 'custom', baseUrl: 'https://gw/v1', model: 'm', key: 'k' },
+      { storageRoot: '/data', executablePath: '/bin/opencode' }
+    )
+
+    // OpenCode scans ~/.agents/skills and ~/.claude/skills independently from its XDG config.
+    // Keep both supported kill switches explicit so a host-global skill cannot be advertised in
+    // the app session even if OpenCode's internal/test-only home override changes or is ignored.
+    expect(config.env?.OPENCODE_DISABLE_EXTERNAL_SKILLS).toBe('true')
+    expect(config.env?.OPENCODE_DISABLE_CLAUDE_CODE_SKILLS).toBe('true')
+  })
+
   it('disables project config loading so a repo cannot inject opencode.json / .opencode config', () => {
     const config = opencodeFramework.prepareModelConfig(
       { type: 'custom', baseUrl: 'https://gw/v1', model: 'm', key: 'k' },
@@ -112,7 +147,13 @@ describe('opencodeFramework.prepareModelConfig', () => {
 
   it('pins the authoritative provider/model/baseURL (not just permission) in OPENCODE_CONFIG_CONTENT', () => {
     const config = opencodeFramework.prepareModelConfig(
-      { type: 'custom', baseUrl: 'https://gw.example/v1', model: 'deepseek-v4-pro', key: 'k' },
+      {
+        type: 'custom',
+        baseUrl: 'https://gw.example/v1',
+        model: 'deepseek-v4-pro',
+        contextWindow: 128_000,
+        key: 'k'
+      },
       { storageRoot: '/data', executablePath: '/bin/opencode' }
     )
 
@@ -121,12 +162,48 @@ describe('opencodeFramework.prepareModelConfig', () => {
     // repoint the endpoint or swap the model while inheriting the key ref.
     expect(content.model).toBe('anthropic/deepseek-v4-pro')
     expect(content.provider.anthropic.options.baseURL).toBe('https://gw.example/v1')
-    expect(content.provider.anthropic.models).toEqual({ 'deepseek-v4-pro': {} })
+    expect(content.provider.anthropic.models).toEqual({
+      'deepseek-v4-pro': { limit: { context: 128_000, output: 32_000 } }
+    })
     // Permission policy is still pinned.
     expect(content.permission['*']).toBe('ask')
     // The key rides the env as a reference only — never a plaintext literal in the pinned layer.
     expect(content.provider.anthropic.options.apiKey).toBe('{env:OPENCODE_APP_API_KEY}')
     expect(config.env?.OPENCODE_CONFIG_CONTENT).not.toContain('"k"')
+  })
+
+  it('gives the Anthropic AI SDK a /v1 base so it requests /v1/messages', () => {
+    const config = opencodeFramework.prepareModelConfig(
+      {
+        type: 'custom',
+        baseUrl: 'https://gateway.example',
+        model: 'claude-opus-4-8',
+        key: 'k'
+      },
+      { storageRoot: '/data', executablePath: '/bin/opencode' }
+    )
+
+    const content = JSON.parse(config.env?.OPENCODE_CONFIG_CONTENT ?? '{}')
+    expect(content.provider.anthropic.options.baseURL).toBe('https://gateway.example/v1')
+  })
+
+  it('caps the required output limit at a custom context window smaller than 32k', () => {
+    const config = opencodeFramework.prepareModelConfig(
+      {
+        type: 'custom',
+        baseUrl: 'https://gateway.example',
+        model: 'small-context-model',
+        contextWindow: 16_000,
+        key: 'k'
+      },
+      { storageRoot: '/data', executablePath: '/bin/opencode' }
+    )
+
+    const content = JSON.parse(config.env?.OPENCODE_CONFIG_CONTENT ?? '{}')
+    expect(content.provider.anthropic.models['small-context-model'].limit).toEqual({
+      context: 16_000,
+      output: 16_000
+    })
   })
 
   it('declares image capability in the pinned layer for a multimodal model', () => {
@@ -194,10 +271,19 @@ describe('opencodeFramework.prepareModelConfig', () => {
     })
   })
 
-  it("clamps the app's top level 'max' to opencode's 'high' in both layers", () => {
+  it.each([
+    ['none', 'none'],
+    ['minimal', 'minimal'],
+    ['low', 'low'],
+    ['medium', 'medium'],
+    ['high', 'high'],
+    ['xhigh', 'xhigh'],
+    ['max', 'max'],
+    ['ultra', 'max']
+  ] as const)('encodes model effort %s as OpenCode transport level %s', (effort, expected) => {
     const config = opencodeFramework.prepareModelConfig(
       { type: 'custom', baseUrl: 'https://gw/v1', model: 'm', key: 'k' },
-      { storageRoot: '/data', executablePath: '/bin/opencode', reasoningEffort: 'max' }
+      { storageRoot: '/data', executablePath: '/bin/opencode', reasoningEffort: effort }
     )
 
     const fileConfig = JSON.parse(
@@ -205,12 +291,68 @@ describe('opencodeFramework.prepareModelConfig', () => {
     )
     const content = JSON.parse(config.env?.OPENCODE_CONFIG_CONTENT ?? '{}')
 
-    // opencode's reasoningEffort follows the AI SDK levels, which top out at 'high'.
-    expect(fileConfig.provider.anthropic.models).toEqual({
-      m: { options: { reasoningEffort: 'high' } }
-    })
-    expect(content.provider.anthropic.models).toEqual({
-      m: { options: { reasoningEffort: 'high' } }
+    const expectedModel = { options: { reasoningEffort: expected } }
+    expect(fileConfig.provider.anthropic.models).toEqual({ m: expectedModel })
+    expect(content.provider.anthropic.models).toEqual({ m: expectedModel })
+  })
+
+  it.each([
+    ['minimax', 'MiniMax-M3', 'none', { thinking: { type: 'disabled' } }],
+    ['minimax', 'MiniMax-M3', 'high', { thinking: { type: 'adaptive' } }],
+    ['xiaomimimo', 'mimo-v2.5-pro', 'none', { thinking: { type: 'disabled' } }],
+    ['xiaomimimo', 'mimo-v2.5-pro', 'high', { thinking: { type: 'enabled' } }],
+    ['deepseek', 'deepseek-v4-pro', 'none', { thinking: { type: 'disabled' } }],
+    [
+      'deepseek',
+      'deepseek-v4-pro',
+      'max',
+      { reasoningEffort: 'max', thinking: { type: 'enabled' } }
+    ],
+    ['openrouter', 'qwen/qwen3.7-max', 'none', { reasoning: { enabled: false } }],
+    ['openrouter', 'openai/gpt-5.5', 'high', { reasoning: { effort: 'high' } }]
+  ] as const)(
+    'encodes %s model %s effort %s with its provider-native options',
+    (vendorId, model, reasoningEffort, expected) => {
+      const config = opencodeFramework.prepareModelConfig(
+        {
+          type: 'custom',
+          vendorId,
+          baseUrl: 'https://gw.example/anthropic',
+          openaiBaseUrl: 'https://gw.example/v1',
+          apiEndpoints: ['anthropic', 'openai'],
+          model,
+          key: 'k'
+        },
+        { storageRoot: '/data', executablePath: '/bin/opencode', reasoningEffort }
+      )
+
+      const fileConfig = JSON.parse(
+        config.configFiles?.find((file) => file.path.endsWith('opencode.json'))?.content ?? '{}'
+      )
+      const content = JSON.parse(config.env?.OPENCODE_CONFIG_CONTENT ?? '{}')
+
+      expect(fileConfig.provider['openai-compatible'].models[model].options).toEqual(expected)
+      expect(content.provider['openai-compatible'].models[model].options).toEqual(expected)
+    }
+  )
+
+  it('uses an explicit custom-provider transport without guessing from its URL or model', () => {
+    const config = opencodeFramework.prepareModelConfig(
+      {
+        type: 'custom',
+        baseUrl: 'https://private-gateway.example/v1',
+        apiEndpoints: ['openai'],
+        model: 'private-model',
+        key: 'k',
+        reasoningEffortTransport: 'deepseek'
+      },
+      { storageRoot: '/data', executablePath: '/bin/opencode', reasoningEffort: 'none' }
+    )
+
+    const content = JSON.parse(config.env?.OPENCODE_CONFIG_CONTENT ?? '{}')
+
+    expect(content.provider['openai-compatible'].models['private-model'].options).toEqual({
+      thinking: { type: 'disabled' }
     })
   })
 
@@ -237,14 +379,17 @@ describe('buildOpencodeConfig', () => {
         type: 'custom',
         baseUrl: 'https://gw.example/v1',
         model: 'deepseek-v4-pro',
-        key: 'sk-secret'
+        key: 'sk-secret',
+        contextWindow: 128_000
       })
     )
 
     // A non-catalog model id is both selected and registered, so opencode treats it as a real model
     // instead of ignoring it and falling back to its own default.
     expect(config.model).toBe('anthropic/deepseek-v4-pro')
-    expect(config.provider.anthropic.models).toEqual({ 'deepseek-v4-pro': {} })
+    expect(config.provider.anthropic.models).toEqual({
+      'deepseek-v4-pro': { limit: { context: 128_000, output: 32_000 } }
+    })
     // The key is referenced via opencode env interpolation, never emitted as a plaintext literal.
     expect(config.provider.anthropic.options).toEqual({
       baseURL: 'https://gw.example/v1',
@@ -282,17 +427,10 @@ describe('buildOpencodeConfig', () => {
     )
 
     // Our rules override the base for every side-effecting built-in.
-    for (const tool of [
-      'edit',
-      'bash',
-      'task',
-      'skill',
-      'webfetch',
-      'websearch',
-      'external_directory'
-    ]) {
+    for (const tool of ['edit', 'bash', 'task', 'webfetch', 'websearch', 'external_directory']) {
       expect(config.permission[tool]).toBe('ask')
     }
+    expect(config.permission.skill).toBe('allow')
   })
 
   it('delegates every side-effecting tool (incl. MCP) via a "*" catch-all, allowing safe reads', () => {
@@ -304,7 +442,7 @@ describe('buildOpencodeConfig', () => {
 
     expect(config.permission['*']).toBe('ask')
     // Safe read-only tools run without prompting (parity with Claude's Ask mode).
-    for (const tool of ['read', 'glob', 'grep', 'list', 'lsp']) {
+    for (const tool of ['read', 'glob', 'grep', 'list', 'lsp', 'skill']) {
       expect(config.permission[tool]).toBe('allow')
     }
     // Mutating/external tools are pinned to ask (and unlisted MCP tools fall through to "*" → ask).
@@ -514,7 +652,7 @@ describe('buildOpencodeConfig', () => {
   })
 
   it('omits model + models registration when the provider has no model', () => {
-    const config = JSON.parse(buildOpencodeConfig({ type: 'claude-default' }))
+    const config = JSON.parse(buildOpencodeConfig({ type: 'custom' }))
 
     expect(config.model).toBeUndefined()
     expect(config.provider.anthropic.models).toBeUndefined()

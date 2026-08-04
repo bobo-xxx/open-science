@@ -11,6 +11,8 @@ release/
 
 # Test coverage reports
 coverage/
+playwright-report/
+test-results/
 *.asar
 *.blockmap
 
@@ -70,6 +72,8 @@ local/
 .codegraph/
 .mcp.json
 .codex/
+.worktree/
+.playwright-cli/
 .claude/
 .ai/
 .aider*

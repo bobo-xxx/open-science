@@ -4,12 +4,25 @@ import { autoUpdater, CancellationToken } from 'electron-updater'
 
 import { APP } from '../../shared/app-config'
 import type { UpdateStatus } from '../../shared/update'
+import { startDiagnosticOperation, type DiagnosticOperation } from '../diagnostics/operation'
+import type { Logger } from '../logger'
 import { fetchManifest } from './manifest'
 import type { InstallGate, UpdateStrategy } from './strategy'
+import type { ApplicationEventMap } from '../application-events'
 import { broadcastToRenderers } from '../renderer-broadcast'
+import { markApplicationShutdownTrigger } from '../application-shutdown-trigger'
 
-// Minimal logger surface so tests inject a spy without pulling electron-log.
-type UpdaterLogger = { info: (msg: string) => void; error: (msg: string, err?: unknown) => void }
+type UpdateBroadcast = <Channel extends 'update:status' | 'update:progress'>(
+  channel: Channel,
+  payload: ApplicationEventMap[Channel]
+) => void
+
+const NOOP_LOGGER: Logger = {
+  debug: () => {},
+  info: () => {},
+  warn: () => {},
+  error: () => {}
+}
 
 // The slice of electron-updater's CancellationToken we drive: pass it to downloadUpdate() so the
 // in-flight HTTP download can be aborted, and read `cancelled` to distinguish a user cancel from a
@@ -35,7 +48,7 @@ export type ElectronUpdaterDeps = {
   currentVersion?: string
   platform?: NodeJS.Platform
   arch?: string
-  broadcast?: (channel: string, payload: unknown) => void
+  broadcast?: UpdateBroadcast
   // Factory for the per-download cancellation token; defaults to electron-updater's CancellationToken.
   // Injectable so tests can drive cancel() without the real class.
   createCancellationToken?: () => MinimalCancellationToken
@@ -43,10 +56,12 @@ export type ElectronUpdaterDeps = {
   // Injectable for tests; defaults to the public stable manifest.
   fetchImpl?: typeof fetch
   manifestUrl?: string
-  // Pre-install backend-shutdown gate; usually injected later via setInstallGate once the runtime exists.
+  // Pre-install backend-shutdown gate, fixed when the strategy is constructed.
   installGate?: InstallGate
-  // Diagnostics sink for the apply path; defaults to a no-op so unit tests stay quiet.
-  log?: UpdaterLogger
+  // Diagnostics sink for update lifecycle operations; defaults to a no-op so unit tests stay quiet.
+  log?: Logger
+  // Marks the app lifecycle handoff immediately before quitAndInstall. Injectable for tests.
+  markUpdateShutdown?: () => () => void
   // True when an x64 process is running under Rosetta 2 on Apple Silicon; false when definitively not;
   // undefined when the probe could not determine it. Electron-updater detects this via
   // sysctl.proc_translated and selects the arm64 artifact, so we must match that to show the correct
@@ -81,9 +96,8 @@ const defaultIsRosetta = (): boolean | undefined => {
 
 // Default broadcast pushes to every live window (mirrors service.ts). Never runs in unit tests, which
 // inject their own broadcast.
-const defaultBroadcast = (channel: string, payload: unknown): void => {
+const defaultBroadcast: UpdateBroadcast = (channel, payload) =>
   broadcastToRenderers(channel, payload)
-}
 
 // Coerce electron-updater's releaseNotes (string | {note}[] | null) to a plain string for the dialog.
 const notesToString = (notes: unknown): string => {
@@ -156,10 +170,10 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
   private readonly currentVersion: string
   private readonly platform: NodeJS.Platform
   private readonly arch: string
-  private readonly broadcast: (channel: string, payload: unknown) => void
+  private readonly broadcast: UpdateBroadcast
   private readonly fetchImpl?: typeof fetch
   private readonly manifestUrl: string
-  private readonly log: UpdaterLogger
+  private readonly log: Logger
   private readonly createCancellationToken: () => MinimalCancellationToken
   // The token for the current download, held so cancel() can abort it. Cleared once download() settles.
   private downloadToken?: MinimalCancellationToken
@@ -170,12 +184,17 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
   // Monotonic id per started download; the finally only clears downloadLifecycle when it is still the
   // latest, so an older (drained) download can't clear a newer one's lifecycle.
   private downloadGeneration = 0
+  private downloadOperation?: DiagnosticOperation
   private status: UpdateStatus
+  private applying = false
+  private installerStarted = false
+  private pendingInstallRollback?: () => void
   // In-flight manifest notes fetch for the current update, awaited by check() so the returned
   // status reflects the hydrated notes.
   private notesHydration?: Promise<void>
-  // Pre-install backend-shutdown gate, injected once the runtime exists (see ipc.ts).
-  private installGate?: InstallGate
+  // Pre-install backend-shutdown gate, owned immutably for the strategy lifetime.
+  private readonly installGate?: InstallGate
+  private readonly markUpdateShutdown: () => () => void
 
   constructor(deps: ElectronUpdaterDeps = {}) {
     this.updater = deps.updater ?? (autoUpdater as unknown as MinimalAutoUpdater)
@@ -199,18 +218,16 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
     this.broadcast = deps.broadcast ?? defaultBroadcast
     this.fetchImpl = deps.fetchImpl
     this.manifestUrl = deps.manifestUrl ?? APP.update.manifestUrl
-    this.log = deps.log ?? { info: () => {}, error: () => {} }
+    this.log = deps.log ?? NOOP_LOGGER
     this.createCancellationToken = deps.createCancellationToken ?? (() => new CancellationToken())
     this.installGate = deps.installGate
+    this.markUpdateShutdown =
+      deps.markUpdateShutdown ?? (() => markApplicationShutdownTrigger('update'))
     this.status = { state: 'idle', current: this.currentVersion, applyKind: 'restart' }
 
     this.updater.autoDownload = false
     this.updater.autoInstallOnAppQuit = false
     this.subscribe()
-  }
-
-  setInstallGate(gate: InstallGate): void {
-    this.installGate = gate
   }
 
   private subscribe(): void {
@@ -234,13 +251,27 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
       this.setStatus({ state: 'up-to-date', latest: i.version })
     })
     this.updater.on('download-progress', (p) => {
-      const info = p as { percent?: number; transferred?: number; total?: number }
+      const info = p as {
+        percent?: number
+        transferred?: number
+        total?: number
+        bytesPerSecond?: number
+      }
       const percent = Math.round(info.percent ?? 0)
       const transferred = info.transferred ?? this.status.downloadedBytes ?? 0
       // Preserve the known artifact size when the event lacks a usable total, so a progress
       // event omitting it can't clobber the size extracted at check time with 0.
       const total = info.total || this.status.totalBytes || 0
-      this.broadcast('update:progress', { percent, transferred, total })
+      // electron-updater handles its own retries internally, so downloads only ever surface as the
+      // 'downloading' phase with attempt 0; its native bytesPerSecond feeds the shared speed display.
+      this.broadcast('update:progress', {
+        phase: 'downloading',
+        percent,
+        transferred,
+        total,
+        bytesPerSecond: info.bytesPerSecond ?? 0,
+        attempt: 0
+      })
       this.setStatus({
         ...this.status,
         state: 'downloading',
@@ -253,13 +284,31 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
       this.setStatus({ ...this.status, state: 'ready', progress: 100 })
     })
     this.updater.on('error', (err) => {
-      this.setStatus({ state: 'error', error: err instanceof Error ? err.message : 'Update error' })
+      if (this.applying && !this.installerStarted) return
+      if (this.installerStarted) {
+        this.pendingInstallRollback?.()
+        this.pendingInstallRollback = undefined
+        const operation = startDiagnosticOperation(this.log, {
+          operation: 'update-installer',
+          fields: { strategy: 'in-place' }
+        })
+        operation.phase('handoff')
+        operation.fail(err, { result: 'error' })
+      }
+      this.applying = false
+      this.installerStarted = false
+      this.setStatus({
+        ...this.status,
+        state: 'error',
+        error: err instanceof Error ? err.message : 'Update error'
+      })
     })
   }
 
   // Always re-stamps current + applyKind so every broadcast status is self-consistent regardless of
   // which event produced it.
   private setStatus(partial: Partial<UpdateStatus>): void {
+    if (this.applying && partial.state !== 'applying') return
     this.status = {
       ...partial,
       state: partial.state ?? this.status.state,
@@ -288,6 +337,12 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
   }
 
   async check(): Promise<UpdateStatus> {
+    if (this.applying) return this.status
+    const operation = startDiagnosticOperation(this.log, {
+      operation: 'update-check',
+      fields: { strategy: 'in-place' }
+    })
+    operation.phase('query-provider')
     try {
       await this.updater.checkForUpdates()
     } catch (error) {
@@ -295,9 +350,15 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
         state: 'error',
         error: error instanceof Error ? error.message : 'Update check failed'
       })
+      operation.fail(error, { result: 'error' })
     }
     // Wait for the notes fetch triggered by update-available so the returned status carries them.
     await this.notesHydration
+    if (this.status.state === 'error') {
+      operation.fail(new Error('Updater check failed'), { result: 'error' })
+    } else {
+      operation.complete({ result: this.status.state })
+    }
     return this.status
   }
 
@@ -305,7 +366,13 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
     // An active download is in flight; ignore repeat clicks / concurrent renderers. Starting a second
     // would overwrite downloadToken and orphan the first (cancel() could no longer stop it). This guard
     // and the token claim below are synchronous so a racing download()/cancel() sees a consistent slot.
-    if (this.downloadToken) return this.status
+    if (this.applying || this.downloadToken) return this.status
+
+    const operation = startDiagnosticOperation(this.log, {
+      operation: 'update-download',
+      fields: { strategy: 'in-place' }
+    })
+    this.downloadOperation = operation
 
     // A just-cancelled download may still be settling: cancel() returns before electron-updater's
     // underlying downloadPromise rejects. downloadUpdate() reuses that live promise and ignores a fresh
@@ -322,10 +389,19 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
       try {
         // Let the prior cancelled download's promise clear (and its cleanup finish) before starting.
         // Swallow its outcome — it is owned by its own lifecycle.
-        if (previous) await previous.catch(() => {})
+        if (previous) {
+          operation.phase('wait-for-previous')
+          await previous.catch(() => {})
+        }
         // A cancel() during the drain means never start this download.
         if (token.cancelled) return
+        operation.phase('transfer')
         await this.updater.downloadUpdate(token)
+        if (this.status.state === 'error') {
+          operation.fail(new Error('Updater download failed'), { result: 'error' })
+        } else {
+          operation.complete({ result: this.status.state })
+        }
       } catch (error) {
         // A user cancel rejects downloadUpdate too; don't surface it as an error. cancel() has already
         // reset the status to 'available', so leave it untouched here. Caught so the lifecycle never
@@ -335,9 +411,11 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
             state: 'error',
             error: error instanceof Error ? error.message : 'Download failed'
           })
+          operation.fail(error, { result: 'error' })
         }
       } finally {
         if (this.downloadToken === token) this.downloadToken = undefined
+        if (this.downloadOperation === operation) this.downloadOperation = undefined
       }
     })()
     this.downloadLifecycle = lifecycle
@@ -354,19 +432,33 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
   // download() awaits it so it never reuses the still-settling (cancelled) downloadPromise. No-op when
   // nothing is downloading.
   async cancel(): Promise<UpdateStatus> {
+    if (this.applying) return this.status
     this.downloadToken?.cancel()
     this.downloadToken = undefined
     if (this.status.state === 'downloading') {
       this.setStatus({ ...this.status, state: 'available', progress: undefined })
     }
+    this.downloadOperation?.cancel({ reason: 'user' })
     return this.status
   }
 
-  // Triggered by the user's "Restart to update" click once the download is ready. On win/linux,
-  // isSilent=true keeps the assisted NSIS installer from showing its wizard and isForceRunAfter=true
-  // relaunches into the new version (per-user install = no UAC prompt). On macOS Squirrel.Mac swaps
-  // the .app and relaunches; it ignores isSilent, so the same call is correct there too.
+  // Triggered by the user's "Restart to update" click once the download is ready. On Windows,
+  // isSilent=false keeps the assisted NSIS progress page visible while the app files are unavailable;
+  // isForceRunAfter=true relaunches into the new version. Other updaters ignore isSilent.
   async apply(): Promise<UpdateStatus> {
+    // Claim the update synchronously so repeat clicks or concurrent renderers cannot start a second
+    // teardown/install. The broadcast also gives the renderer immediate feedback during the shutdown
+    // gate, which can take up to 15 seconds on Windows.
+    if (this.applying) return this.status
+    this.applying = true
+    this.installerStarted = false
+    this.setStatus({ ...this.status, state: 'applying' })
+
+    const operation = startDiagnosticOperation(this.log, {
+      operation: 'update-apply',
+      fields: { strategy: 'in-place' }
+    })
+
     // Stop the agent + notebook process trees BEFORE handing off to the installer. Its uninstall step
     // deletes the running app's files, and on Windows an executable/DLL still mapped by a background
     // child (agent CLI, python kernel, conda) is locked — the classic "Failed to uninstall old
@@ -374,19 +466,63 @@ export class ElectronUpdaterStrategy implements UpdateStrategy {
     // may have left grandchildren), refuse the install rather than fail mid-uninstall: the gate is
     // non-latching, so the app stays usable and the user can retry (fewer live processes next time).
     if (this.installGate) {
-      const readiness = await this.installGate()
+      operation.phase('install-gate')
+      let readiness: Awaited<ReturnType<InstallGate>>
+      try {
+        readiness = await this.installGate()
+      } catch (error) {
+        this.log.error('update install gate failed', error)
+        this.applying = false
+        this.setStatus({
+          ...this.status,
+          state: 'error',
+          error: 'Could not stop background processes before updating. Please try again.'
+        })
+        operation.fail(error, { result: 'error' })
+        return this.status
+      }
+      if (!this.applying) {
+        operation.cancel({ reason: 'apply-interrupted' })
+        return this.status
+      }
       if (!readiness.completed || !readiness.reaped) {
         this.log.error('update install gate refused: backend teardown degraded', readiness)
+        this.applying = false
         this.setStatus({
+          ...this.status,
           state: 'error',
           error: 'Could not fully stop background processes before updating. Please try again.'
+        })
+        operation.fail(new Error('Install gate refused'), {
+          reason: 'install-gate-refused',
+          gateCompleted: readiness.completed,
+          processTreesReaped: readiness.reaped
         })
         return this.status
       }
       this.log.info('update install gate cleared; proceeding to quitAndInstall')
     }
 
-    this.updater.quitAndInstall(true, true)
+    operation.phase('install')
+    const rollbackTrigger = this.markUpdateShutdown()
+    this.pendingInstallRollback = rollbackTrigger
+    this.installerStarted = true
+    try {
+      this.updater.quitAndInstall(false, true)
+    } catch (error) {
+      rollbackTrigger()
+      this.pendingInstallRollback = undefined
+      this.applying = false
+      this.installerStarted = false
+      this.setStatus({
+        ...this.status,
+        state: 'error',
+        error: error instanceof Error ? error.message : 'Could not start the update installer.'
+      })
+      operation.fail(error, { result: 'error' })
+      return this.status
+    }
+    operation.complete({ result: 'handoff-requested' })
     return this.status
   }
 }

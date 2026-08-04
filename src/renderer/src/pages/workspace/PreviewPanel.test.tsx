@@ -69,6 +69,7 @@ describe('PreviewPanel', () => {
     await act(async () => {
       root.unmount()
     })
+    vi.unstubAllGlobals()
     container.remove()
   })
 
@@ -86,11 +87,72 @@ describe('PreviewPanel', () => {
     })
   }
 
-  it('shows an empty state and no tab bar when there are no preview items', async () => {
+  const renderTwoFileTabs = async (): Promise<void> => {
+    usePreviewWorkbenchStore.getState().upsertAndActivateItem(createFileItem({}))
+    usePreviewWorkbenchStore.getState().upsertItem(
+      createFileItem({
+        id: 'item-2',
+        title: 'file-2.pdf',
+        format: 'pdf',
+        path: '/workspace/file-2.pdf',
+        name: 'file-2.pdf'
+      })
+    )
+    await renderPanel()
+  }
+
+  const mockTabScrollGeometry = ({
+    tabIndex,
+    listBounds,
+    tabBounds,
+    scrollLeft = 0
+  }: {
+    tabIndex: number
+    listBounds: [number, number]
+    tabBounds: [number, number]
+    scrollLeft?: number
+  }): { tabBar: HTMLElement; scrollTo: ReturnType<typeof vi.fn> } => {
+    const tabBar = container.querySelector<HTMLElement>('[aria-label="Open previews"]')
+    const tabContainer = container.querySelectorAll<HTMLElement>('[role="presentation"]')[tabIndex]
+    if (!tabBar || !tabContainer) throw new Error('Expected preview tab geometry targets')
+
+    const scrollTo = vi.fn()
+    const rect = ([left, right]: [number, number]): DOMRect =>
+      ({ left, right, width: right - left }) as DOMRect
+    Object.defineProperty(tabBar, 'scrollTo', { configurable: true, value: scrollTo })
+    Object.defineProperty(tabBar, 'scrollLeft', {
+      configurable: true,
+      value: scrollLeft,
+      writable: true
+    })
+    vi.spyOn(tabBar, 'getBoundingClientRect').mockReturnValue(rect(listBounds))
+    vi.spyOn(tabContainer, 'getBoundingClientRect').mockReturnValue(rect(tabBounds))
+
+    return { tabBar, scrollTo }
+  }
+
+  it('shows an empty state without rendering preview header chrome', async () => {
     await renderPanel()
 
     expect(container.textContent).toContain('No preview content')
-    expect(container.querySelectorAll('[title]').length).toBe(0)
+    expect(container.querySelector('[aria-label="Open previews"]')).toBeNull()
+    expect(container.querySelector('[data-testid="preview-panel-top-bar"]')).toBeNull()
+  })
+
+  it('reserves stable header padding for the external preview toggle', async () => {
+    await renderTwoFileTabs()
+
+    const chromeRow = container.querySelector('[data-testid="preview-panel-top-bar"]')
+    const tabBar = container.querySelector('[aria-label="Open previews"]')
+
+    expect(chromeRow).not.toBeNull()
+    expect(chromeRow?.contains(tabBar)).toBe(true)
+    expect(tabBar?.parentElement).toBe(chromeRow)
+    expect(chromeRow?.className).toContain('pl-2')
+    expect(chromeRow?.className).toContain('pr-14')
+    expect(tabBar?.className).toContain('flex-1')
+    expect(container.querySelector('[data-testid="preview-panel-toggle-slot"]')).toBeNull()
+    expect(container.querySelector('[data-testid="workspace-preview-toggle"]')).toBeNull()
   })
 
   it('renders a tab per item, highlights the active one, and routes file items to PreviewFileContent', async () => {
@@ -107,7 +169,7 @@ describe('PreviewPanel', () => {
 
     await renderPanel()
 
-    const tabs = container.querySelectorAll('[title]')
+    const tabs = container.querySelectorAll('[role="tab"]')
     expect(tabs.length).toBe(2)
     const previewTabs = container.querySelectorAll<HTMLElement>('[role="tab"]')
     for (const tab of previewTabs) {
@@ -115,6 +177,7 @@ describe('PreviewPanel', () => {
       expect(panelId).not.toBeNull()
       expect(container.querySelector(`#${panelId}`)?.getAttribute('role')).toBe('tabpanel')
     }
+    expect(container.querySelector('[role="tab"][title="file-1.png"] .lucide-file')).not.toBeNull()
 
     const activeContent = container.querySelector('[data-testid="file-content"]')
     expect(activeContent?.textContent).toBe('file:image:artifact:file-1.png:/workspace/file-1.png')
@@ -135,8 +198,9 @@ describe('PreviewPanel', () => {
 
     const card = container.querySelector('[data-testid="preview-card"]')
     const header = card?.querySelector('[data-testid="preview-card-header"]')
-    const titleTail = header?.querySelector('[data-testid="preview-title-tail"]')
+    const headerFileName = header?.querySelector('[data-testid="file-name-root"]')
     const tabBar = container.querySelector('[aria-label="Open previews"]')
+    const fileTab = tabBar?.querySelector(`[role="tab"][title="${name}"]`)
 
     expect(card?.className).toContain('rounded-md')
     expect(card?.className).toContain('shadow-card')
@@ -146,16 +210,32 @@ describe('PreviewPanel', () => {
     expect(card?.parentElement?.className).toContain('pr-1')
     expect(card?.parentElement?.className).not.toContain('px-2')
     expect(header?.className).toContain('h-8')
-    expect(titleTail?.textContent?.endsWith('.csv')).toBe(true)
-    expect(titleTail?.className).toContain('max-w-')
-    expect(titleTail?.className).toContain('overflow-hidden')
+    expect(headerFileName?.querySelector('[data-testid="file-name-head"]')?.textContent).toBe(
+      'global_climate_anomaly_analysis_1850'
+    )
+    expect(headerFileName?.querySelector('[data-testid="file-name-tail"]')?.textContent).toBe(
+      '-2025'
+    )
+    expect(headerFileName?.querySelector('[data-testid="file-name-extension"]')?.textContent).toBe(
+      '.csv'
+    )
     expect(header?.querySelector(`[aria-label="Download ${name}"]`)).not.toBeNull()
     expect(
       header?.querySelector(`[aria-label="Open full screen preview of ${name}"]`)
     ).not.toBeNull()
     expect(header?.querySelector(`[aria-label="Close preview of ${name}"]`)).not.toBeNull()
     expect(tabBar?.getAttribute('role')).toBe('tablist')
+    expect(tabBar?.className).toContain('min-w-0')
+    expect(tabBar?.className).toContain('flex-1')
     expect(tabBar?.querySelector('[role="tab"][aria-selected="true"]')).not.toBeNull()
+    expect(fileTab?.querySelector('[data-testid="file-name-head"]')?.textContent).toBe(
+      'global_climate_anomaly_analysis_1850'
+    )
+    expect(fileTab?.querySelector('[data-testid="file-name-ellipsis"]')).toBeNull()
+    expect(fileTab?.querySelector('[data-testid="file-name-tail"]')?.textContent).toBe('-2025')
+    const tabExtension = fileTab?.querySelector('[data-testid="file-name-extension"]')
+    expect(tabExtension?.textContent).toBe('.csv')
+    expect(tabExtension?.className).toContain('shrink-0')
     expect(container.querySelector('[role="tabpanel"]')).not.toBeNull()
     expect(tabBar?.querySelector(`[aria-label="Close preview of ${name}"]`)).not.toBeNull()
   })
@@ -172,6 +252,7 @@ describe('PreviewPanel', () => {
     )
 
     await renderPanel()
+    const compactContent = container.querySelector('[data-testid="file-content"]')
 
     await act(async () => {
       container
@@ -180,13 +261,34 @@ describe('PreviewPanel', () => {
     })
 
     const dialog = document.body.querySelector<HTMLElement>('[role="dialog"]')
+    const overlay = Array.from(document.body.querySelectorAll<HTMLElement>('div')).find((element) =>
+      element.className.includes('bg-black/50')
+    )
     expect(dialog).not.toBeNull()
+    expect(overlay?.className).toContain('data-[state=open]:fade-in-0')
     expect(dialog?.className).toContain('h-[90vh]')
     expect(dialog?.className).toContain('w-[90vw]')
     expect(dialog?.className).toContain('overscroll-contain')
+    expect(dialog?.className).toContain('rounded-xl')
+    expect(dialog?.className).toContain('border-border')
+    expect(dialog?.className).toContain('bg-card')
+    expect(dialog?.className).toContain('shadow-dialog')
+    expect(dialog?.className).toContain('data-[state=open]:zoom-in-95')
     expect(dialog?.querySelector('[data-testid="file-content"]')?.textContent).toContain(name)
-    expect(container.querySelector('[data-testid="file-content"]')).toBeNull()
+    expect(dialog?.querySelector('[data-testid="file-content"]')).toBe(compactContent)
     expect(dialog?.querySelector(`[aria-label="Open full screen preview of ${name}"]`)).toBeNull()
+
+    await act(async () => {
+      dialog
+        ?.querySelector<HTMLButtonElement>(`[aria-label="Close preview of ${name}"]`)
+        ?.dispatchEvent(new MouseEvent('pointermove', { bubbles: true }))
+      await new Promise((resolve) => setTimeout(resolve, 300))
+    })
+    // The full-screen dialog floats at z-[61]; header tooltips must layer above it. Radix puts
+    // role="tooltip" on a visually-hidden span, so assert on the styled content div instead.
+    expect(
+      document.body.querySelector('[data-radix-popper-content-wrapper] [data-state]')?.className
+    ).toContain('z-[70]')
 
     await act(async () => {
       dialog
@@ -224,6 +326,101 @@ describe('PreviewPanel', () => {
     expect(container.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain(
       'file-2.pdf'
     )
+  })
+
+  it('scrolls a clipped active preview tab inside the tab list', async () => {
+    await renderTwoFileTabs()
+    const { scrollTo } = mockTabScrollGeometry({
+      tabIndex: 1,
+      listBounds: [100, 300],
+      tabBounds: [260, 360],
+      scrollLeft: 40
+    })
+
+    await act(async () => {
+      container
+        .querySelectorAll<HTMLButtonElement>('[role="tab"]')[1]
+        ?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    expect(scrollTo).toHaveBeenCalledOnce()
+    expect(scrollTo).toHaveBeenCalledWith({
+      behavior: 'smooth',
+      left: 108
+    })
+  })
+
+  it('avoids smooth tab scrolling when the user prefers reduced motion', async () => {
+    vi.stubGlobal(
+      'matchMedia',
+      vi.fn(() => ({ matches: true }))
+    )
+    await renderTwoFileTabs()
+    const { scrollTo } = mockTabScrollGeometry({
+      tabIndex: 1,
+      listBounds: [100, 300],
+      tabBounds: [260, 360]
+    })
+
+    await act(async () => {
+      container
+        .querySelectorAll<HTMLButtonElement>('[role="tab"]')[1]
+        ?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    expect(scrollTo).toHaveBeenCalledWith({
+      behavior: 'auto',
+      left: 68
+    })
+  })
+
+  it('does not scroll when the active preview tab is already fully visible', async () => {
+    await renderTwoFileTabs()
+    const { scrollTo } = mockTabScrollGeometry({
+      tabIndex: 1,
+      listBounds: [100, 300],
+      tabBounds: [160, 260]
+    })
+
+    await act(async () => {
+      container
+        .querySelectorAll<HTMLButtonElement>('[role="tab"]')[1]
+        ?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    expect(scrollTo).not.toHaveBeenCalled()
+  })
+
+  it('rechecks active tab visibility when the preview panel width changes', async () => {
+    let notifyResize: (() => void) | undefined
+    const observe = vi.fn()
+    const disconnect = vi.fn()
+    vi.stubGlobal(
+      'ResizeObserver',
+      class {
+        constructor(callback: ResizeObserverCallback) {
+          notifyResize = () => callback([], this as unknown as ResizeObserver)
+        }
+
+        observe = observe
+        disconnect = disconnect
+      }
+    )
+    usePreviewWorkbenchStore.getState().upsertAndActivateItem(createFileItem({}))
+    await renderPanel()
+    const { tabBar, scrollTo } = mockTabScrollGeometry({
+      tabIndex: 0,
+      listBounds: [100, 260],
+      tabBounds: [220, 300]
+    })
+
+    await act(async () => {
+      notifyResize?.()
+    })
+
+    expect(observe).toHaveBeenCalledWith(tabBar)
+    expect(scrollTo).toHaveBeenCalledWith({ behavior: 'auto', left: 48 })
+    expect(disconnect).not.toHaveBeenCalled()
   })
 
   it('leaves vertical arrows available to the page for a horizontal tab list', async () => {
@@ -320,6 +517,8 @@ describe('PreviewPanel', () => {
     expect(container.querySelector('[data-testid="preview-card"]')).toBeNull()
     expect(container.querySelector('[data-testid="preview-card-header"]')).toBeNull()
     const toolTab = container.querySelector<HTMLElement>('[role="tab"]')
+    expect(toolTab?.querySelector('.lucide-book-open')).not.toBeNull()
+    expect(toolTab?.querySelector('.lucide-file, .lucide-folder-open')).toBeNull()
     expect(
       container.querySelector(`#${toolTab?.getAttribute('aria-controls')}`)?.getAttribute('role')
     ).toBe('tabpanel')
@@ -337,8 +536,81 @@ describe('PreviewPanel', () => {
     await renderPanel()
 
     expect(container.querySelector('button[title="Files"]')).not.toBeNull()
+    expect(container.querySelector('button[title="Files"] .lucide-folder-open')).not.toBeNull()
+    expect(container.querySelector('button[title="Files"] .lucide-file')).toBeNull()
     expect(container.querySelector('[data-testid="tool-content"]')?.textContent).toBe('tool:files')
     expect(container.querySelector('[data-testid="preview-card"]')).toBeNull()
+  })
+
+  it('expands a tool tab into a modal surface without remounting its content', async () => {
+    usePreviewWorkbenchStore.getState().upsertAndActivateItem({
+      id: 'tool:project:files',
+      sessionId: '__project_files__',
+      title: 'Files',
+      type: 'tool',
+      toolKind: 'files'
+    } as never)
+
+    await renderPanel()
+
+    const inlineContent = container.querySelector('[data-testid="tool-content"]')
+    expect(container.querySelector('[role="dialog"]')).toBeNull()
+    expect(container.querySelector('[role="tabpanel"]')?.className).toContain('overflow-y-auto')
+
+    await act(async () => {
+      usePreviewWorkbenchStore.getState().setToolItemExpanded('tool:project:files')
+    })
+
+    const dialog = document.body.querySelector<HTMLElement>('[role="dialog"]')
+    const overlay = Array.from(document.body.querySelectorAll<HTMLElement>('div')).find((element) =>
+      element.className.includes('bg-black/50')
+    )
+    expect(dialog).not.toBeNull()
+    expect(overlay).not.toBeNull()
+    expect(dialog?.getAttribute('aria-modal')).toBe('true')
+    expect(dialog?.getAttribute('aria-label')).toBe('Files')
+    expect(dialog?.className).toContain('h-[90vh]')
+    expect(dialog?.className).toContain('w-[90vw]')
+    expect(dialog?.querySelector('[data-testid="tool-content"]')).toBe(inlineContent)
+
+    await act(async () => {
+      dialog?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    })
+
+    expect(usePreviewWorkbenchStore.getState().expandedToolItemId).toBeNull()
+    expect(document.body.querySelector('[role="dialog"]')).toBeNull()
+    expect(container.querySelector('[data-testid="tool-content"]')).toBe(inlineContent)
+  })
+
+  const panelId = (itemId: string): string => `preview-panel-${encodeURIComponent(itemId)}`
+
+  it('keeps a tool panel mounted while a file tab is active', async () => {
+    usePreviewWorkbenchStore.getState().upsertAndActivateItem(createToolItem({}))
+    usePreviewWorkbenchStore.getState().upsertItem(createFileItem({}))
+
+    await renderPanel()
+
+    // Node identity is the signal: a remount replaces the DOM node and loses component state such
+    // as the local file browser's current directory.
+    const toolContent = container.querySelector('[data-testid="tool-content"]')
+    expect(toolContent).not.toBeNull()
+    const toolPanel = container.querySelector(`#${panelId('tool-1')}`)
+    expect(toolPanel?.hasAttribute('hidden')).toBe(false)
+
+    await act(async () => {
+      usePreviewWorkbenchStore.getState().activateItem('item-1')
+    })
+
+    expect(container.querySelector('[data-testid="file-content"]')).not.toBeNull()
+    expect(container.querySelector(`#${panelId('tool-1')}`)?.hasAttribute('hidden')).toBe(true)
+    expect(container.querySelector('[data-testid="tool-content"]')).toBe(toolContent)
+
+    await act(async () => {
+      usePreviewWorkbenchStore.getState().activateItem('tool-1')
+    })
+
+    expect(container.querySelector(`#${panelId('tool-1')}`)?.hasAttribute('hidden')).toBe(false)
+    expect(container.querySelector('[data-testid="tool-content"]')).toBe(toolContent)
   })
 
   it('activates a different tab on click and swaps the rendered content', async () => {
@@ -427,7 +699,7 @@ describe('PreviewPanel', () => {
     await act(async () => usePreviewWorkbenchStore.getState().collapsePanel())
     expect(container.querySelector('[data-testid="file-content"]')).toBeNull()
 
-    await act(async () => usePreviewWorkbenchStore.getState().openPanel())
+    await act(async () => usePreviewWorkbenchStore.getState().togglePanel())
     expect(container.querySelector('[data-testid="file-content"]')).not.toBeNull()
   })
 })

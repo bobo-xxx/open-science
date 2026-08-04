@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { getUploadedAttachmentPath } from '../../../shared/uploads'
+
 import {
   createNotebookPreviewItem,
   createProjectFilesPreviewItem,
@@ -26,6 +28,29 @@ describe('preview workbench store', () => {
       openRequestVersion: 0,
       items: []
     })
+  })
+
+  it('owns one transient file dialog independent of preview tabs', () => {
+    const item = {
+      id: 'artifact-1',
+      projectId: 'project-a',
+      sessionId: 'session-1',
+      type: 'file' as const,
+      title: 'sin.png',
+      path: 'artifact-version:project-a/session-1/artifact-1/version-1',
+      format: 'image' as const,
+      name: 'sin.png'
+    }
+
+    usePreviewWorkbenchStore.getState().openFileDialog(item)
+
+    expect(usePreviewWorkbenchStore.getState()).toMatchObject({
+      fileDialogItem: item,
+      items: []
+    })
+
+    usePreviewWorkbenchStore.getState().closeFileDialog()
+    expect(usePreviewWorkbenchStore.getState().fileDialogItem).toBeUndefined()
   })
 
   it('stores file preview items in one ordered list', () => {
@@ -77,6 +102,32 @@ describe('preview workbench store', () => {
     })
   })
 
+  it('collapses the panel when the last preview item is removed', () => {
+    const store = usePreviewWorkbenchStore.getState()
+    const item = createProjectFilesPreviewItem()
+
+    store.upsertAndActivateItem(item)
+    store.removeItem(item.id)
+
+    expect(usePreviewWorkbenchStore.getState()).toMatchObject({
+      items: [],
+      activeItemId: undefined,
+      panelState: 'collapsed'
+    })
+  })
+
+  it('does not restore an open panel state when the restored preview list is empty', () => {
+    usePreviewWorkbenchStore.getState().activateProject('project-a', {
+      panelState: 'open',
+      items: []
+    })
+
+    expect(usePreviewWorkbenchStore.getState()).toMatchObject({
+      items: [],
+      panelState: 'collapsed'
+    })
+  })
+
   it('updates an existing item without duplicating it', () => {
     usePreviewWorkbenchStore.getState().upsertAndActivateItem({
       id: 'file:session-1:/workspace/project/report.md',
@@ -108,12 +159,33 @@ describe('preview workbench store', () => {
     })
   })
 
+  it('selects the first passively discovered preview without opening the panel', () => {
+    const notebookItem = createNotebookPreviewItem({
+      sessionId: 'session-1',
+      projectName: 'default-project',
+      workspaceCwd: '/workspace',
+      notebookSessionRoot: '/notebooks/session-1',
+      dataRoot: '/notebooks/session-1/data',
+      runtimeRoot: '/runtime',
+      runJsonPath: '/notebooks/session-1/run.json'
+    })
+
+    usePreviewWorkbenchStore.getState().upsertItem(notebookItem)
+
+    expect(usePreviewWorkbenchStore.getState()).toMatchObject({
+      activeItemId: notebookItem.id,
+      panelState: 'collapsed',
+      openRequestVersion: 0
+    })
+  })
+
   it('reconciles finalized upload paths across project slices without opening new tabs', () => {
     const store = usePreviewWorkbenchStore.getState()
 
     store.activateProject('project-a')
     store.upsertAndActivateItem({
       id: 'upload:upload-a',
+      projectId: 'project-a',
       sessionId: '.pending',
       type: 'file',
       source: 'upload',
@@ -125,6 +197,7 @@ describe('preview workbench store', () => {
     store.activateProject('project-b')
     store.upsertAndActivateItem({
       id: 'upload:upload-b',
+      projectId: 'project-b',
       sessionId: '.pending',
       type: 'file',
       source: 'upload',
@@ -137,6 +210,7 @@ describe('preview workbench store', () => {
     usePreviewWorkbenchStore.getState().reconcileFinalizedUploads([
       {
         id: 'upload-a',
+        versionId: 'version-a',
         sessionId: 'session-a',
         name: 'a.csv',
         originalName: 'a.csv',
@@ -146,6 +220,7 @@ describe('preview workbench store', () => {
       },
       {
         id: 'upload-b',
+        versionId: 'version-b',
         sessionId: 'session-b',
         name: 'b.csv',
         originalName: 'b.csv',
@@ -155,6 +230,7 @@ describe('preview workbench store', () => {
       },
       {
         id: 'upload-never-opened',
+        versionId: 'version-hidden',
         sessionId: 'session-b',
         name: 'hidden.csv',
         originalName: 'hidden.csv',
@@ -168,7 +244,10 @@ describe('preview workbench store', () => {
       {
         id: 'upload:upload-b',
         sessionId: 'session-b',
-        path: '/uploads/default-project/session-b/b.csv'
+        path: getUploadedAttachmentPath(
+          { versionId: 'version-b', sessionId: 'session-b' },
+          'project-b'
+        )
       }
     ])
 
@@ -177,7 +256,10 @@ describe('preview workbench store', () => {
       {
         id: 'upload:upload-a',
         sessionId: 'session-a',
-        path: '/uploads/default-project/session-a/a.csv'
+        path: getUploadedAttachmentPath(
+          { versionId: 'version-a', sessionId: 'session-a' },
+          'project-a'
+        )
       }
     ])
     expect(
@@ -319,6 +401,60 @@ describe('preview workbench store', () => {
     })
   })
 
+  it('tracks the expanded tool item and clears it when the tab is removed', () => {
+    expect(usePreviewWorkbenchStore.getState().expandedToolItemId).toBeNull()
+
+    usePreviewWorkbenchStore.getState().upsertAndActivateItem(createProjectFilesPreviewItem())
+    usePreviewWorkbenchStore.getState().setToolItemExpanded(PROJECT_FILES_PREVIEW_ID)
+
+    expect(usePreviewWorkbenchStore.getState().expandedToolItemId).toBe(PROJECT_FILES_PREVIEW_ID)
+
+    usePreviewWorkbenchStore.getState().setToolItemExpanded(null)
+
+    expect(usePreviewWorkbenchStore.getState().expandedToolItemId).toBeNull()
+
+    usePreviewWorkbenchStore.getState().setToolItemExpanded(PROJECT_FILES_PREVIEW_ID)
+    usePreviewWorkbenchStore.getState().openFileDialog({
+      id: 'artifact-1',
+      projectId: 'project-a',
+      sessionId: 'session-1',
+      type: 'file',
+      title: 'result.png',
+      path: 'artifact-version:project-a/session-1/artifact-1/version-1',
+      format: 'image',
+      name: 'result.png'
+    })
+    usePreviewWorkbenchStore.getState().removeItem(PROJECT_FILES_PREVIEW_ID)
+
+    expect(usePreviewWorkbenchStore.getState().expandedToolItemId).toBeNull()
+    expect(usePreviewWorkbenchStore.getState().fileDialogItem).toBeUndefined()
+  })
+
+  it('clears the expanded tool item when its session is removed', () => {
+    usePreviewWorkbenchStore.getState().upsertAndActivateItem({
+      id: 'tool:session-1:notebook',
+      sessionId: 'session-1',
+      type: 'tool',
+      toolKind: 'notebook',
+      title: 'Notebook'
+    })
+    usePreviewWorkbenchStore.getState().setToolItemExpanded('tool:session-1:notebook')
+
+    usePreviewWorkbenchStore.getState().removeSessionItems('session-1')
+
+    expect(usePreviewWorkbenchStore.getState().expandedToolItemId).toBeNull()
+  })
+
+  it('clears the expanded tool item when switching projects', () => {
+    usePreviewWorkbenchStore.getState().activateProject('project-1')
+    usePreviewWorkbenchStore.getState().upsertAndActivateItem(createProjectFilesPreviewItem())
+    usePreviewWorkbenchStore.getState().setToolItemExpanded(PROJECT_FILES_PREVIEW_ID)
+
+    usePreviewWorkbenchStore.getState().activateProject('project-2')
+
+    expect(usePreviewWorkbenchStore.getState().expandedToolItemId).toBeNull()
+  })
+
   it('removes all preview items for a deleted session', () => {
     usePreviewWorkbenchStore.getState().upsertAndActivateItem({
       id: 'file:session-1:/workspace/project/report.md',
@@ -350,13 +486,11 @@ describe('preview workbench store', () => {
   })
 
   it('tracks manual panel state separately from preview item data', () => {
-    usePreviewWorkbenchStore.getState().openPanel()
-    usePreviewWorkbenchStore.getState().collapsePanel()
     usePreviewWorkbenchStore.getState().togglePanel()
 
     expect(usePreviewWorkbenchStore.getState()).toMatchObject({
-      panelState: 'open',
-      openRequestVersion: 2,
+      panelState: 'collapsed',
+      openRequestVersion: 0,
       items: []
     })
   })
@@ -387,6 +521,26 @@ describe('preview workbench store', () => {
     expect(usePreviewWorkbenchStore.getState().items).toHaveLength(1)
   })
 
+  it('adds the active project scope to file tabs when callers omit it', () => {
+    const store = usePreviewWorkbenchStore.getState()
+    store.activateProject('project-a')
+    store.upsertAndActivateItem({
+      id: 'upload:upload-a',
+      sessionId: 'session-a',
+      type: 'file',
+      source: 'upload',
+      title: 'a.csv',
+      path: 'upload-version:version-a',
+      format: 'csv',
+      name: 'a.csv'
+    })
+
+    expect(usePreviewWorkbenchStore.getState().items[0]).toMatchObject({
+      projectId: 'project-a',
+      sessionId: 'session-a'
+    })
+  })
+
   it('seeds a project slice from restored persistence on first activation', () => {
     usePreviewWorkbenchStore.getState().activateProject('project-a', {
       panelState: 'open',
@@ -408,7 +562,13 @@ describe('preview workbench store', () => {
       activeProjectId: 'project-a',
       panelState: 'open',
       activeItemId: 'file:session-1:/workspace/project/report.md',
-      items: [{ id: 'file:session-1:/workspace/project/report.md', createdAt: Date.now() }]
+      items: [
+        {
+          id: 'file:session-1:/workspace/project/report.md',
+          projectId: 'project-a',
+          createdAt: Date.now()
+        }
+      ]
     })
   })
 

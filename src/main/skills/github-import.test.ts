@@ -4,6 +4,7 @@ import { SKILL_IMPORT_LIMITS } from './import-limits'
 import {
   parseGitHubSkillUrl,
   parseGitHubRepo,
+  fetchSkillPreview,
   fetchSkillFiles,
   scanRepoForSkills,
   type FetchLike
@@ -49,8 +50,13 @@ describe('parseGitHubSkillUrl', () => {
     ).toBe('scientific-skills/Academic Writing/citation-formatter')
   })
 
-  it('returns null for non-GitHub input', () => {
+  it('returns null unless the URL is an HTTPS github.com repository', () => {
     expect(parseGitHubSkillUrl('https://example.com/foo')).toBeNull()
+    expect(parseGitHubSkillUrl('http://github.com/acme/skills')).toBeNull()
+    expect(parseGitHubSkillUrl('https://example.invalid/github.com/acme/skills')).toBeNull()
+    expect(parseGitHubSkillUrl('https://github.com.evil/acme/skills')).toBeNull()
+    expect(parseGitHubSkillUrl('https://github.com/acme')).toBeNull()
+    expect(parseGitHubSkillUrl('https://github.com/acme/skills/issues')).toBeNull()
   })
 })
 
@@ -82,6 +88,125 @@ const fakeFetch = (files: Record<string, string>): FetchLike => {
     }
   }
 }
+
+describe('fetchSkillPreview', () => {
+  it('lists candidate files while downloading only SKILL.md', async () => {
+    const downloads: string[] = []
+    const fetcher: FetchLike = async (url) => {
+      if (url.includes('/contents/')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => [
+            {
+              type: 'file',
+              name: 'SKILL.md',
+              path: 'pack/foo/SKILL.md',
+              download_url: 'https://raw/SKILL.md'
+            },
+            {
+              type: 'file',
+              name: 'guide.md',
+              path: 'pack/foo/references/guide.md',
+              download_url: 'https://raw/guide.md'
+            }
+          ],
+          arrayBuffer: async () => new ArrayBuffer(0)
+        }
+      }
+
+      downloads.push(url)
+      const bytes = new TextEncoder().encode('# Preview body')
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({}),
+        arrayBuffer: async () =>
+          bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)
+      }
+    }
+
+    await expect(
+      fetchSkillPreview({ owner: 'acme', repo: 'skills', ref: 'main', path: 'pack/foo' }, fetcher)
+    ).resolves.toEqual({
+      skillMd: Buffer.from('# Preview body'),
+      files: ['SKILL.md', 'references/guide.md']
+    })
+    expect(downloads).toEqual(['https://raw/SKILL.md'])
+  })
+
+  it('bounds GitHub preview content without preventing import', async () => {
+    const bytes = new Uint8Array(SKILL_IMPORT_LIMITS.maxPreviewContentBytes + 1)
+    const fetcher: FetchLike = async (url) => {
+      if (url.includes('/contents/')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => [
+            {
+              type: 'file',
+              name: 'SKILL.md',
+              path: 'pack/foo/SKILL.md',
+              download_url: 'https://raw/SKILL.md'
+            }
+          ],
+          arrayBuffer: async () => new ArrayBuffer(0)
+        }
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({}),
+        headers: { get: () => String(bytes.byteLength) },
+        arrayBuffer: async () => bytes.buffer
+      }
+    }
+    const location = { owner: 'acme', repo: 'skills', ref: 'main', path: 'pack/foo' }
+
+    await expect(fetchSkillPreview(location, fetcher)).rejects.toThrow(
+      /preview exceeds the 4 MB limit/i
+    )
+    await expect(fetchSkillFiles(location, fetcher)).resolves.toHaveLength(1)
+  })
+
+  it('rejects a declared oversized preview before buffering its body', async () => {
+    let bodyRead = false
+    const fetcher: FetchLike = async (url) => {
+      if (url.includes('/contents/')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => [
+            {
+              type: 'file',
+              name: 'SKILL.md',
+              path: 'pack/foo/SKILL.md',
+              download_url: 'https://raw/SKILL.md'
+            }
+          ],
+          arrayBuffer: async () => new ArrayBuffer(0)
+        }
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({}),
+        headers: {
+          get: (name) => (name.toLowerCase() === 'content-length' ? String(OVER_FILE) : null)
+        },
+        arrayBuffer: async () => {
+          bodyRead = true
+          return new ArrayBuffer(0)
+        }
+      }
+    }
+
+    await expect(
+      fetchSkillPreview({ owner: 'acme', repo: 'skills', ref: 'main', path: 'pack/foo' }, fetcher)
+    ).rejects.toThrow(/preview exceeds the 4 MB limit/i)
+    expect(bodyRead).toBe(false)
+  })
+})
 
 describe('fetchSkillFiles', () => {
   it('downloads files relative to the skill directory', async () => {
@@ -554,12 +679,17 @@ describe('parseGitHubRepo', () => {
 
 describe('scanRepoForSkills', () => {
   // Fakes the repo-meta + recursive git-tree API responses.
+  const commitSha = '0123456789abcdef0123456789abcdef01234567'
   const treeFetch = (
     paths: { path: string; type: string }[],
     defaultBranch = 'main'
   ): FetchLike => {
     return async (url: string) => {
-      const body = url.includes('/git/trees/') ? { tree: paths } : { default_branch: defaultBranch }
+      const body = url.includes('/git/trees/')
+        ? { tree: paths }
+        : url.includes('/commits/')
+          ? { sha: commitSha }
+          : { default_branch: defaultBranch }
       return {
         ok: true,
         status: 200,
@@ -584,9 +714,13 @@ describe('scanRepoForSkills', () => {
       {
         name: 'foo',
         path: 'pack/foo',
-        url: 'https://github.com/acme/skills/tree/main/pack/foo'
+        url: `https://github.com/acme/skills/tree/${commitSha}/pack/foo`
       },
-      { name: 'bar', path: 'bar', url: 'https://github.com/acme/skills/tree/main/bar' }
+      {
+        name: 'bar',
+        path: 'bar',
+        url: `https://github.com/acme/skills/tree/${commitSha}/bar`
+      }
     ])
   })
 })

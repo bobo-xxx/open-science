@@ -1,6 +1,14 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { CliUsageError, parseCliArgs, reportCliError, runTaskCommand } from './cli.mjs'
+import { PUBLIC_TERMINAL_FIXTURE } from '../../test/fixtures/renderer-contract-certification'
+import {
+  CliUsageError,
+  parseCliArgs,
+  reportCliError,
+  rollbackCommand,
+  runCli,
+  runTaskCommand
+} from './cli.mjs'
 
 describe('task CLI', () => {
   it('parses the first milestone run interface', () => {
@@ -54,6 +62,37 @@ describe('task CLI', () => {
     expect(() => parseCliArgs(['run', '--timeout-ms', '1000'])).toThrow(
       '--timeout-ms requires run --wait.'
     )
+    expect(
+      parseCliArgs([
+        'run',
+        '--project',
+        'project-1',
+        '--prompt',
+        'Research this.',
+        '--session',
+        'session-1',
+        '--approval-profile',
+        'full',
+        '--skill',
+        'literature-review',
+        '--skill',
+        'citation-check'
+      ])
+    ).toMatchObject({
+      command: 'run',
+      options: {
+        session: 'session-1',
+        approvalProfile: 'full',
+        skills: ['literature-review', 'citation-check']
+      }
+    })
+    expect(() => parseCliArgs(['run', '--approval-profile', 'unsafe'])).toThrow(
+      'Invalid approval profile: unsafe'
+    )
+    expect(() => parseCliArgs(['run', '--json', '--jsonl', '--wait'])).toThrow(
+      'Use only one of --json or --jsonl.'
+    )
+    expect(() => parseCliArgs(['status', '--unknown'])).toThrow('Unknown option: --unknown')
   })
 
   it('reads a prompt file, waits for completion, and emits one JSON result', async () => {
@@ -100,6 +139,52 @@ describe('task CLI', () => {
     expect(client.waitForRun).toHaveBeenCalledWith('run-1')
     expect(JSON.parse(log.mock.calls[0][0])).toMatchObject({ status: 'completed', output: 'Done' })
     expect(log).toHaveBeenCalledTimes(1)
+  })
+
+  it('parses and runs the explicit offline rollback command', async () => {
+    const parsed = parseCliArgs([
+      'rollback-to-0.7.3',
+      '--yes',
+      '--config-root',
+      '/config',
+      '--data-root',
+      '/data',
+      '--output',
+      '/rollback'
+    ])
+    expect(parsed).toEqual({
+      command: 'rollback-to-0.7.3',
+      options: {
+        open: true,
+        json: false,
+        yes: true,
+        configRoot: '/config',
+        dataRoot: '/data',
+        output: '/rollback'
+      }
+    })
+
+    const runRollback = vi.fn().mockResolvedValue({
+      targetVersion: '0.7.3',
+      rollbackDataRoot: '/rollback',
+      preservedConfigRoot: '/config.before-rollback',
+      preservedDataRoot: '/data',
+      sessionsConverted: 4
+    })
+    const log = vi.fn()
+    await rollbackCommand(parsed.options, { runRollback, log })
+
+    expect(runRollback).toHaveBeenCalledWith({
+      configRoot: '/config',
+      dataRoot: '/data',
+      output: '/rollback',
+      confirm: true
+    })
+    expect(log.mock.calls.map(([line]) => line)).toContain(
+      'Preserved newer Config Root: /config.before-rollback'
+    )
+    expect(() => parseCliArgs(['rollback-to-0.7.3'])).not.toThrow()
+    expect(() => parseCliArgs(['status', '--yes'])).toThrow('--yes requires rollback-to-0.7.3.')
   })
 
   it('dispatches project, session, and artifact commands through the SDK', async () => {
@@ -177,7 +262,7 @@ describe('task CLI', () => {
   it('reads stdin, emits JSONL events, and sets a failed-run exit code', async () => {
     const client = {
       events: async function* () {
-        yield { type: 'run.event', data: { sessionId: 'session-1', kind: 'tool' } }
+        yield PUBLIC_TERMINAL_FIXTURE
       },
       startRun: vi.fn().mockResolvedValue({
         id: 'run-1',
@@ -219,10 +304,63 @@ describe('task CLI', () => {
       prompt: 'Research from stdin.'
     })
     expect(log.mock.calls.map(([line]) => JSON.parse(line))).toEqual([
-      { type: 'run.event', data: { sessionId: 'session-1', kind: 'tool' } },
+      PUBLIC_TERMINAL_FIXTURE,
       expect.objectContaining({ id: 'run-1', status: 'failed' })
     ])
     expect(setExitCode).toHaveBeenCalledWith(1)
+  })
+
+  it('keeps run --session on the stable app id for Task API calls and events', async () => {
+    const stableSessionId = 'stable-app-session'
+    const providerSessionId = 'provider-session'
+    const stableEvent = {
+      type: 'run.event',
+      data: { sessionId: stableSessionId, kind: 'tool' }
+    }
+    const client = {
+      events: async function* () {
+        yield { type: 'run.event', data: { sessionId: providerSessionId, kind: 'tool' } }
+        yield stableEvent
+      },
+      startRun: vi.fn().mockResolvedValue({
+        id: 'run-1',
+        sessionId: stableSessionId,
+        status: 'running'
+      }),
+      waitForRun: vi.fn().mockResolvedValue({
+        id: 'run-1',
+        sessionId: stableSessionId,
+        status: 'completed',
+        output: 'Done',
+        artifacts: []
+      })
+    }
+    const log = vi.fn()
+
+    await runTaskCommand(
+      parseCliArgs([
+        'run',
+        '--project',
+        'project-1',
+        '--session',
+        stableSessionId,
+        '--prompt',
+        'Continue research.',
+        '--wait',
+        '--jsonl'
+      ]),
+      { connect: vi.fn().mockResolvedValue(client), stdinIsTTY: true, log }
+    )
+
+    expect(client.startRun).toHaveBeenCalledWith({
+      project: 'project-1',
+      prompt: 'Continue research.',
+      sessionId: stableSessionId
+    })
+    expect(log.mock.calls.map(([line]) => JSON.parse(line))).toEqual([
+      stableEvent,
+      expect.objectContaining({ id: 'run-1', sessionId: stableSessionId, status: 'completed' })
+    ])
   })
 
   it('passes the wait timeout and warns when a run needs approval', async () => {
@@ -275,6 +413,74 @@ describe('task CLI', () => {
     )
   })
 
+  it('stops only the CLI event wait when a timeout occurs', async () => {
+    const timeout = Object.assign(new Error('Timed out waiting for run run-1.'), {
+      code: 'timeout'
+    })
+    let eventSignal: AbortSignal | undefined
+    const events = vi.fn(({ signal }: { signal: AbortSignal }) => {
+      eventSignal = signal
+      return {
+        ready: Promise.resolve(),
+        [Symbol.asyncIterator]() {
+          return {
+            next: () =>
+              new Promise<IteratorResult<never>>((resolve) => {
+                signal.addEventListener(
+                  'abort',
+                  () => resolve({ value: undefined as never, done: true }),
+                  { once: true }
+                )
+              })
+          }
+        }
+      }
+    })
+    const client = {
+      events,
+      startRun: vi.fn().mockResolvedValue({
+        id: 'run-1',
+        sessionId: 'session-1',
+        status: 'running'
+      }),
+      waitForRun: vi.fn().mockRejectedValue(timeout)
+    }
+
+    await expect(
+      runTaskCommand(
+        {
+          command: 'run',
+          options: {
+            project: 'project-1',
+            prompt: 'Research this.',
+            wait: true,
+            timeoutMs: 25,
+            json: false,
+            jsonl: false
+          }
+        },
+        { connect: vi.fn().mockResolvedValue(client), stdinIsTTY: true }
+      )
+    ).rejects.toBe(timeout)
+
+    expect(client.waitForRun).toHaveBeenCalledWith('run-1', { timeoutMs: 25 })
+    expect(eventSignal?.aborted).toBe(true)
+    expect(client).not.toHaveProperty('cancelRun')
+  })
+
+  it('keeps capability management surfaces outside the CLI', async () => {
+    for (const command of [
+      'permission',
+      'specialist',
+      'compute',
+      'notebook',
+      'notebook-env',
+      'runtime'
+    ]) {
+      await expect(runCli([command])).rejects.toThrow(`Unknown command: ${command}`)
+    }
+  })
+
   it('emits structured machine errors with stable exit codes', () => {
     const error = vi.fn()
     const setExitCode = vi.fn()
@@ -290,5 +496,31 @@ describe('task CLI', () => {
       exitCode: 2
     })
     expect(setExitCode).toHaveBeenCalledWith(2)
+
+    const cases = [
+      { code: 'daemon_unavailable', exitCode: 3 },
+      { code: 'project_not_found', exitCode: 4 },
+      { code: 'session_not_found', exitCode: 4 },
+      { code: 'run_not_found', exitCode: 4 },
+      { code: 'artifact_not_found', exitCode: 4 },
+      { code: 'timeout', exitCode: 1 },
+      { code: 'session_busy', exitCode: 1 },
+      { code: 'command_failed', exitCode: 1 }
+    ]
+    for (const contract of cases) {
+      error.mockClear()
+      setExitCode.mockClear()
+      const failure = Object.assign(new Error(`${contract.code} message`), {
+        code: contract.code
+      })
+      expect(reportCliError(failure, ['run', '--json'], { error, setExitCode })).toBe(
+        contract.exitCode
+      )
+      expect(JSON.parse(error.mock.calls[0][0])).toEqual({
+        error: { code: contract.code, message: `${contract.code} message` },
+        exitCode: contract.exitCode
+      })
+      expect(setExitCode).toHaveBeenCalledWith(contract.exitCode)
+    }
   })
 })

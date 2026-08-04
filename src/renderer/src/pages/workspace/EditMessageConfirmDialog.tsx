@@ -1,6 +1,13 @@
 import { AlertDialog } from 'radix-ui'
 
 import { Button } from '@/components/ui/button'
+import {
+  dialogDescriptionClassName,
+  dialogFooterClassName,
+  dialogOverlayClassName,
+  dialogPanelClassName,
+  dialogTitleClassName
+} from '@/components/ui/dialog-chrome'
 
 type EditMessageConfirmDialogProps = {
   open: boolean
@@ -14,8 +21,7 @@ const cancelButtonClassName =
 const confirmButtonClassName =
   'border-transparent bg-amber-500 text-white hover:bg-amber-500/90 hover:text-white'
 
-// Confirms the destructive half of an inline edit: the turns after the edited message are
-// permanently dropped before the adjusted prompt is resent.
+// Confirms that editing starts a new selectable branch while retaining the original downstream path.
 const EditMessageConfirmDialog = ({
   open,
   subsequentTurns,
@@ -29,17 +35,17 @@ const EditMessageConfirmDialog = ({
     }}
   >
     <AlertDialog.Portal>
-      <AlertDialog.Overlay className="fixed inset-0 z-50 bg-black/25 backdrop-blur-[2px]" />
-      <AlertDialog.Content className="fixed left-1/2 top-1/2 z-50 w-[min(420px,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 rounded-2xl bg-bg-000 p-6 text-text-000 shadow-dialog">
-        <AlertDialog.Title className="text-base font-semibold text-text-000">
-          Resend and overwrite later turns?
+      <AlertDialog.Overlay className={dialogOverlayClassName} />
+      <AlertDialog.Content className={dialogPanelClassName('w-[min(420px,calc(100vw-2rem))]')}>
+        <AlertDialog.Title className={dialogTitleClassName}>
+          Resend on a new branch?
         </AlertDialog.Title>
-        <AlertDialog.Description className="mt-2 text-sm leading-relaxed text-text-100">
-          Sending this edited prompt will overwrite the {subsequentTurns}{' '}
-          {subsequentTurns === 1 ? 'turn' : 'turns'} that follow it in this conversation. This
-          action cannot be undone.
+        <AlertDialog.Description className={dialogDescriptionClassName}>
+          Sending this edited prompt starts a new branch from here. The {subsequentTurns}{' '}
+          {subsequentTurns === 1 ? 'turn' : 'turns'} that currently follow remain available from the
+          message revision controls.
         </AlertDialog.Description>
-        <div className="mt-6 flex justify-end gap-2">
+        <div className={dialogFooterClassName}>
           <AlertDialog.Cancel asChild>
             <Button type="button" variant="outline" className={cancelButtonClassName}>
               Cancel
@@ -47,7 +53,7 @@ const EditMessageConfirmDialog = ({
           </AlertDialog.Cancel>
           <AlertDialog.Action asChild>
             <Button type="button" className={confirmButtonClassName} onClick={onConfirm}>
-              Overwrite and resend
+              Branch and resend
             </Button>
           </AlertDialog.Action>
         </div>

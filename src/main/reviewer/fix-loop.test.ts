@@ -25,6 +25,7 @@ import { AcpRuntime } from '../acp/runtime'
 import { ReviewRepository } from './repository'
 import { createProjectDbClient, ensureProjectSchema } from '../projects/prisma-client'
 import { runReview } from './orchestrator'
+import { callSubmitFindingsAfterReadingEvidence as callSubmitFindings } from './reviewer-mcp-test-client'
 import type { PersistedChatSession, PersistedChatMessage } from '../../shared/session-persistence'
 
 // ---------------------------------------------------------------------------
@@ -46,91 +47,6 @@ class FakeAgentProcess extends EventEmitter {
 
 const asAgentProcess = (p: FakeAgentProcess): ChildProcessWithoutNullStreams =>
   p as unknown as ChildProcessWithoutNullStreams
-
-// ---------------------------------------------------------------------------
-// MCP helpers (from orchestrator.test.ts)
-// ---------------------------------------------------------------------------
-
-const MCP_ACCEPT = 'application/json, text/event-stream'
-
-const parseMcpSseBody = (body: string): { result?: unknown; error?: { message?: string } } => {
-  const dataLine = body.split('\n').find((line) => line.startsWith('data:'))
-  const json = dataLine ? dataLine.slice('data:'.length).trim() : body.trim()
-  return json ? (JSON.parse(json) as { result?: unknown; error?: { message?: string } }) : {}
-}
-
-const callSubmitFindings = async (
-  mcpBaseUrl: string,
-  token: string,
-  checks: Array<{
-    status: 'pass' | 'warn' | 'fail'
-    claim: string
-    evidence: string
-    sourceFindingId?: string
-    locator?: {
-      blockRef: { messageId?: string; activityId?: string; blockIndex: number }
-      contentHash: string
-    }
-  }>
-): Promise<void> => {
-  const initResponse = await fetch(mcpBaseUrl, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      accept: MCP_ACCEPT,
-      authorization: `Bearer ${token}`
-    },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'initialize',
-      params: {
-        protocolVersion: '2024-11-05',
-        capabilities: {},
-        clientInfo: { name: 'test-client', version: '1.0' }
-      }
-    })
-  })
-
-  if (!initResponse.ok) throw new Error(`MCP initialize failed: ${initResponse.status}`)
-
-  const initJson = parseMcpSseBody(await initResponse.text())
-  const sessionId = initResponse.headers.get('mcp-session-id')
-  if (!sessionId || !initJson.result) throw new Error('MCP initialize did not return a session id')
-
-  await fetch(mcpBaseUrl, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      accept: MCP_ACCEPT,
-      authorization: `Bearer ${token}`,
-      'mcp-session-id': sessionId
-    },
-    body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} })
-  })
-
-  const toolResponse = await fetch(mcpBaseUrl, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      accept: MCP_ACCEPT,
-      authorization: `Bearer ${token}`,
-      'mcp-session-id': sessionId
-    },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 2,
-      method: 'tools/call',
-      params: { name: 'submit_findings', arguments: { checks } }
-    })
-  })
-
-  if (!toolResponse.ok) throw new Error(`submit_findings call failed: ${toolResponse.status}`)
-  const toolJson = parseMcpSseBody(await toolResponse.text())
-  if (toolJson.error) {
-    throw new Error(`submit_findings returned an error: ${toolJson.error.message ?? 'unknown'}`)
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Fake ACP agent — handles both reviewer sessions and main-session prompts.
@@ -449,6 +365,29 @@ describe('fix loop: all-pass on re-review ends the loop (resolved)', () => {
       spawnAgent: () => asAgentProcess(process)
     })
 
+    let activityActive = false
+    const originalWithActivity = runtime.withActivity.bind(runtime)
+    const originalBuildReviewerSession = runtime.buildReviewerSession.bind(runtime)
+    const originalSendPrompt = runtime.sendPrompt.bind(runtime)
+    const activitySpy = vi.spyOn(runtime, 'withActivity').mockImplementation((options, work) =>
+      originalWithActivity(options, async (scopedRuntime) => {
+        activityActive = true
+        try {
+          return await work(scopedRuntime)
+        } finally {
+          activityActive = false
+        }
+      })
+    )
+    vi.spyOn(runtime, 'buildReviewerSession').mockImplementation((request) => {
+      expect(activityActive).toBe(true)
+      return originalBuildReviewerSession(request)
+    })
+    vi.spyOn(runtime, 'sendPrompt').mockImplementation((request) => {
+      expect(activityActive).toBe(true)
+      return originalSendPrompt(request)
+    })
+
     await runtime.createSession({ cwd: '/workspace' })
 
     const client = createProjectDbClient(temporaryRoot!)
@@ -475,6 +414,7 @@ describe('fix loop: all-pass on re-review ends the loop (resolved)', () => {
       s.sessionId.startsWith('reviewer-session')
     )
     expect(reviewerSessions).toHaveLength(2)
+    expect(activitySpy).toHaveBeenCalledOnce()
 
     // The original review's warn/fail check must now be resolved.
     const reviews = await repository.getReviewsForSession('session-1')
@@ -486,6 +426,11 @@ describe('fix loop: all-pass on re-review ends the loop (resolved)', () => {
       r.checks.some((c) => c.claim === 'Agent claimed 42 results' && c.resolution === 'resolved')
     )
     expect(initialReview).toBeDefined()
+    const reReview = reviews.find((review) => review.id !== initialReview?.id)
+    expect(reReview?.checks).toEqual([])
+    await expect(
+      repository.getFindingDispositions(initialReview!.checks[0]!.id)
+    ).resolves.toHaveLength(1)
 
     await client.$disconnect()
   })
@@ -630,7 +575,10 @@ describe('fix loop: cancellation', () => {
     expect(
       agentState.sessions.filter((session) => session.sessionId.startsWith('reviewer-session'))
     ).toHaveLength(1)
-    expect(review.checks[0]?.resolution).toBe('open')
+    expect(review.checks[0]?.resolution).toBe('unaddressed')
+    await expect(repository.getFindingDispositions(review.checks[0]!.id)).resolves.toMatchObject([
+      { trigger: 'aborted', outcome: 'unaddressed' }
+    ])
 
     await client.$disconnect()
   })

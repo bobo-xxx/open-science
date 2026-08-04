@@ -51,15 +51,18 @@ describe('workspace page component boundaries', () => {
     expect(appSource).toContain(
       "import { useSessionPersistence } from '@/lib/session-persistence/session-persistence'"
     )
-    expect(appSource).toContain('const isSessionPersistenceReady = useSessionPersistence()')
+    expect(appSource).toContain('const sessionPersistence = useSessionPersistence()')
+    expect(appSource).toContain('const isSessionPersistenceReady = sessionPersistence.isReady')
     expect(appSource).toContain('isSessionPersistenceReady={isSessionPersistenceReady}')
 
     expect(workspacePageSource).toContain('isSessionPersistenceReady')
     expect(workspacePageSource).toContain('isSessionPersistenceReady &&')
     expect(workspacePageSource).toContain('canCreateConversation={isSessionPersistenceReady}')
+    expect(workspacePageSource).toContain('canMutateConversations={isSessionPersistenceReady}')
     expect(workspacePageSource).toContain('canEditDraft={canEditDraft}')
     expect(workspacePageSource).toContain('if (!isSessionPersistenceReady) return')
     expect(workspaceSidebarSource).toContain('disabled={!canCreateConversation}')
+    expect(workspaceSidebarSource).toContain('disabled={!canMutateConversations}')
     expect(conversationPanelSource).toContain('disabled={!canEditDraft}')
   })
 
@@ -101,15 +104,6 @@ describe('workspace page component boundaries', () => {
 
     expect(workspaceSidebarSource).toContain('aria-hidden="true"')
     expect(workspaceSidebarSource).not.toContain('aria-label={`Session status: ${session.status}`}')
-  })
-
-  it('shows the session title in destructive delete confirmation copy', () => {
-    const deleteSessionDialogSource = readFileSync(
-      resolve(__dirname, 'DeleteSessionDialog.tsx'),
-      'utf8'
-    )
-
-    expect(deleteSessionDialogSource).toContain('{session?.title}')
   })
 
   it('uses workspace style tokens instead of migrated hardcoded colors', () => {
@@ -182,6 +176,17 @@ describe('workspace page component boundaries', () => {
     expect(mainCssSource).toContain('--always-black:')
   })
 
+  it('registers the semantic chart tokens used by the response Usage breakdown', () => {
+    const mainCssSource = readFileSync(resolve(__dirname, '../../assets/main.css'), 'utf8')
+    const messageItemSource = readFileSync(workspaceMessageItemPath, 'utf8')
+
+    for (const token of ['chart-1', 'chart-2', 'chart-3', 'chart-4']) {
+      expect(messageItemSource).toContain(`bg-${token}`)
+      expect(mainCssSource).toContain(`--color-${token}: var(--${token});`)
+      expect(mainCssSource.match(new RegExp(`--${token}:`, 'g'))).toHaveLength(2)
+    }
+  })
+
   it('uses the shared primary token for every workspace emphasis state', () => {
     const emphasisSources = [
       conversationPanelPath,
@@ -200,6 +205,27 @@ describe('workspace page component boundaries', () => {
     expect(`${mainCssSource}\n${emphasisSources}`).not.toContain(deprecatedActionToken)
     expect(emphasisSources).toContain('bg-primary')
     expect(emphasisSources).toContain('text-primary')
+  })
+
+  it('keeps first-batch workspace dialogs on the settings dialog chrome', () => {
+    const renameSource = readFileSync(resolve(__dirname, 'RenameSessionDialog.tsx'), 'utf8')
+    const deleteSource = readFileSync(resolve(__dirname, 'DeleteSessionDialog.tsx'), 'utf8')
+    const notebookSource = readFileSync(resolve(__dirname, 'SessionNotebookDialog.tsx'), 'utf8')
+
+    for (const source of [renameSource, notebookSource]) {
+      expect(source).toContain('dialogOverlayClassName')
+      expect(source).toContain('dialogPanelClassName')
+      expect(source).toContain('onInteractOutside={(event) => event.preventDefault()}')
+      expect(source).not.toContain('backdrop-blur')
+    }
+
+    expect(deleteSource).toContain('dialogOverlayClassName')
+    expect(deleteSource).toContain('dialogPanelClassName')
+    expect(deleteSource).toContain('AlertDialog.Root')
+    expect(deleteSource).not.toContain('backdrop-blur')
+
+    expect(notebookSource).toContain('dialogPanelClassName(')
+    expect(notebookSource).toContain('w-[calc(100%-2rem)] max-w-5xl')
   })
 })
 
@@ -259,9 +285,10 @@ describe('conversation message scroller integration', () => {
     const workspaceMessageItemSource = readFileSync(workspaceMessageItemPath, 'utf8')
     const workspaceMessageScrollerSource = readFileSync(workspaceMessageScrollerPath, 'utf8')
 
-    expect(workspaceMessageItemSource).toContain(
-      'className="group flex items-center justify-end gap-1"'
-    )
+    expect(workspaceMessageItemSource).toContain('className="group flex flex-col items-end"')
+    expect(workspaceMessageItemSource).toContain('data-slot="user-bubble-row"')
+    expect(workspaceMessageItemSource).toContain('data-slot="user-message-actions"')
+    expect(workspaceMessageItemSource).toContain('data-slot="user-message-footer"')
     expect(workspaceMessageItemSource).toContain(
       "'max-w-[90%] break-words rounded-2xl bg-bg-300 px-3.5 py-2 text-sm text-message-user-text md:max-w-[min(85%,56rem)] md:px-4 md:py-2.5 md:text-[15px]'"
     )
@@ -285,7 +312,9 @@ describe('conversation message scroller integration', () => {
     expect(conversationPanelSource).toContain('bg-bg-10')
     expect(conversationPanelSource).toContain('composerContentClassName')
     expect(conversationPanelSource).toContain('mx-auto w-full max-w-4xl')
-    expect(conversationPanelSource).toContain('px-4 pb-2')
+    expect(conversationPanelSource).toContain(
+      'px-2 pb-[max(env(safe-area-inset-bottom),0.5rem)] md:px-4 md:pb-2'
+    )
     expect(conversationPanelSource).toContain('px-1 md:px-3')
     expect(workspaceMessageScrollerSource).toContain('bg-bg-10')
     expect(workspaceMessageScrollerSource).toContain('pb-[56px]')
@@ -305,17 +334,19 @@ describe('conversation message scroller integration', () => {
   it('keeps permission prompts constrained to the conversation content width', () => {
     const permissionApprovalControlsSource = readFileSync(permissionApprovalControlsPath, 'utf8')
 
+    // Outer container maintains width constraints (overflow-visible so the scope dropdown is not clipped)
     expect(permissionApprovalControlsSource).toContain(
-      'className="mb-2 w-full max-w-full space-y-2 overflow-hidden rounded-lg'
+      'className="mb-2 flex w-full max-w-full flex-col gap-3 rounded-xl border border-border bg-card'
     )
+    // Header maintains min-w-0 for text truncation
     expect(permissionApprovalControlsSource).toContain(
-      'className="flex min-w-0 flex-col items-stretch gap-2 overflow-hidden"'
+      'className="flex min-w-0 items-center gap-2"'
     )
+    // Code block uses WorkspaceToolCodeBlock with max-height constraint
+    expect(permissionApprovalControlsSource).toContain('WorkspaceToolCodeBlock')
+    // Button row maintains layout constraints
     expect(permissionApprovalControlsSource).toContain(
-      'max-h-48 min-w-0 flex-1 overflow-auto whitespace-pre-wrap break-words'
-    )
-    expect(permissionApprovalControlsSource).toContain(
-      'className="flex flex-wrap items-center justify-end gap-1 w-full overflow-hidden"'
+      'className="flex flex-wrap items-center justify-end gap-2"'
     )
   })
 
@@ -393,7 +424,9 @@ describe('conversation message scroller integration', () => {
     expect(workspaceActivityGroupSource).toContain('data-testid="tool-group"')
     expect(workspaceActivityGroupSource).toContain('data-testid="tool-group-header"')
     expect(workspaceActivityGroupSource).toContain('<WorkspaceWebSearchActivityRow')
-    expect(workspaceActivityGroupSource).toContain('formatActivityGroupTitle(group.activities)')
+    expect(workspaceActivityGroupSource).toContain(
+      'formatActivityGroupTitle(group.activities, group.title)'
+    )
     expect(workspaceActivityGroupSource).toContain('getRenderableActivityEntries(group.activities)')
     expect(workspaceWebSearchActivityRowSource).toContain('const WorkspaceWebSearchActivityRow')
     expect(workspaceWebSearchActivityRowSource).toContain('<WorkspaceToolActivityRowButton')
@@ -505,135 +538,7 @@ describe('conversation composer editor integration', () => {
   })
 })
 
-describe('preview workbench integration', () => {
-  // The workspace shell owns the resizable panel ref while preview state stays in the workbench store.
-  it('wires preview open requests to the right resizable panel', () => {
-    const workspacePageSource = readFileSync(workspacePagePath, 'utf8')
-
-    expect(workspacePageSource).toContain('usePreviewWorkbenchStore')
-    expect(workspacePageSource).toContain("from '@/stores/preview-workbench-store'")
-    expect(workspacePageSource).toContain(
-      "import type { PanelImperativeHandle, PanelSize } from 'react-resizable-panels'"
-    )
-    expect(workspacePageSource).toContain(
-      'const previewPanelRef = useRef<PanelImperativeHandle | null>(null)'
-    )
-    expect(workspacePageSource).toContain(
-      'const previewOpenRequestVersion = usePreviewWorkbenchStore((state) => state.openRequestVersion)'
-    )
-    expect(workspacePageSource).toContain("import { animate } from 'motion'")
-    expect(workspacePageSource).toContain('animatePreviewPanelSize')
-    expect(workspacePageSource).toContain('panelRef={previewPanelRef}')
-    expect(workspacePageSource).toContain('onResize={syncPreviewPanelResize}')
-    expect(workspacePageSource).toContain("disabled={previewPanelState === 'collapsed'}")
-    expect(workspacePageSource).toContain("aria-hidden={previewPanelState === 'collapsed'}")
-  })
-
-  it('sizes the conversation and preview split by percentages', () => {
-    const workspacePageSource = readFileSync(workspacePagePath, 'utf8')
-    const conversationPanelSource = readFileSync(conversationPanelPath, 'utf8')
-    const previewPanelSource = readFileSync(resolve(__dirname, 'PreviewPanel.tsx'), 'utf8')
-
-    expect(workspacePageSource).toContain(
-      'panelSize.asPercentage <= PREVIEW_PANEL_COLLAPSED_THRESHOLD'
-    )
-    expect(conversationPanelSource).toContain('defaultSize="60%"')
-    expect(conversationPanelSource).toContain('minSize="30%"')
-    expect(conversationPanelSource).not.toContain('minSize="520px"')
-    expect(workspacePageSource).toContain(
-      'const PREVIEW_PANEL_MIN_OPEN_SIZE_CSS = `${PREVIEW_PANEL_MIN_OPEN_SIZE}%`'
-    )
-    expect(workspacePageSource).toContain(
-      'const PREVIEW_PANEL_DEFAULT_SIZE_CSS = `${PREVIEW_PANEL_DEFAULT_SIZE}%`'
-    )
-    expect(workspacePageSource).toContain(
-      'const PREVIEW_PANEL_COLLAPSED_SIZE_CSS = `${PREVIEW_PANEL_COLLAPSED_SIZE}%`'
-    )
-    expect(previewPanelSource).toContain('defaultSize={defaultSize}')
-    expect(previewPanelSource).toContain('minSize={minSize}')
-    expect(previewPanelSource).toContain('collapsedSize="0%"')
-    expect(previewPanelSource).not.toContain('maxSize=')
-    expect(previewPanelSource).not.toContain('preserve-pixel-size')
-  })
-
-  it('animates panel expand and collapse through percentage resize', () => {
-    const workspacePageSource = readFileSync(workspacePagePath, 'utf8')
-
-    expect(workspacePageSource).toContain('panel.resize(`${Number(size.toFixed(3))}%`)')
-    expect(workspacePageSource).toContain('onUpdate: resizePanel')
-    expect(workspacePageSource).toContain('prefersReducedMotion')
-    expect(workspacePageSource).toContain(
-      'const PREVIEW_PANEL_ANIMATING_MIN_SIZE = PREVIEW_PANEL_COLLAPSED_SIZE_CSS'
-    )
-    expect(workspacePageSource).toContain('hasSyncedInitialPreviewPanelSizeRef')
-  })
-
-  // Notebook availability is pushed by the main process after the agent first calls notebook MCP.
-  it('promotes agent notebook availability into a composer entry without auto-opening preview', () => {
-    const workspacePageSource = readFileSync(workspacePagePath, 'utf8')
-    const conversationPanelSource = readFileSync(conversationPanelPath, 'utf8')
-
-    expect(workspacePageSource).toContain('window.api.notebook.onAvailable')
-    expect(workspacePageSource).toContain('setNotebookReferences')
-    expect(workspacePageSource).toContain('upsertPreviewItem(createNotebookPreviewItem(notebook))')
-    expect(workspacePageSource).toContain(
-      'upsertAndActivatePreviewItem(createNotebookPreviewItem(notebook))'
-    )
-    expect(workspacePageSource).toContain('notebookReference={activeNotebookReference}')
-    expect(workspacePageSource).toContain('onOpenNotebook={openNotebookPreview}')
-    expect(conversationPanelSource).toContain('notebookReference: NotebookSessionReference')
-    expect(conversationPanelSource).toContain(
-      'onOpenNotebook: (notebook: NotebookSessionReference)'
-    )
-    expect(conversationPanelSource).toContain('aria-label="Open notebook"')
-    expect(conversationPanelSource).toContain('<BookOpen')
-  })
-
-  // The conversation title exposes the only always-visible manual panel toggle.
-  it('puts the preview panel toggle at the right edge of the conversation title', () => {
-    const conversationPanelSource = readFileSync(conversationPanelPath, 'utf8')
-
-    expect(conversationPanelSource).toContain('PanelRight')
-    expect(conversationPanelSource).toContain('isPreviewPanelCollapsed: boolean')
-    expect(conversationPanelSource).toContain('onTogglePreviewPanel: () => void')
-    expect(conversationPanelSource).toContain('aria-controls="right-panel"')
-    expect(conversationPanelSource).toContain(
-      "aria-label={isPreviewPanelCollapsed ? 'Expand preview panel' : 'Collapse preview panel'}"
-    )
-    expect(conversationPanelSource).toContain('<PanelRight')
-    expect(conversationPanelSource).toContain("'text-action-panel-toggle' : 'text-primary'")
-    expect(conversationPanelSource).toContain('fill="none"')
-  })
-
-  // The right panel uses react-resizable-panels collapse semantics instead of conditional rendering.
-  it('configures the preview panel as a collapsible resizable panel', () => {
-    const previewPanelSource = readFileSync(resolve(__dirname, 'PreviewPanel.tsx'), 'utf8')
-
-    expect(previewPanelSource).toContain(
-      "import type { PanelImperativeHandle, PanelSize } from 'react-resizable-panels'"
-    )
-    expect(previewPanelSource).toContain('panelRef: React.Ref<PanelImperativeHandle>')
-    expect(previewPanelSource).toContain('defaultSize: string')
-    expect(previewPanelSource).toContain('minSize: string')
-    expect(previewPanelSource).toContain(
-      'onResize: (panelSize: PanelSize, previousPanelSize: PanelSize | undefined) => void'
-    )
-    expect(previewPanelSource).toContain('panelRef={panelRef}')
-    expect(previewPanelSource).toContain('collapsible')
-    expect(previewPanelSource).toContain('collapsedSize="0%"')
-    expect(previewPanelSource).toContain('onResize={handleResize}')
-    expect(previewPanelSource).toContain(
-      "import { PreviewFileContent } from './previews/PreviewFileContent'"
-    )
-    expect(previewPanelSource).toContain(
-      "import { PreviewToolContent } from './previews/PreviewToolContent'"
-    )
-    expect(previewPanelSource).toContain(
-      "if (item.type === 'tool') return <PreviewToolContent item={item} />"
-    )
-    expect(previewPanelSource).toContain('<PreviewFileContent item={item} />')
-  })
-
+describe('notebook preview integration', () => {
   // The notebook pane renders shared execution history while user code enters through terminal input.
   it('renders notebook preview as history plus terminal input without toolbar run controls', () => {
     const notebookPreviewSource = readFileSync(resolve(__dirname, 'NotebookPreview.tsx'), 'utf8')

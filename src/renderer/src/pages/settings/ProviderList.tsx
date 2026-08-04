@@ -1,9 +1,11 @@
 import {
   CircleCheck,
+  KeyRound,
   LogIn,
   LogOut,
   Pencil,
   PlugZap,
+  RefreshCw,
   Route,
   TriangleAlert,
   Trash2,
@@ -12,14 +14,18 @@ import {
 
 import type {
   ChatApiEndpoint,
+  ClaudeSubscriptionProviderId,
   ProviderValidationFailure,
   ProviderView
 } from '../../../../shared/settings'
 import {
   codexSubscriptionProviderIdentity,
+  isClaudeSubscriptionProvider,
   isCodexSubscriptionProvider,
   providerEndpoints,
-  providerValidationFailed
+  providerValidationFailed,
+  resolveCodexSubscriptionType,
+  selectClaudeSubscriptionProvider
 } from '../../../../shared/settings'
 import { getOfficialVendor } from '../../../../shared/provider-registry'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
@@ -32,6 +38,7 @@ type ProviderListProps = {
   // Provider that sources the currently selected model. Not shown as an "active provider"; used only
   // to keep the in-use provider from being deleted (which would leave no selectable model).
   activeProviderId: string | undefined
+  claudeSubscriptionProviderId?: ClaudeSubscriptionProviderId
   busyProviderId?: string
   onEdit: (provider: ProviderView) => void
   onDelete: (provider: ProviderView) => void
@@ -41,6 +48,23 @@ type ProviderListProps = {
   onCancelCodexLogin?: () => void
   onLoginIsolatedCodex?: () => void
   onLogoutIsolatedCodex?: () => void
+  onReimportCodexAuthentication?: (provider: ProviderView) => void
+  // Claude subscription's browser OAuth sign-in (shared mode): opens the browser and lands
+  // credentials in ~/.claude. Mirrors the codex-isolated flow shape.
+  isClaudeSharedLoginPending?: boolean
+  onLoginSharedClaude?: () => void
+  onCancelSharedClaudeLogin?: () => void
+  onLogoutSharedClaude?: () => void
+  // Claude subscription's isolated mode. The primary sign-in (onLoginIsolatedClaude) is a browser
+  // OAuth: the app runs `claude setup-token` under the isolated config dir, which opens the browser
+  // and returns the token — mirroring the codex-isolated flow, so it carries a pending flag and a
+  // cancel affordance. onLoginIsolatedClaudePaste is the fallback that opens the manual paste modal
+  // for users who prefer to mint and paste the token themselves.
+  isClaudeIsolatedLoginPending?: boolean
+  onLoginIsolatedClaude?: () => void
+  onCancelIsolatedClaudeLogin?: () => void
+  onLoginIsolatedClaudePaste?: () => void
+  onLogoutIsolatedClaude?: () => void
 }
 
 // Concise, actionable reason for a failed connection test, shown on the unverified warning.
@@ -61,6 +85,11 @@ const describeValidationFailure = (failure: ProviderValidationFailure): string =
     case 'incompatible':
       // The pairing, not the credential, is the problem — carry the specific route-mismatch reason.
       return failure.message ?? 'Not compatible with the active agent framework.'
+    case 'server-error':
+      // Gateway or upstream service temporarily unavailable — surface the specific error when present.
+      return failure.message
+        ? `Test failed: ${failure.message}${failure.status ? ` (HTTP ${failure.status})` : ''}`
+        : 'Test failed: the gateway or upstream service is temporarily unavailable.'
     default:
       return failure.message ? `Test failed: ${failure.message}` : 'Connection test failed.'
   }
@@ -79,7 +108,8 @@ const ENDPOINT_PATHS: Record<ChatApiEndpoint, string> = {
 // Human label for a provider type badge: the vendor name for official providers, else a type name.
 const describeType = (provider: ProviderView): string => {
   if (provider.type === 'custom') return 'Custom'
-  if (provider.type === 'claude-default') return 'Local Claude'
+  if (provider.type === 'claude-isolated' || provider.type === 'claude-shared')
+    return 'Claude subscription'
   if (isCodexSubscriptionProvider(provider.type)) return codexSubscriptionProviderIdentity().name
 
   return provider.vendorId
@@ -93,6 +123,7 @@ const describeType = (provider: ProviderView): string => {
 const ProviderList = ({
   providers,
   activeProviderId,
+  claudeSubscriptionProviderId,
   busyProviderId,
   onEdit,
   onDelete,
@@ -100,7 +131,17 @@ const ProviderList = ({
   isCodexLoginPending = false,
   onCancelCodexLogin,
   onLoginIsolatedCodex,
-  onLogoutIsolatedCodex
+  onLogoutIsolatedCodex,
+  onReimportCodexAuthentication,
+  isClaudeSharedLoginPending = false,
+  onLoginSharedClaude,
+  onCancelSharedClaudeLogin,
+  onLogoutSharedClaude,
+  isClaudeIsolatedLoginPending = false,
+  onLoginIsolatedClaude,
+  onCancelIsolatedClaudeLogin,
+  onLoginIsolatedClaudePaste,
+  onLogoutIsolatedClaude
 }: ProviderListProps): React.JSX.Element => {
   if (providers.length === 0) {
     return (
@@ -113,11 +154,24 @@ const ProviderList = ({
   const codexProviders = providers.filter((provider) => isCodexSubscriptionProvider(provider.type))
   const selectedCodexProvider =
     codexProviders.find((provider) => provider.id === activeProviderId) ?? codexProviders[0]
+
+  // Collapse both Claude subscription modes into one card while remembering the last configured mode
+  // even when another provider currently supplies the selected model.
+  const selectedClaudeProvider = selectClaudeSubscriptionProvider(
+    providers,
+    activeProviderId,
+    claudeSubscriptionProviderId
+  )
+
   const displayedProviders = [
-    ...providers.filter((provider) => !isCodexSubscriptionProvider(provider.type)),
+    ...providers.filter(
+      (provider) =>
+        !isCodexSubscriptionProvider(provider.type) && !isClaudeSubscriptionProvider(provider.type)
+    ),
     ...(selectedCodexProvider
       ? [{ ...selectedCodexProvider, name: codexSubscriptionProviderIdentity().name }]
-      : [])
+      : []),
+    ...(selectedClaudeProvider ? [{ ...selectedClaudeProvider, name: 'Claude subscription' }] : [])
   ]
 
   return (
@@ -134,6 +188,9 @@ const ProviderList = ({
           // A passing test shows a green check. Suppressed while a test is in flight.
           const isVerified = !failure && !isBusy && provider.lastValidatedAt !== undefined
           const isCodexSubscription = isCodexSubscriptionProvider(provider.type)
+          const codexSubscriptionType = isCodexSubscription
+            ? resolveCodexSubscriptionType(provider)
+            : undefined
           // The provider sourcing the selected model (and the last remaining one) can't be deleted:
           // removing it would leave no model to run, so its delete action stays disabled.
           const canDelete = !isActiveSource && displayedProviders.length > 1
@@ -212,13 +269,40 @@ const ProviderList = ({
                     ) : null}
                   </div>
                   <div className="mt-1 space-y-0.5 text-xs text-muted-foreground">
-                    {provider.type === 'codex-shared' ? (
-                      <div>Uses your existing Codex profile · Managed by Codex CLI</div>
-                    ) : provider.type === 'codex-isolated' ? (
+                    {codexSubscriptionType === 'codex-shared' ? (
+                      <div>Authentication imported into Open Science</div>
+                    ) : codexSubscriptionType === 'codex-isolated' ? (
                       <div>Codex login stored separately by Open Science</div>
-                    ) : provider.type === 'claude-default' ? (
-                      // Local Claude reuses the machine's own auth: show only the model (never a key).
-                      <div className="truncate">Model: {provider.model || 'default'}</div>
+                    ) : provider.type === 'claude-isolated' && isClaudeIsolatedLoginPending ? (
+                      // Browser sign-in in flight. `claude setup-token` opens the browser itself and
+                      // waits on a localhost callback; when the browser fails to open it stays silent
+                      // (no fallback URL), so tell the user the escape hatch up front: cancel and paste
+                      // a setup token instead. Without this line a stuck login looks like a hang.
+                      <div>
+                        Opening your browser to sign in… Didn&apos;t open? Cancel and use a setup
+                        token.
+                      </div>
+                    ) : provider.type === 'claude-isolated' ? (
+                      // The Claude subscription card carries an OAuth token, so we surface the masked
+                      // hint the same way custom/official providers do (no Keychain leak). The
+                      // signed in / signed out framing belongs to the card icon, not this line. The
+                      // "Expires" line is the issue #347 requirement to make the one-year
+                      // setup-token lifetime visible on the card.
+                      provider.maskedKey ? (
+                        <>
+                          <div className="font-mono">Token: {provider.maskedKey}</div>
+                          {provider.expiresAt !== undefined ? (
+                            <div>
+                              Expires{' '}
+                              <time dateTime={new Date(provider.expiresAt).toISOString()}>
+                                {new Date(provider.expiresAt).toLocaleDateString()}
+                              </time>
+                            </div>
+                          ) : null}
+                        </>
+                      ) : (
+                        <div>Not signed in</div>
+                      )
                     ) : (
                       // custom + official both authenticate with a key; official's models come from its
                       // catalog (shown as a count) rather than a single stored model.
@@ -245,13 +329,18 @@ const ProviderList = ({
                   </div>
                 </div>
                 <div className="flex shrink-0 items-center gap-1.5">
-                  {provider.type === 'codex-isolated' && isCodexLoginPending ? (
+                  {isCodexSubscription && isCodexLoginPending ? (
                     <SettingsIconAction
                       label="Cancel sign-in"
                       icon={X}
                       onClick={() => onCancelCodexLogin?.()}
                       className="border border-border text-foreground"
                     />
+                  ) : (provider.type === 'claude-isolated' && isClaudeIsolatedLoginPending) ||
+                    (provider.type === 'claude-shared' && isClaudeSharedLoginPending) ? (
+                    // Browser sign-in in flight: the Cancel affordance lives in the sign-in group
+                    // below, so suppress the Test button here to avoid a confusing mid-login test.
+                    <></>
                   ) : (
                     <SettingsIconAction
                       label={isCodexSubscription ? 'Check Codex login' : 'Test connection'}
@@ -261,7 +350,18 @@ const ProviderList = ({
                       className="border border-border text-foreground"
                     />
                   )}
-                  {provider.type === 'codex-isolated' && !isVerified && !isCodexLoginPending ? (
+                  {codexSubscriptionType === 'codex-shared' && !isCodexLoginPending ? (
+                    <SettingsIconAction
+                      label="Re-import Codex login"
+                      icon={RefreshCw}
+                      onClick={() => onReimportCodexAuthentication?.(provider)}
+                      disabled={isBusy}
+                      className="border border-border text-foreground"
+                    />
+                  ) : null}
+                  {codexSubscriptionType === 'codex-isolated' &&
+                  !isVerified &&
+                  !isCodexLoginPending ? (
                     <SettingsIconAction
                       label="Sign in"
                       icon={LogIn}
@@ -270,11 +370,78 @@ const ProviderList = ({
                       className="border border-border text-foreground"
                     />
                   ) : null}
-                  {provider.type === 'codex-isolated' && isVerified ? (
+                  {codexSubscriptionType === 'codex-isolated' && isVerified ? (
                     <SettingsIconAction
                       label="Sign out"
                       icon={LogOut}
                       onClick={() => onLogoutIsolatedCodex?.()}
+                      className="border border-border text-foreground"
+                    />
+                  ) : null}
+                  {provider.type === 'claude-isolated' &&
+                  !isVerified &&
+                  !isClaudeIsolatedLoginPending ? (
+                    <>
+                      <SettingsIconAction
+                        label="Sign in with browser"
+                        icon={LogIn}
+                        onClick={() => onLoginIsolatedClaude?.()}
+                        disabled={isBusy}
+                        className="border border-border text-foreground"
+                      />
+                      <SettingsIconAction
+                        label="Use setup token"
+                        icon={KeyRound}
+                        onClick={() => onLoginIsolatedClaudePaste?.()}
+                        disabled={isBusy}
+                        className="border border-border text-foreground"
+                      />
+                    </>
+                  ) : null}
+                  {provider.type === 'claude-isolated' && isClaudeIsolatedLoginPending ? (
+                    <SettingsIconAction
+                      label="Cancel sign-in"
+                      icon={X}
+                      onClick={() => onCancelIsolatedClaudeLogin?.()}
+                      className="border border-border text-foreground"
+                    />
+                  ) : null}
+                  {provider.type === 'claude-isolated' && isVerified ? (
+                    <SettingsIconAction
+                      label="Sign out"
+                      icon={LogOut}
+                      onClick={() => onLogoutIsolatedClaude?.()}
+                      className="border border-border text-foreground"
+                    />
+                  ) : null}
+                  {provider.type === 'claude-shared' &&
+                  !isVerified &&
+                  isClaudeSharedLoginPending ? (
+                    // Browser sign-in in flight: swap to Cancel so the user can back out of a login
+                    // that won't complete, mirroring codex-isolated (and the OpenAI subscription).
+                    <SettingsIconAction
+                      label="Cancel sign-in"
+                      icon={X}
+                      onClick={() => onCancelSharedClaudeLogin?.()}
+                      className="border border-border text-foreground"
+                    />
+                  ) : null}
+                  {provider.type === 'claude-shared' &&
+                  !isVerified &&
+                  !isClaudeSharedLoginPending ? (
+                    <SettingsIconAction
+                      label="Sign in with browser"
+                      icon={LogIn}
+                      onClick={() => onLoginSharedClaude?.()}
+                      disabled={isBusy}
+                      className="border border-border text-foreground"
+                    />
+                  ) : null}
+                  {provider.type === 'claude-shared' && isVerified ? (
+                    <SettingsIconAction
+                      label="Disconnect from Open Science"
+                      icon={LogOut}
+                      onClick={() => onLogoutSharedClaude?.()}
                       className="border border-border text-foreground"
                     />
                   ) : null}

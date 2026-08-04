@@ -1,4 +1,4 @@
-import { useReviewStore } from '@/stores/review-store'
+import { selectProjectSessionReviews, useReviewStore } from '@/stores/review-store'
 import { useNavigationStore } from '@/stores/navigation-store'
 import type { PreviewToolItem } from '@/stores/preview-workbench-store'
 
@@ -11,12 +11,19 @@ const isNotebookPreviewItem = (item: PreviewToolItem): item is NotebookPreviewIt
   item.toolKind === 'notebook' && Boolean(item.notebook)
 
 // Renders the Session reviewer panel from persisted review data for the tool item's session.
-const SessionReviewerContent = ({ item }: { item: PreviewToolItem }): React.JSX.Element | null => {
+const SessionReviewerContent = ({
+  item,
+  projectId
+}: {
+  item: PreviewToolItem
+  projectId?: string
+}): React.JSX.Element | null => {
   const sessionId = item.reviewerSessionId ?? ''
-  const getReviewsForSession = useReviewStore((state) => state.getReviewsForSession)
+  const reviews = useReviewStore((state) =>
+    selectProjectSessionReviews(state.reviewsBySession, projectId, sessionId)
+  )
   // Select the review the finding actually points at; fall back to the newest when the item carries
   // no reviewId (e.g. a session-level entry point) or that review is gone.
-  const reviews = getReviewsForSession(sessionId)
   const review = reviews.find((r) => r.id === item.reviewerReviewId) ?? reviews[0]
 
   if (!review) {
@@ -42,7 +49,9 @@ export const PreviewToolContent = ({
     return <ProjectFilesView key={activeProjectId ?? 'no-active-project'} />
   }
 
-  if (item.toolKind === 'reviewer') return <SessionReviewerContent item={item} />
+  if (item.toolKind === 'reviewer') {
+    return <SessionReviewerContent item={item} projectId={activeProjectId} />
+  }
 
   if (!isNotebookPreviewItem(item)) return null
 

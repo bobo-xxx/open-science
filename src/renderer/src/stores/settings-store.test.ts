@@ -33,11 +33,21 @@ type SettingsApi = {
   setAgentFramework: ReturnType<typeof vi.fn>
   setReasoningEffort: ReturnType<typeof vi.fn>
   setNotificationsEnabled: ReturnType<typeof vi.fn>
+  setConversationSkillImportEnabled: ReturnType<typeof vi.fn>
+  setClosePreference: ReturnType<typeof vi.fn>
+  setAppIconVariant: ReturnType<typeof vi.fn>
   upsertProvider: ReturnType<typeof vi.fn>
   validateProvider: ReturnType<typeof vi.fn>
   cancelCodexLogin: ReturnType<typeof vi.fn>
   loginIsolatedCodex: ReturnType<typeof vi.fn>
   logoutIsolatedCodex: ReturnType<typeof vi.fn>
+  cancelClaudeLogin: ReturnType<typeof vi.fn>
+  loginSharedClaude: ReturnType<typeof vi.fn>
+  logoutSharedClaude: ReturnType<typeof vi.fn>
+  loginIsolatedClaude: ReturnType<typeof vi.fn>
+  loginIsolatedClaudeBrowser: ReturnType<typeof vi.fn>
+  cancelIsolatedClaudeLogin: ReturnType<typeof vi.fn>
+  logoutIsolatedClaude: ReturnType<typeof vi.fn>
   refreshProviderModels: ReturnType<typeof vi.fn>
   setActiveProvider: ReturnType<typeof vi.fn>
   deleteProvider: ReturnType<typeof vi.fn>
@@ -47,6 +57,8 @@ type SettingsApi = {
   importSkillZip: ReturnType<typeof vi.fn>
   importSkillZipBatch: ReturnType<typeof vi.fn>
   previewSkillZip: ReturnType<typeof vi.fn>
+  previewGitHubSkill: ReturnType<typeof vi.fn>
+  previewAgentHomeSkill: ReturnType<typeof vi.fn>
   listConnectors: ReturnType<typeof vi.fn>
   getConnectorDetail: ReturnType<typeof vi.fn>
   setConnectorEnabled: ReturnType<typeof vi.fn>
@@ -78,7 +90,9 @@ const snapshot = (providers: SettingsSnapshot['providers']): SettingsSnapshot =>
   opencodeManaged: false,
   codexManaged: false,
   reasoningEffort: 'default',
-  notificationsEnabled: true
+  notificationsEnabled: true,
+  conversationSkillImportEnabled: true,
+  appIconVariant: 'light'
 })
 
 const providerView = (id: string): SettingsSnapshot['providers'][number] => ({
@@ -146,11 +160,33 @@ beforeEach(() => {
       .mockImplementation((request: { enabled: boolean }) =>
         Promise.resolve({ ...snapshot([]), notificationsEnabled: request.enabled })
       ),
+    setConversationSkillImportEnabled: vi
+      .fn()
+      .mockImplementation((request: { enabled: boolean }) =>
+        Promise.resolve({ ...snapshot([]), conversationSkillImportEnabled: request.enabled })
+      ),
+    setClosePreference: vi
+      .fn()
+      .mockImplementation((request: { preference?: 'minimize' | 'quit' }) =>
+        Promise.resolve({ ...snapshot([]), closePreference: request.preference })
+      ),
+    setAppIconVariant: vi
+      .fn()
+      .mockImplementation((request: { variant: 'light' | 'dark' }) =>
+        Promise.resolve({ ...snapshot([]), appIconVariant: request.variant })
+      ),
     upsertProvider: vi.fn(),
     validateProvider: vi.fn(),
     cancelCodexLogin: vi.fn().mockResolvedValue(undefined),
     loginIsolatedCodex: vi.fn().mockResolvedValue({ ok: true, category: 'ok' }),
     logoutIsolatedCodex: vi.fn().mockResolvedValue(snapshot([])),
+    cancelClaudeLogin: vi.fn().mockResolvedValue(undefined),
+    loginSharedClaude: vi.fn().mockResolvedValue({ ok: true, category: 'ok' }),
+    logoutSharedClaude: vi.fn().mockResolvedValue({ ok: true, category: 'ok' }),
+    loginIsolatedClaude: vi.fn().mockResolvedValue({ ok: true, category: 'ok' }),
+    loginIsolatedClaudeBrowser: vi.fn().mockResolvedValue({ ok: true, category: 'ok' }),
+    cancelIsolatedClaudeLogin: vi.fn().mockResolvedValue(undefined),
+    logoutIsolatedClaude: vi.fn().mockResolvedValue({ ok: true, category: 'ok' }),
     refreshProviderModels: vi.fn(),
     setActiveProvider: vi.fn().mockImplementation((request: { id: string }) => {
       callLog.push(`setActive:${request.id}`)
@@ -165,6 +201,8 @@ beforeEach(() => {
     importSkillZip: vi.fn().mockResolvedValue({ status: 'imported', id: 'z', skills: [] }),
     importSkillZipBatch: vi.fn().mockResolvedValue({ results: [], skills: [] }),
     previewSkillZip: vi.fn().mockResolvedValue({ previews: [], skipped: [] }),
+    previewGitHubSkill: vi.fn(),
+    previewAgentHomeSkill: vi.fn(),
     listConnectors: vi
       .fn()
       .mockResolvedValue({ connectors: [], customServers: [], ncbi: { hasApiKey: false } }),
@@ -201,6 +239,7 @@ beforeEach(() => {
     })
   }
   ;(globalThis as { window?: unknown }).window = { api: { settings: api, acp } }
+  useSettingsStore.getState().clearSettingsWriteError()
   useSettingsStore.setState(createInitialSettingsState())
 })
 
@@ -363,6 +402,34 @@ describe('settings store: loginIsolatedCodex', () => {
   })
 })
 
+describe('settings store: Claude authentication', () => {
+  it.each([
+    ['loginSharedClaude', 'loginSharedClaude'],
+    ['loginIsolatedClaudeBrowser', 'loginIsolatedClaudeBrowser'],
+    ['logoutSharedClaude', 'logoutSharedClaude'],
+    ['logoutIsolatedClaude', 'logoutIsolatedClaude']
+  ] as const)('%s refreshes settings and preflight', async (storeMethod, apiMethod) => {
+    api.getSettings.mockResolvedValue(snapshot([providerView('claude-provider')]))
+
+    await useSettingsStore.getState()[storeMethod]()
+
+    expect(api[apiMethod]).toHaveBeenCalledOnce()
+    expect(api.getSettings).toHaveBeenCalledOnce()
+    expect(api.getPreflight).toHaveBeenCalledOnce()
+    expect(useSettingsStore.getState().providers).toHaveLength(1)
+  })
+
+  it('forwards a pasted token and refreshes settings and preflight', async () => {
+    api.getSettings.mockResolvedValue(snapshot([providerView('builtin-claude-isolated')]))
+
+    await useSettingsStore.getState().loginIsolatedClaude('sk-ant-test')
+
+    expect(api.loginIsolatedClaude).toHaveBeenCalledWith('sk-ant-test')
+    expect(api.getSettings).toHaveBeenCalledOnce()
+    expect(api.getPreflight).toHaveBeenCalledOnce()
+  })
+})
+
 describe('settings store: detectClaude refreshes npm', () => {
   it('re-checks npm availability so a mid-onboarding Node.js install is picked up', async () => {
     // Start from the "npm missing" state a genuine first run without Node.js would have.
@@ -417,6 +484,51 @@ describe('settings store: environment check', () => {
       runtime: { found: true, path: '/bin/claude' }
     })
     await first
+  })
+
+  it('starts a fresh same-framework check when the caller must observe a completed repair', async () => {
+    const staleResult: EnvironmentCheckResult = {
+      checkedAt: 10,
+      platform: 'darwin',
+      architecture: 'arm64',
+      checks: [
+        {
+          id: 'agent',
+          label: 'Claude runtime',
+          status: 'failed',
+          summary: 'Claude is missing.'
+        }
+      ],
+      ready: false,
+      canAutoInstall: true,
+      agentFrameworkId: 'claude-code',
+      runtime: { found: false }
+    }
+    const repairedResult: EnvironmentCheckResult = {
+      ...staleResult,
+      checkedAt: 20,
+      checks: [],
+      ready: true,
+      canAutoInstall: false,
+      runtime: { found: true, path: '/bin/claude' }
+    }
+    const resolvers: Array<(value: EnvironmentCheckResult) => void> = []
+    api.checkEnvironment.mockImplementation(
+      () => new Promise<EnvironmentCheckResult>((resolve) => resolvers.push(resolve))
+    )
+
+    const staleCheck = useSettingsStore.getState().checkEnvironment()
+    const repairCheck = useSettingsStore.getState().checkEnvironment({ force: true })
+
+    expect(api.checkEnvironment).toHaveBeenCalledTimes(2)
+
+    resolvers[1]?.(repairedResult)
+    await repairCheck
+    resolvers[0]?.(staleResult)
+    await staleCheck
+
+    expect(useSettingsStore.getState().environmentCheck?.checkedAt).toBe(20)
+    expect(useSettingsStore.getState().environmentCheck?.ready).toBe(true)
   })
 
   it('re-issues the check when the framework auto-switches mid-flight and does not stick on the stale result', async () => {
@@ -634,6 +746,92 @@ describe('settings store: onboarding completion', () => {
   })
 })
 
+describe('settings store: startup loading', () => {
+  it('deduplicates concurrent StrictMode startup loads', async () => {
+    let resolveSettings: ((value: SettingsSnapshot) => void) | undefined
+    api.getSettings.mockReturnValue(
+      new Promise<SettingsSnapshot>((resolve) => {
+        resolveSettings = resolve
+      })
+    )
+
+    const first = useSettingsStore.getState().load()
+    const duplicate = useSettingsStore.getState().load()
+
+    expect(duplicate).toBe(first)
+    expect(api.getSettings).toHaveBeenCalledOnce()
+    expect(api.getPreflight).toHaveBeenCalledOnce()
+    expect(api.isEncryptionAvailable).toHaveBeenCalledOnce()
+    expect(api.isNpmAvailable).toHaveBeenCalledOnce()
+
+    resolveSettings?.({ ...snapshot([]), onboardingCompletedAt: 111 })
+
+    await expect(first).resolves.toBe(true)
+    await expect(duplicate).resolves.toBe(true)
+    expect(useSettingsStore.getState()).toMatchObject({
+      onboardingCompletedAt: 111,
+      isLoaded: true,
+      isLoading: false,
+      loadError: undefined
+    })
+  })
+
+  it('keeps startup blocked after an IPC failure and recovers on retry', async () => {
+    const rawError = new Error(
+      'EACCES: /Users/private/.open-science/settings.json could not be read'
+    )
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    api.getPreflight.mockRejectedValueOnce(rawError)
+
+    await expect(useSettingsStore.getState().load()).resolves.toBe(false)
+    expect(useSettingsStore.getState()).toMatchObject({
+      isLoaded: false,
+      isLoading: false,
+      loadError: 'Open Science could not load settings. Retry to continue.'
+    })
+    expect(useSettingsStore.getState().loadError).not.toContain('/Users/private')
+    expect(warn).toHaveBeenCalledWith('Settings startup loading failed', rawError)
+
+    await expect(useSettingsStore.getState().load()).resolves.toBe(true)
+    expect(useSettingsStore.getState()).toMatchObject({
+      isLoaded: true,
+      isLoading: false,
+      loadError: undefined
+    })
+  })
+
+  it('keeps the newest retry result when an older load finishes later', async () => {
+    let resolveFirst: ((value: SettingsSnapshot) => void) | undefined
+    let resolveSecond: ((value: SettingsSnapshot) => void) | undefined
+    api.getSettings
+      .mockReturnValueOnce(
+        new Promise<SettingsSnapshot>((resolve) => {
+          resolveFirst = resolve
+        })
+      )
+      .mockReturnValueOnce(
+        new Promise<SettingsSnapshot>((resolve) => {
+          resolveSecond = resolve
+        })
+      )
+
+    const first = useSettingsStore.getState().load()
+    const second = useSettingsStore.getState().load({ force: true })
+
+    resolveSecond?.({ ...snapshot([]), onboardingCompletedAt: 222 })
+    await second
+    resolveFirst?.({ ...snapshot([]), onboardingCompletedAt: 111 })
+    await first
+
+    expect(useSettingsStore.getState()).toMatchObject({
+      onboardingCompletedAt: 222,
+      isLoaded: true,
+      isLoading: false,
+      loadError: undefined
+    })
+  })
+})
+
 describe('settings store: provider/model selection', () => {
   it('passes the chosen model to the IPC and caches activeModel', async () => {
     api.setActiveProvider.mockResolvedValue({
@@ -655,9 +853,75 @@ describe('settings store: provider/model selection', () => {
 
     expect(api.setActiveProvider).toHaveBeenCalledWith({ id: 'p1', model: undefined })
   })
+
+  it('clears an existing preference write error after the active provider saves', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    api.setReasoningEffort.mockRejectedValueOnce(new Error('reasoning unavailable'))
+
+    await useSettingsStore.getState().setReasoningEffort('high')
+    expect(useSettingsStore.getState().settingsWriteError).toBe(
+      'Could not save reasoning effort. Try again.'
+    )
+
+    await useSettingsStore.getState().setActiveProvider('p1', 'glm-4.7')
+
+    expect(useSettingsStore.getState().settingsWriteError).toBeUndefined()
+  })
+
+  it('records a safe write error and preserves rejection semantics when activation fails', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const ipcError = new Error('/Users/example/.open-science/settings.json is unavailable')
+    api.setActiveProvider.mockRejectedValueOnce(ipcError)
+
+    await expect(useSettingsStore.getState().setActiveProvider('p1', 'glm-4.7')).rejects.toBe(
+      ipcError
+    )
+
+    expect(useSettingsStore.getState().settingsWriteError).toBe(
+      'Could not switch active provider or model. Try again.'
+    )
+    expect(useSettingsStore.getState().settingsWriteError).not.toContain('/Users/example')
+    expect(consoleError).toHaveBeenCalledWith('Failed to set active provider', ipcError)
+  })
 })
 
 describe('selectProviderModelOptions', () => {
+  it('exposes only the preferred Claude subscription mode when both records exist', () => {
+    const options = selectProviderModelOptions(
+      [
+        {
+          id: 'builtin-claude-shared',
+          type: 'claude-shared',
+          name: 'Claude subscription',
+          models: [],
+          supportsImageInput: false,
+          hasKey: false,
+          needsKey: false
+        },
+        {
+          id: 'builtin-claude-isolated',
+          type: 'claude-isolated',
+          name: 'Claude subscription',
+          models: [],
+          supportsImageInput: false,
+          hasKey: true,
+          needsKey: false
+        }
+      ],
+      undefined,
+      'builtin-claude-isolated'
+    )
+
+    expect(options).toEqual([
+      {
+        providerId: 'builtin-claude-isolated',
+        providerName: 'Claude subscription',
+        providerType: 'claude-isolated',
+        model: ''
+      }
+    ])
+  })
+
   it('emits one option per catalog model for an official provider', () => {
     const options = selectProviderModelOptions([
       {
@@ -704,8 +968,9 @@ describe('selectProviderModelOptions', () => {
       },
       {
         id: 'local',
-        type: 'claude-default',
+        type: 'custom',
         name: 'Local',
+        model: undefined,
         models: [],
         supportsImageInput: false,
         hasKey: false,
@@ -716,7 +981,7 @@ describe('selectProviderModelOptions', () => {
     expect(options).toEqual([
       { providerId: 'c', providerName: 'GW', providerType: 'custom', model: 'm' },
       // A provider with no concrete model still yields one selectable "default" entry (empty model).
-      { providerId: 'local', providerName: 'Local', providerType: 'claude-default', model: '' }
+      { providerId: 'local', providerName: 'Local', providerType: 'custom', model: '' }
     ])
   })
 
@@ -821,6 +1086,64 @@ describe('settings store: openSettingsToSkill', () => {
   })
 })
 
+describe('settings store: openSettingsToSpecialist', () => {
+  it('opens the dialog on a specialist; consume and close both clear the pending id', () => {
+    useSettingsStore.getState().openSettingsToSpecialist('spc-1')
+    expect(useSettingsStore.getState().isSettingsOpen).toBe(true)
+    expect(useSettingsStore.getState().pendingSpecialistId).toBe('spc-1')
+
+    useSettingsStore.getState().consumePendingSpecialist()
+    expect(useSettingsStore.getState().pendingSpecialistId).toBeUndefined()
+
+    // Closing after a fresh open-to-specialist clears the pending id so a later open starts fresh.
+    useSettingsStore.getState().openSettingsToSpecialist('spc-2')
+    useSettingsStore.getState().closeSettings()
+    expect(useSettingsStore.getState().isSettingsOpen).toBe(false)
+    expect(useSettingsStore.getState().pendingSpecialistId).toBeUndefined()
+  })
+})
+
+describe('settings store: openSettingsToPanel', () => {
+  it('opens the requested panel and clears an unconsumed target on close', () => {
+    useSettingsStore.getState().openSettingsToPanel('storage')
+    expect(useSettingsStore.getState().isSettingsOpen).toBe(true)
+    expect(useSettingsStore.getState().pendingSettingsPanel).toBe('storage')
+
+    useSettingsStore.getState().closeSettings()
+    expect(useSettingsStore.getState().isSettingsOpen).toBe(false)
+    expect(useSettingsStore.getState().pendingSettingsPanel).toBeUndefined()
+  })
+})
+
+describe('settings store: skill import candidate previews', () => {
+  it('forwards renderer-safe GitHub and installed candidate identities', async () => {
+    const preview = {
+      name: 'Alpha',
+      description: 'Preview',
+      sourceLabel: 'source/alpha',
+      metadata: {},
+      body: '# Alpha',
+      files: ['SKILL.md']
+    }
+    api.previewGitHubSkill.mockResolvedValue(preview)
+    api.previewAgentHomeSkill.mockResolvedValue(preview)
+
+    await expect(
+      useSettingsStore
+        .getState()
+        .previewGitHubSkill('https://github.com/acme/skills/tree/main/alpha')
+    ).resolves.toBe(preview)
+    await expect(
+      useSettingsStore.getState().previewAgentHomeSkill({ source: 'agents', slug: 'alpha' })
+    ).resolves.toBe(preview)
+
+    expect(api.previewGitHubSkill).toHaveBeenCalledWith({
+      url: 'https://github.com/acme/skills/tree/main/alpha'
+    })
+    expect(api.previewAgentHomeSkill).toHaveBeenCalledWith({ source: 'agents', slug: 'alpha' })
+  })
+})
+
 describe('settings store: skill bundle upload', () => {
   it('previewSkillZip returns the importable previews plus any skipped skills', async () => {
     api.previewSkillZip.mockResolvedValue({
@@ -829,6 +1152,8 @@ describe('settings store: skill bundle upload', () => {
           subPath: 'skills/alpha',
           name: 'Alpha',
           description: '',
+          metadata: {},
+          body: '# Alpha',
           files: ['SKILL.md'],
           alreadyImported: false
         },
@@ -836,6 +1161,8 @@ describe('settings store: skill bundle upload', () => {
           subPath: 'skills/beta',
           name: 'Beta',
           description: '',
+          metadata: {},
+          body: '# Beta',
           files: ['SKILL.md'],
           alreadyImported: true
         }
@@ -1024,8 +1351,8 @@ describe('settings store: connectors slice', () => {
     useSettingsStore.getState().enqueueApproval(request)
     expect(useSettingsStore.getState().pendingApprovals).toHaveLength(1)
 
-    await useSettingsStore.getState().respondApproval('req-1', 'allow')
-    expect(api.respondConnectorApproval).toHaveBeenCalledWith({ id: 'req-1', decision: 'allow' })
+    await useSettingsStore.getState().respondApproval('req-1', 'once')
+    expect(api.respondConnectorApproval).toHaveBeenCalledWith({ id: 'req-1', decision: 'once' })
     expect(useSettingsStore.getState().pendingApprovals).toEqual([])
   })
 })
@@ -1061,6 +1388,34 @@ describe('settings store: setAgentFramework', () => {
       codex: { resolvedPath: '/bin/codex-acp', version: '1.1.4' },
       isDetectingCodex: false
     })
+  })
+
+  it('keeps the previous framework and exposes a visible failure when main rejects', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const ipcError = new Error('ipc down')
+    api.setAgentFramework.mockRejectedValue(ipcError)
+
+    await expect(useSettingsStore.getState().setAgentFramework('opencode')).rejects.toBe(ipcError)
+
+    expect(useSettingsStore.getState().agentFrameworkId).toBe('claude-code')
+    expect(useSettingsStore.getState().settingsWriteError).toBe(
+      'Could not switch agent framework. Try again.'
+    )
+    expect(consoleError).toHaveBeenCalledWith('Failed to switch agent framework', expect.any(Error))
+  })
+
+  it('does not report a saved framework as a write failure when live detection rejects', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    api.detectOpencode.mockRejectedValue(new Error('probe down'))
+
+    await useSettingsStore.getState().setAgentFramework('opencode')
+
+    expect(useSettingsStore.getState().agentFrameworkId).toBe('opencode')
+    expect(useSettingsStore.getState().settingsWriteError).toBeUndefined()
+    expect(consoleError).toHaveBeenCalledWith(
+      'Failed to refresh agent framework status',
+      expect.any(Error)
+    )
   })
 
   it('installs and uninstalls Codex through the shared runtime lifecycle', async () => {
@@ -1227,10 +1582,15 @@ describe('settings store: setAgentFramework', () => {
 
 describe('settings store: setReasoningEffort', () => {
   it('forwards the level to main and caches the returned snapshot', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    api.setNotificationsEnabled.mockRejectedValueOnce(new Error('notifications unavailable'))
+    await useSettingsStore.getState().setNotificationsEnabled(false)
+
     await useSettingsStore.getState().setReasoningEffort('high')
 
     expect(api.setReasoningEffort).toHaveBeenCalledWith({ effort: 'high' })
     expect(useSettingsStore.getState().reasoningEffort).toBe('high')
+    expect(useSettingsStore.getState().settingsWriteError).toBeUndefined()
   })
 
   it('applies the picked level optimistically before main confirms', async () => {
@@ -1252,13 +1612,140 @@ describe('settings store: setReasoningEffort', () => {
     expect(useSettingsStore.getState().reasoningEffort).toBe('max')
   })
 
-  it('reverts to the previous level and logs when main rejects', async () => {
+  it('surfaces an unrelated older write failure after a newer settings write succeeds', async () => {
+    let rejectReasoning: (reason?: unknown) => void = () => undefined
+    api.setReasoningEffort.mockImplementation(
+      () =>
+        new Promise<SettingsSnapshot>((_resolve, reject) => {
+          rejectReasoning = reject
+        })
+    )
+
+    const olderWrite = useSettingsStore.getState().setReasoningEffort('high')
+    await useSettingsStore.getState().setNotificationsEnabled(false)
+
+    rejectReasoning(new Error('stale failure'))
+    await olderWrite
+
+    expect(useSettingsStore.getState().settingsWriteError).toBe(
+      'Could not save reasoning effort. Try again.'
+    )
+  })
+
+  it('keeps a newer write failure when an older settings write succeeds later', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    let resolveReasoning: (value: SettingsSnapshot) => void = () => undefined
+    api.setReasoningEffort.mockImplementation(
+      () =>
+        new Promise<SettingsSnapshot>((resolve) => {
+          resolveReasoning = resolve
+        })
+    )
+    api.setNotificationsEnabled.mockRejectedValue(new Error('newer failure'))
+
+    const olderWrite = useSettingsStore.getState().setReasoningEffort('high')
+    await useSettingsStore.getState().setNotificationsEnabled(false)
+
+    resolveReasoning({ ...snapshot([]), reasoningEffort: 'high' })
+    await olderWrite
+
+    expect(useSettingsStore.getState().settingsWriteError).toBe(
+      'Could not save notification preference. Try again.'
+    )
+  })
+
+  it('retains failures from concurrent writes to different preferences', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    let rejectReasoning: (reason?: unknown) => void = () => undefined
+    let rejectNotifications: (reason?: unknown) => void = () => undefined
+    api.setReasoningEffort.mockImplementation(
+      () =>
+        new Promise<SettingsSnapshot>((_resolve, reject) => {
+          rejectReasoning = reject
+        })
+    )
+    api.setNotificationsEnabled.mockImplementation(
+      () =>
+        new Promise<SettingsSnapshot>((_resolve, reject) => {
+          rejectNotifications = reject
+        })
+    )
+
+    const reasoningWrite = useSettingsStore.getState().setReasoningEffort('high')
+    const notificationsWrite = useSettingsStore.getState().setNotificationsEnabled(false)
+
+    rejectNotifications(new Error('notifications unavailable'))
+    await notificationsWrite
+    rejectReasoning(new Error('reasoning unavailable'))
+    await reasoningWrite
+
+    expect(useSettingsStore.getState().settingsWriteError).toContain(
+      'Could not save notification preference. Try again.'
+    )
+    expect(useSettingsStore.getState().settingsWriteError).toContain(
+      'Could not save reasoning effort. Try again.'
+    )
+  })
+
+  it('ignores a stale failure from an older write to the same preference', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    api.setReasoningEffort
+      .mockRejectedValueOnce(new Error('stale failure'))
+      .mockResolvedValueOnce({ ...snapshot([]), reasoningEffort: 'max' })
+
+    const olderWrite = useSettingsStore.getState().setReasoningEffort('high')
+    const newerWrite = useSettingsStore.getState().setReasoningEffort('max')
+
+    await Promise.all([olderWrite, newerWrite])
+
+    expect(useSettingsStore.getState().reasoningEffort).toBe('max')
+    expect(useSettingsStore.getState().settingsWriteError).toBeUndefined()
+  })
+
+  it('restores the confirmed value when concurrent writes to the same preference both fail', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    api.setReasoningEffort
+      .mockRejectedValueOnce(new Error('older failure'))
+      .mockRejectedValueOnce(new Error('newer failure'))
+
+    const olderWrite = useSettingsStore.getState().setReasoningEffort('high')
+    const newerWrite = useSettingsStore.getState().setReasoningEffort('max')
+
+    await Promise.all([olderWrite, newerWrite])
+
+    expect(useSettingsStore.getState().reasoningEffort).toBe('default')
+    expect(useSettingsStore.getState().settingsWriteError).toBe(
+      'Could not save reasoning effort. Try again.'
+    )
+  })
+
+  it('restores the last successful value when a queued newer write fails', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    api.setReasoningEffort
+      .mockResolvedValueOnce({ ...snapshot([]), reasoningEffort: 'high' })
+      .mockRejectedValueOnce(new Error('newer failure'))
+
+    const olderWrite = useSettingsStore.getState().setReasoningEffort('high')
+    const newerWrite = useSettingsStore.getState().setReasoningEffort('max')
+
+    await Promise.all([olderWrite, newerWrite])
+
+    expect(useSettingsStore.getState().reasoningEffort).toBe('high')
+    expect(useSettingsStore.getState().settingsWriteError).toBe(
+      'Could not save reasoning effort. Try again.'
+    )
+  })
+
+  it('reverts to the previous level and exposes a visible failure when main rejects', async () => {
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
     api.setReasoningEffort.mockRejectedValue(new Error('ipc down'))
 
     await useSettingsStore.getState().setReasoningEffort('low')
 
     expect(useSettingsStore.getState().reasoningEffort).toBe('default')
+    expect(useSettingsStore.getState().settingsWriteError).toBe(
+      'Could not save reasoning effort. Try again.'
+    )
     expect(consoleError).toHaveBeenCalledWith('Failed to set reasoning effort', expect.any(Error))
   })
 
@@ -1279,13 +1766,16 @@ describe('settings store: setNotificationsEnabled', () => {
     expect(useSettingsStore.getState().notificationsEnabled).toBe(false)
   })
 
-  it('reverts to the previous flag and logs when main rejects', async () => {
+  it('reverts to the previous flag and exposes a visible failure when main rejects', async () => {
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
     api.setNotificationsEnabled.mockRejectedValue(new Error('ipc down'))
 
     await useSettingsStore.getState().setNotificationsEnabled(false)
 
     expect(useSettingsStore.getState().notificationsEnabled).toBe(true)
+    expect(useSettingsStore.getState().settingsWriteError).toBe(
+      'Could not save notification preference. Try again.'
+    )
     expect(consoleError).toHaveBeenCalledWith(
       'Failed to set notifications enabled',
       expect.any(Error)
@@ -1298,5 +1788,106 @@ describe('settings store: setNotificationsEnabled', () => {
     await useSettingsStore.getState().load()
 
     expect(useSettingsStore.getState().notificationsEnabled).toBe(false)
+  })
+})
+
+describe('settings store: setConversationSkillImportEnabled', () => {
+  it('forwards the flag to main and caches the returned snapshot', async () => {
+    await useSettingsStore.getState().setConversationSkillImportEnabled(false)
+
+    expect(api.setConversationSkillImportEnabled).toHaveBeenCalledWith({ enabled: false })
+    expect(useSettingsStore.getState().conversationSkillImportEnabled).toBe(false)
+  })
+
+  it('reverts to the previous flag and exposes a visible failure when main rejects', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    api.setConversationSkillImportEnabled.mockRejectedValue(new Error('ipc down'))
+
+    await useSettingsStore.getState().setConversationSkillImportEnabled(false)
+
+    expect(useSettingsStore.getState().conversationSkillImportEnabled).toBe(true)
+    expect(useSettingsStore.getState().settingsWriteError).toBe(
+      'Could not save conversation Skill import preference. Try again.'
+    )
+    expect(consoleError).toHaveBeenCalledWith(
+      'Failed to set conversation Skill import enabled',
+      expect.any(Error)
+    )
+  })
+
+  it('load() picks up a disabled preference from the settings snapshot', async () => {
+    api.getSettings.mockResolvedValue({
+      ...snapshot([]),
+      conversationSkillImportEnabled: false
+    })
+
+    await useSettingsStore.getState().load()
+
+    expect(useSettingsStore.getState().conversationSkillImportEnabled).toBe(false)
+  })
+})
+
+describe('settings store: setClosePreference', () => {
+  it('forwards a saved action and can reset to ask every time', async () => {
+    await useSettingsStore.getState().setClosePreference('minimize')
+    expect(api.setClosePreference).toHaveBeenCalledWith({ preference: 'minimize' })
+    expect(useSettingsStore.getState().closePreference).toBe('minimize')
+
+    await useSettingsStore.getState().setClosePreference(undefined)
+    expect(api.setClosePreference).toHaveBeenLastCalledWith({ preference: undefined })
+    expect(useSettingsStore.getState().closePreference).toBeUndefined()
+  })
+
+  it('reverts to the previous preference and exposes a visible failure when main rejects', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    useSettingsStore.setState({ closePreference: 'quit' })
+    api.setClosePreference.mockRejectedValue(new Error('ipc down'))
+
+    await useSettingsStore.getState().setClosePreference(undefined)
+
+    expect(useSettingsStore.getState().closePreference).toBe('quit')
+    expect(useSettingsStore.getState().settingsWriteError).toBe(
+      'Could not save window close preference. Try again.'
+    )
+    expect(consoleError).toHaveBeenCalledWith('Failed to set close preference', expect.any(Error))
+  })
+
+  it('load() picks up a saved preference from the settings snapshot', async () => {
+    api.getSettings.mockResolvedValue({ ...snapshot([]), closePreference: 'minimize' })
+
+    await useSettingsStore.getState().load()
+
+    expect(useSettingsStore.getState().closePreference).toBe('minimize')
+  })
+})
+
+describe('settings store: setAppIconVariant', () => {
+  it('forwards the variant to main and caches the returned snapshot', async () => {
+    await useSettingsStore.getState().setAppIconVariant('dark')
+
+    expect(api.setAppIconVariant).toHaveBeenCalledWith({ variant: 'dark' })
+    expect(useSettingsStore.getState().appIconVariant).toBe('dark')
+  })
+
+  it('reverts to the previous variant and exposes a visible failure when main rejects', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    useSettingsStore.setState({ appIconVariant: 'light' })
+    api.setAppIconVariant.mockRejectedValue(new Error('ipc down'))
+
+    await useSettingsStore.getState().setAppIconVariant('dark')
+
+    expect(useSettingsStore.getState().appIconVariant).toBe('light')
+    expect(useSettingsStore.getState().settingsWriteError).toBe(
+      'Could not save app icon preference. Try again.'
+    )
+    expect(consoleError).toHaveBeenCalledWith('Failed to set app icon variant', expect.any(Error))
+  })
+
+  it('load() picks up a saved variant from the settings snapshot', async () => {
+    api.getSettings.mockResolvedValue({ ...snapshot([]), appIconVariant: 'dark' })
+
+    await useSettingsStore.getState().load()
+
+    expect(useSettingsStore.getState().appIconVariant).toBe('dark')
   })
 })

@@ -1,0 +1,312 @@
+import { test as base } from '@playwright/test'
+import { spawn } from 'node:child_process'
+import { chmod, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { delimiter, join, resolve } from 'node:path'
+import { _electron as electron, type ElectronApplication, type Page } from 'playwright'
+import { RendererFailureGate } from './renderer-failure-gate'
+
+const APP_ROOT = resolve(process.cwd())
+const FAKE_AGENT_PATH = resolve(APP_ROOT, 'e2e', 'fixtures', 'fake-opencode.mjs')
+const FAKE_PROVIDER_NAME = 'Electron E2E provider'
+
+type LaunchRoots = {
+  fakeAgentBinRoot: string
+  storageRoot: string
+  userDataRoot: string
+}
+
+type ShortcutModifier = 'alt' | 'control' | 'meta' | 'shift'
+
+type ElectronApp = {
+  readonly page: Page
+  completeOnboarding: () => Promise<Page>
+  configureFakeAgent: () => Promise<Page>
+  findOverlayIsVisible: () => Promise<boolean>
+  launchSecondInstance: () => Promise<Page>
+  mainWindowState: () => Promise<{ minimized: boolean; visible: boolean }>
+  pressMainWindowShortcut: (key: string, modifiers: ShortcutModifier[]) => Promise<void>
+  requestMainWindowClose: () => Promise<void>
+  restart: () => Promise<Page>
+}
+
+const launchEnvironment = (
+  storageRoot: string,
+  fakeAgentBinRoot?: string,
+  inheritedEnvironment: NodeJS.ProcessEnv = process.env
+): Record<string, string> => {
+  const environment: Record<string, string> = {}
+
+  for (const [key, value] of Object.entries(inheritedEnvironment)) {
+    if (value !== undefined && key !== 'ELECTRON_RENDERER_URL') environment[key] = value
+  }
+
+  environment.OPEN_SCIENCE_STORAGE_ROOT = storageRoot
+  if (fakeAgentBinRoot) {
+    const inheritedPath = Object.entries(environment).find(
+      ([key]) => key.toLowerCase() === 'path'
+    )?.[1]
+    for (const key of Object.keys(environment)) {
+      if (key.toLowerCase() === 'path') delete environment[key]
+    }
+    environment.OPEN_SCIENCE_AGENT_FRAMEWORK = 'opencode'
+    environment.PATH = `${fakeAgentBinRoot}${delimiter}${inheritedPath ?? ''}`
+  }
+  return environment
+}
+
+const launchOpenScience = (
+  { storageRoot, userDataRoot, fakeAgentBinRoot }: LaunchRoots,
+  fakeAgentEnabled: boolean
+): Promise<ElectronApplication> =>
+  electron.launch({
+    args: [`--user-data-dir=${userDataRoot}`, APP_ROOT],
+    cwd: APP_ROOT,
+    env: launchEnvironment(storageRoot, fakeAgentEnabled ? fakeAgentBinRoot : undefined)
+  })
+
+const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`
+
+const writeFakeAgentLauncher = async (binRoot: string): Promise<void> => {
+  await mkdir(binRoot, { recursive: true })
+
+  if (process.platform === 'win32') {
+    await writeFile(
+      join(binRoot, 'opencode.cmd'),
+      `@echo off\r\n"${process.execPath}" "${FAKE_AGENT_PATH}" %*\r\n`,
+      'utf8'
+    )
+    return
+  }
+
+  const launcher = join(binRoot, 'opencode')
+  await writeFile(
+    launcher,
+    `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(FAKE_AGENT_PATH)} "$@"\n`,
+    'utf8'
+  )
+  await chmod(launcher, 0o755)
+}
+
+const makeTreeWritable = async (root: string): Promise<void> => {
+  await chmod(root, 0o700).catch(() => undefined)
+  const entries = await readdir(root, { withFileTypes: true }).catch(() => [])
+
+  await Promise.all(
+    entries.map(async (entry) => {
+      const path = join(root, entry.name)
+      if (entry.isDirectory()) await makeTreeWritable(path)
+      else if (!entry.isSymbolicLink()) await chmod(path, 0o600).catch(() => undefined)
+    })
+  )
+}
+
+const openMainWindow = async (
+  application: ElectronApplication,
+  rendererFailures: RendererFailureGate
+): Promise<Page> => {
+  const page = await application.firstWindow()
+  await rendererFailures.observe(page)
+  await page.waitForLoadState('domcontentloaded')
+  return page
+}
+
+class ElectronAppHarness implements ElectronApp {
+  private application: ElectronApplication | undefined
+  private currentPage: Page | undefined
+  private fakeAgentEnabled = false
+  private readonly rendererFailures = new RendererFailureGate()
+
+  private constructor(
+    private readonly testRoot: string,
+    private readonly roots: LaunchRoots
+  ) {}
+
+  static async create(): Promise<ElectronAppHarness> {
+    const testRoot = await mkdtemp(join(tmpdir(), 'open-science-electron-e2e-'))
+    const harness = new ElectronAppHarness(testRoot, {
+      fakeAgentBinRoot: join(testRoot, 'fake-agent-bin'),
+      storageRoot: join(testRoot, 'storage'),
+      userDataRoot: join(testRoot, 'electron-profile')
+    })
+    await writeFakeAgentLauncher(harness.roots.fakeAgentBinRoot)
+    await harness.launch()
+    return harness
+  }
+
+  get page(): Page {
+    if (!this.currentPage) throw new Error('Electron application is not running.')
+    return this.currentPage
+  }
+
+  async completeOnboarding(): Promise<Page> {
+    await this.page.evaluate(async () => {
+      const bridge = globalThis as unknown as {
+        api: { settings: { markOnboardingComplete: () => Promise<unknown> } }
+      }
+      await bridge.api.settings.markOnboardingComplete()
+    })
+    await this.page.reload({ waitUntil: 'domcontentloaded' })
+    return this.page
+  }
+
+  async configureFakeAgent(): Promise<Page> {
+    await this.page.evaluate(async (providerName) => {
+      const bridge = globalThis as unknown as {
+        api: {
+          settings: {
+            setActiveProvider: (request: { id: string; model: string }) => Promise<unknown>
+            setAgentFramework: (request: { id: 'opencode' }) => Promise<unknown>
+            upsertProvider: (request: {
+              apiEndpoints: ['openai']
+              baseUrl: string
+              key: string
+              model: string
+              name: string
+              type: 'custom'
+            }) => Promise<{ providers: Array<{ id: string; name: string }> }>
+          }
+        }
+      }
+      const snapshot = await bridge.api.settings.upsertProvider({
+        type: 'custom',
+        name: providerName,
+        apiEndpoints: ['openai'],
+        baseUrl: 'http://127.0.0.1:9/v1',
+        model: 'e2e-model',
+        key: 'e2e-key'
+      })
+      const provider = snapshot.providers.find((item) => item.name === providerName)
+      if (!provider) throw new Error('The E2E provider was not persisted.')
+
+      await bridge.api.settings.setActiveProvider({ id: provider.id, model: 'e2e-model' })
+      await bridge.api.settings.setAgentFramework({ id: 'opencode' })
+    }, FAKE_PROVIDER_NAME)
+
+    this.fakeAgentEnabled = true
+    return this.restart()
+  }
+
+  async findOverlayIsVisible(): Promise<boolean> {
+    return this.runningApplication.evaluate(({ BrowserWindow }) => {
+      const mainWindow = BrowserWindow.getAllWindows()[0]
+      if (!mainWindow) return false
+
+      return mainWindow.contentView.children.some((view) => {
+        const bounds = view.getBounds()
+        return bounds.width > 0 && bounds.height > 0
+      })
+    })
+  }
+
+  async mainWindowState(): Promise<{ minimized: boolean; visible: boolean }> {
+    return this.runningApplication.evaluate(({ BrowserWindow }) => {
+      const mainWindow = BrowserWindow.getAllWindows()[0]
+      if (!mainWindow) throw new Error('Open Science main window was not found.')
+
+      return { minimized: mainWindow.isMinimized(), visible: mainWindow.isVisible() }
+    })
+  }
+
+  async launchSecondInstance(): Promise<Page> {
+    const { appPath, executable } = await this.runningApplication.evaluate(({ app }) => ({
+      appPath: app.getAppPath(),
+      executable: process.execPath
+    }))
+    await new Promise<void>((resolveLaunch, rejectLaunch) => {
+      const child = spawn(executable, [`--user-data-dir=${this.roots.userDataRoot}`, appPath], {
+        cwd: APP_ROOT,
+        env: launchEnvironment(
+          this.roots.storageRoot,
+          this.fakeAgentEnabled ? this.roots.fakeAgentBinRoot : undefined
+        ),
+        stdio: 'ignore'
+      })
+      child.once('error', rejectLaunch)
+      child.once('exit', (code, signal) => {
+        if (code === 0) resolveLaunch()
+        else rejectLaunch(new Error(`Second Electron instance exited with ${code ?? signal}.`))
+      })
+    })
+    return this.page
+  }
+
+  async pressMainWindowShortcut(key: string, modifiers: ShortcutModifier[]): Promise<void> {
+    await this.runningApplication.evaluate(
+      ({ BrowserWindow }, input) => {
+        const mainWindow = BrowserWindow.getAllWindows()[0]
+        if (!mainWindow) throw new Error('Open Science main window was not found.')
+
+        mainWindow.webContents.focus()
+        mainWindow.webContents.sendInputEvent({
+          type: 'keyDown',
+          keyCode: input.key,
+          modifiers: input.modifiers
+        })
+        mainWindow.webContents.sendInputEvent({
+          type: 'keyUp',
+          keyCode: input.key,
+          modifiers: input.modifiers
+        })
+      },
+      { key, modifiers }
+    )
+  }
+
+  async requestMainWindowClose(): Promise<void> {
+    await this.runningApplication.evaluate(({ BrowserWindow }) => {
+      const mainWindow = BrowserWindow.getAllWindows()[0]
+      if (!mainWindow) throw new Error('Open Science main window was not found.')
+      mainWindow.close()
+    })
+  }
+
+  async restart(): Promise<Page> {
+    await this.close()
+    await this.launch()
+    return this.page
+  }
+
+  async dispose(): Promise<void> {
+    await this.close().catch(() => undefined)
+    await makeTreeWritable(this.testRoot)
+    await rm(this.testRoot, { force: true, maxRetries: 5, recursive: true, retryDelay: 200 })
+    this.rendererFailures.assertNoFailures()
+  }
+
+  private async launch(): Promise<void> {
+    this.application = await launchOpenScience(this.roots, this.fakeAgentEnabled)
+    this.currentPage = await openMainWindow(this.application, this.rendererFailures)
+  }
+
+  private get runningApplication(): ElectronApplication {
+    if (!this.application) throw new Error('Electron application is not running.')
+    return this.application
+  }
+
+  private async close(): Promise<void> {
+    if (!this.application) return
+
+    const application = this.application
+    this.application = undefined
+    this.currentPage = undefined
+    await application.close()
+  }
+}
+
+const test = base.extend<{ app: ElectronApp }>({
+  // Playwright fixture callbacks require an object pattern even when no base fixture is needed.
+  // eslint-disable-next-line no-empty-pattern
+  app: async ({}, install) => {
+    const app = await ElectronAppHarness.create()
+
+    try {
+      await install(app)
+    } finally {
+      await app.dispose()
+    }
+  }
+})
+
+export { launchEnvironment, test }
+export type { ElectronApp }

@@ -60,13 +60,13 @@ describe('HomePage environment repair notice', () => {
       ])
     })
 
-    await act(async () => root.render(<HomePage />))
+    await act(async () => root.render(<HomePage canDeleteProjects hasCompleteSessionCatalog />))
 
     expect(container.querySelector('[aria-label="Open environment repair"]')).toBeNull()
   })
 
-  it('shows a required-item alert and opens repair only after the user clicks it', async () => {
-    const openEnvironmentRepair = vi.fn()
+  it('opens the Agent settings panel for a failed selected runtime only after the alert is clicked', async () => {
+    const openSettingsToPanel = vi.fn()
     useSettingsStore.setState({
       environmentCheck: environment([
         {
@@ -76,19 +76,113 @@ describe('HomePage environment repair notice', () => {
           summary: 'Claude is missing.'
         }
       ]),
-      openEnvironmentRepair
-    })
+      openSettingsToPanel
+    } as never)
 
-    await act(async () => root.render(<HomePage />))
+    await act(async () => root.render(<HomePage canDeleteProjects hasCompleteSessionCatalog />))
 
     const repairButton = container.querySelector<HTMLButtonElement>(
       '[aria-label="Open environment repair"]'
     )
     expect(repairButton?.textContent).toContain('Claude runtime needs attention')
-    expect(openEnvironmentRepair).not.toHaveBeenCalled()
+    expect(openSettingsToPanel).not.toHaveBeenCalled()
 
     await act(async () => repairButton?.click())
 
-    expect(openEnvironmentRepair).toHaveBeenCalledOnce()
+    expect(openSettingsToPanel).toHaveBeenCalledWith('agent')
+  })
+
+  it('opens Storage before Agent when both required checks fail', async () => {
+    const openSettingsToPanel = vi.fn()
+    useSettingsStore.setState({
+      environmentCheck: environment([
+        {
+          id: 'agent',
+          label: 'Claude runtime',
+          status: 'failed',
+          summary: 'Claude is missing.'
+        },
+        {
+          id: 'storage',
+          label: 'Application storage',
+          status: 'failed',
+          summary: 'The application storage directory is unavailable.'
+        }
+      ]),
+      openSettingsToPanel
+    } as never)
+
+    await act(async () => root.render(<HomePage canDeleteProjects hasCompleteSessionCatalog />))
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>('[aria-label="Open environment repair"]')?.click()
+    )
+
+    expect(openSettingsToPanel).toHaveBeenCalledWith('storage')
+  })
+
+  it('opens Storage settings when application storage is the only failed check', async () => {
+    const openSettingsToPanel = vi.fn()
+    useSettingsStore.setState({
+      environmentCheck: environment([
+        {
+          id: 'storage',
+          label: 'Application storage',
+          status: 'failed',
+          summary: 'The application storage directory is unavailable.'
+        }
+      ]),
+      openSettingsToPanel
+    } as never)
+
+    await act(async () => root.render(<HomePage canDeleteProjects hasCompleteSessionCatalog />))
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>('[aria-label="Open environment repair"]')?.click()
+    )
+
+    expect(openSettingsToPanel).toHaveBeenCalledWith('storage')
+  })
+
+  it('opens Agent settings for an install-network blocker', async () => {
+    const openSettingsToPanel = vi.fn()
+    useSettingsStore.setState({
+      environmentCheck: environment([
+        {
+          id: 'install-network',
+          label: 'Installation network',
+          status: 'failed',
+          summary: 'Managed and npm install sources are unavailable.'
+        }
+      ]),
+      openSettingsToPanel
+    } as never)
+
+    await act(async () => root.render(<HomePage canDeleteProjects hasCompleteSessionCatalog />))
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>('[aria-label="Open environment repair"]')?.click()
+    )
+
+    expect(openSettingsToPanel).toHaveBeenCalledWith('agent')
+  })
+
+  it('opens Agent settings for a system compatibility blocker', async () => {
+    const openSettingsToPanel = vi.fn()
+    useSettingsStore.setState({
+      environmentCheck: environment([
+        {
+          id: 'system',
+          label: 'System compatibility',
+          status: 'failed',
+          summary: 'No app-managed runtime is available for this host.'
+        }
+      ]),
+      openSettingsToPanel
+    } as never)
+
+    await act(async () => root.render(<HomePage canDeleteProjects hasCompleteSessionCatalog />))
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>('[aria-label="Open environment repair"]')?.click()
+    )
+
+    expect(openSettingsToPanel).toHaveBeenCalledWith('agent')
   })
 })

@@ -3,6 +3,7 @@ import {
   type ChildProcessWithoutNullStreams,
   type SpawnOptionsWithoutStdio
 } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import type { SessionModeState } from '@agentclientprotocol/sdk'
 
@@ -12,7 +13,8 @@ import {
 } from '../acp/permission-profile-controller'
 import type { PermissionProfileId } from '../../shared/permission-profiles'
 import { augmentedPathEnv } from '../settings/shell-path'
-import type { ReasoningEffort } from '../../shared/settings'
+import type { ModelReasoningEffort } from '../../shared/reasoning-effort'
+import type { OfficialVendorId } from '../../shared/provider-registry'
 import type {
   AgentFramework,
   AgentAuthentication,
@@ -24,6 +26,9 @@ import type {
   SessionSetupContext
 } from './types'
 import { isCodexSubscriptionProvider } from '../../shared/settings'
+import { CODEX_VERSION } from '../settings/managed-codex'
+import { clearSystemProxyEnvironment } from '../settings/system-proxy'
+import codexNativeModelInstructions from './codex-native-model-instructions.md?raw'
 
 const CODEX_PROVIDER_ID = 'open-science'
 // Catalog model used only for Codex's local metadata; the Responses bridge rewrites it to the selected
@@ -31,10 +36,25 @@ const CODEX_PROVIDER_ID = 'open-science'
 // answers. It MUST be a classic tool-mode entry (tool_mode unset), not a `code_mode_only` model like
 // the gpt-5.6-* family: code-mode models advertise no function tools and instead drive an
 // OpenAI-hosted code-execution host that a custom Chat Completions gateway cannot provide, so Codex
-// sends zero tools and the agent can only chat. gpt-5.5 advertises the `shell_command` function tool,
-// which the bridge forwards to Chat Completions. (apply_patch is still a freeform tool the bridge
+// sends zero tools and the agent can only chat. gpt-5.4 advertises the `shell_command` function tool
+// and accepts a 1M context override, while the bridge forwards those tools to Chat Completions.
+// (apply_patch is still a freeform tool the bridge
 // filters, so file edits route through shell rather than the dedicated patch tool.)
-export const CODEX_BRIDGE_MODEL = 'gpt-5.5'
+export const CODEX_BRIDGE_MODEL = 'gpt-5.4'
+const CODEX_EFFECTIVE_CONTEXT_WINDOW_PERCENT = 95
+const CODEX_NATIVE_MODEL_CATALOG_FILENAME_PREFIX = 'model-catalog-'
+const CODEX_BUNDLED_MODEL_IDS_BY_VERSION = {
+  '0.144.6': [
+    'gpt-5.6-sol',
+    'gpt-5.6-terra',
+    'gpt-5.6-luna',
+    'gpt-5.5',
+    'gpt-5.4',
+    'gpt-5.4-mini',
+    'gpt-5.2',
+    'codex-auto-review'
+  ]
+} satisfies Record<typeof CODEX_VERSION, readonly string[]>
 const CODEX_MODE_IDS = {
   ask: 'read-only',
   auto: 'agent',
@@ -48,8 +68,10 @@ const CODEX_ENV_KEYS = [
   'CODEX_HOME',
   'CODEX_PATH',
   'DEFAULT_AUTH_REQUEST',
+  'HOME',
   'MODEL_PROVIDER',
-  'NO_BROWSER'
+  'NO_BROWSER',
+  'USERPROFILE'
 ] as const
 
 type SpawnProcess = (
@@ -68,6 +90,16 @@ type CodexFrameworkDeps = {
 export const codexStorageDir = (storageRoot: string): string => join(storageRoot, 'codex')
 export const codexSubscriptionStorageDir = (storageRoot: string): string =>
   join(storageRoot, 'codex-subscription')
+
+const isolatedCodexHomeEnv = (codexHome: string, platform: NodeJS.Platform): NodeJS.ProcessEnv => ({
+  // Codex discovers user-installed Skills under $HOME/.agents/skills in addition to
+  // $CODEX_HOME/skills. Point both roots at the app-owned profile so a session cannot inherit the
+  // desktop user's Skills. USERPROFILE is the native home source on Windows; HOME is retained there
+  // as well for child tools that use the Unix-compatible variable.
+  HOME: codexHome,
+  ...(platform === 'win32' ? { USERPROFILE: codexHome } : {}),
+  CODEX_HOME: codexHome
+})
 
 const normalizeResponsesBaseUrl = (value: string | undefined): string | undefined => {
   const normalized = value
@@ -90,14 +122,14 @@ const normalizeResponsesBaseUrl = (value: string | undefined): string | undefine
   return normalized
 }
 
-// Codex config takes low|medium|high|xhigh; the app's top level 'max' maps onto 'xhigh'.
-// 'default' is filtered upstream (never reaches here), but stay defensive and omit it too.
-const codexReasoningEffortFor = (effort: ReasoningEffort | undefined): string | undefined =>
-  effort === 'max'
-    ? 'xhigh'
-    : effort === 'low' || effort === 'medium' || effort === 'high'
-      ? effort
-      : undefined
+const isOfficialOpenAiResponsesBase = (value: string | undefined): boolean => {
+  if (!value) return false
+  try {
+    return new URL(value).hostname.toLowerCase() === 'api.openai.com'
+  } catch {
+    return false
+  }
+}
 
 // Just the model + reasoning-effort fields a Codex config can carry, with no provider plumbing.
 // The bridge path layers the open-science custom provider on top of this; the codex-isolated path
@@ -105,25 +137,35 @@ const codexReasoningEffortFor = (effort: ReasoningEffort | undefined): string | 
 // model from session start (issue #277).
 const buildCodexModelOptions = (input: {
   model?: string
-  reasoningEffort?: ReasoningEffort
+  reasoningEffort?: ModelReasoningEffort
 }): Record<string, unknown> => {
-  const codexEffort = codexReasoningEffortFor(input.reasoningEffort)
   return {
     ...(input.model ? { model: input.model } : {}),
-    ...(codexEffort ? { model_reasoning_effort: codexEffort } : {})
+    ...(input.reasoningEffort ? { model_reasoning_effort: input.reasoningEffort } : {})
   }
 }
 
 const buildCodexConfig = (provider: {
   baseUrl?: string
   model?: string
+  contextWindow?: number
   key?: string
-  reasoningEffort?: ReasoningEffort
+  reasoningEffort?: ModelReasoningEffort
 }): Record<string, unknown> => {
   const baseUrl = normalizeResponsesBaseUrl(provider.baseUrl)
+  const contextWindow =
+    provider.contextWindow && provider.contextWindow > 0 ? provider.contextWindow : undefined
 
   return {
     ...buildCodexModelOptions(provider),
+    ...(contextWindow
+      ? {
+          model_context_window: contextWindow,
+          model_auto_compact_token_limit: Math.floor(
+            (contextWindow * CODEX_EFFECTIVE_CONTEXT_WINDOW_PERCENT) / 100
+          )
+        }
+      : {}),
     model_provider: CODEX_PROVIDER_ID,
     model_providers: {
       [CODEX_PROVIDER_ID]: {
@@ -133,9 +175,97 @@ const buildCodexConfig = (provider: {
         ...(provider.key ? { requires_openai_auth: true } : {})
       }
     }
-    // Tool-search configuration is intentionally left at Codex defaults. The Chat bridge exposes the
-    // app-owned notebook tools through explicit namespaced aliases and does not depend on deferred
-    // tool_search behavior.
+    // Tool-search configuration is intentionally left at Codex defaults. The Chat bridge exposes its
+    // app-owned tools through explicit namespaced aliases and does not depend on deferred tool_search.
+  }
+}
+
+const buildCodexNativeModelCatalog = (provider: {
+  model?: string
+  vendorId?: OfficialVendorId
+  baseUrl?: string
+  openaiBaseUrl?: string
+  nativeVersion?: string
+  contextWindow?: number
+  supportsImageInput?: boolean
+  reasoningEffort?: ModelReasoningEffort
+  reasoningEfforts?: readonly ModelReasoningEffort[]
+}): Record<string, unknown> | undefined => {
+  const model = provider.model?.trim()
+  // Bundled capabilities are trustworthy only for an exact model/version pair on OpenAI's official
+  // backend. A custom provider may represent the real api.openai.com endpoint, so vendor identity
+  // alone is insufficient; custom gateways that merely reuse an OpenAI model slug stay conservative.
+  const bundledModelIds =
+    provider.nativeVersion &&
+    Object.hasOwn(CODEX_BUNDLED_MODEL_IDS_BY_VERSION, provider.nativeVersion)
+      ? CODEX_BUNDLED_MODEL_IDS_BY_VERSION[
+          provider.nativeVersion as keyof typeof CODEX_BUNDLED_MODEL_IDS_BY_VERSION
+        ]
+      : undefined
+  const hasTrustedBundledMetadata =
+    (provider.vendorId === 'openai' ||
+      isOfficialOpenAiResponsesBase(provider.openaiBaseUrl ?? provider.baseUrl)) &&
+    bundledModelIds?.includes(model ?? '') === true
+  if (!model || hasTrustedBundledMetadata) return undefined
+
+  const contextWindow =
+    provider.contextWindow && provider.contextWindow > 0 ? provider.contextWindow : 272_000
+  const supportedReasoningEfforts = [...new Set(provider.reasoningEfforts ?? [])]
+  const defaultReasoningEffort =
+    provider.reasoningEffort && supportedReasoningEfforts.includes(provider.reasoningEffort)
+      ? provider.reasoningEffort
+      : null
+
+  return {
+    models: [
+      {
+        slug: model,
+        display_name: model,
+        description: null,
+        default_reasoning_level: defaultReasoningEffort,
+        supported_reasoning_levels: supportedReasoningEfforts.map((effort) => ({
+          effort,
+          description: `${effort === 'xhigh' ? 'Extra high' : effort.charAt(0).toUpperCase() + effort.slice(1)} reasoning effort`
+        })),
+        shell_type: 'shell_command',
+        // codex-acp obtains its session model options from app-server model/list. A hidden-only
+        // static catalog produces an empty list and makes session/new fail before the first prompt.
+        visibility: 'list',
+        supported_in_api: true,
+        priority: 99,
+        additional_speed_tiers: [],
+        service_tiers: [],
+        default_service_tier: null,
+        availability_nux: null,
+        upgrade: null,
+        base_instructions: codexNativeModelInstructions,
+        // Skill discovery is an app/runtime capability, not an optional upstream Responses tool.
+        // Keep Codex's native Skill guidance so materialized mcp-* connector skills remain usable.
+        include_skills_usage_instructions: true,
+        supports_reasoning_summaries: false,
+        default_reasoning_summary: 'none',
+        support_verbosity: false,
+        default_verbosity: null,
+        // Native Responses support does not imply support for OpenAI custom/freeform tools, hosted
+        // search, or parallel calls. Advertise only the function-shaped shell tool until the provider
+        // registry can express and verify those capabilities explicitly.
+        apply_patch_tool_type: null,
+        truncation_policy: { mode: 'tokens', limit: 10_000 },
+        supports_parallel_tool_calls: false,
+        supports_image_detail_original: false,
+        context_window: contextWindow,
+        max_context_window: contextWindow,
+        comp_hash: null,
+        effective_context_window_percent: CODEX_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
+        experimental_supported_tools: [],
+        input_modalities: provider.supportsImageInput ? ['text', 'image'] : ['text'],
+        supports_search_tool: false,
+        use_responses_lite: false,
+        auto_review_model_override: null,
+        tool_mode: null,
+        multi_agent_version: null
+      }
+    ]
   }
 }
 
@@ -146,6 +276,11 @@ const buildSpawnEnvironment = (
   const env = augmentedPathEnv(sourceEnv)
 
   for (const key of CODEX_ENV_KEYS) delete env[key]
+  // A resolved proxy or DIRECT decision is authoritative. A resolver failure uses `inherit` so a
+  // working proxy supplied by the process launcher remains available as the fallback.
+  if (input.proxyEnvironmentMode === 'replace') {
+    clearSystemProxyEnvironment(env)
+  }
 
   return {
     ...env,
@@ -203,6 +338,10 @@ export const createCodexFramework = ({
 }: CodexFrameworkDeps = {}): AgentFramework => ({
   id: 'codex',
   displayName: 'Codex',
+  commandShellDialect: platform === 'win32' ? 'powershell' : 'posix',
+  // codex-acp exposes `/compact` as a built-in command backed by `thread/compact/start`. Codex still
+  // owns automatic compaction, so no host trigger threshold is declared here.
+  contextCompaction: { kind: 'native-command', command: '/compact' },
   supportsSkills: true,
   acceptsStdioMcp: true,
   // codex-acp advertises a thought_level effort option and honors set_config_option on live sessions
@@ -231,62 +370,94 @@ export const createCodexFramework = ({
   },
 
   prepareModelConfig(provider, ctx: ModelConfigContext): AgentModelConfig {
+    const persistentSystemPrompt =
+      ctx.systemPromptAppends?.filter(Boolean).join('\n\n') || undefined
     if (isCodexSubscriptionProvider(provider.type)) {
-      if (provider.type === 'codex-isolated') {
-        // The isolated home has no pre-existing config.toml and no CODEX_CONFIG of its own, so without
-        // a model here codex-acp falls back to its account default and we have to switch models via
-        // session/set_config_option AFTER session creation. That late switch makes the first prompt of
-        // every new session wait ~2 min for the new model to come online (issue #277). Seed the model
-        // + reasoning effort into CODEX_CONFIG so codex-acp uses the right model from session start
-        // and the first prompt is fast. No model_provider/model_providers override here — the ChatGPT
-        // subscription is codex-acp's default provider, configured by the user's stored credentials.
-        const modelOptions = buildCodexModelOptions({
-          model: provider.model,
-          reasoningEffort: ctx.reasoningEffort
-        })
-        const codexConfigJson =
-          Object.keys(modelOptions).length > 0 ? JSON.stringify(modelOptions) : undefined
-        return {
-          env: {
-            CODEX_HOME: codexSubscriptionStorageDir(ctx.storageRoot),
-            ...(codexConfigJson ? { CODEX_CONFIG: codexConfigJson } : {})
-          }
-        }
+      // Every Open Science subscription session uses the same app-owned home. `codex-shared` is
+      // accepted only as a legacy Provider discriminator; it must never select the user's global
+      // Codex profile at runtime. Seed the model before session creation to avoid the slow late
+      // session/set_config_option switch (issue #277).
+      const modelOptions = buildCodexModelOptions({
+        model: provider.model,
+        reasoningEffort: ctx.reasoningEffort
+      })
+      const codexConfig = {
+        ...modelOptions,
+        ...(persistentSystemPrompt ? { developer_instructions: persistentSystemPrompt } : {})
       }
-      return { env: {} }
+      const codexConfigJson =
+        Object.keys(codexConfig).length > 0 ? JSON.stringify(codexConfig) : undefined
+      const codexHome = codexSubscriptionStorageDir(ctx.storageRoot)
+      return {
+        env: {
+          ...isolatedCodexHomeEnv(codexHome, platform),
+          ...(codexConfigJson ? { CODEX_CONFIG: codexConfigJson } : {})
+        },
+        ...(persistentSystemPrompt ? { persistentSystemPrompt } : {})
+      }
     }
 
     const bridge = ctx.responsesBridge
-    const useBridge =
-      bridge !== undefined && !(provider.apiEndpoints?.includes('responses') ?? false)
-    const codexModel = useBridge ? CODEX_BRIDGE_MODEL : provider.model
-    // Native Responses is driven directly. A dual-endpoint vendor keeps its Anthropic route in
+    const useChatBridge =
+      bridge !== undefined &&
+      bridge.kind !== 'responses-compatibility' &&
+      !(provider.apiEndpoints?.includes('responses') ?? false)
+    const useNativeCompatibility =
+      bridge?.kind === 'responses-compatibility' &&
+      (provider.apiEndpoints?.includes('responses') ?? false)
+    const useLocalResponsesEndpoint = useChatBridge || useNativeCompatibility
+    const codexModel = useChatBridge ? CODEX_BRIDGE_MODEL : provider.model
+    // A dual-endpoint vendor keeps its Anthropic route in
     // `baseUrl` and its OpenAI/Responses `/v1` root in `openaiBaseUrl`, so post to the latter; a
-    // Responses-only provider (e.g. OpenAI) carries its base in `baseUrl`. When bridging, the local
-    // bridge URL wins.
-    const responsesBaseUrl = useBridge
+    // Responses-only provider (e.g. OpenAI) carries its base in `baseUrl`. The Chat bridge and the
+    // protocol-preserving native compatibility endpoint both expose a local Responses URL.
+    const responsesBaseUrl = useLocalResponsesEndpoint
       ? bridge.baseUrl
       : (provider.openaiBaseUrl ?? provider.baseUrl)
     const authentication: AgentAuthentication | undefined =
-      provider.key && !useBridge
+      provider.key && !useLocalResponsesEndpoint
         ? {
             methodId: 'api-key',
             _meta: { 'api-key': { apiKey: provider.key } }
           }
         : undefined
 
+    const codexHome = codexStorageDir(ctx.storageRoot)
+    const modelCatalog = useChatBridge
+      ? undefined
+      : buildCodexNativeModelCatalog({
+          ...provider,
+          nativeVersion: ctx.nativeVersion,
+          reasoningEffort: ctx.reasoningEffort,
+          reasoningEfforts: ctx.reasoningEfforts
+        })
+    const modelCatalogContent = modelCatalog
+      ? `${JSON.stringify(modelCatalog, null, 2)}\n`
+      : undefined
+    // Multiple Codex sessions share this app-owned home. A content-addressed filename keeps each
+    // process pinned to immutable metadata even when different native models start concurrently.
+    const modelCatalogPath = modelCatalogContent
+      ? join(
+          codexHome,
+          `${CODEX_NATIVE_MODEL_CATALOG_FILENAME_PREFIX}${createHash('sha256').update(modelCatalogContent).digest('hex')}.json`
+        )
+      : undefined
+    const codexConfig = {
+      ...buildCodexConfig({
+        ...provider,
+        model: codexModel,
+        contextWindow: provider.contextWindow,
+        baseUrl: responsesBaseUrl,
+        key: useLocalResponsesEndpoint ? undefined : provider.key,
+        reasoningEffort: ctx.reasoningEffort
+      }),
+      ...(modelCatalogPath ? { model_catalog_json: modelCatalogPath } : {}),
+      ...(persistentSystemPrompt ? { developer_instructions: persistentSystemPrompt } : {})
+    }
     return {
       env: {
-        CODEX_HOME: codexStorageDir(ctx.storageRoot),
-        CODEX_CONFIG: JSON.stringify(
-          buildCodexConfig({
-            ...provider,
-            model: codexModel,
-            baseUrl: responsesBaseUrl,
-            key: useBridge ? undefined : provider.key,
-            reasoningEffort: ctx.reasoningEffort
-          })
-        ),
+        ...isolatedCodexHomeEnv(codexHome, platform),
+        CODEX_CONFIG: JSON.stringify(codexConfig),
         MODEL_PROVIDER: CODEX_PROVIDER_ID,
         NO_BROWSER: '1'
       },
@@ -295,10 +466,20 @@ export const createCodexFramework = ({
           path: join(codexStorageDir(ctx.storageRoot), 'config.toml'),
           content: 'cli_auth_credentials_store = "ephemeral"\n',
           mode: 0o600
-        }
+        },
+        ...(modelCatalogPath && modelCatalogContent
+          ? [
+              {
+                path: modelCatalogPath,
+                content: modelCatalogContent,
+                mode: 0o600,
+                contentAddressed: true
+              }
+            ]
+          : [])
       ],
       ...(authentication ? { authentication } : {}),
-      ...(useBridge
+      ...(useLocalResponsesEndpoint
         ? {
             providerConfiguration: {
               providerId: 'custom-gateway',
@@ -308,14 +489,19 @@ export const createCodexFramework = ({
             } satisfies AgentProviderConfiguration
           }
         : {}),
-      ...(useBridge ? { sessionModel: CODEX_BRIDGE_MODEL } : {})
+      ...(useChatBridge ? { sessionModel: CODEX_BRIDGE_MODEL } : {}),
+      ...(persistentSystemPrompt ? { persistentSystemPrompt } : {})
     }
   },
 
   buildSessionSetup(ctx: SessionSetupContext): SessionSetup {
+    // Production backends pass no stable appends here because developer_instructions owns them.
+    // Keep the fallback for injected/legacy backends and ephemeral reviewer sessions.
+    const promptPrefix = [...ctx.systemPromptAppends, ...(ctx.turnPromptReminders ?? [])]
+      .filter(Boolean)
+      .join('\n\n')
     return {
-      promptPrefix:
-        ctx.systemPromptAppends.length > 0 ? ctx.systemPromptAppends.join('\n\n') : undefined
+      ...(promptPrefix ? { promptPrefix } : {})
     }
   },
 
@@ -324,4 +510,9 @@ export const createCodexFramework = ({
 
 export const codexFramework = createCodexFramework()
 
-export { buildCodexConfig, mapCodexPermissionProfile, normalizeResponsesBaseUrl }
+export {
+  buildCodexConfig,
+  isOfficialOpenAiResponsesBase,
+  mapCodexPermissionProfile,
+  normalizeResponsesBaseUrl
+}

@@ -47,6 +47,7 @@ const createSnapshot = (overrides: Partial<AcpStateSnapshot> = {}): AcpStateSnap
   pendingPermissions: [],
   permissionProfiles: {},
   permissionGrants: {},
+  contextUsageBySession: {},
   promptInFlight: false,
   promptInFlightSessionIds: [],
   ...overrides
@@ -77,6 +78,7 @@ let acpApi: {
   disconnect: ReturnType<typeof vi.fn>
   createSession: ReturnType<typeof vi.fn>
   resumeSession: ReturnType<typeof vi.fn>
+  compactSession: ReturnType<typeof vi.fn>
   deleteSession: ReturnType<typeof vi.fn>
   cancel: ReturnType<typeof vi.fn>
   sendPrompt: ReturnType<typeof vi.fn>
@@ -109,6 +111,7 @@ beforeEach(() => {
     disconnect: vi.fn().mockResolvedValue(createSnapshot({ status: 'idle' })),
     createSession: vi.fn().mockResolvedValue({ sessionId: 'session-1' }),
     resumeSession: vi.fn().mockResolvedValue({ sessionId: 'session-1' }),
+    compactSession: vi.fn().mockResolvedValue(createSnapshot()),
     deleteSession: vi.fn().mockResolvedValue(createSnapshot()),
     cancel: vi.fn().mockResolvedValue(createSnapshot()),
     sendPrompt: vi.fn().mockResolvedValue(createSnapshot()),
@@ -154,6 +157,26 @@ describe('useAcpRuntime respondToPermission', () => {
       optionId: 'allow-once',
       cancelled: false
     })
+  })
+
+  it('reports and rethrows a permission persistence failure', async () => {
+    acpApi.respondToPermission.mockRejectedValueOnce(
+      new Error('Permission approval could not be saved; the tool call was cancelled.')
+    )
+    const { result } = await mountRuntime()
+
+    let caught: unknown
+    await act(async () => {
+      try {
+        await result.current.respondToPermission('request-1', 'allow-project')
+      } catch (error) {
+        caught = error
+      }
+    })
+
+    expect(caught).toBeInstanceOf(Error)
+    expect((caught as Error).message).toContain('Permission approval could not be saved')
+    expect(result.current.actionError).toContain('Permission approval could not be saved')
   })
 })
 
@@ -237,6 +260,16 @@ describe('useAcpRuntime value action failures', () => {
 })
 
 describe('useAcpRuntime payload construction', () => {
+  it('requests native context compaction for one session', async () => {
+    const { result } = await mountRuntime()
+
+    await act(async () => {
+      await result.current.compactSession('session-1')
+    })
+
+    expect(acpApi.compactSession).toHaveBeenCalledWith({ sessionId: 'session-1' })
+  })
+
   it('forwards the previous framework id into the resume payload for a framework switch', async () => {
     const { result } = await mountRuntime()
 

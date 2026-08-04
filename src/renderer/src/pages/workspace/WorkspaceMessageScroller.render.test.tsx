@@ -3,6 +3,11 @@ import type { JSX, PropsWithChildren } from 'react'
 import type { ChatMessage, ChatSession, ToolActivity } from '@/stores/session-store'
 import type { UploadedAttachment } from '../../../../shared/uploads'
 import type { JobSummary } from '../../../../shared/compute'
+import { createLinearConversationGraph } from '../../../../shared/conversation-graph'
+import type {
+  HandoffLifecycleEvent,
+  HandoffLifecycleEventSource
+} from '../../../../shared/handoff-lifecycle'
 import { describe, expect, it, vi } from 'vitest'
 
 import type { ToolActivityDetails } from './workspace-tool-activity-details'
@@ -73,14 +78,15 @@ vi.mock('@/stores/preview-workbench-store', () => ({
 }))
 
 vi.mock('@/stores/review-store', () => ({
+  selectProjectSessionReviews: () => [],
   useReviewStore: (
     selector: (state: {
-      getReviewForTurn: () => undefined
+      reviewsBySession: Record<string, never[]>
       loadReviewsForSession: () => Promise<void>
     }) => unknown
   ) =>
     selector({
-      getReviewForTurn: () => undefined,
+      reviewsBySession: {},
       loadReviewsForSession: () => Promise.resolve()
     })
 }))
@@ -167,15 +173,58 @@ const renderScroller = async (session: ChatSession): Promise<string> => {
   const { WorkspaceMessageScroller } = await import('./WorkspaceMessageScroller')
 
   return renderToStaticMarkup(
-    <WorkspaceMessageScroller
-      activeSession={session}
-      canEditMessage={false}
-      onSendEditedMessage={vi.fn()}
-    />
+    <WorkspaceMessageScroller activeSession={session} onSendEditedMessage={vi.fn()} />
   )
 }
 
 describe('WorkspaceMessageScroller loading render', () => {
+  it('renders a coordinator-owned handoff status in the original turn timeline', async () => {
+    const source: HandoffLifecycleEventSource = {
+      getEvents: (): readonly HandoffLifecycleEvent[] => [
+        {
+          id: 'handoff-1',
+          sessionId: 'session-1',
+          sequence: 2,
+          observedAt: 1710000000100,
+          phase: 'reconfiguring',
+          target: { kind: 'specialist', name: 'Data analyst' },
+          provenance: {
+            originatingTurnId: 'turn-1',
+            originatingUserMessageId: 'prompt-1',
+            attachmentIds: ['upload-1'],
+            artifactIds: ['artifact-1']
+          }
+        }
+      ],
+      subscribe: () => () => undefined
+    }
+    const { WorkspaceMessageScroller } = await import('./WorkspaceMessageScroller')
+    const html = renderToStaticMarkup(
+      <WorkspaceMessageScroller
+        activeSession={createSession({
+          messages: [
+            createMessage({ id: 'prompt-1', createdAt: 1710000000000 }),
+            createMessage({
+              id: 'pre-handoff-output',
+              role: 'agent',
+              content: 'I will inspect the input first.',
+              responseToMessageId: 'prompt-1',
+              createdAt: 1710000000200
+            })
+          ]
+        })}
+        onSendEditedMessage={vi.fn()}
+        handoffLifecycleSource={source}
+      />
+    )
+
+    expect(html).toContain('Reconfiguring Data analyst')
+    expect(html).toContain('data-originating-user-message-id="prompt-1"')
+    expect(html.indexOf('Reconfiguring Data analyst')).toBeLessThan(
+      html.indexOf('I will inspect the input first.')
+    )
+  })
+
   it('renders an accessible agent loading row before streamed text arrives', async () => {
     const html = await renderScroller(
       createSession({
@@ -221,6 +270,128 @@ describe('WorkspaceMessageScroller loading render', () => {
 
     expect(html).not.toContain('role="status"')
     expect(html).toContain('Answer text')
+  })
+
+  it('calculates elapsed time and keeps token totals behind the Usage summary', async () => {
+    const html = await renderScroller(
+      createSession({
+        status: 'idle',
+        messages: [
+          createMessage({ id: 'prompt-1', createdAt: 1710000000000 }),
+          createMessage({
+            id: 'reply-1',
+            role: 'agent',
+            content: 'Answer text',
+            responseToMessageId: 'prompt-1',
+            createdAt: 1710000030000,
+            completedAt: 1710000125000,
+            updatedAt: 1710000999000,
+            turnUsage: { inputTokens: 12_345, cacheTokens: 678, outputTokens: 90 }
+          })
+        ]
+      })
+    )
+
+    expect(html).toContain('Completed ')
+    expect(html).toContain('Elapsed 2m 5s')
+    expect(html).toContain('>Usage</button>')
+    expect(html).not.toContain('Input</dt>')
+  })
+
+  it('does not expose the fallback framework from a synthesized legacy graph', async () => {
+    const messages = [
+      createMessage({ id: 'prompt-1' }),
+      createMessage({
+        id: 'reply-1',
+        role: 'agent',
+        content: 'Legacy answer',
+        completedAt: 1710000001000
+      })
+    ]
+    const html = await renderScroller(
+      createSession({
+        status: 'idle',
+        messages,
+        conversationGraph: createLinearConversationGraph({
+          sessionId: 'session-1',
+          messages,
+          createdAt: 1710000000000,
+          updatedAt: 1710000001000
+        })
+      })
+    )
+
+    expect(html).not.toContain('>Usage</button>')
+  })
+
+  it('renders completion metadata once after the final assistant message fragment in a tool turn', async () => {
+    const html = await renderScroller(
+      createSession({
+        status: 'idle',
+        messages: [
+          createMessage({ id: 'prompt-1', createdAt: 1710000000000, sortIndex: 1 }),
+          createMessage({
+            id: 'reply-1',
+            role: 'agent',
+            content: 'I loaded the skill.',
+            responseToMessageId: 'prompt-1',
+            createdAt: 1710000030000,
+            completedAt: 1710000125000,
+            sortIndex: 2
+          }),
+          createMessage({
+            id: 'reply-2',
+            role: 'agent',
+            content: 'I found the baseline count.',
+            responseToMessageId: 'prompt-1',
+            createdAt: 1710000060000,
+            completedAt: 1710000125000,
+            sortIndex: 4
+          }),
+          createMessage({
+            id: 'reply-3',
+            role: 'agent',
+            content: 'Here is the final answer.',
+            responseToMessageId: 'prompt-1',
+            createdAt: 1710000090000,
+            completedAt: 1710000125000,
+            sortIndex: 6
+          })
+        ],
+        activities: [
+          createActivity({
+            id: 'activity-1',
+            title: 'First tool action',
+            sortIndex: 3,
+            createdAt: 1710000045000,
+            updatedAt: 1710000045000
+          }),
+          createActivity({
+            id: 'activity-2',
+            title: 'Second tool action',
+            sortIndex: 5,
+            createdAt: 1710000075000,
+            updatedAt: 1710000075000
+          })
+        ]
+      })
+    )
+
+    const timelineContent = [
+      'I loaded the skill.',
+      'data-message-id="activity-group-activity-1"',
+      'I found the baseline count.',
+      'data-message-id="activity-group-activity-2"',
+      'Here is the final answer.'
+    ]
+    const timelinePositions = timelineContent.map((content) => html.indexOf(content))
+
+    expect(timelinePositions.every((position) => position >= 0)).toBe(true)
+    expect(timelinePositions).toEqual([...timelinePositions].sort((left, right) => left - right))
+    expect(html.match(/data-slot="assistant-message-footer"/g)).toHaveLength(1)
+    expect(html.indexOf('data-slot="assistant-message-footer"')).toBeGreaterThan(
+      html.indexOf('Here is the final answer.')
+    )
   })
 
   it('keeps the loading row during permission waits and hides it without an active run', async () => {
@@ -323,6 +494,57 @@ describe('WorkspaceMessageScroller loading render', () => {
     expect(html).toContain('result.txt')
     expect(html).toContain('aria-label="Preview generated file result.txt"')
     expect(html).toContain('TXT')
+  })
+
+  it('renders one generated card for legacy and native ids of the same Artifact Version', async () => {
+    const html = await renderScroller(
+      createSession({
+        status: 'idle',
+        messages: [
+          createMessage({ id: 'prompt-1' }),
+          createMessage({
+            id: 'reply-1',
+            role: 'agent',
+            content: 'Saved the script',
+            artifactIds: ['session-1:reply-1:test_script.r', 'artifact-version-1']
+          })
+        ],
+        artifacts: [
+          {
+            id: 'session-1:reply-1:test_script.r',
+            artifactId: 'artifact-lineage-1',
+            versionId: 'artifact-version-1',
+            versionNumber: 1,
+            kind: 'managed-file',
+            path: '/managed/reply-1/test_script.r',
+            name: 'test_script.r',
+            mimeType: 'text/x-r',
+            size: 227,
+            mtimeMs: 1710000000100
+          },
+          {
+            id: 'artifact-version-1',
+            artifactId: 'artifact-lineage-1',
+            versionId: 'artifact-version-1',
+            versionNumber: 1,
+            kind: 'managed-file',
+            path: '/managed/.provenance/artifact-lineage-1/artifact-version-1/content',
+            name: 'test_script.r',
+            mimeType: 'text/x-r',
+            size: 227,
+            mtimeMs: 1710000000101,
+            sha256: 'a'.repeat(64)
+          }
+        ]
+      })
+    )
+
+    expect(html).toContain('GENERATED · 1')
+    expect(html.match(/aria-label="Preview generated file test_script\.r"/g)).toHaveLength(1)
+    expect(html).toContain(
+      'title="/managed/.provenance/artifact-lineage-1/artifact-version-1/content"'
+    )
+    expect(html).not.toContain('title="/managed/reply-1/test_script.r"')
   })
 
   it('renders image cards and a more button for larger generated artifact sets without file urls', async () => {
@@ -464,7 +686,8 @@ describe('WorkspaceMessageScroller loading render', () => {
     expect(html).toContain('/forecast')
     expect(html).toContain('bg-mention-chip')
     expect(html).toContain('text-mention-chip-foreground')
-    expect(html).toContain('@clinical trial03.pdf')
+    expect(html).toContain('aria-label="Preview clinical trial03.pdf"')
+    expect(html).toContain('file-name-extension')
   })
 
   it('renders plain content for user messages without structured parts', async () => {

@@ -1,10 +1,27 @@
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { isAbsolute, join, normalize, sep } from 'node:path'
 import { tmpdir } from 'node:os'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { SettingsRepository, sanitizeSettings } from './repository'
 import type { StoredProvider } from './types'
+
+// Capture the warn calls the repository makes through createLogger. vi.hoisted runs before the
+// module's top-level code so the vi.mock factory can reference the same spy instance.
+const loggerMock = vi.hoisted(() => ({
+  debug: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn()
+}))
+const { warn: warnSpy } = loggerMock
+vi.mock('../logger', () => ({
+  createLogger: () => loggerMock
+}))
+
+beforeEach(() => {
+  warnSpy.mockClear()
+})
 
 let storageRoot: string | undefined
 
@@ -32,6 +49,87 @@ afterEach(async () => {
 })
 
 describe('settings repository', () => {
+  it('keeps only an existing Claude subscription provider as the preferred mode', () => {
+    const providers = [
+      {
+        id: 'builtin-claude-isolated',
+        type: 'claude-isolated',
+        name: 'Claude subscription'
+      }
+    ]
+
+    expect(
+      sanitizeSettings({
+        claudeSubscriptionProviderId: 'builtin-claude-isolated',
+        providers
+      }).claudeSubscriptionProviderId
+    ).toBe('builtin-claude-isolated')
+    expect(
+      sanitizeSettings({
+        claudeSubscriptionProviderId: 'builtin-claude-shared',
+        providers
+      }).claudeSubscriptionProviderId
+    ).toBeUndefined()
+    expect(
+      sanitizeSettings({
+        claudeSubscriptionProviderId: 'unknown',
+        providers
+      }).claudeSubscriptionProviderId
+    ).toBeUndefined()
+  })
+
+  it('remembers the most recently upserted Claude subscription mode', async () => {
+    const repository = new SettingsRepository(await createStorageRoot())
+
+    await repository.upsertProvider(
+      provider({
+        id: 'builtin-claude-shared',
+        type: 'claude-shared',
+        name: 'Claude subscription'
+      })
+    )
+    await repository.upsertProvider(
+      provider({
+        id: 'builtin-claude-isolated',
+        type: 'claude-isolated',
+        name: 'Claude subscription'
+      })
+    )
+
+    await expect(repository.getSettings()).resolves.toMatchObject({
+      claudeSubscriptionProviderId: 'builtin-claude-isolated'
+    })
+  })
+
+  it('remembers the last activated Claude mode after switching to another provider', async () => {
+    const root = await createStorageRoot()
+    const repository = new SettingsRepository(root)
+
+    await repository.upsertProvider(
+      provider({
+        id: 'builtin-claude-isolated',
+        type: 'claude-isolated',
+        name: 'Claude subscription'
+      })
+    )
+    await repository.upsertProvider(
+      provider({
+        id: 'builtin-claude-shared',
+        type: 'claude-shared',
+        name: 'Claude subscription'
+      })
+    )
+    await repository.upsertProvider(provider())
+
+    await repository.setActiveProvider('builtin-claude-isolated')
+    await repository.setActiveProvider('p1')
+
+    await expect(new SettingsRepository(root).getSettings()).resolves.toMatchObject({
+      activeProviderId: 'p1',
+      claudeSubscriptionProviderId: 'builtin-claude-isolated'
+    })
+  })
+
   it('migrates two legacy Codex subscription cards into one active-mode provider', () => {
     const settings = sanitizeSettings({
       activeProviderId: 'builtin-codex-isolated',
@@ -45,10 +143,83 @@ describe('settings repository', () => {
       expect.objectContaining({
         id: 'builtin-codex-subscription',
         type: 'codex-isolated',
+        codexAuthMode: 'isolated',
         name: 'Codex subscription'
       })
     ])
     expect(settings.activeProviderId).toBe('builtin-codex-subscription')
+  })
+
+  it('migrates a legacy shared Codex provider to the isolated runtime form', () => {
+    const settings = sanitizeSettings({
+      activeProviderId: 'builtin-codex-shared',
+      providers: [
+        {
+          id: 'builtin-codex-shared',
+          type: 'codex-shared',
+          name: 'Existing Codex profile',
+          lastValidatedAt: 1710000000000,
+          lastValidationFailure: { at: 1710000000001, category: 'auth' },
+          expiresAt: 1710000000002
+        }
+      ]
+    })
+
+    expect(settings.providers).toEqual([
+      expect.objectContaining({
+        id: 'builtin-codex-subscription',
+        type: 'codex-isolated',
+        codexAuthMode: 'isolated',
+        name: 'Codex subscription'
+      })
+    ])
+    expect(settings.providers[0].lastValidatedAt).toBeUndefined()
+    expect(settings.providers[0].lastValidationFailure).toBeUndefined()
+    expect(settings.providers[0].expiresAt).toBeUndefined()
+    expect(settings.activeProviderId).toBe('builtin-codex-subscription')
+  })
+
+  it('migrates an ambiguous normalized Codex subscription as isolated', () => {
+    const settings = sanitizeSettings({
+      activeProviderId: 'builtin-codex-subscription',
+      providers: [
+        {
+          id: 'builtin-codex-subscription',
+          type: 'codex-isolated',
+          name: 'Codex subscription'
+        }
+      ]
+    })
+
+    expect(settings.providers).toEqual([
+      expect.objectContaining({
+        id: 'builtin-codex-subscription',
+        type: 'codex-isolated',
+        codexAuthMode: 'isolated',
+        name: 'Codex subscription'
+      })
+    ])
+    expect(settings.activeProviderId).toBe('builtin-codex-subscription')
+  })
+
+  it('preserves an explicit imported mode on a normalized Codex subscription', () => {
+    const settings = sanitizeSettings({
+      activeProviderId: 'builtin-codex-subscription',
+      providers: [
+        {
+          id: 'builtin-codex-subscription',
+          type: 'codex-isolated',
+          codexAuthMode: 'imported',
+          name: 'Codex subscription'
+        }
+      ]
+    })
+
+    expect(settings.providers[0]).toMatchObject({
+      id: 'builtin-codex-subscription',
+      type: 'codex-isolated',
+      codexAuthMode: 'imported'
+    })
   })
 
   it('returns empty settings when nothing is stored yet', async () => {
@@ -102,7 +273,7 @@ describe('settings repository', () => {
     expect(reloaded.reasoningEffort).toBe('high')
   })
 
-  it.each(['default', 'low', 'medium', 'high', 'max'] as const)(
+  it.each(['default', 'low', 'medium', 'high', 'xhigh', 'max'] as const)(
     'keeps the %s reasoning effort on load',
     (effort) => {
       expect(sanitizeSettings({ reasoningEffort: effort }).reasoningEffort).toBe(effort)
@@ -137,6 +308,69 @@ describe('settings repository', () => {
     expect(sanitizeSettings({ notificationsEnabled: 'yes' }).notificationsEnabled).toBeUndefined()
     expect(sanitizeSettings({ notificationsEnabled: 1 }).notificationsEnabled).toBeUndefined()
     expect(sanitizeSettings({}).notificationsEnabled).toBeUndefined()
+  })
+
+  it('persists the conversation Skill import preference across a sanitized read and a reload', async () => {
+    const root = await createStorageRoot()
+    const repository = new SettingsRepository(root)
+
+    await repository.setConversationSkillImportEnabled(false)
+
+    expect((await repository.getSettings()).conversationSkillImportEnabled).toBe(false)
+    expect((await new SettingsRepository(root).getSettings()).conversationSkillImportEnabled).toBe(
+      false
+    )
+  })
+
+  it.each([true, false])('keeps the %s conversation Skill import preference on load', (enabled) => {
+    expect(
+      sanitizeSettings({ conversationSkillImportEnabled: enabled }).conversationSkillImportEnabled
+    ).toBe(enabled)
+  })
+
+  it('drops a non-boolean conversation Skill import preference on load', () => {
+    expect(
+      sanitizeSettings({ conversationSkillImportEnabled: 'yes' }).conversationSkillImportEnabled
+    ).toBeUndefined()
+    expect(
+      sanitizeSettings({ conversationSkillImportEnabled: 1 }).conversationSkillImportEnabled
+    ).toBeUndefined()
+    expect(sanitizeSettings({}).conversationSkillImportEnabled).toBeUndefined()
+  })
+
+  it('persists, sanitizes, and clears the close action preference', async () => {
+    const root = await createStorageRoot()
+    const repository = new SettingsRepository(root)
+
+    await repository.setClosePreference('minimize')
+    expect((await new SettingsRepository(root).getSettings()).closePreference).toBe('minimize')
+    expect(sanitizeSettings({ closePreference: 'invalid' }).closePreference).toBeUndefined()
+
+    await repository.setClosePreference(undefined)
+    expect((await repository.getSettings()).closePreference).toBeUndefined()
+  })
+
+  it('persists the app icon variant across a sanitized read and a reload', async () => {
+    const root = await createStorageRoot()
+    const repository = new SettingsRepository(root)
+
+    await repository.setAppIconVariant('dark')
+
+    // sanitizeSettings must not strip the variant on read-back, or the picker can never switch.
+    expect((await repository.getSettings()).appIconVariant).toBe('dark')
+
+    // A fresh repository on the same storage dir models an app restart: the variant is read back.
+    expect((await new SettingsRepository(root).getSettings()).appIconVariant).toBe('dark')
+  })
+
+  it.each(['light', 'dark'] as const)('keeps the %s app icon variant on load', (variant) => {
+    expect(sanitizeSettings({ appIconVariant: variant }).appIconVariant).toBe(variant)
+  })
+
+  it('drops an unknown app icon variant on load', () => {
+    expect(sanitizeSettings({ appIconVariant: 'sparkle' }).appIconVariant).toBeUndefined()
+    expect(sanitizeSettings({ appIconVariant: 3 }).appIconVariant).toBeUndefined()
+    expect(sanitizeSettings({}).appIconVariant).toBeUndefined()
   })
 
   it('persists the Codex adapter and paired native runtime across a sanitized read', async () => {
@@ -234,6 +468,62 @@ describe('settings repository', () => {
     expect(settings.claude).toEqual({ resolvedPath: '/bin/claude' })
   })
 
+  it('keeps only a positive whole-number custom context window', () => {
+    const base = { id: 'p1', type: 'custom', name: 'Gateway' }
+
+    expect(
+      sanitizeSettings({ providers: [{ ...base, contextWindow: 64_000 }] }).providers[0]
+        .contextWindow
+    ).toBe(64_000)
+    for (const contextWindow of [0, -1, 1.5, Number.NaN, '200000']) {
+      expect(
+        sanitizeSettings({ providers: [{ ...base, contextWindow }] }).providers[0].contextWindow
+      ).toBeUndefined()
+    }
+  })
+
+  it('keeps only a known custom-model reasoning effort preset', () => {
+    const base = { id: 'p1', type: 'custom', name: 'Gateway' }
+
+    expect(
+      sanitizeSettings({ providers: [{ ...base, reasoningEffortPreset: 'none-high' }] })
+        .providers[0].reasoningEffortPreset
+    ).toBe('none-high')
+    expect(
+      sanitizeSettings({ providers: [{ ...base, reasoningEffortPreset: 'unsupported' }] })
+        .providers[0].reasoningEffortPreset
+    ).toBe('unsupported')
+    expect(
+      sanitizeSettings({ providers: [{ ...base, reasoningEffortPreset: 'dynamic' }] }).providers[0]
+        .reasoningEffortPreset
+    ).toBeUndefined()
+  })
+
+  it('keeps only a known custom-model reasoning effort transport', () => {
+    const base = { id: 'p1', type: 'custom', name: 'Gateway' }
+
+    expect(
+      sanitizeSettings({ providers: [{ ...base, reasoningEffortTransport: 'deepseek' }] })
+        .providers[0].reasoningEffortTransport
+    ).toBe('deepseek')
+    expect(
+      sanitizeSettings({ providers: [{ ...base, reasoningEffortTransport: 'guessed' }] })
+        .providers[0].reasoningEffortTransport
+    ).toBeUndefined()
+    expect(
+      sanitizeSettings({
+        providers: [
+          {
+            ...base,
+            type: 'official',
+            vendorId: 'deepseek',
+            reasoningEffortTransport: 'openrouter'
+          }
+        ]
+      }).providers[0].reasoningEffortTransport
+    ).toBeUndefined()
+  })
+
   it('round-trips a recorded validation failure across a reload', async () => {
     const root = await createStorageRoot()
     const repository = new SettingsRepository(root)
@@ -277,6 +567,30 @@ describe('settings repository', () => {
       at: 1717000000000,
       category: 'incompatible',
       message: 'Not compatible with Claude Code: it needs /v1/messages.'
+    })
+  })
+
+  it('round-trips a server-error validation failure across a reload', async () => {
+    const root = await createStorageRoot()
+    const repository = new SettingsRepository(root)
+
+    await repository.upsertProvider(
+      provider({
+        lastValidationFailure: {
+          at: 1717000000000,
+          category: 'server-error',
+          status: 503,
+          message: 'Service temporarily unavailable'
+        }
+      })
+    )
+
+    const reloaded = await new SettingsRepository(root).getSettings()
+    expect(reloaded.providers[0].lastValidationFailure).toEqual({
+      at: 1717000000000,
+      category: 'server-error',
+      status: 503,
+      message: 'Service temporarily unavailable'
     })
   })
 
@@ -597,6 +911,23 @@ describe('settings repository: v2 official providers & activeModel migration', (
     expect((await repository.getSettings()).activeModel).toBeUndefined()
   })
 
+  it('does not recreate a deleted Claude provider when a late credential save arrives', async () => {
+    const repository = new SettingsRepository(await createStorageRoot())
+    await repository.upsertClaudeIsolatedProvider({
+      keyRef: 'enc:initial',
+      keyMask: 'sk-ant-…initial'
+    })
+    await repository.deleteProvider('builtin-claude-isolated')
+
+    await expect(
+      repository.updateClaudeIsolatedCredentialsIfExists({
+        keyRef: 'enc:late',
+        keyMask: 'sk-ant-…late'
+      })
+    ).resolves.toBe(false)
+    expect((await repository.getSettings()).providers).toEqual([])
+  })
+
   it('persists the active provider + model across a reload (app restart)', async () => {
     const root = await createStorageRoot()
     const repository = new SettingsRepository(root)
@@ -721,5 +1052,94 @@ describe('settings repository: v2 official providers & activeModel migration', (
     // An empty list deletes the language and drops the map once empty.
     await repository.setManualInterpreters('python', [])
     expect((await repository.getSettings()).notebookManualInterpreters).toBeUndefined()
+  })
+})
+
+describe('settings repository: unknown provider type on load (claude-default removal)', () => {
+  // This is the upgrade-path guarantee #346 makes: an existing install with a stored
+  // claude-default provider (and possibly an activeProviderId / activeModel pointing at it) must
+  // come up cleanly on the next launch, with the unknown provider dropped, the active pointers
+  // cleared, and a WARN log so the user can see what happened.
+
+  const writeRawSettings = async (root: string, payload: object): Promise<void> => {
+    await writeFile(join(root, 'settings.json'), JSON.stringify(payload), 'utf8')
+  }
+
+  it('drops a stored claude-default provider at load and logs a WARN with the unknown id+type', async () => {
+    // The repository's `log` is a module-scoped const created via createLogger. We can't reach it
+    // directly, so the test mocks the logger module at the top of the file and asserts the
+    // repository called `warn` with the unknown id + type. The dedicated log-format tests in
+    // logger.test.ts cover the formatting pipeline; this test pins the repository's call site.
+    const { warn: warnSpy } = loggerMock
+    const root = await createStorageRoot()
+    const repository = new SettingsRepository(root)
+
+    await writeRawSettings(root, {
+      version: 1,
+      providers: [
+        { id: 'p-custom', type: 'custom', name: 'Custom' },
+        // claude-shared is a real, supported type: it must survive the allowlist, not be dropped.
+        { id: 'builtin-claude-shared', type: 'claude-shared', name: 'Claude subscription' },
+        { id: 'p-removed', type: 'claude-default', name: 'Old Local Claude' }
+      ]
+    })
+
+    const settings = await repository.getSettings()
+    expect(settings.providers.map((p) => p.id)).toEqual(['p-custom', 'builtin-claude-shared'])
+    // One warn call for the dropped record, carrying id + type so an operator reading the log can
+    // identify which provider was discarded.
+    expect(warnSpy).toHaveBeenCalledWith(
+      'dropping stored provider with unknown type',
+      expect.objectContaining({ id: 'p-removed', type: 'claude-default' })
+    )
+  })
+
+  it('clears activeProviderId and activeModel when the active provider is the dropped one', async () => {
+    const root = await createStorageRoot()
+    const repository = new SettingsRepository(root)
+
+    await writeRawSettings(root, {
+      version: 1,
+      activeProviderId: 'p-removed',
+      activeModel: 'claude-sonnet-4-5',
+      providers: [
+        {
+          id: 'p-removed',
+          type: 'claude-default',
+          name: 'Old Local Claude',
+          model: 'claude-sonnet-4-5'
+        }
+      ]
+    })
+
+    const settings = await repository.getSettings()
+
+    // The dropped provider's id is no longer in the list, so the active pointer must be cleared.
+    expect(settings.providers.find((p) => p.id === 'p-removed')).toBeUndefined()
+    expect(settings.activeProviderId).toBeUndefined()
+    // activeModel must follow the activeProviderId: a stale model without a provider is a half-state
+    // the composer can pick up.
+    expect(settings.activeModel).toBeUndefined()
+  })
+
+  it('keeps activeProviderId when the active provider survives the drop', async () => {
+    const root = await createStorageRoot()
+    const repository = new SettingsRepository(root)
+
+    await writeRawSettings(root, {
+      version: 1,
+      activeProviderId: 'p-survives',
+      activeModel: 'gpt-4o',
+      providers: [
+        { id: 'p-survives', type: 'custom', name: 'Survives', model: 'gpt-4o' },
+        { id: 'p-removed', type: 'claude-default', name: 'Old Local Claude' }
+      ]
+    })
+
+    const settings = await repository.getSettings()
+
+    expect(settings.activeProviderId).toBe('p-survives')
+    expect(settings.activeModel).toBe('gpt-4o')
+    expect(settings.providers.find((p) => p.id === 'p-removed')).toBeUndefined()
   })
 })

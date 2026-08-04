@@ -16,6 +16,7 @@ import {
   type KernelLoopResponse
 } from './kernel-protocol'
 import { mapLoopOutputs, type MappedFigure } from './loop-output-mapper'
+import { protectManagedRuntimeWrites } from './managed-runtime-guard'
 import {
   condaActivatedPath,
   DEFAULT_PY_ENV,
@@ -32,6 +33,7 @@ import type {
   NotebookExecutor
 } from './runtime-service'
 import { DEFAULT_TIMEOUT_MS, TimeoutController } from './timeout-controller'
+import { startWorkingFileObservation, type WorkingFileObservation } from './working-file-observer'
 
 // Driver-internal process kind. 'python'/'r' are the data kernels selected by the agent-facing
 // NotebookLanguage; 'repl' is the control-plane Node kernel reached only via the control path. The
@@ -115,6 +117,7 @@ type PendingRequest = {
   resolve: (response: KernelLoopResponse) => void
   reject: (error: unknown) => void
   timeout: TimeoutController
+  timeoutMs: number
 }
 
 // One persistent loop process for a (kind, env), reused across cells until it exits or is killed.
@@ -257,6 +260,7 @@ class NotebookKernelExecutor implements NotebookExecutor {
 
   // Sends one cell to the kind's loop and resolves with the mapped execution result.
   async execute(request: NotebookExecutionRequest): Promise<NotebookExecutionResult> {
+    let workingFileObservation: WorkingFileObservation | undefined
     try {
       const kind = resolveProcessKind(request)
       const env = kind === 'repl' ? '' : resolveRequestEnv(kind, request)
@@ -268,8 +272,11 @@ class NotebookKernelExecutor implements NotebookExecutor {
         throw new Error('Notebook execution is already running.')
       }
 
+      workingFileObservation = await startWorkingFileObservation(request)
       const reqId = randomUUID()
       const { response, timedOut } = await this.sendRequest(proc, reqId, request)
+      const workingFiles = await workingFileObservation.finish()
+      workingFileObservation = undefined
 
       const figures = await this.readFigures(response.figures)
       const mapped = mapLoopOutputs({
@@ -292,9 +299,11 @@ class NotebookKernelExecutor implements NotebookExecutor {
         traceback: mapped.traceback,
         cwdAfter: response.cwd || request.cwd,
         outputs: mapped.outputs,
-        workingFiles: []
+        workingFiles,
+        environmentOverlay: response.environmentOverlay
       }
     } catch (error) {
+      await workingFileObservation?.finish()
       return errorToExecutionResult(error, request)
     }
   }
@@ -451,7 +460,15 @@ class NotebookKernelExecutor implements NotebookExecutor {
       this.disarmIdleTimer(proc)
       this.procs.delete(key)
       proc.readline.close()
-      this.rejectPending(proc, new Error('Notebook kernel process exited.'))
+      const pending = proc.pending
+      this.rejectPending(
+        proc,
+        pending?.timeout.timedOut
+          ? new NotebookExecutionTimeoutError(
+              `Notebook execution timed out after ${pending.timeoutMs}ms.`
+            )
+          : new Error('Notebook kernel process exited.')
+      )
       // Unexpected exit of a still-live proc is a crash; surface it as a 'terminated' kernel status.
       // Intentional teardown (shutdown/restart) and hard-timeout/idle drops clear the map first, so
       // this only fires for a genuine crash (the stale-proc guard above returns early otherwise).
@@ -495,7 +512,16 @@ class NotebookKernelExecutor implements NotebookExecutor {
       args = [...(request.resolvedInterpreter?.args ?? []), loopPath]
     }
 
-    const child = spawn(command, args, { cwd: spawnCwd, env: spawnEnv })
+    // The semantic guard rejects known installers before dispatch. This native layer makes the
+    // app-owned runtime read-only to the complete persistent-kernel process tree as well, covering
+    // dynamically constructed R/Python/REPL calls. manage_packages runs in the main process outside
+    // this wrapper and remains the only package writer.
+    const invocation = protectManagedRuntimeWrites(
+      { executable: command, args },
+      request.runtimeRoot,
+      this.platform
+    )
+    const child = spawn(invocation.executable, invocation.args, { cwd: spawnCwd, env: spawnEnv })
     await new Promise<void>((resolve, reject) => {
       child.once('spawn', resolve)
       child.once('error', reject)
@@ -602,14 +628,15 @@ class NotebookKernelExecutor implements NotebookExecutor {
         reqId,
         resolve: (response) => resolve({ response, timedOut: timeout.timedOut }),
         reject,
-        timeout
+        timeout,
+        timeoutMs
       }
 
       if (proc.kind === 'r') {
         proc.child.stdin.write(frameRRequest(reqId, request.code))
       } else {
         // Python and the repl (JS) loop share the same JSON-lines request framing.
-        proc.child.stdin.write(framePythonRequest(reqId, request.code))
+        proc.child.stdin.write(framePythonRequest(reqId, request.code, request.controlInvocationId))
       }
       timeout.arm(timeoutMs)
     })

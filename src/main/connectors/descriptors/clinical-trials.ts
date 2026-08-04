@@ -135,7 +135,8 @@ function normalizeNct(id: unknown): string {
 
 // ── Essie expression builders (query.term / filter.advanced) ─────────────────
 
-const quotePhrase = (text: string): string => '"' + text.replace(/"/g, '\\"') + '"'
+const quotePhrase = (text: string): string =>
+  '"' + text.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"'
 const areaPhrase = (area: string, phrase: string): string => `AREA[${area}]${quotePhrase(phrase)}`
 const areaTerm = (area: string, term: string): string => `AREA[${area}]${term}`
 const areaRange = (area: string, lo: string | null, hi: string | null): string =>
@@ -546,7 +547,7 @@ export const CLINICAL_TRIALS_TOOLS: ToolDescriptor[] = [
     returns:
       '`{ count, total (only when count_total, else null), next_page_token, items: [ { nct_id, title, status, phase (array|null), conditions, interventions, sponsor, enrollment, start_date, primary_completion_date, locations_count, study_type } ] }`.',
     example:
-      'const result = await host.mcp("clinical_trials", "search_trials", {"condition": "lung cancer", "status": ["RECRUITING"], "phase": ["PHASE3"], "count_total": True, "page_size": 10})',
+      'const result = await host.mcp("clinical_trials", "search_trials", {"condition": "lung cancer", "status": ["RECRUITING"], "phase": ["PHASE3"], "count_total": true, "page_size": 10})',
     run: async (ctx, a) => {
       const countTotal = Boolean(a.count_total)
       const page = await fetchPage(
@@ -608,7 +609,7 @@ export const CLINICAL_TRIALS_TOOLS: ToolDescriptor[] = [
     returns:
       'Same shape as search_trials: `{ count, total, next_page_token, items: [ trial summaries ] }`.',
     example:
-      'const result = await host.mcp("clinical_trials", "search_by_sponsor", {"sponsor_name": "Pfizer", "phase": ["PHASE3"], "count_total": True})',
+      'const result = await host.mcp("clinical_trials", "search_by_sponsor", {"sponsor_name": "Pfizer", "phase": ["PHASE3"], "count_total": true})',
     run: async (ctx, a) => {
       const countTotal = Boolean(a.count_total)
       const page = await fetchPage(

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import type { ChatSession, ToolActivity } from '@/stores/session-store'
+import type { HandoffLifecycleEvent } from '../../../../shared/handoff-lifecycle'
 import {
   createConversationItems,
   formatActivityTitle,
@@ -31,6 +32,20 @@ const createActivity = (overrides: Partial<ToolActivity>): ToolActivity => ({
 })
 
 describe('workspace conversation items', () => {
+  it('shows an OpenCode Skill name without exposing its content', () => {
+    expect(
+      formatActivityTitle(
+        createActivity({ title: 'Loaded skill: mcp-pubmed', status: 'completed' })
+      )
+    ).toBe('Loaded skill: mcp-pubmed')
+  })
+
+  it('keeps the projected Codex Skill name when a load fails', () => {
+    expect(
+      formatActivityTitle(createActivity({ title: 'Loading skill: mcp-pubmed', status: 'failed' }))
+    ).toBe('Skill failed: mcp-pubmed')
+  })
+
   it('orders messages and activities by stable runtime sort index when timestamps match', () => {
     const session: ChatSession = {
       ...baseSession,
@@ -71,6 +86,77 @@ describe('workspace conversation items', () => {
       'activity-tool-web-1',
       'message-2'
     ])
+  })
+
+  it('anchors a handoff lifecycle row to the original user turn without inventing another user message', () => {
+    const session: ChatSession = {
+      ...baseSession,
+      messages: [
+        {
+          id: 'user-1',
+          role: 'user',
+          content: 'Analyze the sample',
+          status: 'complete',
+          eventIds: [],
+          sortIndex: 1,
+          createdAt: 1_000,
+          updatedAt: 1_000
+        },
+        {
+          id: 'assistant-1',
+          role: 'agent',
+          content: 'I will inspect the input first.',
+          status: 'complete',
+          responseToMessageId: 'user-1',
+          eventIds: [],
+          sortIndex: 3,
+          createdAt: 1_200,
+          updatedAt: 1_200
+        },
+        {
+          id: 'assistant-2',
+          role: 'agent',
+          content: 'Continuing with the approved specialist.',
+          status: 'streaming',
+          responseToMessageId: 'user-1',
+          eventIds: [],
+          sortIndex: 4,
+          createdAt: 1_300,
+          updatedAt: 1_300
+        }
+      ]
+    }
+    const handoff: HandoffLifecycleEvent = {
+      id: 'handoff-1',
+      sessionId: 'session-1',
+      sequence: 2,
+      observedAt: 1_100,
+      phase: 'reconfiguring',
+      target: { kind: 'specialist', name: 'Data analyst' },
+      provenance: {
+        originatingTurnId: 'turn-1',
+        originatingUserMessageId: 'user-1',
+        attachmentIds: ['upload-1'],
+        artifactIds: ['artifact-1']
+      }
+    }
+
+    const items = createConversationItems(session, [handoff])
+
+    expect(items.map((item) => item.id)).toEqual([
+      'user-1',
+      'handoff:session-1:turn-1',
+      'assistant-1',
+      'assistant-2'
+    ])
+    expect(
+      items.filter((item) => item.type === 'message' && item.message.role === 'user')
+    ).toHaveLength(1)
+    expect(items.find((item) => item.type === 'handoff')).toMatchObject({
+      originatingUserMessageId: 'user-1',
+      phase: 'reconfiguring',
+      provenance: { attachmentIds: ['upload-1'], artifactIds: ['artifact-1'] }
+    })
   })
 
   it('formats activities by tool identity without exposing title details', () => {
@@ -145,6 +231,33 @@ describe('workspace conversation items', () => {
         })
       )
     ).toBe('Using tool: Notebook restart')
+  })
+
+  it('detects notebook tools whose server name was underscore-sanitized (Codex/gpt bridge)', () => {
+    // The gpt/codex bridge rewrites the hyphenated server name to underscores; still a notebook cell.
+    expect(
+      formatActivityTitle(
+        createActivity({
+          id: 'tool-notebook-underscore',
+          status: 'completed',
+          providerToolName: 'mcp__open_science_notebook__notebook_execute',
+          toolKind: 'other'
+        })
+      )
+    ).toBe('Used tool: Notebook cell')
+  })
+
+  it('detects a Codex notebook activity whose MCP identity is only in the title', () => {
+    expect(
+      formatActivityTitle(
+        createActivity({
+          id: 'tool-codex-notebook',
+          title: 'mcp.open-science-notebook.notebook_execute',
+          status: 'completed',
+          toolKind: 'execute'
+        })
+      )
+    ).toBe('Used tool: Notebook cell')
   })
 
   it('falls back to readable tool kind names for unnamed tools', () => {

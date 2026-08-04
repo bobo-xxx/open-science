@@ -1,10 +1,21 @@
-import { mkdtemp, readdir, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { createLogger, errorLogFields, flushLogs, formatLine, initLogger } from './logger'
+import {
+  createLogger,
+  diagnosticErrorFields,
+  errorLogFields,
+  flushLogs,
+  formatLine,
+  initLogger
+} from './logger'
+import {
+  ApplicationModuleDisposalTimeoutError,
+  shutdownApplicationSurfaces
+} from './application-runtime'
 
 let logDir: string | undefined
 
@@ -53,6 +64,67 @@ describe('logger: formatLine', () => {
 
     expect(() => JSON.parse(line)).not.toThrow()
     expect((JSON.parse(line) as { data: unknown }).data).toBe('[unserializable]')
+  })
+})
+
+describe('logger: process run context', () => {
+  it('adds the configured run ID to every emitted JSONL record without changing existing keys', async () => {
+    logDir = await mkdtemp(join(tmpdir(), 'os-logger-run-'))
+    initLogger({
+      logDir,
+      fileName: 'main.log',
+      mirrorToConsole: false,
+      runId: 'test-run-id'
+    })
+
+    createLogger('startup').info('ready', { phase: 'ready' })
+    await flushLogs()
+
+    const record = JSON.parse(await readFile(join(logDir, 'main.log'), 'utf8')) as Record<
+      string,
+      unknown
+    >
+    expect(record).toMatchObject({
+      level: 'info',
+      runId: 'test-run-id',
+      scope: 'startup',
+      msg: 'ready',
+      data: { phase: 'ready' }
+    })
+    expect(typeof record.t).toBe('string')
+  })
+})
+
+describe('logger: diagnosticErrorFields', () => {
+  it('classifies a provider request error without retaining its payload', () => {
+    const secret = 'provider-secret-value'
+    const fields = diagnosticErrorFields(
+      Object.assign(new Error(`provider rejected ${secret}`), {
+        name: 'RequestError',
+        code: -32603,
+        data: { credential: secret },
+        path: `/private/${secret}`
+      })
+    )
+
+    expect(fields).toEqual({ errorCategory: 'request' })
+    expect(JSON.stringify(fields)).not.toContain(secret)
+  })
+
+  it('does not copy arbitrary error names or codes into the category', () => {
+    const secret = 'custom-secret-category'
+    for (const name of [secret, 'toString', 'constructor', '__proto__']) {
+      const fields = diagnosticErrorFields({
+        name,
+        code: secret,
+        message: secret,
+        data: { credential: secret }
+      })
+
+      expect(fields).toEqual({ errorCategory: 'object' })
+      expect(typeof fields.errorCategory).toBe('string')
+      expect(JSON.stringify(fields)).not.toContain(secret)
+    }
   })
 })
 
@@ -890,6 +962,64 @@ describe('logger: errorLogFields', () => {
     expect(fixed.data.error).toBe('x')
     expect(typeof fixed.data.stack).toBe('string')
     expect(fixed.data.framework).toBe('claude-code')
+  })
+})
+
+describe('logger: application shutdown diagnostics', () => {
+  it('persists fixed surface outcomes without aggregate error details', async () => {
+    logDir = await mkdtemp(join(tmpdir(), 'os-logger-shutdown-'))
+    initLogger({ logDir, fileName: 'main.log', mirrorToConsole: false })
+    const log = createLogger('shutdown')
+
+    await shutdownApplicationSurfaces({
+      disposeApplicationRuntime: () =>
+        Promise.reject(
+          new AggregateError([
+            new ApplicationModuleDisposalTimeoutError('mcp-client-manager', 1000),
+            new Error('compute poller stop failed at /private/project')
+          ])
+        ),
+      shutdownRemoteAccess: () => undefined,
+      disposeWebController: () => undefined,
+      disposeIpcHandlers: () => undefined,
+      log
+    })
+    await flushLogs()
+
+    const records = (await readFile(join(logDir, 'main.log'), 'utf8'))
+      .trim()
+      .split('\n')
+      .map(
+        (line) =>
+          JSON.parse(line) as {
+            msg: string
+            data: { surface: string; result: string; errorCategory: string }
+          }
+      )
+
+    expect(records).toEqual([
+      expect.objectContaining({
+        msg: 'application surface shutdown failed',
+        data: {
+          surface: 'application-runtime',
+          result: 'timeout',
+          errorCategory: 'object'
+        }
+      }),
+      expect.objectContaining({
+        msg: 'application surface shutdown failed',
+        data: {
+          surface: 'application-runtime',
+          result: 'failed',
+          errorCategory: 'error'
+        }
+      })
+    ])
+    const json = JSON.stringify(records)
+    expect(json).not.toContain('mcp-client-manager')
+    expect(json).not.toContain('1000ms')
+    expect(json).not.toContain('compute poller stop failed')
+    expect(json).not.toContain('/private/project')
   })
 })
 

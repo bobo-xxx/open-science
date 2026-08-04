@@ -1,15 +1,17 @@
-import { ipcMain } from 'electron'
+import { ipcMainHandle } from '../ipc-handler-registry'
 
 import {
-  CODEX_SUBSCRIPTION_PROVIDER_ID,
-  isReasoningEffort,
-  type ReasoningEffort,
+  type AppIconPreview,
+  type SetAppIconVariantRequest,
   type CreateSkillRequest,
   type DeleteProviderRequest,
   type DeleteSkillRequest,
+  type ImportAgentHomeSkillsRequest,
   type ImportSkillRequest,
   type ImportSkillZipRequest,
   type ImportSkillZipBatchRequest,
+  type PreviewAgentHomeSkillRequest,
+  type PreviewGitHubSkillRequest,
   type PreviewSkillZipRequest,
   type ScanRepoRequest,
   type InstallClaudeRequest,
@@ -27,6 +29,8 @@ import {
   type SetConnectorEnabledRequest,
   type SetNcbiCredentialsRequest,
   type SetPackageMirrorRequest,
+  type SetClosePreferenceRequest,
+  type SetConversationSkillImportEnabledRequest,
   type SetNotificationsEnabledRequest,
   type SetReasoningEffortRequest,
   type SetSkillEnabledRequest,
@@ -35,9 +39,18 @@ import {
   type UpsertProviderRequest,
   type ValidateProviderRequest
 } from '../../shared/settings'
-import { createDefaultSettingsService, SettingsService } from './service'
+import { SettingsService } from './service'
+import type { SettingsWorkflows } from './workflows'
 import { createLogger } from '../logger'
 import { broadcastToRenderers } from '../renderer-broadcast'
+import {
+  readAppIconVariant,
+  readClosePreference,
+  readConversationSkillImportEnabled,
+  readIsolatedClaudeToken,
+  readNotificationsEnabled,
+  readReasoningEffort
+} from './transport-validation'
 
 const log = createLogger('settings-ipc')
 
@@ -46,17 +59,11 @@ const log = createLogger('settings-ipc')
 const SETTINGS_INSTALL_LOG_CHANNEL = 'settings:install-log'
 
 export type SettingsIpcOptions = {
-  service?: SettingsService
-  // Called after the active provider changes so the ACP runtime can drop its stale connection.
-  onActiveProviderChanged?: () => void
-  // Called after the reasoning effort changes so the ACP runtime can live-apply it to open sessions.
-  // Returns true when the level was applied over ACP (no reconnect needed); false means the active
-  // framework only carries effort in its spawn config and onActiveProviderChanged must fire instead.
-  onReasoningEffortChanged?: (effort: ReasoningEffort) => Promise<boolean>
-  // Called after a skill is toggled so the ACP runtime reloads skills on its next reconnect.
-  onSkillsChanged?: () => void
-  // Called after a connector/tool/credential change so bundled + custom skill docs re-sync.
-  onConnectorsChanged?: () => void
+  service: SettingsService
+  workflows: SettingsWorkflows
+  // Renders the built-in icon variants to preview data URLs for the Appearance picker. Absent means
+  // the picker gets an empty list (no bundled assets available, e.g. an environment without them).
+  listAppIconPreviews?: () => AppIconPreview[]
 }
 
 // Streams one install event (log line or progress tick) to every open renderer window.
@@ -67,311 +74,210 @@ const broadcastInstallEvent = (event: ClaudeInstallEvent): void => {
 // Registers renderer-callable settings commands. Secret handling stays entirely in the service; the
 // handlers only marshal typed requests and forward install log streaming.
 const registerSettingsIpcHandlers = ({
-  service = createDefaultSettingsService(),
-  onActiveProviderChanged,
-  onReasoningEffortChanged,
-  onSkillsChanged,
-  onConnectorsChanged
-}: SettingsIpcOptions = {}): void => {
-  ipcMain.handle('settings:get-preflight', () => service.getPreflight())
-  ipcMain.handle('settings:get-settings', () => service.getSettingsView())
-  ipcMain.handle('settings:encryption-available', () => service.isEncryptionAvailable())
-  ipcMain.handle('settings:npm-available', () => service.isNpmAvailable())
-  ipcMain.handle('settings:check-environment', () => service.checkEnvironment())
-  ipcMain.handle('settings:detect-claude', () => service.detectClaude())
-  ipcMain.handle('settings:detect-opencode', () => service.detectOpencode())
-  ipcMain.handle('settings:detect-codex', () => service.detectCodex())
-  ipcMain.handle('settings:install-opencode', (_event, request: InstallOpencodeRequest) =>
+  service,
+  workflows,
+  listAppIconPreviews
+}: SettingsIpcOptions): void => {
+  ipcMainHandle('settings:get-preflight', () => service.getPreflight())
+  ipcMainHandle('settings:get-settings', () => service.getSettingsView())
+  ipcMainHandle('settings:encryption-available', () => service.isEncryptionAvailable())
+  ipcMainHandle('settings:npm-available', () => service.isNpmAvailable())
+  ipcMainHandle('settings:check-environment', () => service.checkEnvironment())
+  ipcMainHandle('settings:detect-claude', () => service.detectClaude())
+  ipcMainHandle('settings:detect-opencode', () => service.detectOpencode())
+  ipcMainHandle('settings:detect-codex', () => service.detectCodex())
+  ipcMainHandle('settings:install-opencode', (_event, request: InstallOpencodeRequest) =>
     service.installOpencode(request, broadcastInstallEvent)
   )
-  ipcMain.handle('settings:install-codex', (_event, request: InstallCodexRequest) =>
+  ipcMainHandle('settings:install-codex', (_event, request: InstallCodexRequest) =>
     service.installCodex(request, broadcastInstallEvent)
   )
 
-  ipcMain.handle('settings:install-claude', (_event, request: InstallClaudeRequest) =>
+  ipcMainHandle('settings:install-claude', (_event, request: InstallClaudeRequest) =>
     service.installClaude(request, broadcastInstallEvent)
   )
 
-  ipcMain.handle('settings:uninstall-claude', async () => {
-    const { snapshot, activeBackendAffected } = await service.uninstallClaude()
-
-    // Reconnect only when the removed runtime backed the active framework (its live agent is now stale,
-    // possibly auto-switched to the other). Uninstalling the inactive runtime touches nothing the live
-    // agent depends on, so it must not churn the connection.
-    if (activeBackendAffected) onActiveProviderChanged?.()
-
-    return snapshot
-  })
-
-  ipcMain.handle('settings:uninstall-opencode', async () => {
-    const { snapshot, activeBackendAffected } = await service.uninstallOpencode()
-
-    if (activeBackendAffected) onActiveProviderChanged?.()
-
-    return snapshot
-  })
-
-  ipcMain.handle('settings:uninstall-codex', async () => {
-    const { snapshot, activeBackendAffected } = await service.uninstallCodex()
-
-    if (activeBackendAffected) onActiveProviderChanged?.()
-
-    return snapshot
-  })
-
-  ipcMain.handle('settings:upsert-provider', async (_event, request: UpsertProviderRequest) => {
-    const snapshot = await service.upsertProvider(request)
-
-    // Editing the currently-active provider in place must also refresh the agent. The live process
-    // baked its base URL / key / model in at spawn time, so without this a credential or model edit
-    // would silently keep hitting the pre-edit gateway until the next manual provider switch.
-    if (request.id && request.id === snapshot.activeProviderId) {
-      onActiveProviderChanged?.()
-    }
-
-    return snapshot
-  })
-  ipcMain.handle('settings:delete-provider', async (_event, request: DeleteProviderRequest) => {
-    const before = await service.getSettingsView()
-    const snapshot = await service.deleteProvider(request.id)
-
-    // The live process still holds the decrypted key until it reconnects.
-    if (before.activeProviderId === request.id) onActiveProviderChanged?.()
-
-    return snapshot
-  })
-  ipcMain.handle(
-    'settings:set-active-provider',
-    async (_event, request: SetActiveProviderRequest) => {
-      const snapshot = await service.setActiveProvider(request.id, request.model)
-
-      // Switching providers requires a fresh agent process so the new credentials take effect.
-      onActiveProviderChanged?.()
-
-      return snapshot
-    }
+  ipcMainHandle('settings:uninstall-claude', () =>
+    workflows.runtime.uninstallRuntime('uninstallClaude', 'claude-code')
   )
-  ipcMain.handle(
+
+  ipcMainHandle('settings:uninstall-opencode', () =>
+    workflows.runtime.uninstallRuntime('uninstallOpencode', 'opencode')
+  )
+
+  ipcMainHandle('settings:uninstall-codex', () =>
+    workflows.runtime.uninstallRuntime('uninstallCodex', 'codex')
+  )
+
+  ipcMainHandle('settings:upsert-provider', (_event, request: UpsertProviderRequest) =>
+    workflows.runtime.upsertProvider(request)
+  )
+  ipcMainHandle('settings:delete-provider', (_event, request: DeleteProviderRequest) =>
+    workflows.runtime.deleteProvider(request.id)
+  )
+  ipcMainHandle('settings:set-active-provider', (_event, request: SetActiveProviderRequest) =>
+    workflows.runtime.setActiveProvider(request)
+  )
+  ipcMainHandle(
     'settings:set-agent-framework',
     async (_event, request: SetAgentFrameworkRequest) => {
       log.info('set agent framework requested', { id: request.id })
-      const snapshot = await service.setAgentFramework(request.id)
-
-      // Switching frameworks needs a fresh agent process, exactly like a provider switch — the live
-      // process is a different backend binary, so the choice only takes effect on reconnect.
-      onActiveProviderChanged?.()
-
-      return snapshot
+      return workflows.runtime.setAgentFramework(request)
     }
   )
-  ipcMain.handle(
+  ipcMainHandle(
     'settings:set-reasoning-effort',
     async (_event, request: SetReasoningEffortRequest) => {
-      // Renderer payloads are untyped at runtime: reject anything outside the known levels instead
-      // of persisting a value the agent-mapping layers can't interpret.
-      if (!isReasoningEffort(request?.effort)) {
-        throw new Error(`Unknown reasoning effort: ${String(request?.effort)}`)
-      }
-
-      log.info('set reasoning effort requested', { effort: request.effort })
-      const snapshot = await service.setReasoningEffort(request.effort)
-
-      // Live-capable frameworks (Claude Code, Codex) apply the level to open sessions over ACP —
-      // no respawn, the way a model switch feels. Others (opencode) bake effort into the spawn
-      // config, so only the provider-switch reconnect can deliver it.
-      const appliedLive = (await onReasoningEffortChanged?.(request.effort)) ?? false
-
-      if (!appliedLive) {
-        onActiveProviderChanged?.()
-      }
-
-      return snapshot
+      const effort = readReasoningEffort(request)
+      log.info('set reasoning effort requested', { effort })
+      return workflows.runtime.setReasoningEffort({ effort })
     }
   )
-  ipcMain.handle(
+  ipcMainHandle(
     'settings:set-notifications-enabled',
     async (_event, request: SetNotificationsEnabledRequest) => {
-      // Renderer payloads are untyped at runtime: only a real boolean may persist.
-      if (typeof request?.enabled !== 'boolean') {
-        throw new Error(`Invalid notifications-enabled flag: ${String(request?.enabled)}`)
-      }
-
-      log.info('set notifications enabled requested', { enabled: request.enabled })
-      return service.setNotificationsEnabled(request.enabled)
+      const enabled = readNotificationsEnabled(request)
+      log.info('set notifications enabled requested', { enabled })
+      return service.setNotificationsEnabled(enabled)
     }
   )
-  ipcMain.handle('settings:validate-provider', (_event, request: ValidateProviderRequest) =>
+  ipcMainHandle(
+    'settings:set-conversation-skill-import-enabled',
+    async (_event, request: SetConversationSkillImportEnabledRequest) => {
+      const enabled = readConversationSkillImportEnabled(request)
+      log.info('set conversation Skill import enabled requested', { enabled })
+      return workflows.skills.setConversationSkillImportEnabled({ enabled })
+    }
+  )
+  ipcMainHandle(
+    'settings:set-close-preference',
+    async (_event, request: SetClosePreferenceRequest) => {
+      const preference = readClosePreference(request)
+      log.info('set close preference requested', { preference: preference ?? 'ask' })
+      return service.setClosePreference(preference)
+    }
+  )
+  ipcMainHandle('settings:list-app-icons', (): AppIconPreview[] => listAppIconPreviews?.() ?? [])
+  ipcMainHandle(
+    'settings:set-app-icon-variant',
+    async (_event, request: SetAppIconVariantRequest) => {
+      const variant = readAppIconVariant(request)
+      log.info('set app icon variant requested', { variant })
+      return workflows.appearance.setAppIconVariant(variant)
+    }
+  )
+  ipcMainHandle('settings:validate-provider', (_event, request: ValidateProviderRequest) =>
     service.validateProvider(request)
   )
-  ipcMain.handle('settings:cancel-codex-login', () => service.cancelCodexLogin())
-  ipcMain.handle('settings:login-isolated-codex', async () => {
-    const result = await service.loginIsolatedCodex()
-
-    // A fresh login changes the credentials the live agent relies on; reconnect so it picks them
-    // up. Skip when the outcome was discarded by a mid-flow switch to shared — reconnecting the
-    // now-shared runtime would be redundant (its credentials didn't change).
-    if (result.ok) {
-      const snapshot = await service.getSettingsView()
-      const active = snapshot.providers.find(
-        (provider) => provider.id === snapshot.activeProviderId
-      )
-      if (
-        snapshot.activeProviderId === CODEX_SUBSCRIPTION_PROVIDER_ID &&
-        active?.type === 'codex-isolated'
-      ) {
-        onActiveProviderChanged?.()
-      }
-    }
-
-    return result
+  ipcMainHandle('settings:cancel-codex-login', () => service.cancelCodexLogin())
+  ipcMainHandle('settings:cancel-claude-login', () => service.cancelClaudeLogin())
+  ipcMainHandle('settings:login-shared-claude', () => workflows.runtime.loginClaudeShared())
+  ipcMainHandle('settings:logout-shared-claude', () => workflows.runtime.logoutClaudeShared())
+  ipcMainHandle('settings:login-isolated-claude', (_event, token: string) =>
+    workflows.runtime.loginIsolatedClaude(readIsolatedClaudeToken(token))
+  )
+  ipcMainHandle('settings:login-isolated-claude-browser', () =>
+    workflows.runtime.loginIsolatedClaudeBrowser()
+  )
+  ipcMainHandle('settings:cancel-isolated-claude-login', async () => {
+    await service.cancelClaudeIsolatedLogin()
   })
-  ipcMain.handle('settings:logout-isolated-codex', async () => {
-    const result = await service.logoutIsolatedCodex()
-
-    // Reconnect only when the sign-out actually cleared the credential. A timed-out sign-out leaves
-    // it in place, so forcing the live agent to reconnect would just re-authenticate against the
-    // credential we failed to remove.
-    if (result.ok) {
-      const snapshot = await service.getSettingsView()
-      if (snapshot.activeProviderId === CODEX_SUBSCRIPTION_PROVIDER_ID) {
-        onActiveProviderChanged?.()
-      }
-    }
-
-    return result
-  })
-  ipcMain.handle(
+  ipcMainHandle('settings:logout-isolated-claude', () => workflows.runtime.logoutIsolatedClaude())
+  ipcMainHandle('settings:login-isolated-codex', () => workflows.runtime.loginIsolatedCodex())
+  ipcMainHandle('settings:logout-isolated-codex', () => workflows.runtime.logoutIsolatedCodex())
+  ipcMainHandle(
     'settings:refresh-provider-models',
     (_event, request: RefreshProviderModelsRequest) => service.refreshProviderModels(request)
   )
-  ipcMain.handle('settings:mark-onboarding-complete', () => service.markOnboardingComplete())
+  ipcMainHandle('settings:mark-onboarding-complete', () => service.markOnboardingComplete())
 
-  ipcMain.handle('settings:get-package-mirror', () => service.getPackageMirror())
-  ipcMain.handle('settings:set-package-mirror', (_event, request: SetPackageMirrorRequest) =>
+  ipcMainHandle('settings:get-package-mirror', () => service.getPackageMirror())
+  ipcMainHandle('settings:set-package-mirror', (_event, request: SetPackageMirrorRequest) =>
     service.setPackageMirror(request)
   )
 
-  ipcMain.handle('settings:list-skills', () => service.listSkills())
-  ipcMain.handle('settings:get-skill-detail', (_event, id: string) => service.getSkillDetail(id))
-  ipcMain.handle('settings:set-skill-enabled', async (_event, request: SetSkillEnabledRequest) => {
-    const skills = await service.setSkillEnabled(request)
-
-    // A toggle takes effect on the next reconnect: the runtime re-provisions (re-materializes) the
-    // config dir and resumes the open session with full context on its next message.
-    onSkillsChanged?.()
-
-    return skills
-  })
-  ipcMain.handle('settings:create-skill', async (_event, request: CreateSkillRequest) => {
-    const skills = await service.createSkill(request)
-    onSkillsChanged?.()
-    return skills
-  })
-  ipcMain.handle('settings:update-skill', async (_event, request: UpdateSkillRequest) => {
-    const skills = await service.updateSkill(request)
-    onSkillsChanged?.()
-    return skills
-  })
-  ipcMain.handle('settings:delete-skill', async (_event, request: DeleteSkillRequest) => {
-    const skills = await service.deleteSkill(request)
-    onSkillsChanged?.()
-    return skills
-  })
-  ipcMain.handle('settings:import-skill', async (_event, request: ImportSkillRequest) => {
-    const result = await service.importSkill(request)
-    onSkillsChanged?.()
-    return result
-  })
-  ipcMain.handle('settings:import-skill-zip', async (_event, request: ImportSkillZipRequest) => {
-    const result = await service.importSkillZip(request)
-    onSkillsChanged?.()
-    return result
-  })
-  ipcMain.handle(
-    'settings:import-skill-zip-batch',
-    async (_event, request: ImportSkillZipBatchRequest) => {
-      const result = await service.importSkillZipBatch(request)
-      onSkillsChanged?.()
-      return result
-    }
+  ipcMainHandle('settings:list-skills', () => service.listSkills())
+  ipcMainHandle('settings:get-skill-detail', (_event, id: string) => service.getSkillDetail(id))
+  ipcMainHandle('settings:set-skill-enabled', (_event, request: SetSkillEnabledRequest) =>
+    workflows.skills.setSkillEnabled(request)
   )
-  ipcMain.handle('settings:preview-skill-zip', (_event, request: PreviewSkillZipRequest) =>
+  ipcMainHandle('settings:create-skill', (_event, request: CreateSkillRequest) =>
+    workflows.skills.createSkill(request)
+  )
+  ipcMainHandle('settings:update-skill', (_event, request: UpdateSkillRequest) =>
+    workflows.skills.updateSkill(request)
+  )
+  ipcMainHandle('settings:delete-skill', (_event, request: DeleteSkillRequest) =>
+    workflows.skills.deleteSkill(request)
+  )
+  ipcMainHandle('settings:import-skill', (_event, request: ImportSkillRequest) =>
+    workflows.skills.importSkill(request)
+  )
+  ipcMainHandle('settings:import-skill-zip', (_event, request: ImportSkillZipRequest) =>
+    workflows.skills.importSkillZip(request)
+  )
+  ipcMainHandle('settings:import-skill-zip-batch', (_event, request: ImportSkillZipBatchRequest) =>
+    workflows.skills.importSkillZipBatch(request)
+  )
+  ipcMainHandle('settings:preview-skill-zip', (_event, request: PreviewSkillZipRequest) =>
     service.previewSkillZip(request)
   )
-  ipcMain.handle('settings:scan-repo-skills', (_event, request: ScanRepoRequest) =>
+  ipcMainHandle('settings:preview-github-skill', (_event, request: PreviewGitHubSkillRequest) =>
+    service.previewGitHubSkill(request)
+  )
+  ipcMainHandle('settings:scan-repo-skills', (_event, request: ScanRepoRequest) =>
     service.scanRepoSkills(request)
   )
+  // Lists the generic global skill source plus the active framework's source. Read-only — the
+  // renderer submits checked source-id/slug pairs through the batch import handler below.
+  ipcMainHandle('settings:list-agent-home-skills', () => service.listAgentHomeSkills())
+  ipcMainHandle(
+    'settings:preview-agent-home-skill',
+    (_event, request: PreviewAgentHomeSkillRequest) => service.previewAgentHomeSkill(request)
+  )
+  ipcMainHandle(
+    'settings:import-agent-home-skills',
+    (_event, request: ImportAgentHomeSkillsRequest) =>
+      workflows.skills.importAgentHomeSkills(request)
+  )
 
-  ipcMain.handle('settings:list-connectors', () => service.listConnectors())
-  ipcMain.handle('settings:get-connector-detail', (_event, id: string) =>
+  ipcMainHandle('settings:list-connectors', () => service.listConnectors())
+  ipcMainHandle('settings:get-connector-detail', (_event, id: string) =>
     service.getConnectorDetail(id)
   )
-  ipcMain.handle(
-    'settings:set-connector-enabled',
-    async (_event, request: SetConnectorEnabledRequest) => {
-      const snapshot = await service.setConnectorEnabled(request)
-      onConnectorsChanged?.()
-      return snapshot
-    }
+  ipcMainHandle('settings:set-connector-enabled', (_event, request: SetConnectorEnabledRequest) =>
+    workflows.connectors.setConnectorEnabled(request)
   )
-  ipcMain.handle(
+  ipcMainHandle(
     'settings:set-connector-auto-allow',
-    async (_event, request: SetConnectorAutoAllowRequest) => {
-      const snapshot = await service.setConnectorAutoAllow(request)
-      onConnectorsChanged?.()
-      return snapshot
-    }
+    (_event, request: SetConnectorAutoAllowRequest) =>
+      workflows.connectors.setConnectorAutoAllow(request)
   )
-  ipcMain.handle(
-    'settings:set-tool-permission',
-    async (_event, request: SetToolPermissionRequest) => {
-      const detail = await service.setToolPermission(request)
-      onConnectorsChanged?.()
-      return detail
-    }
+  ipcMainHandle('settings:set-tool-permission', (_event, request: SetToolPermissionRequest) =>
+    workflows.connectors.setToolPermission(request)
   )
-  ipcMain.handle(
-    'settings:set-ncbi-credentials',
-    async (_event, request: SetNcbiCredentialsRequest) => {
-      const snapshot = await service.setNcbiCredentials(request)
-      onConnectorsChanged?.()
-      return snapshot
-    }
+  ipcMainHandle('settings:set-ncbi-credentials', (_event, request: SetNcbiCredentialsRequest) =>
+    workflows.connectors.setNcbiCredentials(request)
   )
-  ipcMain.handle('settings:add-custom-server', async (_event, request: AddCustomServerRequest) => {
-    const snapshot = await service.addCustomServer(request)
-    onConnectorsChanged?.()
-    return snapshot
-  })
-  ipcMain.handle(
+  ipcMainHandle('settings:add-custom-server', (_event, request: AddCustomServerRequest) =>
+    workflows.connectors.addCustomServer(request)
+  )
+  ipcMainHandle(
     'settings:set-custom-server-enabled',
-    async (_event, request: SetCustomServerEnabledRequest) => {
-      const snapshot = await service.setCustomServerEnabled(request)
-      onConnectorsChanged?.()
-      return snapshot
-    }
+    (_event, request: SetCustomServerEnabledRequest) =>
+      workflows.connectors.setCustomServerEnabled(request)
   )
-  ipcMain.handle(
-    'settings:remove-custom-server',
-    async (_event, request: RemoveCustomServerRequest) => {
-      const snapshot = await service.removeCustomServer(request)
-      onConnectorsChanged?.()
-      return snapshot
-    }
+  ipcMainHandle('settings:remove-custom-server', (_event, request: RemoveCustomServerRequest) =>
+    workflows.connectors.removeCustomServer(request)
   )
-  ipcMain.handle(
-    'settings:update-custom-server',
-    async (_event, request: UpdateCustomServerRequest) => {
-      const snapshot = await service.updateCustomServer(request)
-      onConnectorsChanged?.()
-      return snapshot
-    }
+  ipcMainHandle('settings:update-custom-server', (_event, request: UpdateCustomServerRequest) =>
+    workflows.connectors.updateCustomServer(request)
   )
   // Compute file browser bookmarks: keyed by provider_id in settings.computeBookmarks.
-  ipcMain.handle('compute:bookmarks:get', (_event, providerId: string) =>
+  ipcMainHandle('compute:bookmarks:get', (_event, providerId: string) =>
     service.getComputeBookmarks(providerId)
   )
-  ipcMain.handle('compute:bookmarks:set', (_event, providerId: string, folders: string[]) =>
+  ipcMainHandle('compute:bookmarks:set', (_event, providerId: string, folders: string[]) =>
     service.setComputeBookmarks(providerId, folders)
   )
 }

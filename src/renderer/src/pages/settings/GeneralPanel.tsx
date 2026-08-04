@@ -2,11 +2,15 @@ import { ExternalLink, FolderOpen, Globe, Terminal } from 'lucide-react'
 import { useEffect, useState } from 'react'
 
 import { ExternalTextLink } from '@/components/ExternalTextLink'
+import { ThemeSegmentedControl } from '@/components/ThemeControls'
 import { GitHubStarBadge } from '@/components/GitHubStarBadge'
 import { Button } from '@/components/ui/button'
+import { Select, SelectContent, SelectItem, SelectTrigger } from '@/components/ui/select'
 import { useSettingsStore } from '@/stores/settings-store'
+import type { CloseActionPreference } from '../../../../shared/window-controls'
 import type { CliLauncherStatus } from '../../../../shared/cli'
 import { APP } from '../../../../shared/app-config'
+import { AppIconSection } from './AppIconSection'
 import { AppVersionSection } from './AppVersionSection'
 import { SettingsRow, SettingsSection, SettingsToggle } from './SettingsLayout'
 
@@ -40,6 +44,8 @@ const GeneralPanel = (): React.JSX.Element => {
   const [cliError, setCliError] = useState<string | undefined>(undefined)
   const notificationsEnabled = useSettingsStore((state) => state.notificationsEnabled)
   const setNotificationsEnabled = useSettingsStore((state) => state.setNotificationsEnabled)
+  const closePreference = useSettingsStore((state) => state.closePreference)
+  const setClosePreference = useSettingsStore((state) => state.setClosePreference)
 
   useEffect(() => {
     void window.api.logs.getPath().then(setLogPath)
@@ -99,6 +105,61 @@ const GeneralPanel = (): React.JSX.Element => {
       <AppVersionSection />
 
       <SettingsSection
+        title="Appearance"
+        description="Choose how the app looks. System follows your device; light and dark stay fixed. Your choice is remembered on this device."
+        aria-label="Appearance"
+        separated
+      >
+        <SettingsRow
+          label="Theme"
+          description="Follow the system setting, or force light or dark."
+          className="pt-0"
+          controlClassName="flex justify-end"
+        >
+          <ThemeSegmentedControl />
+        </SettingsRow>
+      </SettingsSection>
+
+      {window.api.platform === 'win32' && window.api.window?.onCloseConfirmRequest ? (
+        <SettingsSection
+          title="Window behavior"
+          description="Choose what the titlebar close button does."
+          aria-label="Window behavior"
+          separated
+        >
+          <SettingsRow
+            label="When closing the window"
+            description="Ask each time, keep Open Science running in the tray, or quit the app."
+            className="pt-0"
+          >
+            <Select
+              value={closePreference ?? 'ask'}
+              onValueChange={(value) =>
+                void setClosePreference(
+                  value === 'ask' ? undefined : (value as CloseActionPreference)
+                )
+              }
+            >
+              <SelectTrigger aria-label="When closing the window">
+                <span>
+                  {closePreference === 'minimize'
+                    ? 'Minimize to tray'
+                    : closePreference === 'quit'
+                      ? 'Quit'
+                      : 'Ask every time'}
+                </span>
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="ask">Ask every time</SelectItem>
+                <SelectItem value="minimize">Minimize to tray</SelectItem>
+                <SelectItem value="quit">Quit</SelectItem>
+              </SelectContent>
+            </Select>
+          </SettingsRow>
+        </SettingsSection>
+      ) : null}
+
+      <SettingsSection
         title="Notifications"
         description={
           <>
@@ -129,6 +190,8 @@ const GeneralPanel = (): React.JSX.Element => {
           notification permission the first time one appears.
         </p>
       </SettingsSection>
+
+      <AppIconSection />
 
       <SettingsSection
         title="Diagnostics"
