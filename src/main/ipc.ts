@@ -1040,6 +1040,7 @@ const createApplicationModules = async (
       provenanceRepository: artifactProvenanceRepository,
       uploadRepository,
       notebookRpcServer,
+      peekNotebookHandoffContext: (sessionId) => notebookService.peekHandoffContext(sessionId),
       authorizeSkillImportReferencedUploads: (projectId, sessionId, paths) =>
         conversationSkillImporter.authorizeReferencedUploads(projectId, sessionId, paths),
       settingsService,
@@ -1220,7 +1221,8 @@ const createApplicationModules = async (
     runtime: {
       requestProviderReconnect: () => void runtime.requestProviderReconnect(),
       requestAgentFrameworkSwitch: () => void runtime.requestAgentFrameworkSwitch(),
-      applyReasoningEffort: (effort) => runtime.applyReasoningEffortChange(effort)
+      applyReasoningEffort: (effort) => runtime.applyReasoningEffortChange(effort),
+      applyModelChange: (target) => runtime.applyModelChange(target)
     },
     skills: { requestSkillsReload: () => void runtime.requestSkillsReload() },
     connectors: {

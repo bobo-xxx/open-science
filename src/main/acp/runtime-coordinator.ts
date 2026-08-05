@@ -24,6 +24,7 @@ import type { AcpRuntimeActivity, AcpRuntimeActivityOptions } from './runtime-ac
 import { ConversationPermissionGrantStore } from './permission-broker'
 import type { ApprovedSwitchReadBack, ClaudeCodeReplayInput } from '../agents/claude-code-handoff'
 import type { ShutdownStepOutcome } from '../lifecycle-shutdown'
+import type { AgentModelChangeTarget } from '../agent-framework'
 
 const MAX_EVENTS = 500
 const QUIT_PREPARATION_TIMEOUT_MS = 4_000
@@ -736,6 +737,10 @@ class AcpRuntimeCoordinator {
     return this.getActiveRuntime().applyReasoningEffortChange(effort)
   }
 
+  async applyModelChange(target: AgentModelChangeTarget): Promise<boolean> {
+    return this.getActiveRuntime().applyModelChange(target)
+  }
+
   writeArtifactForCurrentRun(
     sessionId: string,
     input: Parameters<AcpRuntime['writeArtifactForCurrentRun']>[1]
@@ -812,8 +817,12 @@ class AcpRuntimeCoordinator {
         const contextReset = await ensureActivitySession(request.sessionId)
         const historyPreamble = options.session?.historyPreamble
         return this.dispatchPrompt(
-          contextReset && historyPreamble && !request.historyPreamble
-            ? { ...request, historyPreamble }
+          contextReset
+            ? {
+                ...request,
+                contextReset: true,
+                ...(historyPreamble && !request.historyPreamble ? { historyPreamble } : {})
+              }
             : request,
           undefined,
           'sendPrompt',

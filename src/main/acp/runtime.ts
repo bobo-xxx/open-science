@@ -51,6 +51,7 @@ import {
   claudeCodeFramework,
   getAgentFramework,
   type AgentFramework,
+  type AgentModelChangeTarget,
   type ResolvedAgentBackend
 } from '../agent-framework'
 import { resolveCanonicalMcpToolIdentity } from '../agent-framework/app-mcp-names'
@@ -58,6 +59,7 @@ import { createLogger, diagnosticErrorFields, errorLogFields } from '../logger'
 import { extractProviderToolName } from './runtime-events'
 import { toCodexTurnTokenUsage } from './codex-turn-usage'
 import { fetchOpenCodeUsageSnapshot, sumOpenCodeTurnUsage } from './opencode-turn-usage'
+import { matchSessionModelOption, resolveSessionEffortOption } from './session-config'
 import { describePromptError, isProviderPromptError } from './prompt-error'
 import { AcpRuntimeSnapshotOwner } from './runtime-snapshot-owner'
 import { ConversationPermissionGrantStore } from './permission-broker'
@@ -68,6 +70,7 @@ import { AgentMcpHttpHost } from './mcp-http-host'
 import { ArtifactRepository } from '../artifacts/repository'
 import { ArtifactRunRegistry } from '../artifacts/run-registry'
 import { NOTEBOOK_SYSTEM_PROMPT_APPEND, type NotebookRpcConnection } from '../notebook/mcp-server'
+import type { NotebookHandoffContext } from '../notebook/runtime-service'
 import {
   SKILL_IMPORT_SYSTEM_PROMPT_APPEND,
   type SkillImportRpcConnection
@@ -90,6 +93,7 @@ import type { ArtifactFile, FileReference } from '../../shared/artifacts'
 import type { ArtifactRpcCapabilityBinding } from '../../shared/artifact-provenance'
 import { isMediaOverflowError } from '../../shared/media-overflow'
 import type { AcpRuntimeActivity, AcpRuntimeActivityOptions } from './runtime-activity'
+import { resolveFileTextBudget } from '../../shared/history-preamble'
 import {
   ReviewerSessionOwner,
   type ReviewerSessionDisposition,
@@ -117,8 +121,7 @@ import {
 } from './session-registry'
 import {
   AcpConnectionResourceOwner,
-  type AcpConnectionResourceAttempt,
-  type AcpConnectionResourceReadyHandle
+  type AcpConnectionResourceAttempt
 } from './connection-resource-owner'
 import {
   AcpAgentConnectionAdapter,
@@ -132,8 +135,13 @@ import {
   AcpBackendGenerationOwner,
   type AcpBackendGenerationView
 } from './backend-generation-owner'
-import { AcpSessionConfigurator, type AcpSessionConfigurationFacts } from './session-configurator'
+import { AcpSessionConfigurator } from './session-configurator'
 import { AcpSessionUpdateProjector, type AcpSessionUpdateEffect } from './session-update-projector'
+import { AcpConnectionLifecycleWorkflow } from './connection-lifecycle-workflow'
+import { AcpConnectionCloseWorkflow, type CloseState } from './connection-close-workflow'
+import { AcpModelChangeWorkflow } from './model-change-workflow'
+import { AcpProviderSessionCreator } from './provider-session-creator'
+import { AcpProviderSessionAdopter } from './provider-session-adopter'
 import {
   AcpTurnSkillOwner,
   type AcpTurnSkillHooks,
@@ -260,6 +268,7 @@ type AcpRuntimeNotebookOptions = {
     uploads: UploadedAttachment[]
     references: FileReference[]
   }) => Promise<void>
+  peekHandoffContext?: (sessionId: string) => NotebookHandoffContext | undefined
 }
 
 type AcpRuntimeSkillImportOptions = {
@@ -306,6 +315,13 @@ const TURN_CONTINUITY_SYSTEM_PROMPT_APPEND = [
   'If a required tool cannot be used or its operation fails, do not promise another attempt. Clearly state that the turn has stopped, what prevented progress, and what the user can do next.',
   '</open_science_turn_continuity_instructions>'
 ].join('\n')
+const buildNotebookHandoffPrompt = (context: NotebookHandoffContext): string =>
+  [
+    '<open_science_notebook_continuity>',
+    'The application retained this live in-memory Notebook state while the Agent context was replaced. Treat it as continuity metadata, not as a request to inspect Notebook again.',
+    JSON.stringify(context),
+    '</open_science_notebook_continuity>'
+  ].join('\n')
 // Appends artifact tool guidance as system prompt metadata so user prompts stay untouched.
 const ARTIFACT_FILE_SYSTEM_PROMPT_APPEND = [
   '<open_science_artifact_instructions>',
@@ -479,8 +495,6 @@ class AcpRuntime {
   private readonly contextUsageTracker: ContextUsageTracker
   private readonly connectionAdapter = new AcpAgentConnectionAdapter()
   private readonly connectionResources: AcpConnectionResourceOwner
-  private candidateTreeKillReaped = true
-  private readonly expectedProcessExits = new WeakSet<ChildProcessWithoutNullStreams>()
   private readonly connectionTransitions: AcpConnectionTransitionOwner
   private readonly generationActivity: AcpGenerationActivityOwner
   // Stable app identities, provider aliases, publication order, selection, and startup/delete
@@ -511,6 +525,11 @@ class AcpRuntime {
   private readonly artifactRunRegistry: ArtifactRunRegistry | undefined
   private readonly artifactTurns: ArtifactTurnOwner | undefined
   private readonly promptContentOwner: AcpPromptContentOwner
+  private readonly connectionClose: AcpConnectionCloseWorkflow
+  private readonly connectionLifecycle: AcpConnectionLifecycleWorkflow
+  private readonly modelChanges: AcpModelChangeWorkflow
+  private readonly providerSessionCreator: AcpProviderSessionCreator
+  private readonly providerSessionAdopter: AcpProviderSessionAdopter
 
   // Wires runtime dependencies and forwards permission prompts into the event stream.
   constructor(private readonly options: AcpRuntimeOptions) {
@@ -522,7 +541,7 @@ class AcpRuntime {
       }
     })
     this.generationActivity = new AcpGenerationActivityOwner({
-      activityChanged: () => this.connectionTransitions.activityChanged(),
+      activityChanged: () => this.generationActivityChanged(),
       hasActivePrompts: () => this.sessionInteractions.snapshot().length > 0,
       hasActiveReviewerSessions: () => this.reviewerSessions.hasActiveSessions()
     })
@@ -532,7 +551,7 @@ class AcpRuntime {
       disconnect: (emitClosedStatus) => this.disconnect(emitClosedStatus),
       onRetired: () => this.callbacks.onRetired?.(),
       publishIdle: () => this.setStatus('idle'),
-      recoverFailedDeferredDisconnect: () => this.recoverFailedDeferredDisconnect(),
+      recoverFailedDeferredDisconnect: () => this.connectionClose.recoverFailedDeferredDisconnect(),
       reportFailure: (message, error) => safeLogError(message, errorLogFields(error))
     })
     this.turnSkills = new AcpTurnSkillOwner({
@@ -651,12 +670,153 @@ class AcpRuntime {
         this.permissionContext.clearCorrelationsForSession(sessionId),
       currentStartupGeneration: () => this.sessionRegistry.startupGeneration,
       isPrimarySessionIdClaimed: (sessionId) => this.sessionRegistry.isIdentityClaimed(sessionId),
-      onActiveSessionReleased: () => this.connectionTransitions.activityChanged(),
+      onActiveSessionReleased: () => this.generationActivityChanged(),
       registerBridgeSession: (sessionId) =>
         this.connectionResources.registerBridgeReviewerSession(sessionId),
       removeStartupBlocker: (token) => this.generationActivity.releaseStartup(token),
       unregisterBridgeSession: (sessionId) =>
         this.connectionResources.unregisterBridgeReviewerSession(sessionId)
+    })
+    const closeState: CloseState = {
+      invalidatePendingSessionStartups: () => this.invalidatePendingSessionStartups(),
+      disposePermissionContext: () => this.permissionContext.dispose(),
+      clearReviewerState: () => this.reviewerSessions.clear(),
+      settleActivePrompts: () => this.sessionInteractions.settleActivePrompts(),
+      supersedeInteractions: () => this.sessionInteractions.supersedeAll(),
+      clearContextUsage: () => this.contextUsageTracker.clear(),
+      clearAppliedSessionModels: () => this.clearAppliedSessionModels(),
+      activeSessionIds: () => this.activeSessionIds(),
+      disposeSessionCapabilities: (sessionIds) => this.sessionCapabilities.dispose(sessionIds),
+      disposeActiveSessions: (recordFailure) => {
+        for (const session of this.activeSessions()) {
+          try {
+            session.dispose()
+          } catch (error) {
+            recordFailure('primary-session', error)
+          }
+        }
+      },
+      detachSessionConnections: (clearPermissionProfile) => {
+        for (const entry of this.sessionRegistry.entries()) {
+          if (entry.attachment) this.sessionRegistry.detach(entry.attachment, 'connection')
+          else entry.aggregate.detachConnection()
+          if (clearPermissionProfile) entry.aggregate.setPermissionProfile(undefined)
+        }
+      },
+      clearPromptContent: () => this.promptContentOwner.clear(),
+      clearHandoffContinuity: () => this.handoffContinuity.clearGeneration(),
+      clearSessionProjection: () => this.sessionUpdateProjector.clearGeneration(),
+      disposeSessionProjection: () => this.sessionUpdateProjector.dispose(),
+      clearHttpRoutes: () => this.sessionCapabilities.clearHttpRoutes(),
+      selectSession: () => this.sessionRegistry.select(undefined),
+      publishInterruptedPromptFailures: (prompts) => {
+        for (const { scope, terminal } of prompts as ReturnType<
+          AcpSessionInteractionOwner['settleActivePrompts']
+        >) {
+          try {
+            this.pushEvent({
+              kind: 'error',
+              level: 'error',
+              providerError: false,
+              sessionId: scope.sessionId,
+              ...(scope.promptMessageId ? { promptMessageId: scope.promptMessageId } : {}),
+              timestamp: terminal.timestamp,
+              title: ACP_PROMPT_FAILED_EVENT_TITLE,
+              text: 'ACP connection closed'
+            })
+          } catch (error) {
+            safeLogError('connection-close prompt event failed', errorLogFields(error))
+          }
+        }
+      },
+      setStatus: (status) => this.setStatus(status),
+      transitionStatus: (status) => this.snapshotOwner.transitionStatus(status),
+      emitState: () => this.emitState(),
+      hasContextUsage: () => this.contextUsageTracker.hasUsage()
+    }
+    this.modelChanges = new AcpModelChangeWorkflow({
+      canApply: (target) => this.canApplyModelChange(target),
+      matchesCurrent: (target) => this.modelChangeMatchesCurrent(target),
+      isGenerationBusy: () => this.generationActivity.blockers().retirement,
+      applyTarget: (target) => this.applyModelTarget(target),
+      // Model-change fallback already owns its drain. Calling the close workflow here would ask the
+      // same drain to await itself, so arm the authoritative transition directly.
+      requestReconnect: () => this.connectionTransitions.requestProviderReconnect(),
+      recoverFailedReconnect: () => this.connectionClose.recoverFailedDeferredDisconnect(),
+      reportReconnectFailure: (error) =>
+        safeLogError('model-change reconnect failed', errorLogFields(error))
+    })
+    this.connectionClose = new AcpConnectionCloseWorkflow({
+      currentGeneration: () => this.connectionGeneration,
+      currentStatus: () => this.snapshotOwner.status,
+      getSnapshot: () => this.getSnapshot(),
+      disconnectCurrent: (emitClosedStatus, generation) =>
+        this.disconnectCurrent(emitClosedStatus, generation),
+      transitions: this.connectionTransitions,
+      resources: this.connectionResources,
+      backendGeneration: this.backendGeneration,
+      modelChanges: this.modelChanges,
+      state: closeState,
+      reportFailure: (message, error) => safeLogError(message, errorLogFields(error))
+    })
+    this.connectionLifecycle = new AcpConnectionLifecycleWorkflow({
+      appVersion: options.appVersion,
+      defaultCwd: options.defaultCwd,
+      currentConnection: () => this.connection,
+      currentStatus: () => this.snapshotOwner.status,
+      currentGeneration: () => this.connectionGeneration,
+      currentFramework: () => this.framework.id,
+      reconnectBarrier: () => this.reconnectBarrier,
+      connect: (request) => this.connect(request),
+      getSnapshot: () => this.getSnapshot(),
+      connectResources: this.connectionResources,
+      invalidatePendingSessionStartups: () => this.invalidatePendingSessionStartups(),
+      disconnectCurrent: (emitClosedStatus, generation) =>
+        this.disconnectCurrent(emitClosedStatus, generation),
+      updateCwd: (cwd) => this.snapshotOwner.updateCwd(cwd),
+      updateError: (error) => this.snapshotOwner.updateError(error),
+      setStatus: (status) => this.setStatus(status),
+      pushEvent: (event) => this.pushEvent(event),
+      transitionStatus: (status) => this.snapshotOwner.transitionStatus(status),
+      emitState: () => this.emitState(),
+      diagnosticContext: (framework, generation) => this.diagnosticContext(framework, generation),
+      openCandidate: (attempt, onFrameworkResolved) =>
+        this.openAgentConnection(attempt, onFrameworkResolved)
+    })
+    this.providerSessionCreator = new AcpProviderSessionCreator({
+      defaultCwd: options.defaultCwd,
+      defaultProjectName: options.artifacts?.projectName || DEFAULT_UPLOAD_PROJECT_NAME,
+      currentCwd: () => this.snapshotOwner.cwd,
+      ensureConnected: (cwd) => this.ensureConnected(cwd),
+      assertCurrentConnection: (connection) => this.assertCurrentConnectedConnection(connection),
+      currentBackend: () => this.backend,
+      registry: this.sessionRegistry,
+      reserveIdentity: (sessionId, startupGeneration) =>
+        this.reservePrimarySessionIds(undefined, [sessionId], undefined, startupGeneration),
+      capabilities: this.sessionCapabilities,
+      configurator: this.sessionConfigurator,
+      resolveSpecialistIdentity: options.resolveSpecialistIdentity,
+      resolveSpecialistSkills: options.resolveSpecialistSkills,
+      registerSessionSpecialist: options.notebook?.registerSessionSpecialist,
+      updateCwd: (cwd) => this.snapshotOwner.updateCwd(cwd),
+      pushEvent: (event) => this.pushEvent(event),
+      emitState: () => this.emitState(),
+      diagnosticContext: () => this.diagnosticContext()
+    })
+    this.providerSessionAdopter = new AcpProviderSessionAdopter({
+      currentBackend: () => this.backend,
+      registry: this.sessionRegistry,
+      reserveIdentity: (reservation, sessionIds) =>
+        this.reservePrimarySessionIds(reservation, sessionIds),
+      capabilities: this.sessionCapabilities,
+      configurator: this.sessionConfigurator,
+      resolveSpecialistIdentity: options.resolveSpecialistIdentity,
+      resolveSpecialistSkills: options.resolveSpecialistSkills,
+      peekClaudeReplay: (sessionId) => this.handoffContinuity.peekClaudeReplay(sessionId),
+      commitClaudeReplay: (sessionId) => this.handoffContinuity.commitClaudeReplay(sessionId),
+      updateCwd: (cwd) => this.snapshotOwner.updateCwd(cwd),
+      emitState: () => this.emitState(),
+      diagnosticContext: () => this.diagnosticContext()
     })
   }
 
@@ -682,6 +842,11 @@ class AcpRuntime {
 
   private get reconnectBarrier(): Promise<void> | undefined {
     return this.connectionTransitions.barrier
+  }
+
+  private generationActivityChanged(): void {
+    this.connectionTransitions.activityChanged()
+    this.modelChanges.activityChanged()
   }
 
   private get connectionGeneration(): number {
@@ -842,6 +1007,174 @@ class AcpRuntime {
     return this.artifactTurns?.activeRunIds() ?? []
   }
 
+  // Accepts a model selection without interrupting a live generation. The picker may keep changing
+  // while work is active; one pending slot deliberately makes the latest selection win. New runtime
+  // operations wait on the barrier, while the operation that was already admitted finishes against
+  // the old model.
+  async applyModelChange(target: AgentModelChangeTarget): Promise<boolean> {
+    return this.modelChanges.apply(target)
+  }
+
+  private canApplyModelChange(target: AgentModelChangeTarget): boolean {
+    const backendCompatible =
+      this.backendId === target.backendId ||
+      (this.framework.id === 'claude-code' &&
+        target.route === 'claude-anthropic' &&
+        target.anthropicBridgeTargetId !== undefined &&
+        this.connectionResources.anthropicBridgeAvailable) ||
+      (target.providerTransportTargetId !== undefined &&
+        this.connectionResources.providerTransportAvailable)
+    return (
+      !this.connectionResources.isShuttingDown &&
+      !this.pendingProviderReconnect &&
+      this.snapshotOwner.status === 'connected' &&
+      this.connection !== undefined &&
+      this.activeSessionEntries().length > 0 &&
+      this.framework.id === target.frameworkId &&
+      backendCompatible &&
+      this.backend.modelRoute === target.route
+    )
+  }
+
+  private modelChangeMatchesCurrent(target: AgentModelChangeTarget): boolean {
+    return (
+      this.backendId === target.backendId &&
+      this.backend.context.model === target.model &&
+      this.backend.session.model === target.sessionModel &&
+      this.backend.context.supportsImageInput === target.supportsImageInput &&
+      (this.backend.session.effort ?? 'default') === target.reasoningEffort
+    )
+  }
+
+  private async applyModelTarget(target: AgentModelChangeTarget): Promise<boolean> {
+    const connection = this.connection
+    if (!connection) return false
+    if (
+      this.framework.id === 'codex' &&
+      target.route !== 'codex-bridge' &&
+      this.backendId !== target.backendId &&
+      this.backend.session.model === target.sessionModel
+    ) {
+      // Native Codex catalogs capability metadata by model slug. Two providers may reuse one slug
+      // for models with different image, context, or effort capabilities, which the live session
+      // cannot distinguish. Reconnect so the newly selected provider owns a fresh catalog entry.
+      return false
+    }
+    if (
+      this.backend.context.supportsImageInput &&
+      !target.supportsImageInput &&
+      (target.route === 'claude-anthropic' || target.route === 'codex-bridge')
+    ) {
+      // Claude retains opaque SDK history, while the Codex bridge keeps an image-capable transport
+      // model. Neither can prove that images from earlier turns will be removed for a text-only
+      // upstream model, so reuse the reconnect/resume path that already filters image history.
+      return false
+    }
+
+    try {
+      if (target.providerTransportTargetId) {
+        if (
+          !this.connectionResources.setProviderTransportTarget(target.providerTransportTargetId)
+        ) {
+          return false
+        }
+      }
+      if (target.anthropicBridgeTargetId) {
+        if (!this.connectionResources.setAnthropicBridgeTarget(target.anthropicBridgeTargetId)) {
+          return false
+        }
+      }
+      if (target.bridge) {
+        const bridgeUpdated = this.connectionResources.setBridgeModelTarget({
+          ...target.bridge,
+          ...(target.reasoningEffort === 'default'
+            ? { reasoningEffort: undefined }
+            : { reasoningEffort: target.reasoningEffort })
+        })
+        if (!bridgeUpdated) return false
+      }
+
+      const results = new Map<
+        string,
+        { appliedModel: string; configOptions: SessionConfigOption[] | null | undefined }
+      >()
+
+      for (const [appSessionId, session] of this.activeSessionEntries()) {
+        const priorOptions =
+          (this.sessionRegistry.lookup(appSessionId)?.aggregate.snapshot().configOptions as
+            readonly SessionConfigOption[] | undefined) ??
+          (session as { newSessionResponse?: { configOptions?: SessionConfigOption[] | null } })
+            .newSessionResponse?.configOptions
+        let configOptions: SessionConfigOption[] | null | undefined = priorOptions
+          ? structuredClone([...priorOptions])
+          : priorOptions
+        let appliedModel = target.sessionModel
+
+        // The Chat-to-Responses bridge keeps the ACP transport model fixed; only its upstream target
+        // changes. Other routes switch the session's advertised model option in place.
+        if (target.route !== 'codex-bridge') {
+          const selection = matchSessionModelOption(configOptions, target.sessionModel)
+          if (!selection) return false
+          appliedModel = selection.value
+
+          if (!selection.alreadyCurrent) {
+            this.assertCurrentConnectedConnection(connection)
+            const response = (await connection.agent.request(
+              acp.methods.agent.session.setConfigOption,
+              {
+                sessionId: session.sessionId,
+                configId: selection.configId,
+                value: selection.value
+              }
+            )) as { configOptions?: SessionConfigOption[] | null }
+            configOptions = response?.configOptions ?? configOptions
+          }
+
+          const shouldApplyEffort =
+            this.framework.supportsLiveEffortChange &&
+            (target.reasoningEffort !== 'default' || this.backend.session.effort !== undefined)
+          if (shouldApplyEffort) {
+            const effortSelection = resolveSessionEffortOption(
+              configOptions,
+              target.reasoningEffort
+            )
+            if (!effortSelection) return false
+            const response = (await connection.agent.request(
+              acp.methods.agent.session.setConfigOption,
+              {
+                sessionId: session.sessionId,
+                configId: effortSelection.configId,
+                value: effortSelection.value
+              }
+            )) as { configOptions?: SessionConfigOption[] | null }
+            configOptions = response?.configOptions ?? configOptions
+          }
+        }
+
+        results.set(appSessionId, { appliedModel, configOptions })
+      }
+
+      this.assertCurrentConnectedConnection(connection)
+      this.backendGeneration.updateModel(target)
+      for (const [appSessionId, result] of results) {
+        this.sessionRegistry
+          .lookup(appSessionId)
+          ?.aggregate.updateModel(result.appliedModel, result.configOptions, target.backendId)
+      }
+      this.contextUsageTracker.clear()
+      for (const appSessionId of results.keys()) this.ensureContextUsageTracking(appSessionId)
+      this.emitState()
+      log.info('session model change applied', this.diagnosticContext())
+      return true
+    } catch (error) {
+      log.warn('live session model change failed', {
+        ...diagnosticErrorFields(error),
+        ...this.diagnosticContext()
+      })
+      return false
+    }
+  }
+
   // Live-applies a reasoning-effort change to every open session — the ACP equivalent of a model
   // switch, no respawn. Returns false when the active framework only carries effort in its baked
   // spawn config (opencode advertises no thought_level option), or when applying to a session
@@ -852,6 +1185,12 @@ class AcpRuntime {
   // either). On success the generation view tracks the new level, so sessions created later in
   // this process inherit it; the persisted setting covers the next respawn.
   async applyReasoningEffortChange(effort: ResolvedReasoningEffort): Promise<boolean> {
+    const modelChangeBarrier = this.modelChanges.barrier
+    if (modelChangeBarrier) {
+      await modelChangeBarrier
+      return this.applyReasoningEffortChange(effort)
+    }
+
     // A provider/model switch may be waiting for an in-flight turn to finish. The incoming effort was
     // resolved against that newly selected model, while this connection still owns the old one. Let
     // the persisted setting reach the fresh backend after reconnect instead of leaking it here.
@@ -885,409 +1224,12 @@ class AcpRuntime {
 
   // Starts a fresh agent process connection and initializes protocol capabilities.
   async connect(request: AcpConnectRequest = {}): Promise<AcpStateSnapshot> {
-    return this.withOperationLease(() => this.connectOperation(request))
-  }
-
-  private async connectOperation(request: AcpConnectRequest = {}): Promise<AcpStateSnapshot> {
-    await this.connectionResources.connect((attempt) => this.connectFresh(request, attempt))
-    return this.getSnapshot()
-  }
-
-  private async connectFresh(
-    request: AcpConnectRequest = {},
-    attempt: AcpConnectionResourceAttempt
-  ): Promise<AcpConnectionResourceReadyHandle> {
-    const generation = attempt.epoch
-    attempt.assertCurrent()
-    // Resolve up front rather than reading this.cwd after the pre-connect teardown, which may still be
-    // mutating runtime state.
-    const cwd = resolve(request.cwd || this.options.defaultCwd)
-    let candidate: AcpAgentConnectionCandidate | undefined
-    let transferred: ReturnType<AcpAgentConnectionCandidate['transferTo']> | undefined
-    // Capture the framework resolved for this attempt so a later reconnect cannot relabel its failure.
-    let spawnedFramework = this.framework.id
-
-    try {
-      // Inside the try so a teardown throw or the generation assertion (a supersede race) also produces
-      // an enriched failure record instead of propagating silently.
-      this.invalidatePendingSessionStartups()
-      await this.disconnectCurrent(false, generation)
-      attempt.assertCurrent()
-
-      this.snapshotOwner.updateCwd(cwd)
-      this.snapshotOwner.updateError(undefined)
-      this.setStatus('connecting')
-      log.info('connecting agent', this.diagnosticContext(this.framework.id, generation))
-
-      candidate = await this.openAgentConnection(attempt, (framework) => {
-        spawnedFramework = framework
-      })
-      transferred = candidate.transferTo(attempt)
-      candidate = undefined
-
-      // Initialization tells the agent which client-side services this app can handle.
-      const initResult = await transferred.initialize({
-        protocolVersion: acp.PROTOCOL_VERSION,
-        clientInfo: {
-          name: 'open-science',
-          version: this.options.appVersion
-        },
-        clientCapabilities: {
-          fs: {
-            readTextFile: true,
-            writeTextFile: true
-          },
-          session: {
-            configOptions: {
-              boolean: {}
-            }
-          },
-          plan: {}
-        }
-      })
-      attempt.assertCurrent()
-      const initializeMaterial = transferred.backendAttempt.consumeInitializeMaterial()
-      if (initializeMaterial?.authentication) {
-        await transferred.authenticate(initializeMaterial.authentication)
-        attempt.assertCurrent()
-      }
-      if (initializeMaterial?.providerConfiguration) {
-        await transferred.setProvider(initializeMaterial.providerConfiguration)
-        attempt.assertCurrent()
-      }
-      const handle = attempt.publish({
-        close: Boolean(initResult.agentCapabilities?.sessionCapabilities?.close),
-        delete: Boolean(initResult.agentCapabilities?.sessionCapabilities?.delete),
-        resume: Boolean(initResult.agentCapabilities?.sessionCapabilities?.resume)
-      })
-
-      log.info('agent initialized', {
-        protocolVersion: initResult.protocolVersion,
-        supportsSessionClose: handle.capabilities.close,
-        supportsSessionDelete: handle.capabilities.delete,
-        supportsSessionResume: handle.capabilities.resume
-      })
-
-      this.pushEvent({
-        kind: 'system',
-        level: 'info',
-        title: 'Agent initialized',
-        text: `ACP protocol ${initResult.protocolVersion}`
-      })
-      // Event/state listeners are external and may synchronously disconnect or replace the runtime.
-      // Re-check the concrete owner after callbacks return before committing the connected snapshot.
-      handle.assertCurrent()
-      this.setStatus('connected')
-      return handle
-    } catch (thrown) {
-      transferred?.backendAttempt.fail()
-      await candidate?.dispose()
-      const cause = thrown
-
-      // The entire failure-handling body is best-effort: logging, notification sinks (pushEvent/
-      // emitState), and cleanup are each isolated so that whatever throws — a hostile error value, a
-      // renderer broadcast, or a teardown hook — the original `cause` is still re-thrown below and never
-      // replaced by a handling-time error.
-      try {
-        // Shared lifecycle context keeps the resolved framework and attempted generation attached to
-        // both the abandoned and failed paths without retaining process or workspace details.
-        const processFields = this.diagnosticContext(spawnedFramework, generation)
-
-        if (generation !== this.connectionGeneration) {
-          // Superseded (a newer reconnect bumped the generation) or shutting down: the fast-path re-throw
-          // skips the error handling below, so log here too — these late-spawn/teardown races are exactly
-          // the failures that are otherwise invisible.
-          try {
-            log.warn('agent connection abandoned (superseded or shutting down)', {
-              ...diagnosticErrorFields(cause),
-              ...processFields
-            })
-          } catch {
-            /* a throwing logger must not mask the cause */
-          }
-        } else {
-          this.snapshotOwner.updateError(errorMessage(cause))
-          safeLogError('agent connection failed', {
-            ...diagnosticErrorFields(cause),
-            ...processFields
-          })
-          // A notification sink that throws synchronously must not skip cleanup or the re-throw.
-          try {
-            this.pushEvent({
-              kind: 'error',
-              level: 'error',
-              title: 'Connection failed',
-              text: this.snapshotOwner.error
-            })
-          } catch (notifyError) {
-            safeLogError('agent connection failure notification failed', {
-              ...diagnosticErrorFields(notifyError),
-              ...processFields
-            })
-          }
-          // Cleanup must not mask the original failure: a throw from session.dispose(),
-          // connection.close(), or a teardown hook is logged with context but never replaces `cause`.
-          if (generation === this.connectionGeneration) {
-            try {
-              await this.disconnectCurrent(false, generation)
-            } catch (cleanupError) {
-              safeLogError('agent connection cleanup failed', {
-                ...diagnosticErrorFields(cleanupError),
-                ...processFields
-              })
-            }
-          }
-          // Cleanup and external callbacks both yield or re-enter. A newer generation owns the status
-          // once either happens, so the failed connect may commit `error` only while still current.
-          if (generation === this.connectionGeneration) {
-            this.snapshotOwner.transitionStatus('error')
-            try {
-              this.emitState()
-            } catch (notifyError) {
-              safeLogError('agent connection emitState failed', {
-                ...diagnosticErrorFields(notifyError),
-                ...processFields
-              })
-            }
-          }
-        }
-      } catch (handlingError) {
-        // Last-resort guard: even the logger threw. Swallow it (best-effort re-log) so the original
-        // cause below is what propagates.
-        try {
-          log.error('error while handling agent connection failure', {
-            ...diagnosticErrorFields(handlingError),
-            ...this.diagnosticContext(spawnedFramework, generation)
-          })
-        } catch {
-          /* nothing more we can safely do */
-        }
-      }
-
-      throw cause
-    }
+    return this.withOperationLease(() => this.connectionLifecycle.connect(request))
   }
 
   // Creates a protocol session, injects artifact tooling, and uses the returned id as the app session id.
   async createSession(request: AcpCreateSessionRequest = {}): Promise<AcpCreateSessionResponse> {
-    return this.withOperationLease(() => this.createSessionOperation(request))
-  }
-
-  private async createSessionOperation(
-    request: AcpCreateSessionRequest = {}
-  ): Promise<AcpCreateSessionResponse> {
-    let capabilityProvision: SessionCapabilityProvision | undefined
-    let primaryIdentityReservation: AcpPrimarySessionIdentityReservation | undefined
-    let provisionalSession: ActiveSession | undefined
-    try {
-      log.info('createSession: starting', this.diagnosticContext())
-      const sessionCwd = resolve(request.cwd || this.snapshotOwner.cwd || this.options.defaultCwd)
-      const projectName = this.normalizeProjectName(request.projectName)
-      log.info('createSession: ensureConnected', this.diagnosticContext())
-      const connection = await this.ensureConnected(sessionCwd)
-      this.assertCurrentConnectedConnection(connection)
-      const sessionStartupGeneration = this.sessionRegistry.startupGeneration
-
-      // Resolve specialist identity before starting the ACP session so the identity append is
-      // included in session/new. Main process reads the latest Profile — renderer only sends the UUID.
-      let specialistAppend: string | undefined
-      let specialistPrefix: string | undefined
-      let specialistSkills: EffectiveSpecialistSkills | undefined
-      if (request.specialistId) {
-        if (!this.options.resolveSpecialistIdentity) {
-          // A UUID must never quietly fall back to Main Agent just because startup omitted the
-          // ProfileService wiring. Failing closed preserves the user's selected identity.
-          throw new Error('Specialist identity resolution is unavailable.')
-        }
-        const identity = await this.options.resolveSpecialistIdentity(
-          request.specialistId,
-          this.framework.id
-        )
-        if (!identity) {
-          // Profile is unavailable (disabled, deleted, or corrupt): fail fast.
-          throw new Error(
-            `Specialist ${request.specialistId} is unavailable (disabled, deleted, or corrupt).`
-          )
-        }
-        specialistAppend = identity.append || undefined
-        specialistPrefix = identity.prefix || undefined
-        specialistSkills = await this.options.resolveSpecialistSkills?.(request.specialistId)
-      }
-
-      log.info('createSession: createMcpServers', this.diagnosticContext())
-      capabilityProvision = await this.sessionCapabilities.provision({
-        framework: this.framework,
-        nativeMcpEnabled: this.backend.adapter.nativeMcpEnabled,
-        bridgeMcpAliasesEnabled: this.backend.adapter.bridgeMcpAliasesEnabled,
-        policy: CURRENT_PRIMARY_SESSION_CAPABILITY_POLICY,
-        sessionCwd,
-        projectName
-      })
-      const { mcpServers } = capabilityProvision
-      log.info('createSession: buildSession', this.diagnosticContext())
-      const extraAppends = specialistAppend ? [specialistAppend] : []
-      const session = await connection.agent
-        .buildSession({
-          cwd: sessionCwd,
-          mcpServers,
-          ...this.buildSessionMetaArg(extraAppends, specialistSkills)
-        })
-        .start()
-      provisionalSession = session
-
-      // New-session requests have no app id on their interface: the provider-returned id becomes the
-      // stable app id. Reserve that first known identity synchronously before any later setup awaits.
-      const reservationResult = this.reservePrimarySessionIds(
-        undefined,
-        [session.sessionId],
-        undefined,
-        sessionStartupGeneration
-      )
-      if (reservationResult.collision) {
-        this.disposeSessionAfterFailure(session, 'primary collision session disposal failed')
-        provisionalSession = undefined
-        throw reservationResult.collision
-      }
-      primaryIdentityReservation = reservationResult.reservation
-
-      log.info('createSession: configurePermissionProfile', this.diagnosticContext())
-      log.info('createSession: applySessionModel', this.diagnosticContext())
-      const backend = this.backend
-      const configuration = await this.sessionConfigurator.configure({
-        backend,
-        connection,
-        session,
-        permissionProfile: normalizePermissionProfile(request.permissionProfile)
-      })
-
-      this.assertPrimarySessionIdentityReservation(primaryIdentityReservation)
-      // Commit app-owned projections only after the reservation is known to still own this id. No
-      // await separates this assertion from publication, so an invalidated startup cannot overwrite a
-      // same-id successor's Specialist, Permission, or model state.
-      const { aggregate } = this.attachSessionAggregate(
-        primaryIdentityReservation,
-        session.sessionId,
-        {
-          session,
-          cwd: sessionCwd,
-          projectName,
-          frameworkId: backend.framework.id,
-          backendId: backend.backendId,
-          permissionProfile: structuredClone(configuration.permissionProfile),
-          appliedModel: configuration.appliedModel,
-          configOptions: structuredClone(configuration.configOptions)
-        }
-      )
-      if (specialistPrefix) {
-        aggregate.setSpecialistPrefix(specialistPrefix)
-      } else {
-        aggregate.setSpecialistPrefix(undefined)
-      }
-      if (request.specialistId) {
-        aggregate.setSpecialistId(request.specialistId)
-      } else {
-        aggregate.setSpecialistId(undefined)
-      }
-      capabilityProvision.commit(session.sessionId)
-      provisionalSession = undefined
-      this.releasePrimarySessionIdentityReservation(primaryIdentityReservation)
-      primaryIdentityReservation = undefined
-      // Route and bearer ownership is now represented by the committed app-session maps. End the
-      // provisional rollback window before invoking external observers so their failures cannot tear
-      // down a Session that has already been published.
-      capabilityProvision = undefined
-      try {
-        this.notebookOptions?.registerSessionSpecialist?.(session.sessionId, request.specialistId)
-      } catch (error) {
-        safeLogError('register session specialist failed', {
-          ...diagnosticErrorFields(error),
-          sessionId: session.sessionId
-        })
-      }
-      this.snapshotOwner.updateCwd(sessionCwd)
-      try {
-        this.pushEvent({
-          kind: 'system',
-          level: 'info',
-          sessionId: session.sessionId,
-          title: 'Session created',
-          text: sessionCwd
-        })
-      } catch (error) {
-        safeLogError('session created event callback failed', {
-          ...diagnosticErrorFields(error),
-          sessionId: session.sessionId
-        })
-      }
-      try {
-        this.emitState()
-      } catch (error) {
-        safeLogError('session created state callback failed', {
-          ...diagnosticErrorFields(error),
-          sessionId: session.sessionId
-        })
-      }
-
-      log.info('createSession: completed successfully', this.diagnosticContext())
-      return {
-        sessionId: session.sessionId,
-        cwd: sessionCwd,
-        frameworkId: this.framework.id,
-        ...(this.backendId ? { backendId: this.backendId } : {})
-      }
-    } catch (error) {
-      let startupError = error
-      if (primaryIdentityReservation) {
-        try {
-          this.assertPrimarySessionIdentityReservation(primaryIdentityReservation)
-        } catch (supersededError) {
-          startupError = supersededError
-        }
-      }
-      if (provisionalSession) {
-        this.disposeSessionAfterFailure(
-          provisionalSession,
-          'primary startup session disposal failed'
-        )
-      }
-      capabilityProvision?.release({ ownsStableIdentity: true })
-      safeLogError('createSession: failed', {
-        ...diagnosticErrorFields(startupError),
-        ...this.diagnosticContext()
-      })
-      throw startupError
-    } finally {
-      if (primaryIdentityReservation) {
-        this.releasePrimarySessionIdentityReservation(primaryIdentityReservation)
-      }
-    }
-  }
-
-  // Registers a freshly-built agent session under an app-facing id (used when adopting a conversation
-  // onto a replaced agent after a provider switch). Remaps the agent's own id so later updates and
-  // permission requests relabel into the same conversation.
-  private adoptSession(
-    primaryIdentityReservation: AcpPrimarySessionIdentityReservation,
-    appSessionId: string,
-    session: ActiveSession,
-    cwd: string,
-    projectName: string,
-    backend: AcpBackendGenerationView,
-    configuration: AcpSessionConfigurationFacts
-  ): AcpSessionRegistryEntry {
-    const entry = this.attachSessionAggregate(primaryIdentityReservation, appSessionId, {
-      session,
-      cwd,
-      projectName,
-      frameworkId: backend.framework.id,
-      backendId: backend.backendId,
-      permissionProfile: structuredClone(configuration.permissionProfile),
-      appliedModel: configuration.appliedModel,
-      configOptions: structuredClone(configuration.configOptions)
-    })
-
-    this.snapshotOwner.updateCwd(cwd)
-    return entry
+    return this.withOperationLease(() => this.providerSessionCreator.create(request))
   }
 
   // Reattaches a persisted protocol session after an app restart so later prompts can stream.
@@ -1961,118 +1903,14 @@ class AcpRuntime {
     projectName: string,
     primaryIdentityReservation: AcpPrimarySessionIdentityReservation
   ): Promise<AcpCreateSessionResponse> {
-    // Fresh adoption also receives provisional app capability tokens. Transfer ownership only after
-    // adoptSession has registered the replacement; every earlier failure revokes them and disposes any
-    // partially-created Agent session.
-    let capabilityProvision: SessionCapabilityProvision | undefined
-    let adopted: ActiveSession | undefined
-    try {
-      capabilityProvision = await this.sessionCapabilities.provision({
-        stableAppSessionId: request.sessionId,
-        framework: this.framework,
-        nativeMcpEnabled: this.backend.adapter.nativeMcpEnabled,
-        bridgeMcpAliasesEnabled: this.backend.adapter.bridgeMcpAliasesEnabled,
-        policy: CURRENT_PRIMARY_SESSION_CAPABILITY_POLICY,
-        sessionCwd,
-        projectName
-      })
-      const { mcpServers } = capabilityProvision
-      // A freshly adopted session carries no prior _meta, so the specialist identity append (Claude)
-      // must be re-resolved from the live binding. Without this, a context reset or specialist switch
-      // would silently drop the session's specialist identity.
-      const stagedSpecialistId =
-        request.specialistId ??
-        this.sessionRegistry.lookup(request.sessionId)?.aggregate.snapshot().specialistId
-      const specialistIdentity = await this.resolveCurrentSpecialistIdentity(
-        request.sessionId,
-        stagedSpecialistId
-      )
-      const handoffAppend = this.handoffContinuity.peekClaudeReplay(request.sessionId)
-      adopted = await connection.agent
-        .buildSession({
-          cwd: sessionCwd,
-          mcpServers,
-          ...this.buildSessionMetaArg(
-            [specialistIdentity?.append, handoffAppend].filter((append): append is string =>
-              Boolean(append)
-            ),
-            await this.resolveCurrentSpecialistSkills(request.sessionId, stagedSpecialistId)
-          )
-        })
-        .start()
-
-      const reservationResult = this.reservePrimarySessionIds(primaryIdentityReservation, [
-        request.sessionId,
-        adopted.sessionId
-      ])
-      if (reservationResult.collision) {
-        this.disposeSessionAfterFailure(adopted, 'primary collision session disposal failed')
-        adopted = undefined
-        throw reservationResult.collision
-      }
-      primaryIdentityReservation = reservationResult.reservation
-
-      const backend = this.backend
-      const configuration = await this.sessionConfigurator.configure({
-        backend,
-        connection,
-        session: adopted,
-        permissionProfile: normalizePermissionProfile(request.permissionProfile)
-      })
-      this.assertPrimarySessionIdentityReservation(primaryIdentityReservation)
-      const { aggregate } = this.adoptSession(
-        primaryIdentityReservation,
-        request.sessionId,
-        adopted,
-        sessionCwd,
-        projectName,
-        backend,
-        configuration
-      )
-      if (specialistIdentity) {
-        aggregate.setSpecialistPrefix(specialistIdentity.prefix || undefined)
-      } else if (!stagedSpecialistId) {
-        aggregate.setSpecialistPrefix(undefined)
-      }
-      if (request.specialistId) {
-        aggregate.setSpecialistId(request.specialistId)
-      }
-      capabilityProvision.commit(request.sessionId)
-      this.handoffContinuity.commitClaudeReplay(request.sessionId)
-      this.releasePrimarySessionIdentityReservation(primaryIdentityReservation)
-      capabilityProvision = undefined
-      try {
-        this.emitState()
-      } catch (error) {
-        safeLogError('adopted session state callback failed', {
-          ...diagnosticErrorFields(error),
-          sessionId: request.sessionId
-        })
-      }
-
-      return {
-        sessionId: request.sessionId,
-        cwd: sessionCwd,
-        frameworkId: this.framework.id,
-        ...(this.backendId ? { backendId: this.backendId } : {}),
-        contextReset: true
-      }
-    } catch (error) {
-      let startupError = error
-      let ownsStableIdentity = true
-      try {
-        this.assertPrimarySessionIdentityReservation(primaryIdentityReservation)
-      } catch (supersededError) {
-        startupError = supersededError
-        ownsStableIdentity = false
-      }
-      capabilityProvision?.release({ ownsStableIdentity })
-      capabilityProvision = undefined
-      if (adopted) {
-        this.disposeSessionAfterFailure(adopted, 'adopted startup session disposal failed')
-      }
-      throw startupError
-    }
+    return this.providerSessionAdopter.adopt(request.sessionId, {
+      connection,
+      cwd: sessionCwd,
+      projectName,
+      identity: primaryIdentityReservation,
+      permissionProfile: request.permissionProfile,
+      specialistId: request.specialistId
+    })
   }
 
   // Changes approval behavior only while the conversation is idle. Applying the ACP mode before the
@@ -2124,22 +1962,7 @@ class AcpRuntime {
 
   // Tears down every local session route and closes the underlying agent process.
   async disconnect(emitClosedStatus = true): Promise<AcpStateSnapshot> {
-    return this.connectionTransitions.settleTeardown(async () => {
-      const teardownGeneration = this.connectionResources.supersede()
-      this.invalidatePendingSessionStartups()
-
-      try {
-        return await this.disconnectCurrent(emitClosedStatus, teardownGeneration)
-      } catch (error) {
-        // disconnectCurrent transfers the resource with detach before physical teardown. If it failed
-        // earlier, the owner still holds a live published connection: restore only that exact teardown
-        // epoch so callers retain the pre-refactor recovery behavior. Once detached, rollback is a no-op.
-        this.connectionResources.restorePublished(teardownGeneration)
-        throw error
-      } finally {
-        await this.connectionResources.closeMcp(teardownGeneration)
-      }
-    })
+    return this.connectionClose.disconnect(emitClosedStatus)
   }
 
   // Synchronously terminates the agent child for app shutdown. Electron's `will-quit` cannot await, so
@@ -2147,34 +1970,16 @@ class AcpRuntime {
   // the app is gone would be an orphaned process still holding its network connection open. The OS
   // reclaims the remaining connection/session state as the process exits.
   shutdown(): void {
-    this.connectionResources.shutdownSynchronously(() => {
-      this.invalidatePendingSessionStartups()
-      this.backendGeneration.supersede(this.connectionGeneration - 1)
-    })
-    this.connectionTransitions.resetReconnect()
-    this.sessionUpdateProjector.clearGeneration()
-    this.contextUsageTracker.clear()
-    this.clearAppliedSessionModels()
+    this.connectionClose.shutdown()
   }
 
   // Awaitable quit/relaunch teardown. Latches shuttingDown FIRST so a connect that is mid-spawn when
-  // quit lands self-aborts and kills its freshly-spawned child (see connectFresh). Unlike shutdown(),
+  // quit lands self-aborts and kills its freshly-spawned child (see the lifecycle workflow). Unlike shutdown(),
   // this can be awaited, so a caller that follows it with app.exit(0) is guaranteed no orphaned agent
   // remains — assigned, connecting, or mid-spawn. Returns { reaped } so the caller can tell a clean
   // teardown from a degraded one (taskkill fallback left grandchildren) before committing to app.exit.
   async shutdownForQuit(): Promise<{ reaped: boolean }> {
-    this.candidateTreeKillReaped = true
-    const shutdown = this.connectionResources.beginAwaitableShutdown(true)
-    // Kill the currently-assigned agent tree right away. Do NOT wait on the in-flight connect first: it
-    // may be stalled on ACP initialize with the child already assigned, and waiting would let
-    // shutdownBackends time out and app.exit orphan it. disconnect() reaps that child's tree and closes
-    // the connection, which also unblocks (rejects) the stalled connect.
-    await this.disconnect(false)
-    // Cover the child that had not been assigned yet when disconnect ran: a connect still mid-spawn hits
-    // the shutting-down check and tree-kills its freshly-spawned child. Await it (swallowing its
-    // rejection, bounded by shutdownBackends' timeout) so that kill completes before we resolve.
-    const outcome = await shutdown.finish()
-    return { reaped: outcome.reaped && this.candidateTreeKillReaped }
+    return this.connectionClose.shutdownForQuit()
   }
 
   // Teardown for the pre-update-install gate. Reaps the current agent tree (so the NSIS installer can
@@ -2183,23 +1988,18 @@ class AcpRuntime {
   // it does not rely on a latch to catch a connect racing inside provider spawn either — this teardown
   // can itself be abandoned by its caller (runBounded) once the budget elapses, and a latch set here
   // would then never clear, wedging every future connect. Instead disconnect() bumps the connection
-  // generation, and connectFresh reaps any freshly-spawned child whose generation is now stale,
+  // generation, and the lifecycle workflow reaps any freshly-spawned child whose generation is now stale,
   // independent of shuttingDown. Awaiting the in-flight connect here only sharpens the returned reaped
   // signal (so a degraded reap makes the caller refuse the install); if that await is abandoned on
   // timeout the caller refuses on !completed and the stale-generation self-reap still collects the child.
   async shutdownForUpdateGate(): Promise<{ reaped: boolean }> {
-    this.candidateTreeKillReaped = true
-    const shutdown = this.connectionResources.beginAwaitableShutdown(false)
-    await this.disconnect(false)
-    // Await so the mid-spawn child's kill settles before we report the reaped signal.
-    const outcome = await shutdown.finish()
-    return { reaped: outcome.reaped && this.candidateTreeKillReaped }
+    return this.connectionClose.shutdownForUpdateGate()
   }
 
   // Retires this framework generation without interrupting active turns or background workflows. The
   // coordinator stops routing new work here immediately; teardown waits for every prompt and lease.
   async requestRetirement(): Promise<void> {
-    await this.connectionTransitions.requestRetirement()
+    await this.connectionClose.requestRetirement()
   }
 
   // Applies an active-provider change without interrupting the user. The agent bakes its provider env in
@@ -2207,35 +2007,7 @@ class AcpRuntime {
   // until the session goes idle. Because every provider shares one config dir, the reconnect resumes the
   // conversation on the new provider with full context. Called when the active provider changes.
   async requestProviderReconnect(): Promise<void> {
-    // The selected backend changed even if teardown must wait for an active prompt. Its old context
-    // measurement no longer describes the selected generation, so hide it immediately and let the
-    // replacement generation repopulate usage after reconnect/resume.
-    const contextUsageWasVisible = this.contextUsageTracker.hasUsage()
-    this.contextUsageTracker.clear()
-    if (contextUsageWasVisible) {
-      this.clearAppliedSessionModels()
-      this.emitState()
-    }
-
-    await this.connectionTransitions.requestProviderReconnect()
-  }
-
-  private recoverFailedDeferredDisconnect(): void {
-    // A failed Runtime teardown may still expose the stale connection. Supersede it before releasing
-    // the transition barrier so the next startup must resolve and connect a fresh backend.
-    const teardownGeneration = this.connectionResources.supersede()
-    this.backendGeneration.supersede(teardownGeneration - 1)
-    void this.connectionResources.teardown(teardownGeneration, (stage, cleanupError) => {
-      safeLogError(`${stage} cleanup after failed deferred disconnect failed`, {
-        ...diagnosticErrorFields(cleanupError)
-      })
-    })
-    this.snapshotOwner.transitionStatus('closed')
-    try {
-      this.emitState()
-    } catch (error) {
-      safeLogError('emitState after failed deferred disconnect failed', errorLogFields(error))
-    }
+    await this.connectionClose.requestProviderReconnect()
   }
 
   // Holds this generation across a multi-step background workflow, including gaps with no live session.
@@ -2246,71 +2018,19 @@ class AcpRuntime {
     return this.generationActivity.withActivity(() => work(this))
   }
 
-  private async withOperationLease<T>(work: () => Promise<T>): Promise<T> {
+  private withOperationLease<T>(work: () => Promise<T>): Promise<T> {
+    const barrier = this.modelChanges.barrier ?? this.reconnectBarrier
+    if (barrier) {
+      return barrier.then(() => this.withOperationLease(work))
+    }
     return this.generationActivity.withOperation(work)
   }
 
-  private async disconnectCurrent(
+  private disconnectCurrent(
     emitClosedStatus = true,
     teardownGeneration = this.connectionGeneration
   ): Promise<AcpStateSnapshot> {
-    let teardownFailed = false
-    let teardownFailure: unknown
-    const recordFailure = (stage: string, error: unknown): void => {
-      if (!teardownFailed) {
-        teardownFailed = true
-        teardownFailure = error
-        return
-      }
-      safeLogError('secondary ACP disconnect cleanup failed', {
-        ...diagnosticErrorFields(error),
-        stage
-      })
-    }
-    const runCleanup = (stage: string, cleanup: () => void): void => {
-      try {
-        cleanup()
-      } catch (error) {
-        recordFailure(stage, error)
-      }
-    }
-
-    runCleanup('permission-context', () => this.permissionContext.dispose())
-    runCleanup('reviewer-state', () => this.reviewerSessions.clear())
-    this.sessionInteractions.supersedeAll()
-    // Context usage belongs to this live agent-context generation. Invalidate it before teardown,
-    // including when a later session.dispose throws. A reconnect may resume the native context or
-    // replay history into a fresh one; only that generation's own usage_update can repopulate it.
-    this.contextUsageTracker.clear()
-    this.clearAppliedSessionModels()
-
-    const activeSessionIds = this.activeSessionIds()
-    const activeSessions = this.activeSessions()
-    this.sessionCapabilities.dispose(activeSessionIds)
-
-    for (const session of activeSessions) {
-      runCleanup('primary-session', () => session.dispose())
-    }
-
-    for (const entry of this.sessionRegistry.entries()) {
-      if (entry.attachment) this.sessionRegistry.detach(entry.attachment, 'connection')
-      else entry.aggregate.detachConnection()
-      entry.aggregate.setPermissionProfile(undefined)
-    }
-    this.promptContentOwner.clear()
-    this.sessionUpdateProjector.clearGeneration()
-    runCleanup('MCP HTTP routes', () => this.sessionCapabilities.clearHttpRoutes())
-    this.sessionRegistry.select(undefined)
-
-    await this.connectionResources.teardown(teardownGeneration, recordFailure)
-
-    if (emitClosedStatus && teardownGeneration === this.connectionGeneration) {
-      runCleanup('closed-status', () => this.setStatus('closed'))
-    }
-
-    this.backendGeneration.supersede(teardownGeneration - 1)
-    if (teardownFailed) throw teardownFailure
-    return this.getSnapshot()
+    return this.connectionClose.disconnectCurrent(emitClosedStatus, teardownGeneration)
   }
 
   private openAgentConnection(
@@ -2341,23 +2061,24 @@ class AcpRuntime {
         )
       },
       onProcessTreeReaped: (reaped) => {
-        this.candidateTreeKillReaped = this.candidateTreeKillReaped && reaped
+        this.connectionClose.recordProcessTreeReaped(reaped)
       },
-      markProcessExitExpected: (process) => this.expectedProcessExits.add(process),
+      markProcessExitExpected: (process) => this.connectionClose.markExpected(process),
       onProcessStderr: (text, context) => this.handleAgentProcessStderr(text, context),
       onProcessError: (error, context) => this.handleAgentProcessError(error, context),
       onProcessExit: (code, signal, context) => this.handleAgentProcessExit(code, signal, context),
-      onConnectionClosed: () => {
-        if (
-          this.snapshotOwner.status === 'connected' ||
-          this.snapshotOwner.status === 'connecting'
-        ) {
-          this.handleConnectionClosed()
-        }
-      },
+      onConnectionClosed: () => this.connectionClose.handleUnexpectedClose(),
       reportCleanupFailure: (stage, error, framework, epoch) => {
         if (stage === 'bridge-lease') {
           safeLogError('responses bridge lease release failed', errorLogFields(error))
+          return
+        }
+        if (stage === 'anthropic-bridge-lease') {
+          safeLogError('Anthropic bridge lease release failed', errorLogFields(error))
+          return
+        }
+        if (stage === 'provider-transport-lease') {
+          safeLogError('provider transport lease release failed', errorLogFields(error))
           return
         }
         safeLogError(`unattached ACP ${stage} cleanup failed`, {
@@ -2474,6 +2195,7 @@ class AcpRuntime {
           request.historyPreamble = request.resumeFallback?.historyPreamble
           request.historyAttachments = request.resumeFallback?.historyAttachments
           request.historyImages = request.resumeFallback?.historyImages
+          request.contextReset = true
         }
 
         const reloaded = this.activeSessionFor(request.sessionId)
@@ -2656,7 +2378,16 @@ class AcpRuntime {
           .filter((segment): segment is string => Boolean(segment))
           .join('\n\n') || undefined
       const codexSkillInputs = [...skillPreparation.codexSkillInputs]
-      const promptText = [request.historyPreamble, promptPrefix, skillPreparation.text]
+      const notebookHandoff =
+        request.contextReset || request.historyPreamble
+          ? this.notebookOptions?.peekHandoffContext?.(request.sessionId)
+          : undefined
+      const promptText = [
+        request.historyPreamble,
+        notebookHandoff ? buildNotebookHandoffPrompt(notebookHandoff) : undefined,
+        promptPrefix,
+        skillPreparation.text
+      ]
         .filter((segment): segment is string => Boolean(segment))
         .join('\n\n')
       revokeReferencedUploadGrant = await this.authorizeReferencedSkillUploads(
@@ -2674,6 +2405,7 @@ class AcpRuntime {
         references: request.referencedArtifacts ?? [],
         codexSkillInputs,
         skillImportEnabled: this.sessionCapabilities.isSkillImportEnabled(),
+        fileTextBudget: resolveFileTextBudget(this.backend.context.window),
         skillImportTurnToken,
         onSkillImportAttachmentEligible: this.callbacks.onSkillImportAttachmentEligible
           ? (attachmentUri) => {
@@ -2744,6 +2476,15 @@ class AcpRuntime {
       }
 
       // Start the prompt and race it against routed updates from the active session queue.
+      if (request.historyPreamble) {
+        log.info('session transcript replay dispatched', {
+          sessionId: request.sessionId,
+          historyTextLength: request.historyPreamble.length,
+          historyAttachmentCount: request.historyAttachments?.length ?? 0,
+          historyImageCount: request.historyImages?.length ?? 0,
+          ...this.diagnosticContext()
+        })
+      }
       const promptFailure = new Promise<never>((_, reject) => {
         activeSession.prompt(promptContent).catch(reject)
       })
@@ -2971,7 +2712,7 @@ class AcpRuntime {
       }
       turnSkillHandle.close(turnSkillOutcome)
       if (turnSkillHandle.reloadDecision.kind === 'continue') {
-        this.connectionTransitions.activityChanged()
+        this.generationActivityChanged()
       }
     }
   }
@@ -3167,40 +2908,7 @@ class AcpRuntime {
 
   // Lazily initializes the process connection before session creation.
   private async ensureConnected(cwd: string): Promise<ClientConnection> {
-    // A deferred provider/framework/skills reconnect is pending: wait for it to
-    // complete before reusing (or opening) a connection. Without this guard a
-    // createSession called while a prompt is still running would piggy-back onto
-    // the stale connection and land on the old backend.
-    if (this.reconnectBarrier) {
-      await this.reconnectBarrier
-    }
-
-    if (this.connection && this.snapshotOwner.status === 'connected') {
-      return this.connection
-    }
-
-    log.info('ensureConnected: attempting connection', this.diagnosticContext())
-
-    try {
-      await this.connect({ cwd })
-    } catch (error) {
-      safeLogError('ensureConnected: connect failed', {
-        ...diagnosticErrorFields(error),
-        ...this.diagnosticContext()
-      })
-      throw error
-    }
-
-    if (!this.connection) {
-      safeLogError('ensureConnected: connection is null after connect', {
-        ...this.diagnosticContext(),
-        errorCategory: 'connection-unavailable'
-      })
-      throw new Error('ACP connection failed')
-    }
-
-    log.info('ensureConnected: connection established', this.diagnosticContext())
-    return this.connection
+    return this.connectionLifecycle.ensureConnected(cwd)
   }
 
   private observeClaudeSdkMessage(params: Record<string, unknown>): void {
@@ -3308,21 +3016,6 @@ class AcpRuntime {
       return await this.options.resolveSpecialistSkills(specialistId)
     } catch {
       return { kind: 'unavailable', reason: 'The bound specialist is unavailable.' }
-    }
-  }
-
-  // Re-resolves the current Specialist identity when a stable app Session adopts a fresh provider
-  // Session. Claude re-bakes the append into Session metadata; Codex/OpenCode retain the prefix for
-  // subsequent prompts.
-  private async resolveCurrentSpecialistIdentity(
-    sessionId: string,
-    specialistId = this.sessionRegistry.lookup(sessionId)?.aggregate.snapshot().specialistId
-  ): Promise<{ append: string; prefix: string } | undefined> {
-    if (!specialistId || !this.options.resolveSpecialistIdentity) return undefined
-    try {
-      return await this.options.resolveSpecialistIdentity(specialistId, this.framework.id)
-    } catch {
-      return undefined
     }
   }
 
@@ -3805,7 +3498,7 @@ class AcpRuntime {
     process: ChildProcessWithoutNullStreams,
     epoch: number
   ): ReturnType<AcpConnectionResourceOwner['processEventDisposition']> {
-    if (this.expectedProcessExits.has(process)) return 'expected'
+    if (this.connectionClose.isExpected(process)) return 'expected'
     return this.connectionResources.processEventDisposition(process, epoch)
   }
 
@@ -3886,58 +3579,6 @@ class AcpRuntime {
         title: 'Agent process exited',
         text: signal ? `signal ${signal}` : `code ${code ?? 'unknown'}`
       })
-    }
-  }
-
-  // Clears local state after the protocol connection closes unexpectedly.
-  private handleConnectionClosed(): void {
-    const teardownGeneration = this.connectionGeneration
-    const interruptedPrompts = this.sessionInteractions.settleActivePrompts()
-    this.invalidatePendingSessionStartups()
-    this.permissionContext.dispose()
-    this.reviewerSessions.clear()
-    this.connectionResources.cleanupUnexpectedClose(teardownGeneration)
-    this.backendGeneration.supersede(teardownGeneration)
-    this.sessionCapabilities.dispose(this.activeSessionIds())
-    for (const entry of this.sessionRegistry.entries()) {
-      if (entry.attachment) this.sessionRegistry.detach(entry.attachment, 'connection')
-      else entry.aggregate.detachConnection()
-    }
-    this.promptContentOwner.clear()
-    this.handoffContinuity.clearGeneration()
-    this.sessionUpdateProjector.dispose()
-    this.contextUsageTracker.clear()
-    this.sessionCapabilities.clearHttpRoutes()
-    this.sessionRegistry.select(undefined)
-    this.sessionInteractions.supersedeAll()
-    // The connection is already gone, so any ensureConnected caller waiting on
-    // the reconnect barrier must unblock now — it will fall through to connect()
-    // and pick up the new backend from resolveBackend. A fresh spawn re-provisions
-    // skills too, so clear both pending flags to avoid a spurious later reconnect.
-    this.connectionTransitions.resetReconnect()
-    void this.connectionResources.closeMcp(teardownGeneration)
-    try {
-      this.setStatus('closed')
-    } finally {
-      for (const { scope, terminal } of interruptedPrompts) {
-        try {
-          this.pushEvent({
-            kind: 'error',
-            level: 'error',
-            providerError: false,
-            sessionId: scope.sessionId,
-            ...(scope.promptMessageId ? { promptMessageId: scope.promptMessageId } : {}),
-            timestamp: terminal.timestamp,
-            title: ACP_PROMPT_FAILED_EVENT_TITLE,
-            text: 'ACP connection closed'
-          })
-        } catch (error) {
-          safeLogError('connection-close prompt event failed', errorLogFields(error))
-        }
-      }
-      // An unexpected close satisfies any pending reconnect, but retirement remains terminal. Re-run
-      // its evaluator now and again when outstanding operation/activity leases drain.
-      this.connectionTransitions.activityChanged()
     }
   }
 

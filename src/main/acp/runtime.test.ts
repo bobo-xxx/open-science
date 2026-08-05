@@ -33,8 +33,10 @@ import {
   claudeCodeFramework,
   codexFramework,
   opencodeFramework,
+  type AgentModelChangeTarget,
   type ResolvedAgentBackend
 } from '../agent-framework'
+import { CODEX_BRIDGE_MODEL } from '../agent-framework/codex'
 import { ArtifactRepository } from '../artifacts/repository'
 import { ArtifactProvenanceRepository } from '../artifacts/provenance-repository'
 import type { ArtifactRunClaim } from '../artifacts/run-registry'
@@ -1669,18 +1671,18 @@ describe('ACP runtime session management', () => {
       (runtime: AcpRuntime) =>
         (
           runtime as unknown as {
-            handleConnectionClosed: () => void
+            connectionClose: { handleUnexpectedClose: () => void }
           }
-        ).handleConnectionClosed()
+        ).connectionClose.handleUnexpectedClose()
     ],
     [
       'failed deferred disconnect recovery',
       (runtime: AcpRuntime) =>
         (
           runtime as unknown as {
-            recoverFailedDeferredDisconnect: () => void
+            connectionClose: { recoverFailedDeferredDisconnect: () => void }
           }
-        ).recoverFailedDeferredDisconnect()
+        ).connectionClose.recoverFailedDeferredDisconnect()
     ]
   ] satisfies ReadonlyArray<readonly [string, (runtime: AcpRuntime) => void | Promise<void>]>
 
@@ -2550,7 +2552,7 @@ describe('ACP runtime session management', () => {
     expect(receivedPrompts[0]).toMatchObject([
       { type: 'text', text: 'inspect all context' },
       { type: 'image', mimeType: 'image/png', data: historyImageData },
-      { type: 'resource', resource: { text: 'history upload' } },
+      { type: 'resource_link', name: 'history.txt' },
       { type: 'resource', resource: { text: 'current upload' } },
       { type: 'resource', resource: { text: 'mentioned upload' } }
     ])
@@ -8146,8 +8148,10 @@ describe('ACP runtime session management', () => {
     const reviewerCwds = fakeAgent.newSessions.map(({ cwd }) => cwd)
     await runtime.requestProviderReconnect()
     const handleConnectionClosed = (
-      runtime as unknown as { handleConnectionClosed: () => void }
-    ).handleConnectionClosed.bind(runtime)
+      runtime as unknown as { connectionClose: { handleUnexpectedClose: () => void } }
+    ).connectionClose.handleUnexpectedClose.bind(
+      (runtime as unknown as { connectionClose: unknown }).connectionClose
+    )
 
     try {
       expect(handleConnectionClosed).not.toThrow()
@@ -8669,6 +8673,66 @@ describe('ACP runtime session management', () => {
     releasePendingMode.resolve()
     await expect(pending).resolves.toMatchObject({ sessionId: 'pending-primary' })
     await vi.waitFor(() => expect(process.killed).toBe(true))
+  })
+
+  it('does not let a startup reserved behind an armed reconnect barrier publish on the old connection', async () => {
+    const process = new FakeAgentProcess()
+    const promptGate = createDeferred()
+    const secondNewStarted = createDeferred()
+    const releaseSecondNew = createDeferred()
+    const secondModeStarted = createDeferred()
+    const releaseSecondMode = createDeferred()
+    let modeRequestCount = 0
+    const fakeAgent = startFakeAgent(process, ['first-session', 'barrier-session'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent'),
+      onNewSession: async ({ index }) => {
+        if (index !== 1) return
+        secondNewStarted.resolve()
+        await releaseSecondNew.promise
+      },
+      onSetMode: async () => {
+        modeRequestCount += 1
+        if (modeRequestCount !== 2) return
+        secondModeStarted.resolve()
+        await releaseSecondMode.promise
+      },
+      onPrompt: () => promptGate.promise
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...codexFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/codex-acp',
+        env: {}
+      })
+    })
+    const first = await runtime.createSession({ cwd: '/workspace' })
+    const prompt = runtime.sendPrompt({ sessionId: first.sessionId, text: 'stay active' })
+    await vi.waitFor(() => expect(fakeAgent.prompts).toHaveLength(1))
+    const second = runtime.createSession({ cwd: '/workspace' })
+    await secondNewStarted.promise
+
+    try {
+      await runtime.requestProviderReconnect()
+      releaseSecondNew.resolve()
+      await secondModeStarted.promise
+
+      promptGate.resolve()
+      await prompt
+      await vi.waitFor(() => expect(process.killed).toBe(true))
+
+      releaseSecondMode.resolve()
+      await expect(second).rejects.toThrow('ACP session startup was superseded.')
+      expect(runtime.getSnapshot().sessionIds).not.toContain('barrier-session')
+    } finally {
+      promptGate.resolve()
+      releaseSecondNew.resolve()
+      releaseSecondMode.resolve()
+      await prompt.catch(() => undefined)
+      await second.catch(() => undefined)
+      await runtime.disconnect().catch(() => undefined)
+    }
   })
 
   it('defers a provider reconnect until a pending reviewer startup activates', async () => {
@@ -10754,13 +10818,29 @@ describe('ACP runtime session management', () => {
   })
 
   it('prepends a history preamble to the agent content but not the user-facing message', async () => {
+    infoLogSpy.mockClear()
     const process = new FakeAgentProcess()
     const fakeAgent = startFakeAgent(process, ['adopted-session-1'], { resumeNotFound: true })
     const messageEvents: Array<{ role?: string; text?: string }> = []
+    const peekHandoffContext = vi.fn(() => ({
+      executionCount: 2,
+      cells: [{ id: 'cell-1', language: 'python' as const, status: 'completed' as const }],
+      kernels: [{ kind: 'python' as const, status: 'idle' as const }],
+      runtimes: []
+    }))
     const runtime = new AcpRuntime({
       appVersion: '0.1.0',
       defaultCwd: '/workspace',
       spawnAgent: () => asAgentProcess(process),
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({
+          endpoint: 'http://127.0.0.1:1/notebook',
+          token: 'notebook-token'
+        }),
+        peekHandoffContext
+      },
       callbacks: {
         onEvent: (event) => {
           if (event.kind === 'message' && event.role === 'user') {
@@ -10779,9 +10859,64 @@ describe('ACP runtime session management', () => {
 
     // The agent sees the replayed context ahead of the user's text...
     expect(fakeAgent.prompts[0]?.text).toContain('PRIOR CONTEXT: the user asked to plot data.')
+    expect(fakeAgent.prompts[0]?.text).toContain('<open_science_notebook_continuity>')
+    expect(fakeAgent.prompts[0]?.text).toContain('"executionCount":2')
     expect(fakeAgent.prompts[0]?.text).toContain('keep going')
     // ...but the conversation bubble records only what the user actually typed.
     expect(messageEvents).toEqual([{ role: 'user', text: 'keep going' }])
+    expect(
+      infoLogSpy.mock.calls.find(
+        ([message]) => message === 'session transcript replay dispatched'
+      )?.[1]
+    ).toMatchObject({
+      sessionId: 'switched-session',
+      historyTextLength: 43,
+      historyAttachmentCount: 0,
+      historyImageCount: 0,
+      framework: 'claude-code',
+      status: 'connected'
+    })
+
+    await runtime.sendPrompt({ sessionId: 'switched-session', text: 'ordinary continuation' })
+    expect(peekHandoffContext).toHaveBeenCalledOnce()
+    expect(fakeAgent.prompts[1]?.text).not.toContain('<open_science_notebook_continuity>')
+  })
+
+  it('hands off live Notebook state after a context reset with no replayable transcript', async () => {
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['session-1'])
+    const peekHandoffContext = vi.fn(() => ({
+      executionCount: 1,
+      cells: [{ id: 'cell-1', language: 'python' as const, status: 'completed' as const }],
+      kernels: [{ kind: 'python' as const, status: 'idle' as const }],
+      runtimes: []
+    }))
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({
+          endpoint: 'http://127.0.0.1:1/notebook',
+          token: 'notebook-token'
+        }),
+        peekHandoffContext
+      }
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    await runtime.sendPrompt({
+      sessionId: 'session-1',
+      text: 'retry the interrupted first turn',
+      contextReset: true
+    })
+
+    expect(peekHandoffContext).toHaveBeenCalledOnce()
+    expect(fakeAgent.prompts[0]?.text).toContain('<open_science_notebook_continuity>')
+    expect(fakeAgent.prompts[0]?.text).toContain('"executionCount":1')
+    expect(fakeAgent.prompts[0]?.text).not.toContain('Previous conversation')
   })
 
   it('sends an app-owned continuation without publishing its synthetic text as a user message', async () => {
@@ -16529,6 +16664,745 @@ describe('ACP runtime — connect failure logging', () => {
   })
 })
 
+describe('ACP runtime — model hot switch', () => {
+  const modelOption = (): SessionConfigOption =>
+    ({
+      type: 'select',
+      id: 'model',
+      name: 'Model',
+      category: 'model',
+      currentValue: 'model-a',
+      options: ['model-a', 'model-b', 'model-c'].map((value) => ({ value, name: value }))
+    }) as SessionConfigOption
+
+  const modelTarget = (
+    model: string,
+    overrides: Partial<AgentModelChangeTarget> = {}
+  ): AgentModelChangeTarget => ({
+    frameworkId: 'claude-code',
+    backendId: 'claude-code:provider-a',
+    route: 'claude-anthropic',
+    model,
+    sessionModel: model,
+    sessionModelRequired: false,
+    supportsImageInput: true,
+    reasoningEffort: 'default',
+    ...overrides
+  })
+
+  const createModelRuntime = (
+    process: FakeAgentProcess,
+    spawn = vi.fn(),
+    supportsImageInput = true
+  ): { spawn: ReturnType<typeof vi.fn>; runtime: AcpRuntime } => {
+    spawn.mockImplementation(() => asAgentProcess(process))
+    return {
+      spawn,
+      runtime: new AcpRuntime({
+        appVersion: '0.1.0',
+        defaultCwd: '/workspace',
+        resolveBackend: () => ({
+          framework: { ...claudeCodeFramework, spawn },
+          backendId: 'claude-code:provider-a',
+          modelRoute: 'claude-anthropic',
+          executablePath: '/bin/claude',
+          env: {},
+          sessionModel: 'model-a',
+          supportsImageInput,
+          contextUsageModel: 'model-a'
+        })
+      })
+    }
+  }
+
+  it('switches every idle session and the generation default without replacing the process', async () => {
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['s-model-1', 's-model-2', 's-model-3'], {
+      configOptions: [modelOption()]
+    })
+    const { runtime, spawn } = createModelRuntime(process)
+    await runtime.createSession({ cwd: '/workspace' })
+    await runtime.createSession({ cwd: '/workspace' })
+    fakeAgent.configChanges.length = 0
+
+    await expect(runtime.applyModelChange(modelTarget('model-b'))).resolves.toBe(true)
+    await runtime.createSession({ cwd: '/workspace' })
+
+    expect(spawn).toHaveBeenCalledOnce()
+    expect(process.killed).toBe(false)
+    expect(fakeAgent.configChanges).toEqual([
+      { sessionId: 's-model-1', configId: 'model', value: 'model-b' },
+      { sessionId: 's-model-2', configId: 'model', value: 'model-b' },
+      { sessionId: 's-model-3', configId: 'model', value: 'model-b' }
+    ])
+  })
+
+  it('hot-switches an advertised model across compatible Claude backend identities', async () => {
+    const process = new FakeAgentProcess()
+    const configOptions = [modelOption()]
+    const fakeAgent = startFakeAgent(process, ['s-model'], {
+      configOptions,
+      onSetConfigOption: ({ value }) => {
+        const model = configOptions[0]
+        if (model.type === 'select' && typeof value === 'string') model.currentValue = value
+      }
+    })
+    const spawn = vi.fn(() => asAgentProcess(process))
+    const setTarget = vi.fn(() => true)
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...claudeCodeFramework, spawn },
+        backendId: 'claude-code:provider-a',
+        modelRoute: 'claude-anthropic',
+        executablePath: '/bin/claude',
+        env: {},
+        sessionModel: 'model-a',
+        supportsImageInput: false,
+        contextUsageModel: 'model-a',
+        anthropicBridgeLease: {
+          setTarget,
+          release: vi.fn(async () => undefined)
+        }
+      })
+    })
+    await runtime.createSession({ cwd: '/workspace' })
+    fakeAgent.configChanges.length = 0
+
+    await expect(
+      runtime.applyModelChange(
+        modelTarget('model-b', {
+          backendId: 'claude-code:provider-b',
+          anthropicBridgeTargetId: 'provider-b/model-b'
+        })
+      )
+    ).resolves.toBe(true)
+    await expect(
+      runtime.applyModelChange(
+        modelTarget('model-a', {
+          backendId: 'claude-code:provider-a',
+          anthropicBridgeTargetId: 'provider-a/model-a'
+        })
+      )
+    ).resolves.toBe(true)
+
+    expect(fakeAgent.configChanges).toEqual([
+      { sessionId: 's-model', configId: 'model', value: 'model-b' },
+      { sessionId: 's-model', configId: 'model', value: 'model-a' }
+    ])
+    expect(spawn).toHaveBeenCalledOnce()
+    expect(setTarget.mock.calls).toEqual([['provider-b/model-b'], ['provider-a/model-a']])
+    expect(process.killed).toBe(false)
+  })
+
+  it('hot-switches OpenCode across pre-registered provider transports', async () => {
+    const process = new FakeAgentProcess()
+    const configOptions = [
+      {
+        type: 'select',
+        id: 'model',
+        name: 'Model',
+        category: 'model',
+        currentValue: 'open-science-a/model-a',
+        options: ['open-science-a/model-a', 'open-science-b/model-b'].map((value) => ({
+          value,
+          name: value
+        }))
+      } as SessionConfigOption
+    ]
+    const fakeAgent = startFakeAgent(process, ['s-opencode-provider'], {
+      configOptions,
+      onSetConfigOption: ({ value }) => {
+        const model = configOptions[0]
+        if (model.type === 'select' && typeof value === 'string') model.currentValue = value
+      }
+    })
+    const spawn = vi.fn(() => asAgentProcess(process))
+    const setTarget = vi.fn(() => true)
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...opencodeFramework, spawn },
+        backendId: 'opencode:provider-a',
+        modelRoute: 'opencode-openai',
+        executablePath: '/bin/opencode',
+        env: {},
+        sessionModel: 'open-science-a/model-a',
+        supportsImageInput: false,
+        contextUsageModel: 'model-a',
+        providerTransportLease: {
+          setTarget,
+          release: vi.fn(async () => undefined)
+        }
+      })
+    })
+    await runtime.createSession({ cwd: '/workspace' })
+    fakeAgent.configChanges.length = 0
+
+    await runtime.applyModelChange({
+      frameworkId: 'opencode',
+      backendId: 'opencode:provider-b',
+      route: 'opencode-openai',
+      model: 'model-b',
+      sessionModel: 'open-science-b/model-b',
+      sessionModelRequired: false,
+      supportsImageInput: false,
+      reasoningEffort: 'default',
+      providerTransportTargetId: JSON.stringify(['opencode', 'provider-b', 'model-b'])
+    })
+
+    expect(setTarget).toHaveBeenCalledWith(JSON.stringify(['opencode', 'provider-b', 'model-b']))
+    expect(fakeAgent.configChanges).toEqual([
+      {
+        sessionId: 's-opencode-provider',
+        configId: 'model',
+        value: 'open-science-b/model-b'
+      }
+    ])
+    expect(spawn).toHaveBeenCalledOnce()
+    expect(process.killed).toBe(false)
+  })
+
+  it('falls back when no primary session can verify that the agent advertises the model', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, [], { configOptions: [modelOption()] })
+    const { runtime } = createModelRuntime(process)
+    await runtime.connect({ cwd: '/workspace' })
+
+    await expect(runtime.applyModelChange(modelTarget('model-b'))).resolves.toBe(false)
+
+    expect(process.killed).toBe(false)
+  })
+
+  it('hot-switches from a text-only model to an image-capable model in place', async () => {
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['s-model'], { configOptions: [modelOption()] })
+    const { runtime } = createModelRuntime(process, vi.fn(), false)
+    await runtime.createSession({ cwd: '/workspace' })
+    fakeAgent.configChanges.length = 0
+
+    await runtime.applyModelChange(modelTarget('model-b'))
+
+    expect(fakeAgent.configChanges).toEqual([
+      { sessionId: 's-model', configId: 'model', value: 'model-b' }
+    ])
+    expect(process.killed).toBe(false)
+  })
+
+  it.each([
+    ['OpenCode', opencodeFramework, 'opencode-openai', 'opencode:provider-a'],
+    ['native Codex', codexFramework, 'codex-responses', 'codex:provider-a']
+  ] as const)(
+    'lets %s filter historical images while hot-switching to a text-only model',
+    async (_name, framework, route, backendId) => {
+      const process = new FakeAgentProcess()
+      const fakeAgent = startFakeAgent(process, ['s-model'], {
+        configOptions: [modelOption()],
+        ...(framework.id === 'codex'
+          ? { modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent') }
+          : {})
+      })
+      const spawn = vi.fn(() => asAgentProcess(process))
+      const runtime = new AcpRuntime({
+        appVersion: '0.1.0',
+        defaultCwd: '/workspace',
+        resolveBackend: () => ({
+          framework: { ...framework, spawn },
+          backendId,
+          modelRoute: route,
+          executablePath: '/bin/agent',
+          env: {},
+          sessionModel: 'model-a',
+          supportsImageInput: true,
+          contextUsageModel: 'model-a'
+        })
+      })
+      await runtime.createSession({ cwd: '/workspace' })
+      fakeAgent.configChanges.length = 0
+
+      await runtime.applyModelChange({
+        frameworkId: framework.id,
+        backendId,
+        route,
+        model: 'model-b',
+        sessionModel: 'model-b',
+        sessionModelRequired: false,
+        supportsImageInput: false,
+        reasoningEffort: 'default'
+      })
+
+      expect(fakeAgent.configChanges).toEqual([
+        { sessionId: 's-model', configId: 'model', value: 'model-b' }
+      ])
+      expect(process.killed).toBe(false)
+    }
+  )
+
+  it('retargets an image-capable Codex bridge but reconnects before an image downgrade', async () => {
+    const process = new FakeAgentProcess()
+    const setModelTarget = vi.fn()
+    const setProviderTarget = vi.fn(() => true)
+    const fakeAgent = startFakeAgent(process, ['s-bridge-model'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent')
+    })
+    const spawn = vi.fn(() => asAgentProcess(process))
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...codexFramework, spawn },
+        backendId: 'codex:provider-a',
+        modelRoute: 'codex-bridge',
+        executablePath: '/bin/codex-acp',
+        env: {},
+        sessionModel: CODEX_BRIDGE_MODEL,
+        supportsImageInput: true,
+        contextUsageModel: 'model-a',
+        responsesBridgeLease: {
+          selectSkills: vi.fn(async () => []),
+          registerReviewerSession: vi.fn(),
+          unregisterReviewerSession: vi.fn(() => false),
+          setModelTarget,
+          release: vi.fn(async () => undefined)
+        },
+        providerTransportLease: {
+          setTarget: setProviderTarget,
+          release: vi.fn(async () => undefined)
+        }
+      })
+    })
+    await runtime.createSession({ cwd: '/workspace' })
+    fakeAgent.configChanges.length = 0
+
+    await runtime.applyModelChange({
+      frameworkId: 'codex',
+      backendId: 'codex:provider-b',
+      route: 'codex-bridge',
+      model: 'model-b',
+      sessionModel: CODEX_BRIDGE_MODEL,
+      sessionModelRequired: false,
+      supportsImageInput: true,
+      reasoningEffort: 'high',
+      providerTransportTargetId: JSON.stringify(['codex', 'provider-b', 'model-b']),
+      bridge: {
+        model: 'model-b',
+        vendorId: 'deepseek',
+        reasoningEffortTransport: 'deepseek'
+      }
+    })
+
+    expect(setModelTarget).toHaveBeenCalledWith({
+      model: 'model-b',
+      vendorId: 'deepseek',
+      reasoningEffortTransport: 'deepseek',
+      reasoningEffort: 'high'
+    })
+    expect(setProviderTarget).toHaveBeenCalledWith(
+      JSON.stringify(['codex', 'provider-b', 'model-b'])
+    )
+    expect(fakeAgent.configChanges).toEqual([])
+    expect(spawn).toHaveBeenCalledOnce()
+    expect(process.killed).toBe(false)
+
+    setModelTarget.mockClear()
+    await runtime.applyModelChange({
+      frameworkId: 'codex',
+      backendId: 'codex:provider-a',
+      route: 'codex-bridge',
+      model: 'model-c',
+      sessionModel: CODEX_BRIDGE_MODEL,
+      sessionModelRequired: false,
+      supportsImageInput: false,
+      reasoningEffort: 'default',
+      providerTransportTargetId: JSON.stringify(['codex', 'provider-a', 'model-c']),
+      bridge: { model: 'model-c' }
+    })
+
+    expect(setModelTarget).not.toHaveBeenCalled()
+    expect(setProviderTarget).toHaveBeenCalledOnce()
+    expect(process.killed).toBe(true)
+  })
+
+  it('reconnects native Codex before switching providers that share one model slug', async () => {
+    const process = new FakeAgentProcess()
+    const setProviderTarget = vi.fn(() => true)
+    const fakeAgent = startFakeAgent(process, ['s-native-model'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'agent'),
+      configOptions: [modelOption()]
+    })
+    const spawn = vi.fn(() => asAgentProcess(process))
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...codexFramework, spawn },
+        backendId: 'codex:provider-a',
+        modelRoute: 'codex-responses',
+        executablePath: '/bin/codex-acp',
+        env: {},
+        sessionModel: 'model-a',
+        supportsImageInput: true,
+        contextUsageModel: 'model-a',
+        providerTransportLease: {
+          setTarget: setProviderTarget,
+          release: vi.fn(async () => undefined)
+        }
+      })
+    })
+    await runtime.createSession({ cwd: '/workspace' })
+    fakeAgent.configChanges.length = 0
+
+    await runtime.applyModelChange({
+      frameworkId: 'codex',
+      backendId: 'codex:provider-b',
+      route: 'codex-responses',
+      model: 'model-a',
+      sessionModel: 'model-a',
+      sessionModelRequired: false,
+      supportsImageInput: false,
+      reasoningEffort: 'default',
+      providerTransportTargetId: JSON.stringify(['codex', 'provider-b', 'model-a'])
+    })
+
+    expect(setProviderTarget).not.toHaveBeenCalled()
+    expect(fakeAgent.configChanges).toEqual([])
+    expect(process.killed).toBe(true)
+  })
+
+  it('clears an advertised effort override when the switched model resolves to default', async () => {
+    const process = new FakeAgentProcess()
+    const effortOption = {
+      type: 'select',
+      id: 'effort',
+      name: 'Effort',
+      category: 'thought_level',
+      currentValue: 'high',
+      options: ['default', 'high'].map((value) => ({ value, name: value }))
+    } as SessionConfigOption
+    const fakeAgent = startFakeAgent(process, ['s-default-effort'], {
+      configOptions: [modelOption(), effortOption]
+    })
+    const spawn = vi.fn(() => asAgentProcess(process))
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...claudeCodeFramework, spawn },
+        backendId: 'claude-code:provider-a',
+        modelRoute: 'claude-anthropic',
+        executablePath: '/bin/claude',
+        env: {},
+        sessionModel: 'model-a',
+        sessionEffort: 'high',
+        supportsImageInput: true,
+        contextUsageModel: 'model-a'
+      })
+    })
+    await runtime.createSession({ cwd: '/workspace' })
+    fakeAgent.configChanges.length = 0
+
+    await runtime.applyModelChange(modelTarget('model-b'))
+
+    expect(fakeAgent.configChanges).toEqual([
+      { sessionId: 's-default-effort', configId: 'model', value: 'model-b' },
+      { sessionId: 's-default-effort', configId: 'effort', value: 'default' }
+    ])
+    expect(process.killed).toBe(false)
+  })
+
+  it('keeps the generating message on its model and applies only the latest queued selection', async () => {
+    const process = new FakeAgentProcess()
+    const promptStarted = createDeferred()
+    const finishPrompt = createDeferred()
+    const fakeAgent = startFakeAgent(process, ['s-model'], {
+      configOptions: [modelOption()],
+      onPrompt: async ({ text }) => {
+        if (text === 'old-model turn') {
+          promptStarted.resolve()
+          await finishPrompt.promise
+        }
+        return { stopReason: 'end_turn' }
+      }
+    })
+    const { runtime } = createModelRuntime(process)
+    await runtime.createSession({ cwd: '/workspace' })
+    fakeAgent.configChanges.length = 0
+
+    const oldPrompt = runtime.sendPrompt({ sessionId: 's-model', text: 'old-model turn' })
+    await promptStarted.promise
+
+    await expect(runtime.applyModelChange(modelTarget('model-b'))).resolves.toBe(true)
+    await expect(runtime.applyModelChange(modelTarget('model-c'))).resolves.toBe(true)
+    const nextPrompt = runtime.sendPrompt({ sessionId: 's-model', text: 'new-model turn' })
+
+    expect(fakeAgent.configChanges).toEqual([])
+    expect(fakeAgent.prompts.map(({ text }) => text)).toEqual(['old-model turn'])
+
+    finishPrompt.resolve()
+    await oldPrompt
+    await nextPrompt
+
+    expect(fakeAgent.configChanges).toEqual([
+      { sessionId: 's-model', configId: 'model', value: 'model-c' }
+    ])
+    expect(fakeAgent.prompts.map(({ text }) => text)).toEqual(['old-model turn', 'new-model turn'])
+  })
+
+  it('holds a new session behind a queued model switch', async () => {
+    const process = new FakeAgentProcess()
+    const promptStarted = createDeferred()
+    const finishPrompt = createDeferred()
+    const fakeAgent = startFakeAgent(process, ['s-existing', 's-created-after-switch'], {
+      configOptions: [modelOption()],
+      onPrompt: async () => {
+        promptStarted.resolve()
+        await finishPrompt.promise
+        return { stopReason: 'end_turn' }
+      }
+    })
+    const { runtime } = createModelRuntime(process)
+    await runtime.createSession({ cwd: '/workspace' })
+    fakeAgent.configChanges.length = 0
+
+    const prompt = runtime.sendPrompt({ sessionId: 's-existing', text: 'old-model turn' })
+    await promptStarted.promise
+    await runtime.applyModelChange(modelTarget('model-b'))
+    const create = runtime.createSession({ cwd: '/workspace' })
+
+    await Promise.resolve()
+    expect(fakeAgent.newSessions).toHaveLength(1)
+
+    finishPrompt.resolve()
+    await prompt
+    await create
+
+    expect(fakeAgent.configChanges).toEqual([
+      { sessionId: 's-existing', configId: 'model', value: 'model-b' },
+      { sessionId: 's-created-after-switch', configId: 'model', value: 'model-b' }
+    ])
+  })
+
+  it('includes a session whose creation is in progress when draining a queued model switch', async () => {
+    const process = new FakeAgentProcess()
+    const creationStarted = createDeferred()
+    const finishCreation = createDeferred()
+    const fakeAgent = startFakeAgent(process, ['s-existing', 's-creating'], {
+      configOptions: [modelOption()],
+      onNewSession: async ({ index }) => {
+        if (index !== 1) return
+        creationStarted.resolve()
+        await finishCreation.promise
+      }
+    })
+    const { runtime } = createModelRuntime(process)
+    await runtime.createSession({ cwd: '/workspace' })
+    fakeAgent.configChanges.length = 0
+
+    const create = runtime.createSession({ cwd: '/workspace' })
+    await creationStarted.promise
+    await runtime.applyModelChange(modelTarget('model-b'))
+    expect(fakeAgent.configChanges).toEqual([])
+
+    finishCreation.resolve()
+    await create
+    await vi.waitFor(() => expect(fakeAgent.configChanges).toHaveLength(2))
+
+    expect(fakeAgent.configChanges).toEqual([
+      { sessionId: 's-existing', configId: 'model', value: 'model-b' },
+      { sessionId: 's-creating', configId: 'model', value: 'model-b' }
+    ])
+  })
+
+  it('applies a newer effort change after a queued model switch', async () => {
+    const process = new FakeAgentProcess()
+    const promptStarted = createDeferred()
+    const finishPrompt = createDeferred()
+    const effortOption = {
+      type: 'select',
+      id: 'effort',
+      name: 'Effort',
+      category: 'thought_level',
+      currentValue: 'default',
+      options: ['default', 'low', 'high'].map((value) => ({ value, name: value }))
+    } as SessionConfigOption
+    const fakeAgent = startFakeAgent(process, ['s-model-effort'], {
+      configOptions: [modelOption(), effortOption],
+      onPrompt: async ({ text }) => {
+        if (text === 'old-model turn') {
+          promptStarted.resolve()
+          await finishPrompt.promise
+        }
+        return { stopReason: 'end_turn' }
+      }
+    })
+    const { runtime } = createModelRuntime(process)
+    await runtime.createSession({ cwd: '/workspace' })
+    fakeAgent.configChanges.length = 0
+
+    const prompt = runtime.sendPrompt({ sessionId: 's-model-effort', text: 'old-model turn' })
+    await promptStarted.promise
+
+    await runtime.applyModelChange(modelTarget('model-b', { reasoningEffort: 'high' }))
+    const effortChange = runtime.applyReasoningEffortChange('low')
+
+    finishPrompt.resolve()
+    await prompt
+    await expect(effortChange).resolves.toBe(true)
+    await runtime.sendPrompt({ sessionId: 's-model-effort', text: 'new-model turn' })
+
+    expect(fakeAgent.configChanges).toEqual([
+      { sessionId: 's-model-effort', configId: 'model', value: 'model-b' },
+      { sessionId: 's-model-effort', configId: 'effort', value: 'high' },
+      { sessionId: 's-model-effort', configId: 'effort', value: 'low' }
+    ])
+  })
+
+  it('waits for a generating Claude message before retargeting its upstream provider', async () => {
+    const process = new FakeAgentProcess()
+    const promptStarted = createDeferred()
+    const finishPrompt = createDeferred()
+    const setTarget = vi.fn(() => true)
+    const configOptions = [modelOption()]
+    const fakeAgent = startFakeAgent(process, ['s-provider-switch'], {
+      configOptions,
+      onPrompt: async () => {
+        promptStarted.resolve()
+        await finishPrompt.promise
+        return { stopReason: 'end_turn' }
+      },
+      onSetConfigOption: ({ value }) => {
+        const model = configOptions[0]
+        if (model.type === 'select' && typeof value === 'string') model.currentValue = value
+      }
+    })
+    const spawn = vi.fn(() => asAgentProcess(process))
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...claudeCodeFramework, spawn },
+        backendId: 'claude-code:provider-a',
+        modelRoute: 'claude-anthropic',
+        executablePath: '/bin/claude',
+        env: {},
+        sessionModel: 'model-a',
+        supportsImageInput: true,
+        contextUsageModel: 'model-a',
+        anthropicBridgeLease: {
+          setTarget,
+          release: vi.fn(async () => undefined)
+        }
+      })
+    })
+    await runtime.createSession({ cwd: '/workspace' })
+    fakeAgent.configChanges.length = 0
+    const prompt = runtime.sendPrompt({
+      sessionId: 's-provider-switch',
+      text: 'stay on provider a'
+    })
+    await promptStarted.promise
+
+    await runtime.applyModelChange(
+      modelTarget('model-b', {
+        backendId: 'claude-code:provider-b',
+        anthropicBridgeTargetId: 'provider-b/model-b'
+      })
+    )
+
+    expect(setTarget).not.toHaveBeenCalled()
+    expect(fakeAgent.configChanges).toEqual([])
+    expect(process.killed).toBe(false)
+
+    finishPrompt.resolve()
+    await prompt
+    await vi.waitFor(() => {
+      expect(setTarget).toHaveBeenCalledWith('provider-b/model-b')
+      expect(fakeAgent.configChanges).toHaveLength(1)
+    })
+
+    expect(fakeAgent.configChanges).toEqual([
+      { sessionId: 's-provider-switch', configId: 'model', value: 'model-b' }
+    ])
+    expect(spawn).toHaveBeenCalledOnce()
+    expect(process.killed).toBe(false)
+  })
+
+  it('cancels a queued switch when the user selects the currently applied model again', async () => {
+    const process = new FakeAgentProcess()
+    const promptStarted = createDeferred()
+    const finishPrompt = createDeferred()
+    const fakeAgent = startFakeAgent(process, ['s-model'], {
+      configOptions: [modelOption()],
+      onPrompt: async () => {
+        promptStarted.resolve()
+        await finishPrompt.promise
+        return { stopReason: 'end_turn' }
+      }
+    })
+    const { runtime } = createModelRuntime(process)
+    await runtime.createSession({ cwd: '/workspace' })
+    fakeAgent.configChanges.length = 0
+    const prompt = runtime.sendPrompt({ sessionId: 's-model', text: 'keep model a' })
+    await promptStarted.promise
+
+    await runtime.applyModelChange(modelTarget('model-b', { supportsImageInput: false }))
+    await runtime.applyModelChange(modelTarget('model-a'))
+    finishPrompt.resolve()
+    await prompt
+
+    expect(fakeAgent.configChanges).toEqual([])
+    expect(process.killed).toBe(false)
+  })
+
+  it('waits for the active Claude message before reconnecting for an image downgrade', async () => {
+    const process = new FakeAgentProcess()
+    const promptStarted = createDeferred()
+    const finishPrompt = createDeferred()
+    const fakeAgent = startFakeAgent(process, ['s-model'], {
+      configOptions: [modelOption()],
+      onPrompt: async () => {
+        promptStarted.resolve()
+        await finishPrompt.promise
+        return { stopReason: 'end_turn' }
+      }
+    })
+    const { runtime } = createModelRuntime(process)
+    await runtime.createSession({ cwd: '/workspace' })
+    fakeAgent.configChanges.length = 0
+    const prompt = runtime.sendPrompt({ sessionId: 's-model', text: 'finish before downgrade' })
+    await promptStarted.promise
+
+    await runtime.applyModelChange(modelTarget('model-b', { supportsImageInput: false }))
+
+    expect(fakeAgent.configChanges).toEqual([])
+    expect(process.killed).toBe(false)
+
+    finishPrompt.resolve()
+    await prompt
+    await vi.waitFor(() => expect(runtime.getSnapshot().status).toBe('idle'))
+    expect(process.killed).toBe(true)
+    expect(fakeAgent.configChanges).toEqual([])
+  })
+
+  it('falls back to a reconnect instead of leaving a partially switched generation', async () => {
+    const process = new FakeAgentProcess()
+    const agentOptions: Parameters<typeof startFakeAgent>[2] = {
+      configOptions: [modelOption()]
+    }
+    startFakeAgent(process, ['s-model'], agentOptions)
+    const { runtime } = createModelRuntime(process)
+    await runtime.createSession({ cwd: '/workspace' })
+    agentOptions.rejectSetConfigOption = true
+
+    await expect(runtime.applyModelChange(modelTarget('model-b'))).resolves.toBe(true)
+
+    expect(process.killed).toBe(true)
+    expect(runtime.getSnapshot().status).toBe('idle')
+  })
+})
+
 describe('ACP runtime — session effort', () => {
   // A select option like the thought_level selector opencode/Claude Code advertise from session/new.
   const thoughtLevelOption = (values: string[]): SessionConfigOption =>
@@ -16669,6 +17543,44 @@ describe('ACP runtime — session effort', () => {
     // Sessions created later in the same process inherit the new level.
     await runtime.createSession({ cwd: '/workspace' })
     expect(fakeAgent.configChanges[1]).toMatchObject({ configId: 'effort', value: 'high' })
+  })
+
+  it('keeps a session created concurrently with a live effort change on the new level', async () => {
+    const process = new FakeAgentProcess()
+    const staleConfigurationStarted = createDeferred()
+    const finishStaleConfiguration = createDeferred()
+    const fakeAgent = startFakeAgent(process, ['s-existing', 's-creating'], {
+      configOptions: [thoughtLevelOption(['default', 'low', 'high'])],
+      onSetConfigOption: async ({ sessionId, value }) => {
+        if (sessionId !== 's-creating' || value !== 'low') return
+        staleConfigurationStarted.resolve()
+        await finishStaleConfiguration.promise
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: { ...claudeCodeFramework, spawn: () => asAgentProcess(process) },
+        executablePath: '/bin/claude',
+        env: {},
+        sessionEffort: 'low'
+      })
+    })
+    await runtime.createSession({ cwd: '/workspace' })
+    fakeAgent.configChanges.length = 0
+
+    const create = runtime.createSession({ cwd: '/workspace' })
+    await staleConfigurationStarted.promise
+    await runtime.applyReasoningEffortChange('high')
+    finishStaleConfiguration.resolve()
+    await create
+
+    expect(fakeAgent.configChanges).toEqual([
+      { sessionId: 's-creating', configId: 'effort', value: 'low' },
+      { sessionId: 's-existing', configId: 'effort', value: 'high' },
+      { sessionId: 's-creating', configId: 'effort', value: 'high' }
+    ])
   })
 
   it('updates only the runtime-owned Responses bridge with a live effort change', async () => {
