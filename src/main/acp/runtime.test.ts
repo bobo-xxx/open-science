@@ -1591,6 +1591,7 @@ describe('ACP runtime session management', () => {
     artifactId: 'artifact-1',
     artifactVersionId: 'version-1',
     artifactChecksum: 'a'.repeat(64),
+    originatingPromptMessageId: 'plan-origin',
     revision,
     approval,
     lifecycle:
@@ -1634,13 +1635,14 @@ describe('ACP runtime session management', () => {
       callbacks: { onEvent: (event) => events.push(event) }
     })
     const approved = restoredPlanProjection('approved', 5)
+    const pending = restoredPlanProjection('pending', 4)
     const respond = vi.fn(async () => ({ projection: approved, changed: true }))
     const checkTurnCompletion = vi.fn(async () => ({ allow: true }))
     Object.assign(runtime as unknown as { planService: unknown }, {
       planService: {
         respond,
         checkTurnCompletion,
-        getProjection: vi.fn(async () => approved)
+        getProjection: vi.fn(async () => pending)
       }
     })
 
@@ -1653,6 +1655,10 @@ describe('ACP runtime session management', () => {
         artifactVersionId: 'version-1',
         expectedRevision: 4,
         pendingAction: 'approve'
+      },
+      provenanceContext: {
+        promptMessageId: 'approve-message',
+        messageAncestry: ['plan-origin', 'approve-message']
       }
     })
 
@@ -1701,6 +1707,10 @@ describe('ACP runtime session management', () => {
         artifactVersionId: 'version-1',
         expectedRevision: 4,
         pendingAction: 'review'
+      },
+      provenanceContext: {
+        promptMessageId: 'feedback-message',
+        messageAncestry: ['plan-origin', 'feedback-message']
       }
     })
 
@@ -1720,6 +1730,10 @@ describe('ACP runtime session management', () => {
           artifactVersionId: 'version-1',
           expectedRevision: 3,
           pendingAction: 'review'
+        },
+        provenanceContext: {
+          promptMessageId: 'stale-feedback-message',
+          messageAncestry: ['plan-origin', 'stale-feedback-message']
         }
       })
     ).rejects.toMatchObject({ code: 'revision-conflict' })
@@ -1736,11 +1750,12 @@ describe('ACP runtime session management', () => {
       framework: opencodeFramework
     })
     const rejected = restoredPlanProjection('rejected', 5)
+    const pending = restoredPlanProjection('pending', 4)
     const respond = vi.fn(async () => ({ projection: rejected, changed: true }))
     Object.assign(runtime as unknown as { planService: unknown }, {
       planService: {
         respond,
-        getProjection: vi.fn(async () => rejected)
+        getProjection: vi.fn(async () => pending)
       }
     })
 
@@ -1753,6 +1768,10 @@ describe('ACP runtime session management', () => {
         artifactVersionId: 'version-1',
         expectedRevision: 4,
         pendingAction: 'reject'
+      },
+      provenanceContext: {
+        promptMessageId: 'reject-message',
+        messageAncestry: ['plan-origin', 'reject-message']
       }
     })
 
@@ -3439,6 +3458,43 @@ describe('ACP runtime session management', () => {
         .getSnapshot()
         .events.filter((event) => event.kind === 'message' || event.kind === 'thought')
     ).toEqual([])
+  })
+
+  it('keeps compaction successful when a hidden usage update state callback throws', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['remote-session-1'], {
+      usageForPrompt: (text) => (text === '/compact' ? { used: 24_000, size: 200_000 } : undefined)
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: claudeCodeFramework,
+      callbacks: {
+        onStateChanged: (snapshot) => {
+          if (Object.values(snapshot.contextUsageBySession).some(({ used }) => used === 24_000)) {
+            throw new Error('state listener failed')
+          }
+        }
+      }
+    })
+    const session = await runtime.createSession({ cwd: '/workspace' })
+
+    await expect(runtime.compactSession({ sessionId: session.sessionId })).resolves.toEqual({
+      stopReason: 'end_turn'
+    })
+
+    expect(runtime.getSnapshot().contextUsageBySession[session.sessionId]).toMatchObject({
+      used: 24_000,
+      size: 200_000
+    })
+    expect(
+      runtime
+        .getSnapshot()
+        .events.filter((event) => event.kind === 'compaction')
+        .map(({ status }) => status)
+    ).toEqual(['in_progress', 'completed'])
+    expect(runtime.getSnapshot().promptInFlightSessionIds).toEqual([])
   })
 
   it('serializes prompts and compaction per session without blocking another session', async () => {
@@ -12622,6 +12678,7 @@ describe('ACP runtime session management', () => {
         artifactId: 'artifact-1',
         artifactVersionId: 'version-7',
         artifactChecksum: 'a'.repeat(64),
+        originatingPromptMessageId: 'plan-origin',
         revision: 11,
         approval: 'approved',
         lifecycle: 'approved',
@@ -12664,6 +12721,10 @@ describe('ACP runtime session management', () => {
           projectId: 'project-1',
           artifactVersionId: 'version-7',
           expectedRevision: 11
+        },
+        provenanceContext: {
+          promptMessageId: 'continuation-message',
+          messageAncestry: ['plan-origin', 'continuation-message']
         }
       })
 
@@ -12679,6 +12740,39 @@ describe('ACP runtime session management', () => {
       expect(fakeAgent.prompts[0]?.text).toContain('continue')
     }
   )
+
+  it('rejects an explicit Plan continuation from a sibling Message Branch', async () => {
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['s1'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: opencodeFramework
+    })
+    const active = restoredPlanProjection('approved', 4)
+    Object.assign(runtime as unknown as { planService: unknown }, {
+      planService: { authorizeContinuation: vi.fn(async () => active) }
+    })
+
+    await runtime.createSession({ cwd: '/workspace', projectName: 'project-1' })
+    await expect(
+      runtime.sendPrompt({
+        sessionId: 's1',
+        text: 'continue a sibling plan',
+        planContinuation: {
+          projectId: 'project-1',
+          artifactVersionId: 'version-1',
+          expectedRevision: 4
+        },
+        provenanceContext: {
+          promptMessageId: 'branch-b-message',
+          messageAncestry: ['branch-b-root', 'branch-b-message']
+        }
+      })
+    ).rejects.toMatchObject({ code: 'interaction-mismatch' })
+    expect(fakeAgent.prompts).toHaveLength(0)
+  })
 
   it.each([
     ['Claude Code', claudeCodeFramework],
@@ -12710,6 +12804,7 @@ describe('ACP runtime session management', () => {
         artifactId: 'artifact-1',
         artifactVersionId: 'version-1',
         artifactChecksum: 'a'.repeat(64),
+        originatingPromptMessageId: 'plan-origin',
         revision: 2,
         approval: 'approved',
         lifecycle: 'approved',
@@ -12752,6 +12847,10 @@ describe('ACP runtime session management', () => {
             projectId: 'project-1',
             artifactVersionId: 'version-1',
             expectedRevision: 2
+          },
+          provenanceContext: {
+            promptMessageId: 'completion-message',
+            messageAncestry: ['plan-origin', 'completion-message']
           }
         })
       ).rejects.toThrow('The active Session Plan is not complete (in_progress).')
@@ -15020,7 +15119,7 @@ describe('ACP runtime session management', () => {
       if (listAttempts === 1) throw new Error('temporary Artifact list failure')
       return [generatedArtifact]
     })
-    const artifactEvents: AcpRuntimeEvent[] = []
+    const terminalEvents: AcpRuntimeEvent[] = []
     const process = new FakeAgentProcess()
     startFakeAgent(process, ['remote-session-1'])
     const runtime = new AcpRuntime({
@@ -15040,19 +15139,26 @@ describe('ACP runtime session management', () => {
       },
       callbacks: {
         onEvent: (event) => {
-          if (event.kind === 'artifact') artifactEvents.push(event)
+          if (event.kind === 'artifact' || event.kind === 'stop') terminalEvents.push(event)
         }
       }
     })
     const session = await runtime.createSession({ cwd: '/workspace', projectName: 'project-1' })
 
-    await expect(
-      runtime.sendPrompt({ sessionId: session.sessionId, text: 'prepare an Artifact claim' })
-    ).rejects.toThrow('temporary Artifact list failure')
+    warnLogSpy.mockImplementation(() => {
+      throw new Error('logger failed')
+    })
+    try {
+      await expect(
+        runtime.sendPrompt({ sessionId: session.sessionId, text: 'prepare an Artifact claim' })
+      ).rejects.toThrow('temporary Artifact list failure')
+    } finally {
+      warnLogSpy.mockReset()
+    }
 
     expect(listRunVersions).toHaveBeenCalledTimes(2)
-    expect(artifactEvents).toHaveLength(1)
-    const claim = resolveArtifactRunClaim(runtime, artifactEvents[0].artifactClaimId!)
+    expect(terminalEvents.map((event) => event.kind)).toEqual(['artifact', 'stop'])
+    const claim = resolveArtifactRunClaim(runtime, terminalEvents[0].artifactClaimId!)
     expect(claim.artifactVersionIds).toEqual(['version-1'])
     await expect(
       repository.findRunFinalizationMarker('project-1', claim.runId)
@@ -15174,6 +15280,8 @@ describe('ACP runtime session management', () => {
               artifactClaimId: event.artifactClaimId,
               artifactCount: event.artifacts?.length
             })
+          } else if (event.kind === 'stop') {
+            events.push({ kind: event.kind, sessionId: event.sessionId })
           }
         }
       }
@@ -15194,6 +15302,10 @@ describe('ACP runtime session management', () => {
         promptMessageId: expect.stringMatching(/^prompt-artifact-run-/),
         artifactClaimId: expect.stringMatching(/^artifact-claim-/),
         artifactCount: 1
+      },
+      {
+        kind: 'stop',
+        sessionId: 'remote-session-1'
       }
     ])
     await expect(
@@ -15944,6 +16056,38 @@ describe('ACP runtime session management', () => {
         code: -32603,
         data: { errorKind: 'request_too_large' }
       })
+    )
+  })
+
+  it('preserves a provider failure and its terminal event when the failure logger throws', async () => {
+    const process = new FakeAgentProcess()
+    const events: AcpRuntimeEvent[] = []
+    startFakeAgent(process, ['remote-session-1'], {
+      onPrompt: () => {
+        throw acp.RequestError.internalError({ errorKind: 'invalid_request' }, 'provider failed')
+      }
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      callbacks: { onEvent: (event) => events.push(event) }
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+    errorLogSpy.mockImplementation(() => {
+      throw new Error('logger failed')
+    })
+    try {
+      await expect(
+        runtime.sendPrompt({ sessionId: 'remote-session-1', text: 'hi' })
+      ).rejects.toMatchObject({ code: -32603, data: { errorKind: 'invalid_request' } })
+    } finally {
+      errorLogSpy.mockReset()
+    }
+
+    expect(events).toContainEqual(
+      expect.objectContaining({ kind: 'error', title: ACP_PROMPT_FAILED_EVENT_TITLE })
     )
   })
 
