@@ -14,6 +14,7 @@ import {
 
 type RuntimeProjectionRouting = Readonly<{
   kind: 'runtime'
+  framework?: PermissionToolContext['framework']
   appSessionId?: string
   eventId: string
   timestamp?: number
@@ -107,6 +108,10 @@ class AcpSessionUpdateProjector {
     this.codexSkillActivity.setSkillsRoot(undefined)
   }
 
+  clearSession(sessionId: string): void {
+    this.codexSkillActivity.clearSession(sessionId)
+  }
+
   dispose(): void {
     this.clearGeneration()
   }
@@ -134,7 +139,12 @@ class AcpSessionUpdateProjector {
     }
 
     const projection = this.codexSkillActivity.projectWithContext(
-      toAcpRuntimeEvent(routed, routing.eventId, routing.timestamp)
+      toAcpRuntimeEvent(
+        routed,
+        routing.eventId,
+        routing.timestamp,
+        routing.framework === 'claude-code'
+      )
     )
     const event = deepFreeze(projection.event)
     if (event.contextUsage && routing.reconnectPending) return Object.freeze([])

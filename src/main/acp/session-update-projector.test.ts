@@ -75,6 +75,41 @@ describe('AcpSessionUpdateProjector', () => {
     expect(projector.project(notification, { ...routing, reconnectPending: true })).toEqual([])
   })
 
+  it('removes Claude Code policy attribution from visible refusal messages', () => {
+    const projector = new AcpSessionUpdateProjector()
+    const [context, refresh, visible] = projector.project(
+      {
+        sessionId: 'session-1',
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: {
+            type: 'text',
+            text: 'API Error: Claude Code is unable to respond to this request, which appears to violate our Usage Policy (https://www.anthropic.com/legal/aup). Try rephrasing.'
+          }
+        }
+      },
+      {
+        kind: 'runtime',
+        framework: 'claude-code',
+        eventId: 'event-refusal',
+        visible: true,
+        reconnectPending: false,
+        mcpServerNames: []
+      }
+    )
+
+    expect([context.kind, refresh.kind, visible.kind]).toEqual([
+      'context-observation',
+      'context-refresh',
+      'visible-event'
+    ])
+    expect(visible).toMatchObject({
+      event: {
+        text: 'The selected model declined to complete this response under its safety policy. Try rephrasing.'
+      }
+    })
+  })
+
   it('projects hidden current-mode updates while a reconnect suppresses stale context effects', () => {
     const projector = new AcpSessionUpdateProjector()
     const notification: SessionNotification = {
@@ -241,6 +276,60 @@ describe('AcpSessionUpdateProjector', () => {
     })
 
     projector.dispose()
+  })
+
+  it('clears Codex Skill presentation state for only one Session', () => {
+    const projector = new AcpSessionUpdateProjector()
+    const skillsRoot = resolve('/data', 'codex-home', 'skills')
+    projector.beginGeneration(skillsRoot)
+    const routing = {
+      kind: 'runtime' as const,
+      eventId: 'event-skill',
+      visible: true,
+      reconnectPending: false,
+      mcpServerNames: []
+    }
+
+    for (const [sessionId, skillName] of [
+      ['session-a', 'mcp-pubmed'],
+      ['session-b', 'mcp-chemistry']
+    ] as const) {
+      projector.project(
+        {
+          sessionId,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: 'shared-call-id',
+            title: `Read ${skillName}`,
+            kind: 'read',
+            status: 'in_progress',
+            locations: [{ path: join(skillsRoot, skillName, 'SKILL.md') }]
+          }
+        },
+        routing
+      )
+    }
+
+    projector.clearSession('session-a')
+    const complete = (sessionId: string): ReturnType<AcpSessionUpdateProjector['project']> =>
+      projector.project(
+        {
+          sessionId,
+          update: {
+            sessionUpdate: 'tool_call_update',
+            toolCallId: 'shared-call-id',
+            status: 'completed'
+          }
+        },
+        { ...routing, eventId: `event-${sessionId}` }
+      )
+
+    expect(complete('session-a').at(-1)).not.toMatchObject({
+      event: { title: expect.stringContaining('skill') }
+    })
+    expect(complete('session-b').at(-1)).toMatchObject({
+      event: { title: 'Loaded skill: mcp-chemistry' }
+    })
   })
 
   it('projects Permission tool correlation first with the stable Session identity', () => {

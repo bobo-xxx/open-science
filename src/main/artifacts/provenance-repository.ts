@@ -151,6 +151,7 @@ export type WriteAppGeneratedArtifactVersionRequest = Omit<
   filename: string
   content: string
   contentType?: string
+  kind?: 'plan'
 }
 
 type PersistedVersionFileRecord = {
@@ -1384,7 +1385,7 @@ class ArtifactProvenanceRepository {
   async writeAppGeneratedVersion(
     request: WriteAppGeneratedArtifactVersionRequest
   ): Promise<ArtifactVersionFile> {
-    const { content, ...versionRequest } = request
+    const { content, kind, ...versionRequest } = request
     const writeOperationId = `artifact-app-write-${this.createId()}`
 
     return this.compatibilityRepository.withPendingFileTransaction(
@@ -1394,6 +1395,7 @@ class ArtifactProvenanceRepository {
         runId: request.artifactRunId,
         filename: request.filename,
         mimeType: request.contentType,
+        kind,
         source: { kind: 'inline', content, encoding: 'utf8' }
       },
       {},
@@ -1410,7 +1412,7 @@ class ArtifactProvenanceRepository {
           })
         )
 
-        return this.createVersionWithOptions(
+        const version = await this.createVersionWithOptions(
           {
             ...versionRequest,
             writeOperationId,
@@ -1430,6 +1432,7 @@ class ArtifactProvenanceRepository {
               resolveStorageKey(this.options.storageRoot, version.contentStorageKey)
             )
         )
+        return version
       }
     )
   }
@@ -1588,11 +1591,17 @@ class ArtifactProvenanceRepository {
       sessionId: artifactStorageSessionId,
       runId: artifactRunId
     })
-    const pendingFile = pendingFiles.find(
+    const matchingPendingFiles = pendingFiles.filter(
       (file) => normalizeFilename(file.name) === normalizedFilename
     )
+    const pendingFile =
+      matchingPendingFiles.find((file) => file.name === request.filename) ??
+      (matchingPendingFiles.length === 1 ? matchingPendingFiles[0] : undefined)
 
     if (!pendingFile) {
+      if (matchingPendingFiles.length > 1) {
+        throw new Error(`Pending artifact filename is ambiguous: ${request.filename}`)
+      }
       throw new Error(`Pending artifact file not found: ${request.filename}`)
     }
 

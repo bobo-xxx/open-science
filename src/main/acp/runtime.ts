@@ -2,16 +2,13 @@ import * as acp from '@agentclientprotocol/sdk'
 import type {
   ActiveSession,
   ClientConnection,
-  ContentBlock,
   PromptResponse,
   RequestPermissionRequest,
   RequestPermissionResponse,
   SessionConfigOption,
-  SessionModeState,
   SessionNotification
 } from '@agentclientprotocol/sdk'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
-import { readFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 
 import type {
@@ -31,11 +28,6 @@ import type {
   AcpTurnTokenUsage,
   AcpSetPermissionProfileRequest,
   AcpStateSnapshot
-} from '../../shared/acp'
-import {
-  ACP_MODEL_TURN_COUNT_META_KEY,
-  ACP_TURN_TOKEN_USAGE_META_KEY,
-  toAcpTurnTokenUsage
 } from '../../shared/acp'
 import { ACP_PROMPT_FAILED_EVENT_TITLE } from '../../shared/acp'
 import {
@@ -57,8 +49,7 @@ import {
 import { resolveCanonicalMcpToolIdentity } from '../agent-framework/app-mcp-names'
 import { createLogger, diagnosticErrorFields, errorLogFields } from '../logger'
 import { extractProviderToolName } from './runtime-events'
-import { toCodexTurnTokenUsage } from './codex-turn-usage'
-import { fetchOpenCodeUsageSnapshot, sumOpenCodeTurnUsage } from './opencode-turn-usage'
+import { fetchOpenCodeUsageSnapshot } from './opencode-turn-usage'
 import { matchSessionModelOption, resolveSessionEffortOption } from './session-config'
 import { describePromptError, isProviderPromptError } from './prompt-error'
 import { AcpRuntimeSnapshotOwner } from './runtime-snapshot-owner'
@@ -93,7 +84,6 @@ import type { ArtifactFile, FileReference } from '../../shared/artifacts'
 import type { ArtifactRpcCapabilityBinding } from '../../shared/artifact-provenance'
 import { isMediaOverflowError } from '../../shared/media-overflow'
 import type { AcpRuntimeActivity, AcpRuntimeActivityOptions } from './runtime-activity'
-import { resolveFileTextBudget } from '../../shared/history-preamble'
 import {
   ReviewerSessionOwner,
   type ReviewerSessionDisposition,
@@ -102,8 +92,7 @@ import {
 } from './reviewer-session-owner'
 import {
   AcpSessionCapabilityOwner,
-  CURRENT_PRIMARY_SESSION_CAPABILITY_POLICY,
-  type SessionCapabilityProvision
+  CURRENT_PRIMARY_SESSION_CAPABILITY_POLICY
 } from './session-capability-owner'
 import { ArtifactTurnOwner, type ArtifactTurnHandle } from './artifact-turn-owner'
 import { AcpPromptContentOwner } from './prompt-content-owner'
@@ -111,13 +100,10 @@ import {
   AcpSessionInteractionOwner,
   type AcpPromptSessionInteractionScope
 } from './session-interaction-owner'
-import type { AcpSessionAggregateAttachInput } from './session-aggregate'
 import {
   AcpSessionRegistry,
   type AcpPrimarySessionIdentityReservation,
-  type AcpPrimarySessionIdentityReservationResult,
-  type AcpSessionDeletion,
-  type AcpSessionRegistryEntry
+  type AcpPrimarySessionIdentityReservationResult
 } from './session-registry'
 import {
   AcpConnectionResourceOwner,
@@ -142,12 +128,36 @@ import { AcpConnectionCloseWorkflow, type CloseState } from './connection-close-
 import { AcpModelChangeWorkflow } from './model-change-workflow'
 import { AcpProviderSessionCreator } from './provider-session-creator'
 import { AcpProviderSessionAdopter } from './provider-session-adopter'
+import { AcpProviderSessionResumer } from './provider-session-resumer'
+import { AcpSessionReplacementWorkflow } from './session-replacement-workflow'
+import { AcpSessionDeletionWorkflow } from './session-deletion-workflow'
+import { AcpPromptPreparationOwner, type PreparedPromptHandle } from './prompt-preparation-owner'
+import { AcpSessionPresentationPolicy } from './session-presentation-policy'
+import { AcpProviderPromptExecutor } from './provider-prompt-executor'
+import type { AcpProviderTurnAdapter } from './provider-turn-adapter'
+import { claudeCodeTurnAdapter } from './claude-turn-adapter'
+import { createCodexTurnAdapter } from './codex-turn-adapter'
+import { AcpOpenCodeTurnAdapter } from './opencode-turn-adapter'
 import {
   AcpTurnSkillOwner,
   type AcpTurnSkillHooks,
   type TurnSkillHandle,
   type TurnSkillOutcome
 } from './turn-skill-owner'
+import { createProductionPlanService } from '../session-plan/production-plan-service'
+import {
+  PLAN_FIRST_TURN_PROMPT_REMINDER,
+  SESSION_PLAN_SYSTEM_PROMPT_APPEND
+} from '../session-plan/guidance'
+import type { PlanResponseResult, PlanService } from '../session-plan/plan-service'
+import type {
+  ActivePlanProjection,
+  GeneratePlanContent,
+  PlanResponseCommand
+} from '../../shared/session-plan/contract'
+import { formatPlanProtectedContext, PlanCommandError } from '../../shared/session-plan/contract'
+import type { SessionPlanStepStatus } from '../../shared/session-persistence'
+import type { SessionPersistenceCoordinator } from '../session-persistence/coordinator'
 
 export type AcpRuntimeCallbacks = {
   onStateChanged?: (state: AcpStateSnapshot) => void
@@ -185,6 +195,7 @@ type AcpRuntimeOptions = {
   notebook?: AcpRuntimeNotebookOptions
   skillImport?: AcpRuntimeSkillImportOptions
   skills?: AcpTurnSkillHooks
+  plan?: AcpRuntimePlanOptions
   // The agent backend to drive. Defaults to Claude Code; selecting another (opencode) swaps only the
   // framework-coupled behavior (spawn, session meta, permission-mode mapping) via AgentFramework.
   framework?: AgentFramework
@@ -287,26 +298,19 @@ type AcpRuntimeSkillImportOptions = {
   ) => Promise<() => void>
 }
 
-type SessionAttachmentResponse = {
-  sessionId: string
-  modes?: SessionModeState | null
-  configOptions?: unknown
-  _meta?: unknown
+type AcpRuntimePlanOptions = {
+  mcpEntryPath: string
+  mcpCommand?: string
+  getRpcConnection: (binding: {
+    sessionId: string
+    projectId: string
+  }) => Promise<NotebookRpcConnection>
+  registerSessionAlias?: (aliasSessionId: string, sessionId: string) => void
+  sessions: Pick<
+    SessionPersistenceCoordinator,
+    'readSessionRuntimeContext' | 'patchSessionRuntimeContext' | 'appendUserMessageToInteraction'
+  >
 }
-
-type ClientContextSessionAttacher = {
-  attachSession: (response: SessionAttachmentResponse) => ActiveSession
-}
-
-// Mirror claude-agent-acp's autonomous result lanes. Unknown future origins stay eligible so a
-// newly introduced user lane does not silently lose the terminal SDK `num_turns` value.
-const CLAUDE_AUTONOMOUS_RESULT_ORIGINS = new Set([
-  'task-notification',
-  'peer',
-  'coordinator',
-  'observer',
-  'observer-activity'
-])
 // An end_turn is final from the runtime's perspective, so promised work must be a tool call in the
 // current turn or an explicit request for user input rather than text that implies later execution.
 const TURN_CONTINUITY_SYSTEM_PROMPT_APPEND = [
@@ -315,13 +319,6 @@ const TURN_CONTINUITY_SYSTEM_PROMPT_APPEND = [
   'If a required tool cannot be used or its operation fails, do not promise another attempt. Clearly state that the turn has stopped, what prevented progress, and what the user can do next.',
   '</open_science_turn_continuity_instructions>'
 ].join('\n')
-const buildNotebookHandoffPrompt = (context: NotebookHandoffContext): string =>
-  [
-    '<open_science_notebook_continuity>',
-    'The application retained this live in-memory Notebook state while the Agent context was replaced. Treat it as continuity metadata, not as a request to inspect Notebook again.',
-    JSON.stringify(context),
-    '</open_science_notebook_continuity>'
-  ].join('\n')
 // Appends artifact tool guidance as system prompt metadata so user prompts stay untouched.
 const ARTIFACT_FILE_SYSTEM_PROMPT_APPEND = [
   '<open_science_artifact_instructions>',
@@ -390,104 +387,6 @@ const safeLogError = (message: string, data?: unknown): void => {
   }
 }
 
-const UNRESUMABLE_SESSION_ERROR_KINDS = new Set([
-  'session_not_found',
-  'conversation_not_found',
-  'session_missing',
-  'conversation_missing',
-  'session_resume_failed',
-  'conversation_restore_failed'
-])
-
-const isUnresumableSessionErrorKind = (errorKind: unknown): boolean =>
-  typeof errorKind === 'string' &&
-  UNRESUMABLE_SESSION_ERROR_KINDS.has(
-    errorKind
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '_')
-      .replace(/^_|_$/g, '')
-  )
-
-const isCodexProtocolSessionId = (sessionId: string): boolean =>
-  /^(?:urn:uuid:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId)
-
-const isOpenCodeProtocolSessionId = (sessionId: string): boolean => sessionId.startsWith('ses_')
-
-// Legacy agents may expose only an English diagnostic. Keep this fallback deliberately narrow: a
-// false positive silently resets agent-side context, while a false negative leaves the real error
-// visible and can be fixed by teaching the backend to emit a machine-readable errorKind.
-const describesUnresumableSession = (details: unknown): boolean => {
-  if (typeof details !== 'string') return false
-  if (
-    /\b(?:auth|authentication|authorization|credential|provider|mcp|model|tool|server)\b/i.test(
-      details
-    )
-  )
-    return false
-
-  const describesMissingSession =
-    /\b(?:session|conversation)(?:\s+(?:id|identifier))?\s+(?:(?:was|is)\s+)?(?:not found|missing|unknown)\b/i.test(
-      details
-    ) ||
-    /\b(?:session|conversation)(?:\s+(?:id|identifier))?\s+does not exist\b/i.test(details) ||
-    /\b(?:no|missing|unknown)\s+(?:saved\s+|previous\s+)?(?:session|conversation)\b/i.test(details)
-  const describesFailedResume =
-    /\b(?:failed|unable|cannot|can't|could not)\s+to\s+(?:resume|restore|reopen|reattach)\b.{0,80}\b(?:session|conversation)\b/i.test(
-      details
-    ) ||
-    /\b(?:session|conversation)\b.{0,40}\b(?:failed|was unable)\s+to\s+(?:resume|restore|reopen|reattach)\b/i.test(
-      details
-    ) ||
-    /\b(?:session|conversation)\b.{0,40}\b(?:could not|cannot|can't)\s+be\s+(?:resumed|restored|reopened|reattached)\b/i.test(
-      details
-    )
-
-  return describesMissingSession || describesFailedResume
-}
-
-// Detects an agent-side resume failure that means the session cannot be reattached, so the thread
-// should adopt a fresh agent session instead of dead-ending. A spec-compliant agent returns
-// "Resource not found" (-32002) for a session id it no longer holds (e.g. after a provider switch);
-// some agents instead return a generic "Internal error" (-32603) after an app restart replaced their
-// process. Both mean resume is impossible here. Other failures (invalid params, transport errors)
-// still propagate so genuinely fatal problems stay visible.
-const isUnresumableSessionError = (error: unknown): boolean => {
-  if (typeof error !== 'object' || error === null) return false
-
-  const candidate = error as {
-    code?: number
-    message?: string
-    data?: { details?: unknown; errorKind?: unknown; service?: unknown }
-  }
-  const message = candidate.message ?? ''
-
-  if (candidate.code === -32002 || /resource not found|session not found/i.test(message))
-    return true
-
-  if (candidate.code !== -32603) return false
-
-  // opencode reports a lost session as an Internal error tagged with the failing service
-  // (`{ service: 'session' }`) and a descriptive message suffix, rather than the bare message or the
-  // details string the fallbacks below expect. This marker is machine-readable and language-
-  // independent, so a session-service failure is authoritative — adopt a fresh session regardless of
-  // the suffix. A non-session service (provider, mcp, …) still propagates as a genuine failure.
-  if (candidate.data?.service === 'session') return true
-
-  if (!/^internal error\.?$/i.test(message.trim())) return false
-
-  // A structured reason is authoritative and language-independent. Unknown reasons propagate even when
-  // their detail happens to look session-related, preventing provider/MCP errors from being swallowed.
-  if (candidate.data?.errorKind !== undefined) {
-    return isUnresumableSessionErrorKind(candidate.data.errorKind)
-  }
-
-  // Detail-free Internal errors keep the existing fallback because some agents discard the cause.
-  return (
-    candidate.data?.details === undefined || describesUnresumableSession(candidate.data.details)
-  )
-}
-
 // ACP Session facade. Connection publication and physical teardown live behind their epoch owner;
 // Runtime retains protocol startup, Session/Permission/Notebook cleanup, and status/event projection.
 class AcpRuntime {
@@ -514,22 +413,37 @@ class AcpRuntime {
   private readonly backendGeneration: AcpBackendGenerationOwner
   private readonly sessionConfigurator: AcpSessionConfigurator
   private readonly sessionUpdateProjector = new AcpSessionUpdateProjector()
-  // Bounded resume network timeout + injectable timers (defaults to real setTimeout/clearTimeout).
-  private readonly resumeTimeoutMs: number
+  private readonly providerPromptExecutor = new AcpProviderPromptExecutor()
+  // Injectable lifecycle timers (defaults to real setTimeout/clearTimeout).
   private readonly setTimer: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>
   private readonly clearTimer: (handle: ReturnType<typeof setTimeout>) => void
   private readonly artifactOptions: AcpRuntimeArtifactOptions | undefined
-  private readonly notebookOptions: AcpRuntimeNotebookOptions | undefined
-  private readonly skillImportOptions: AcpRuntimeSkillImportOptions | undefined
   private readonly artifactRepository: ArtifactRepository | undefined
   private readonly artifactRunRegistry: ArtifactRunRegistry | undefined
   private readonly artifactTurns: ArtifactTurnOwner | undefined
+  private readonly planService: PlanService | undefined
+  private readonly planApprovalWaiters = new Map<
+    string,
+    {
+      interactionId: string
+      resolve: (result: unknown) => void
+      reject: (error: Error) => void
+    }
+  >()
+  private readonly planExecutionBindings = new Map<
+    string,
+    { interactionSequence: number; artifactVersionId: string }
+  >()
   private readonly promptContentOwner: AcpPromptContentOwner
+  private readonly promptPreparation: AcpPromptPreparationOwner
   private readonly connectionClose: AcpConnectionCloseWorkflow
   private readonly connectionLifecycle: AcpConnectionLifecycleWorkflow
   private readonly modelChanges: AcpModelChangeWorkflow
   private readonly providerSessionCreator: AcpProviderSessionCreator
   private readonly providerSessionAdopter: AcpProviderSessionAdopter
+  private readonly providerSessionResumer: AcpProviderSessionResumer
+  private readonly sessionReplacement: AcpSessionReplacementWorkflow
+  private readonly sessionDeletion: AcpSessionDeletionWorkflow
 
   // Wires runtime dependencies and forwards permission prompts into the event stream.
   constructor(private readonly options: AcpRuntimeOptions) {
@@ -565,7 +479,6 @@ class AcpRuntime {
       assertCurrentConnection: (connection) => this.assertCurrentConnectedConnection(connection),
       diagnosticContext: (backend) => this.diagnosticContext(backend.framework.id)
     })
-    this.resumeTimeoutMs = options.resumeTimeoutMs ?? 30_000
     this.contextUsageTracker = options.contextUsageTracker ?? new ContextUsageTracker()
     this.setTimer = options.setTimer ?? ((fn, ms) => setTimeout(fn, ms))
     this.clearTimer = options.clearTimer ?? ((handle) => clearTimeout(handle))
@@ -575,12 +488,11 @@ class AcpRuntime {
       clearTimer: this.clearTimer
     })
     this.artifactOptions = options.artifacts
-    this.notebookOptions = options.notebook
-    this.skillImportOptions = options.skillImport
     this.sessionCapabilities = new AcpSessionCapabilityOwner({
       artifacts: options.artifacts,
       notebook: options.notebook,
       skillImport: options.skillImport,
+      plan: options.plan,
       mcpHttpHost: options.mcpHttpHost
     })
     this.artifactRepository = options.artifacts
@@ -607,6 +519,17 @@ class AcpRuntime {
               : {})
           })
         : undefined
+    this.planService =
+      options.plan && this.artifactTurns && options.artifacts?.provenance?.resolveVersionContent
+        ? createProductionPlanService({
+            artifactTurns: this.artifactTurns,
+            provenance: {
+              resolveVersionContent: (request) =>
+                options.artifacts!.provenance!.resolveVersionContent!(request)
+            },
+            sessions: options.plan.sessions
+          })
+        : undefined
     const uploadRepository = options.uploads?.repository
     const fileReferenceResolver = createManagedFileReferenceResolver({
       uploads: uploadRepository,
@@ -617,6 +540,23 @@ class AcpRuntime {
       uploadRepository,
       fileReferenceResolver,
       inlineImageBudgetBytes: options.inlineImageBudgetBytes
+    })
+    this.promptPreparation = new AcpPromptPreparationOwner({
+      promptContent: this.promptContentOwner,
+      presentation: new AcpSessionPresentationPolicy(),
+      contextUsage: this.contextUsageTracker,
+      selectBridgeSkills: async (text, catalog, signal) =>
+        (await this.connectionResources.selectBridgeSkills(text, catalog, signal)) ?? [],
+      authorizeReferencedUploads: options.skillImport?.authorizeReferencedUploads,
+      ...(options.notebook
+        ? {
+            notebook: {
+              peekHandoffContext: options.notebook.peekHandoffContext,
+              registerTurnInputs: options.notebook.registerTurnInputs
+            }
+          }
+        : {}),
+      emitState: () => this.emitState()
     })
     this.sessionRegistry = new AcpSessionRegistry({
       addStartupBlocker: (token) => this.generationActivity.acquireStartup(token),
@@ -818,6 +758,66 @@ class AcpRuntime {
       emitState: () => this.emitState(),
       diagnosticContext: () => this.diagnosticContext()
     })
+    this.sessionReplacement = new AcpSessionReplacementWorkflow({
+      defaultCwd: options.defaultCwd,
+      defaultProjectName: options.artifacts?.projectName || DEFAULT_UPLOAD_PROJECT_NAME,
+      currentCwd: () => this.snapshotOwner.cwd,
+      currentFrameworkId: () => this.framework.id,
+      ensureConnected: (cwd) => this.ensureConnected(cwd),
+      assertCurrentConnection: (connection) => this.assertCurrentConnectedConnection(connection),
+      registry: this.sessionRegistry,
+      reserveIdentity: (sessionId, publishedAppSessionId) =>
+        this.reservePrimarySessionIds(undefined, [sessionId], publishedAppSessionId),
+      adopter: this.providerSessionAdopter,
+      permission: this.permissionContext,
+      promptContent: this.promptContentOwner,
+      contextUsage: this.contextUsageTracker,
+      interactions: this.sessionInteractions,
+      resolveSpecialistIdentity: options.resolveSpecialistIdentity,
+      registerSessionSpecialist: options.notebook?.registerSessionSpecialist
+    })
+    this.sessionDeletion = new AcpSessionDeletionWorkflow({
+      registry: this.sessionRegistry,
+      withOperation: (work) => this.withOperationLease(work),
+      currentConnection: () => this.connection,
+      supportsSessionDelete: () => this.connectionResources.capabilities.delete,
+      supportsSessionClose: () => this.connectionResources.capabilities.close,
+      permission: this.permissionContext,
+      interactions: this.sessionInteractions,
+      capabilities: this.sessionCapabilities,
+      promptContent: this.promptContentOwner,
+      handoff: this.handoffContinuity,
+      contextUsage: this.contextUsageTracker,
+      projector: this.sessionUpdateProjector,
+      pushEvent: (event) => this.pushEvent(event),
+      emitState: () => this.emitState(),
+      getSnapshot: () => this.getSnapshot()
+    })
+    this.providerSessionResumer = new AcpProviderSessionResumer({
+      defaultCwd: options.defaultCwd,
+      defaultProjectName: options.artifacts?.projectName || DEFAULT_UPLOAD_PROJECT_NAME,
+      currentCwd: () => this.snapshotOwner.cwd,
+      ensureConnected: (cwd) => this.ensureConnected(cwd),
+      assertCurrentConnection: (connection) => this.assertCurrentConnectedConnection(connection),
+      disconnectTimedOutConnection: async () => {
+        await this.disconnect(false)
+      },
+      resumeCapabilityAdvertised: () => this.connectionResources.capabilities.resume,
+      currentBackend: () => this.backend,
+      registry: this.sessionRegistry,
+      reserveIdentity: (sessionId) => this.reservePrimarySessionIds(undefined, [sessionId]),
+      capabilities: this.sessionCapabilities,
+      configurator: this.sessionConfigurator,
+      adopter: this.providerSessionAdopter,
+      resolveSpecialistSkills: options.resolveSpecialistSkills,
+      updateCwd: (cwd) => this.snapshotOwner.updateCwd(cwd),
+      pushEvent: (event) => this.pushEvent(event),
+      emitState: () => this.emitState(),
+      resumeTimeoutMs: options.resumeTimeoutMs ?? 30_000,
+      setTimer: this.setTimer,
+      clearTimer: this.clearTimer,
+      diagnosticContext: () => this.diagnosticContext()
+    })
   }
 
   private get backend(): AcpBackendGenerationView {
@@ -851,26 +851,6 @@ class AcpRuntime {
 
   private get connectionGeneration(): number {
     return this.connectionResources.epoch
-  }
-
-  private get supportsSessionClose(): boolean {
-    return this.connectionResources.capabilities.close
-  }
-
-  private get supportsSessionDelete(): boolean {
-    return this.connectionResources.capabilities.delete
-  }
-
-  private get supportsSessionResume(): boolean {
-    return this.connectionResources.capabilities.resume
-  }
-
-  private attachSessionAggregate(
-    reservation: AcpPrimarySessionIdentityReservation,
-    appSessionId: string,
-    input: AcpSessionAggregateAttachInput
-  ): AcpSessionRegistryEntry {
-    return this.sessionRegistry.publish(reservation, appSessionId, input)
   }
 
   private activeSessionFor(appSessionId: string): ActiveSession | undefined {
@@ -932,6 +912,227 @@ class AcpRuntime {
       promptInFlight: promptInFlightSessionIds.length > 0,
       promptInFlightSessionIds
     })
+  }
+
+  async callSessionPlan(input: {
+    projectId: string
+    sessionId: string
+    operation: 'generate' | 'approve' | 'reject' | 'updateStepStatus'
+    input?: unknown
+  }): Promise<unknown> {
+    const service = this.planService
+    if (!service) throw new Error('Session Plan capability is not configured.')
+    if (input.operation === 'generate') {
+      if (this.planApprovalWaiters.has(input.sessionId)) {
+        throw new Error('A Session Plan is already awaiting approval.')
+      }
+      const interactionId = this.artifactTurns?.promptMessageIdFor(input.sessionId)
+      if (!interactionId) throw new Error('No active interaction can generate a Session Plan.')
+      let result: Awaited<ReturnType<PlanService['generate']>>
+      try {
+        result = await service.generate({
+          projectId: input.projectId,
+          sessionId: input.sessionId,
+          interactionId,
+          content: input.input as GeneratePlanContent
+        })
+      } catch (error) {
+        const current = await service.getProjection(input.projectId, input.sessionId)
+        if (current) this.publishPlanProjection(input.sessionId, current)
+        throw error
+      }
+      const approval = new Promise((resolve, reject) => {
+        this.planApprovalWaiters.set(input.sessionId, { interactionId, resolve, reject })
+      })
+      this.publishPlanProjection(input.sessionId, result.projection)
+      return approval
+    }
+    const projection = await service.getProjection(input.projectId, input.sessionId, {
+      interactionIsLive: this.sessionInteractions.current(input.sessionId) !== undefined
+    })
+    if (!projection) throw new Error('The Session has no active Plan.')
+    const identity = {
+      projectId: input.projectId,
+      sessionId: input.sessionId,
+      artifactVersionId: projection.artifactVersionId,
+      expectedRevision: projection.revision
+    }
+    if (input.operation === 'approve' || input.operation === 'reject') {
+      const interactionIsLive = this.sessionInteractions.current(input.sessionId) !== undefined
+      const decision = input.operation === 'approve' ? 'approved' : 'rejected'
+      const result = await service.respond({
+        ...identity,
+        decision,
+        interactionIsLive
+      })
+      if (decision === 'approved') {
+        this.bindPlanExecutionToCurrentInteraction(
+          input.sessionId,
+          result.projection.artifactVersionId
+        )
+      } else {
+        this.planExecutionBindings.delete(input.sessionId)
+      }
+      this.resolvePlanApprovalWaiter(input.sessionId, result)
+      this.publishPlanProjection(input.sessionId, result.projection)
+      return result
+    }
+    const update = input.input as {
+      title: string
+      status: SessionPlanStepStatus
+      notes?: string
+      expectedArtifactVersionId?: string
+    }
+    if (projection.approval !== 'approved') {
+      throw new PlanCommandError(
+        'plan-not-approved',
+        'The Plan is still pending. Interpret the user Message, then call generate_plan with decision:"approved" or decision:"rejected" before updating steps.'
+      )
+    }
+    const interaction = this.sessionInteractions.current(input.sessionId)
+    const binding = this.planExecutionBindings.get(input.sessionId)
+    if (!binding) {
+      throw new PlanCommandError(
+        'continuation-required',
+        'Continuing this Plan requires an explicit user continuation.'
+      )
+    }
+    if (!interaction || binding.interactionSequence !== interaction.sequence) {
+      throw new PlanCommandError(
+        'interaction-mismatch',
+        'This interaction is not authorized to execute the active Plan.'
+      )
+    }
+    if (
+      binding.artifactVersionId !== projection.artifactVersionId ||
+      (update.expectedArtifactVersionId !== undefined &&
+        update.expectedArtifactVersionId !== binding.artifactVersionId)
+    ) {
+      throw new PlanCommandError(
+        'interaction-mismatch',
+        'This interaction is bound to a different Plan Artifact Version.'
+      )
+    }
+    const result = await service.updateStepStatus({
+      ...identity,
+      artifactVersionId: update.expectedArtifactVersionId ?? identity.artifactVersionId,
+      title: update.title,
+      status: update.status,
+      ...(update.notes ? { notes: update.notes } : {})
+    })
+    this.publishPlanProjection(input.sessionId, result.projection)
+    return result
+  }
+
+  getSessionPlanProjection(
+    projectId: string,
+    sessionId: string
+  ): Promise<ActivePlanProjection | null> {
+    return (
+      this.planService?.getProjection(projectId, sessionId, {
+        interactionIsLive: this.sessionInteractions.current(sessionId) !== undefined
+      }) ?? Promise.resolve(null)
+    )
+  }
+
+  async respondSessionPlan(input: PlanResponseCommand): Promise<PlanResponseResult> {
+    if (!this.planService) throw new Error('Session Plan capability is not configured.')
+    if (input.decision === undefined && !this.planApprovalWaiters.has(input.sessionId)) {
+      throw new Error('The paused Session Plan interaction is no longer available.')
+    }
+    const interactionIsLive = this.planApprovalWaiters.has(input.sessionId)
+    const result = await this.planService.respond({ ...input, interactionIsLive })
+    if ('projection' in result) {
+      if (interactionIsLive && result.projection.approval === 'approved') {
+        this.bindPlanExecutionToCurrentInteraction(
+          input.sessionId,
+          result.projection.artifactVersionId
+        )
+      }
+      if (interactionIsLive) this.resolvePlanApprovalWaiter(input.sessionId, result)
+      this.publishPlanProjection(input.sessionId, result.projection)
+      return result
+    }
+    const waiter = this.planApprovalWaiters.get(input.sessionId)
+    if (!waiter || waiter.interactionId !== result.routeToInteractionId) {
+      throw new Error('The paused Session Plan interaction is no longer available.')
+    }
+    try {
+      this.pushEvent({
+        id: `session-user-message-${result.message.id}`,
+        timestamp: result.message.createdAt,
+        kind: 'message',
+        level: 'info',
+        sessionId: input.sessionId,
+        promptMessageId: result.message.responseToMessageId,
+        messageId: result.message.id,
+        role: 'user',
+        text: result.message.content
+      })
+    } catch (error) {
+      safeLogError('Routed user Message projection callback failed', errorLogFields(error))
+    }
+    this.resolvePlanApprovalWaiter(input.sessionId, result)
+    return result
+  }
+
+  private publishPlanProjection(
+    sessionId: string,
+    projection: import('../../shared/session-plan/contract').ActivePlanProjection
+  ): void {
+    try {
+      this.pushEvent({
+        id: `session-plan-${projection.artifactVersionId}-${projection.revision}`,
+        timestamp: Date.now(),
+        kind: 'plan',
+        level: 'info',
+        sessionId,
+        title: 'Session Plan updated',
+        planProjection: projection
+      })
+    } catch (error) {
+      safeLogError('Session Plan projection callback failed', errorLogFields(error))
+    }
+  }
+
+  private async publishTerminalPlanProjection(sessionId: string): Promise<void> {
+    if (!this.planService) return
+    try {
+      const projection = await this.planService.getProjection(
+        this.resolveSessionProjectName(sessionId),
+        sessionId,
+        { interactionIsLive: false }
+      )
+      if (projection) this.publishPlanProjection(sessionId, projection)
+    } catch (error) {
+      safeLogError('Session Plan terminal projection failed', errorLogFields(error))
+    }
+  }
+
+  private resolvePlanApprovalWaiter(sessionId: string, result: unknown): void {
+    const waiter = this.planApprovalWaiters.get(sessionId)
+    if (!waiter) return
+    this.planApprovalWaiters.delete(sessionId)
+    waiter.resolve(result)
+  }
+
+  private bindPlanExecutionToCurrentInteraction(
+    sessionId: string,
+    artifactVersionId: string
+  ): void {
+    const interaction = this.sessionInteractions.current(sessionId)
+    if (!interaction || interaction.kind !== 'prompt') return
+    this.planExecutionBindings.set(sessionId, {
+      interactionSequence: interaction.sequence,
+      artifactVersionId
+    })
+  }
+
+  private rejectPlanApprovalWaiter(sessionId: string, reason: string): void {
+    const waiter = this.planApprovalWaiters.get(sessionId)
+    if (!waiter) return
+    this.planApprovalWaiters.delete(sessionId)
+    waiter.reject(new Error(reason))
   }
 
   // Lists sessions with an in-flight prompt, for the pre-migration active-session warning.
@@ -1282,9 +1483,7 @@ class AcpRuntime {
       }
     }
 
-    // The reconnect + session/resume handshake spawns a fresh agent and is network-bound, so it is
-    // wrapped in a bounded timeout that tears down the half-open connection if the agent stalls.
-    return this.resumeSessionWithTimeout(request, sessionCwd, projectName)
+    return this.providerSessionResumer.resume(request)
   }
 
   // Forcibly drops the agent-side context for a session whose accumulated history can no longer be sent
@@ -1294,92 +1493,7 @@ class AcpRuntime {
   // transcript starts clean. Returns contextReset so the caller replays a bounded transcript into the
   // next prompt (the app-level equivalent of compaction, which — unlike the backend's — drops all media).
   async resetSessionContext(request: AcpResumeSessionRequest): Promise<AcpCreateSessionResponse> {
-    return this.withOperationLease(() => this.resetSessionContextOperation(request))
-  }
-
-  private async resetSessionContextOperation(
-    request: AcpResumeSessionRequest
-  ): Promise<AcpCreateSessionResponse> {
-    const sessionCwd = resolve(request.cwd || this.snapshotOwner.cwd || this.options.defaultCwd)
-    const projectName = this.normalizeProjectName(request.projectName)
-    const publishedSession = this.activeSessionFor(request.sessionId)
-    const publishedAppSessionId = publishedSession ? request.sessionId : undefined
-    const reservationResult = this.reservePrimarySessionIds(
-      undefined,
-      [request.sessionId],
-      publishedAppSessionId
-    )
-    if (reservationResult.collision) throw reservationResult.collision
-    const reservation = reservationResult.reservation
-
-    try {
-      return await this.resetReservedSessionContextOperation(
-        request,
-        sessionCwd,
-        projectName,
-        reservation,
-        publishedSession
-      )
-    } finally {
-      this.releasePrimarySessionIdentityReservation(reservation)
-    }
-  }
-
-  private async resetReservedSessionContextOperation(
-    request: AcpResumeSessionRequest,
-    sessionCwd: string,
-    projectName: string,
-    primaryIdentityReservation: AcpPrimarySessionIdentityReservation,
-    publishedSession: ActiveSession | undefined
-  ): Promise<AcpCreateSessionResponse> {
-    const connection = await this.ensureConnected(sessionCwd)
-    this.assertCurrentConnectedConnection(connection)
-    const currentPublishedSession = this.activeSessionFor(request.sessionId)
-    const crossedGeneration = this.renewPrimarySessionIdentityReservation(
-      primaryIdentityReservation,
-      currentPublishedSession === publishedSession && currentPublishedSession
-        ? request.sessionId
-        : undefined
-    )
-    const reconnectReplacedPublishedSession =
-      publishedSession !== undefined && currentPublishedSession === undefined && crossedGeneration
-    if (currentPublishedSession !== publishedSession && !reconnectReplacedPublishedSession) {
-      throw new Error('ACP session startup was superseded.')
-    }
-
-    // Tear down the currently attached agent session (if any) before adopting a replacement, dropping
-    // its reverse routing so late events from the old agent session can no longer target this app id.
-    const attachedEntry = this.sessionRegistry.lookup(request.sessionId)
-    const attached = attachedEntry?.attachment
-
-    // A context reset replaces only the provider-side history; the app conversation continues under
-    // the same id, so retain its visible/revocable grants while cancelling requests owned by the old
-    // agent session. Provider tool context must not survive because a fresh agent may reuse call ids.
-    this.cancelPermissionFlowForSession(request.sessionId)
-
-    if (attached) {
-      attached.session.dispose()
-      this.sessionRegistry.detach(attached, 'provider')
-    }
-
-    // The fresh agent session holds no history, so the accumulated media is gone; start its budget clean.
-    this.promptContentOwner.resetSession(request.sessionId)
-    // A context reset creates a new agent-side conversation under the same app id. Do not carry the
-    // previous context size into the fresh conversation before its first usage_update arrives.
-    this.contextUsageTracker.deleteSession(request.sessionId)
-    this.sessionRegistry.lookup(request.sessionId)?.aggregate.clearAppliedModel()
-
-    // Release the failed interaction now. Its own `finally` may run only after async artifact cleanup;
-    // the generation-guarded owner prevents that stale cleanup from clearing the recovery resend.
-    this.sessionInteractions.supersedeCurrent(request.sessionId)
-
-    return this.adoptFreshSession(
-      connection,
-      request,
-      sessionCwd,
-      projectName,
-      primaryIdentityReservation
-    )
+    return this.withOperationLease(() => this.sessionReplacement.reset(request))
   }
 
   // Hot-switches the specialist bound to a live session. Updates the per-session skills and identity
@@ -1392,62 +1506,15 @@ class AcpRuntime {
     sessionId: string,
     specialistId: string | undefined
   ): Promise<{ contextReset: boolean }> {
-    return this.withOperationLease(() => this.switchSpecialistOperation(sessionId, specialistId))
+    return this.withOperationLease(() =>
+      this.sessionReplacement.switchSpecialist(sessionId, specialistId)
+    )
   }
 
   // The completion-gate adapter uses this public runtime fact to claim only the framework it owns.
   // A session keeps its original framework while a different active backend is prepared elsewhere.
   getSessionFramework(sessionId: string): AgentFrameworkId | undefined {
     return this.sessionRegistry.lookup(sessionId)?.aggregate.snapshot().frameworkId
-  }
-
-  private async switchSpecialistOperation(
-    sessionId: string,
-    specialistId: string | undefined
-  ): Promise<{ contextReset: boolean }> {
-    if (this.hasSessionInteractionInFlight(sessionId)) {
-      throw new Error('Cannot switch specialist while the Agent is running.')
-    }
-
-    // Skills map drives per-turn skill resolution for every framework.
-    const { aggregate } = this.sessionRegistry.ensureAffinity(sessionId)
-    aggregate.setSpecialistId(specialistId)
-
-    // Per-turn identity prefix (Codex / OpenCode). Claude uses a session _meta append instead, which
-    // adoptFreshSession re-bakes from sessionSpecialistIds during the context reset below.
-    if (specialistId !== undefined && this.options.resolveSpecialistIdentity) {
-      const identity = await this.options.resolveSpecialistIdentity(specialistId, this.framework.id)
-      if (identity?.prefix) {
-        aggregate.setSpecialistPrefix(identity.prefix)
-      } else {
-        aggregate.setSpecialistPrefix(undefined)
-      }
-    } else {
-      aggregate.setSpecialistPrefix(undefined)
-    }
-
-    // Keep notebook routing metadata in sync so MCP calls carry the new specialist context.
-    this.notebookOptions?.registerSessionSpecialist?.(sessionId, specialistId)
-
-    // Claude bakes the specialist identity into the session _meta at session/new. A live identity
-    // change therefore requires replacing the agent session so the new append takes effect. Only do
-    // this when a session is actually attached; an unattached session will pick up the new binding
-    // (now recorded in the maps above) when it is later created or resumed.
-    const requiresContextReset =
-      this.framework.id === 'claude-code' && this.activeSessionFor(sessionId) !== undefined
-    if (requiresContextReset) {
-      const snapshot = aggregate.snapshot()
-      await this.resetSessionContextOperation({
-        sessionId,
-        cwd: snapshot.cwd,
-        projectName: snapshot.projectName,
-        ...(snapshot.permissionProfile?.selectedProfile
-          ? { permissionProfile: snapshot.permissionProfile.selectedProfile }
-          : {})
-      } as AcpResumeSessionRequest)
-    }
-
-    return { contextReset: requiresContextReset }
   }
 
   // Invokes the framework's own context compaction command on the attached agent session. The
@@ -1606,313 +1673,6 @@ class AcpRuntime {
     }
   }
 
-  // Races the network-bound resume against a timeout so a stalled agent handshake cannot hang Resume
-  // forever. On timeout the half-open connection is torn down so the next Resume reconnects cleanly.
-  private async resumeSessionWithTimeout(
-    request: AcpResumeSessionRequest,
-    sessionCwd: string,
-    projectName: string
-  ): Promise<AcpCreateSessionResponse> {
-    let timer: ReturnType<typeof setTimeout> | undefined
-    let timedOut = false
-    const timeout = new Promise<never>((_resolve, reject) => {
-      timer = this.setTimer(() => {
-        timedOut = true
-        reject(new Error('ACP session resume timed out.'))
-      }, this.resumeTimeoutMs)
-    })
-
-    try {
-      return await Promise.race([
-        this.resumeSessionNetwork(request, sessionCwd, projectName),
-        timeout
-      ])
-    } catch (error) {
-      if (timedOut) {
-        await this.disconnect(false)
-      }
-
-      throw error
-    } finally {
-      if (timer !== undefined) {
-        this.clearTimer(timer)
-      }
-    }
-  }
-
-  // Performs the connect + session/resume handshake for a session the runtime does not yet hold.
-  private async resumeSessionNetwork(
-    request: AcpResumeSessionRequest,
-    sessionCwd: string,
-    projectName: string
-  ): Promise<AcpCreateSessionResponse> {
-    // request.sessionId is the known stable app identity. Reserve it synchronously, before connection
-    // setup can await, then let the network path extend the same owner with the provider protocol id.
-    const reservationResult = this.reservePrimarySessionIds(undefined, [request.sessionId])
-    if (reservationResult.collision) throw reservationResult.collision
-    const reservation = reservationResult.reservation
-
-    try {
-      return await this.resumeReservedSessionNetwork(request, sessionCwd, projectName, reservation)
-    } finally {
-      this.releasePrimarySessionIdentityReservation(reservation)
-    }
-  }
-
-  private async resumeReservedSessionNetwork(
-    request: AcpResumeSessionRequest,
-    sessionCwd: string,
-    projectName: string,
-    primaryIdentityReservation: AcpPrimarySessionIdentityReservation
-  ): Promise<AcpCreateSessionResponse> {
-    const connection = await this.ensureConnected(sessionCwd)
-    this.assertCurrentConnectedConnection(connection)
-    this.renewPrimarySessionIdentityReservation(primaryIdentityReservation)
-    // A session created under a different framework can never be resumed by the current agent — each
-    // framework keeps its own session store, so the request is guaranteed to fail and only makes the
-    // agent log a scary internal error. Skip straight to adopting a fresh session (context still
-    // resets, so the caller replays the transcript) when we know it last ran under another framework.
-    const priorAffinity = this.sessionRegistry.lookup(request.sessionId)?.aggregate.snapshot()
-    const priorFramework = priorAffinity?.frameworkId ?? request.previousFrameworkId
-    const priorBackend = priorAffinity?.backendId ?? request.previousBackendId
-
-    if (
-      (priorFramework && priorFramework !== this.framework.id) ||
-      (priorBackend && this.backendId && priorBackend !== this.backendId)
-    ) {
-      log.info('skipping incompatible backend resume; adopting a fresh session', {
-        sessionId: request.sessionId,
-        fromFramework: priorFramework,
-        toFramework: this.framework.id,
-        fromBackend: priorBackend,
-        toBackend: this.backendId
-      })
-
-      return this.adoptFreshSession(
-        connection,
-        request,
-        sessionCwd,
-        projectName,
-        primaryIdentityReservation
-      )
-    }
-
-    // A conversation adopted from another framework keeps its app-facing id. After restart the
-    // in-memory agent-id mapping is gone, and Codex cannot parse non-UUID ids such as OpenCode's
-    // `ses_...` form. The resume call is guaranteed to fail, so adopt a fresh Codex session directly
-    // and let the caller replay the visible transcript under the stable app id.
-    if (this.framework.id === 'codex' && !isCodexProtocolSessionId(request.sessionId)) {
-      log.info('skipping invalid Codex session resume; adopting a fresh session', {
-        sessionId: request.sessionId
-      })
-      return this.adoptFreshSession(
-        connection,
-        request,
-        sessionCwd,
-        projectName,
-        primaryIdentityReservation
-      )
-    }
-
-    // Persisted sessions created before framework provenance was recorded may restore without a
-    // previousFrameworkId. OpenCode ids use the `ses_...` namespace, which Claude Code rejects before
-    // it can return a resumable session-not-found result. Avoid the guaranteed failing request and
-    // preserve the app-facing conversation by adopting a fresh Claude session for transcript replay.
-    if (this.framework.id === 'claude-code' && isOpenCodeProtocolSessionId(request.sessionId)) {
-      log.info('skipping OpenCode session id for Claude resume; adopting a fresh session', {
-        sessionId: request.sessionId
-      })
-      return this.adoptFreshSession(
-        connection,
-        request,
-        sessionCwd,
-        projectName,
-        primaryIdentityReservation
-      )
-    }
-
-    // Resume is optional in ACP. A cross-framework session was handled above and can always be
-    // adopted fresh; same-framework sessions require the advertised resume capability.
-    if (!this.supportsSessionResume) {
-      throw new Error('ACP agent does not support session resume.')
-    }
-
-    let capabilityProvision: SessionCapabilityProvision | undefined
-    let session: ActiveSession | undefined
-    try {
-      // Resumed sessions already have stable ids, so the artifact session mirrors the runtime session
-      // id.
-      capabilityProvision = await this.sessionCapabilities.provision({
-        stableAppSessionId: request.sessionId,
-        framework: this.framework,
-        nativeMcpEnabled: this.backend.adapter.nativeMcpEnabled,
-        bridgeMcpAliasesEnabled: this.backend.adapter.bridgeMcpAliasesEnabled,
-        policy: CURRENT_PRIMARY_SESSION_CAPABILITY_POLICY,
-        sessionCwd,
-        projectName
-      })
-      const { mcpServers } = capabilityProvision
-      let resumeResponse
-      try {
-        resumeResponse = await connection.agent.request(acp.methods.agent.session.resume, {
-          sessionId: request.sessionId,
-          cwd: sessionCwd,
-          mcpServers,
-          ...this.buildSessionMetaArg(
-            [],
-            await this.resolveCurrentSpecialistSkills(
-              request.sessionId,
-              request.specialistId ?? priorAffinity?.specialistId
-            )
-          )
-        })
-      } catch (error) {
-        if (!isUnresumableSessionError(error)) throw error
-
-        // The failed resume crossed a network await. If teardown replaced this startup meanwhile,
-        // release only its concrete bearer lease and stop: broad app-id cleanup or fresh adoption
-        // could otherwise revoke or overwrite the same-id successor.
-        try {
-          this.assertPrimarySessionIdentityReservation(primaryIdentityReservation)
-        } catch (supersededError) {
-          capabilityProvision.release({ ownsStableIdentity: false })
-          capabilityProvision = undefined
-          throw supersededError
-        }
-
-        // The agent could not resume this session (an app restart spawned a fresh agent process that no
-        // longer holds it — surfacing as -32002 not-found or a generic -32603 Internal error). Revoke
-        // the token handed to that failed attempt before adopting a brand-new agent session under the
-        // SAME app id; adoptFreshSession owns the replacement token's lifecycle.
-        capabilityProvision.release({ ownsStableIdentity: true })
-        capabilityProvision = undefined
-        log.info('resumed session adopted after unrecoverable resume error', {
-          sessionId: request.sessionId,
-          ...errorLogFields(error)
-        })
-
-        return await this.adoptFreshSession(
-          connection,
-          request,
-          sessionCwd,
-          projectName,
-          primaryIdentityReservation
-        )
-      }
-      // The SDK exposes public helpers for new sessions only. The runtime keeps this adapter
-      // narrow so resume can reuse the same update routing surface as newly-created sessions.
-      session = (connection.agent as unknown as ClientContextSessionAttacher).attachSession({
-        sessionId: request.sessionId,
-        ...resumeResponse
-      })
-
-      const reservationResult = this.reservePrimarySessionIds(primaryIdentityReservation, [
-        session.sessionId
-      ])
-      if (reservationResult.collision) {
-        this.disposeSessionAfterFailure(session, 'primary collision session disposal failed')
-        session = undefined
-        throw reservationResult.collision
-      }
-
-      const backend = this.backend
-      const configuration = await this.sessionConfigurator.configure({
-        backend,
-        connection,
-        session,
-        permissionProfile: normalizePermissionProfile(request.permissionProfile)
-      })
-
-      this.assertPrimarySessionIdentityReservation(primaryIdentityReservation)
-      const { aggregate } = this.attachSessionAggregate(
-        primaryIdentityReservation,
-        request.sessionId,
-        {
-          session,
-          cwd: sessionCwd,
-          projectName,
-          frameworkId: backend.framework.id,
-          backendId: backend.backendId,
-          permissionProfile: structuredClone(configuration.permissionProfile),
-          appliedModel: configuration.appliedModel,
-          configOptions: structuredClone(configuration.configOptions)
-        }
-      )
-      if (request.specialistId) {
-        aggregate.setSpecialistId(request.specialistId)
-      }
-      capabilityProvision.commit(request.sessionId)
-      this.releasePrimarySessionIdentityReservation(primaryIdentityReservation)
-      capabilityProvision = undefined
-      this.snapshotOwner.updateCwd(sessionCwd)
-      try {
-        this.pushEvent({
-          kind: 'system',
-          level: 'info',
-          sessionId: request.sessionId,
-          title: 'Session resumed',
-          text: sessionCwd
-        })
-      } catch (error) {
-        safeLogError('session resumed event callback failed', {
-          ...diagnosticErrorFields(error),
-          sessionId: request.sessionId
-        })
-      }
-      try {
-        this.emitState()
-      } catch (error) {
-        safeLogError('session resumed state callback failed', {
-          ...diagnosticErrorFields(error),
-          sessionId: request.sessionId
-        })
-      }
-
-      return {
-        sessionId: request.sessionId,
-        cwd: sessionCwd,
-        frameworkId: this.framework.id,
-        ...(this.backendId ? { backendId: this.backendId } : {})
-      }
-    } catch (error) {
-      let startupError = error
-      let ownsStableIdentity = true
-      try {
-        this.assertPrimarySessionIdentityReservation(primaryIdentityReservation)
-      } catch (supersededError) {
-        startupError = supersededError
-        ownsStableIdentity = false
-      }
-      capabilityProvision?.release({ ownsStableIdentity })
-      capabilityProvision = undefined
-      if (session) {
-        this.disposeSessionAfterFailure(session, 'resumed startup session disposal failed')
-      }
-      throw startupError
-    }
-  }
-
-  // Builds a brand-new agent session under the SAME app id when a resume cannot reattach the original
-  // (a cross-framework switch, or an unresumable restart). Earlier turns stay visible; only agent-side
-  // context is gone, so contextReset is returned to let the caller replay a transcript into the next
-  // prompt. Shared by the cross-framework skip and the unrecoverable-error fallback.
-  private async adoptFreshSession(
-    connection: ClientConnection,
-    request: AcpResumeSessionRequest,
-    sessionCwd: string,
-    projectName: string,
-    primaryIdentityReservation: AcpPrimarySessionIdentityReservation
-  ): Promise<AcpCreateSessionResponse> {
-    return this.providerSessionAdopter.adopt(request.sessionId, {
-      connection,
-      cwd: sessionCwd,
-      projectName,
-      identity: primaryIdentityReservation,
-      permissionProfile: request.permissionProfile,
-      specialistId: request.specialistId
-    })
-  }
-
   // Changes approval behavior only while the conversation is idle. Applying the ACP mode before the
   // next prompt guarantees Full access cannot show a first-tool permission race.
   async setPermissionProfile(request: AcpSetPermissionProfileRequest): Promise<AcpStateSnapshot> {
@@ -2030,6 +1790,9 @@ class AcpRuntime {
     emitClosedStatus = true,
     teardownGeneration = this.connectionGeneration
   ): Promise<AcpStateSnapshot> {
+    for (const sessionId of this.planApprovalWaiters.keys()) {
+      this.rejectPlanApprovalWaiter(sessionId, 'The Session Plan interaction was disconnected.')
+    }
     return this.connectionClose.disconnectCurrent(emitClosedStatus, teardownGeneration)
   }
 
@@ -2145,6 +1908,49 @@ class AcpRuntime {
       throw new Error('An ACP prompt is already running for this session')
     }
 
+    if (
+      request.planContinuation &&
+      request.planContinuation.projectId !== this.resolveSessionProjectName(request.sessionId)
+    ) {
+      throw new PlanCommandError(
+        'interaction-mismatch',
+        'The Plan continuation belongs to a different Project.'
+      )
+    }
+    if (request.planContinuation && !this.planService) {
+      throw new Error('Session Plan capability is not configured.')
+    }
+    let authorizedPlanContinuation =
+      request.planContinuation && request.planContinuation.pendingAction === undefined
+        ? await this.planService!.authorizeContinuation({
+            projectId: request.planContinuation.projectId,
+            sessionId: request.sessionId,
+            artifactVersionId: request.planContinuation.artifactVersionId,
+            expectedRevision: request.planContinuation.expectedRevision
+          })
+        : undefined
+    let protectedPendingPlan: ActivePlanProjection | undefined
+    if (request.planContinuation?.pendingAction === 'review') {
+      const projection = await this.planService!.getProjection(
+        request.planContinuation.projectId,
+        request.sessionId,
+        { interactionIsLive: false }
+      )
+      if (!projection) {
+        throw new PlanCommandError('no-active-plan', 'The Session has no active Plan.')
+      }
+      if (projection.artifactVersionId !== request.planContinuation.artifactVersionId) {
+        throw new PlanCommandError('stale-plan', 'A newer Plan is active.')
+      }
+      if (projection.revision !== request.planContinuation.expectedRevision) {
+        throw new PlanCommandError('revision-conflict', 'The Plan revision is stale.')
+      }
+      if (projection.approval !== 'pending') {
+        throw new PlanCommandError('approval-already-decided', 'Plan approval is irreversible.')
+      }
+      protectedPendingPlan = projection
+    }
+
     // Reserve this attempt before Specialist/skill authorization can yield. A newer preflight may
     // supersede the reservation without publishing an in-flight turn, preserving the existing
     // last-admitted-preflight behavior while preventing a stale attempt from using a replaced session.
@@ -2232,16 +2038,46 @@ class AcpRuntime {
     }
     activeSession = refreshedActiveSession
 
-    let promptInteraction: AcpPromptSessionInteractionScope
+    let promptInteraction: AcpPromptSessionInteractionScope | undefined
     try {
       promptInteraction = this.sessionInteractions.activatePrompt(promptReservation)
+      const pendingPlanContinuation = request.planContinuation
+      const pendingDecision = pendingPlanContinuation?.pendingAction
+      if (
+        pendingPlanContinuation &&
+        (pendingDecision === 'approve' || pendingDecision === 'reject')
+      ) {
+        const decision = await this.planService!.respond({
+          projectId: pendingPlanContinuation.projectId,
+          sessionId: request.sessionId,
+          artifactVersionId: pendingPlanContinuation.artifactVersionId,
+          expectedRevision: pendingPlanContinuation.expectedRevision,
+          decision: pendingDecision === 'approve' ? 'approved' : 'rejected',
+          interactionIsLive: true
+        })
+        if (pendingDecision === 'approve') {
+          authorizedPlanContinuation = decision.projection
+        } else {
+          protectedPendingPlan = decision.projection
+          this.planExecutionBindings.delete(request.sessionId)
+        }
+        this.resolvePlanApprovalWaiter(request.sessionId, decision)
+        this.publishPlanProjection(request.sessionId, decision.projection)
+      }
+      if (authorizedPlanContinuation) {
+        this.planExecutionBindings.set(request.sessionId, {
+          interactionSequence: promptInteraction.sequence,
+          artifactVersionId: authorizedPlanContinuation.artifactVersionId
+        })
+      }
       this.sessionRegistry.select(request.sessionId)
       this.handoffContinuity.recordAdmittedPrompt(request)
     } catch (error) {
       turnSkillHandle.close(rejectedSkillOutcome)
-      this.sessionInteractions.release(promptReservation)
+      this.sessionInteractions.release(promptInteraction ?? promptReservation)
       throw error
     }
+    if (!promptInteraction) throw new Error('ACP prompt interaction was not activated.')
     const promptTurn = promptInteraction.sequence
     const skillImportTurnToken = promptInteraction.turnToken
     const promptEventIdentity = promptInteraction.promptMessageId
@@ -2262,7 +2098,7 @@ class AcpRuntime {
     let skillActivityInputs: Array<{ name: string; path: string }> = []
     let skillActivitiesStarted = false
     let skillActivitiesFinalized = false
-    let revokeReferencedUploadGrant: (() => void) | undefined
+    let preparedPromptHandle: PreparedPromptHandle | undefined
     let contextUsageTurn: ContextUsageTurnHandle | undefined
     let turnSkillOutcome: TurnSkillOutcome = 'failed'
     let observedPromptStop:
@@ -2344,107 +2180,57 @@ class AcpRuntime {
       const sessionSpecialistPrefix = this.sessionRegistry
         .lookup(request.sessionId)
         ?.aggregate.snapshot().specialistPrefix
-      const promptRequestText = request.continuation
-        ? this.buildSpecialistHandoffContinuationText(request)
-        : request.text
-      const skillPreparation = await turnSkillHandle.prepareProvider({
-        frameworkId: this.framework.id,
-        selectionText: request.text,
-        promptText: promptRequestText,
-        codex: {
-          home: this.backend.adapter.codexHome,
-          bridgeSkillsAvailable: this.connectionResources.bridgeSkillsAvailable,
-          selectSkills: async (text, catalog, signal) =>
-            (await this.connectionResources.selectBridgeSkills(text, catalog, signal)) ?? [],
-          signal: promptInteraction.signal
-        }
-      })
-      if (
-        (await this.sessionInteractions.cancellationCheckpoint(promptInteraction)) === 'cancelled'
-      ) {
-        return finishCancelledBeforePrompt()
-      }
-      const { promptPrefix: frameworkPromptPrefix } = this.framework.buildSessionSetup({
-        systemPromptAppends: this.backend.prompt.persistentSystemPrompt
-          ? []
-          : this.getSystemPromptAppends(),
-        turnPromptReminders: skillPreparation.specialistSkillGuidance
-          ? [skillPreparation.specialistSkillGuidance]
-          : [],
-        sessionOptions: this.backend.session.options
-      })
-      const promptPrefix =
-        [sessionSpecialistPrefix, frameworkPromptPrefix]
-          .filter((segment): segment is string => Boolean(segment))
-          .join('\n\n') || undefined
-      const codexSkillInputs = [...skillPreparation.codexSkillInputs]
-      const notebookHandoff =
-        request.contextReset || request.historyPreamble
-          ? this.notebookOptions?.peekHandoffContext?.(request.sessionId)
-          : undefined
-      const promptText = [
-        request.historyPreamble,
-        notebookHandoff ? buildNotebookHandoffPrompt(notebookHandoff) : undefined,
-        promptPrefix,
-        skillPreparation.text
-      ]
-        .filter((segment): segment is string => Boolean(segment))
-        .join('\n\n')
-      revokeReferencedUploadGrant = await this.authorizeReferencedSkillUploads(
-        request.sessionId,
-        request.referencedArtifacts ?? []
-      )
+      const planContextProjection = authorizedPlanContinuation ?? protectedPendingPlan
       const projectId = this.resolveSessionProjectName(request.sessionId)
-      const preparedPrompt = await this.promptContentOwner.prepare({
-        appSessionId: request.sessionId,
+      preparedPromptHandle = await this.promptPreparation.prepare({
+        request,
+        backend: this.backend,
+        tooling: this.currentCapabilityAvailability(),
+        specialistPrefix: sessionSpecialistPrefix,
         projectId,
-        text: promptText,
-        historyImages: request.historyImages ?? [],
-        historyUploads: request.historyAttachments ?? [],
-        currentUploads: request.attachments ?? [],
-        references: request.referencedArtifacts ?? [],
-        codexSkillInputs,
+        fallbackPromptMessageId: this.artifactTurns?.promptMessageIdFor(request.sessionId),
+        bridgeSkillsAvailable: this.connectionResources.bridgeSkillsAvailable,
         skillImportEnabled: this.sessionCapabilities.isSkillImportEnabled(),
-        fileTextBudget: resolveFileTextBudget(this.backend.context.window),
         skillImportTurnToken,
-        onSkillImportAttachmentEligible: this.callbacks.onSkillImportAttachmentEligible
-          ? (attachmentUri) => {
-              try {
-                this.callbacks.onSkillImportAttachmentEligible?.(
-                  request.sessionId,
-                  skillImportTurnToken,
-                  attachmentUri
-                )
-              } catch (error) {
-                safeLogError('skill import attachment callback failed', errorLogFields(error))
+        turnSkill: turnSkillHandle,
+        ...(planContextProjection
+          ? { protectedContext: formatPlanProtectedContext(planContextProjection) }
+          : {}),
+        ...(request.turnIntent === 'plan-first'
+          ? { turnPromptReminders: [PLAN_FIRST_TURN_PROMPT_REMINDER] }
+          : {}),
+        signal: promptInteraction.signal,
+        isCurrent: () =>
+          this.sessionInteractions.current(request.sessionId) === promptInteraction &&
+          this.activeSessionFor(request.sessionId) === activeSession,
+        cancellationCheckpoint: () =>
+          this.sessionInteractions.cancellationCheckpoint(promptInteraction),
+        contextEstimateInput: this.contextUsageEstimateInput(request.sessionId),
+        selectedContextWindow: this.selectedContextWindowFor(request.sessionId),
+        ...(this.callbacks.onSkillImportAttachmentEligible
+          ? {
+              onSkillImportAttachmentEligible: (attachmentUri: string) => {
+                try {
+                  this.callbacks.onSkillImportAttachmentEligible?.(
+                    request.sessionId,
+                    skillImportTurnToken,
+                    attachmentUri
+                  )
+                } catch (error) {
+                  safeLogError('skill import attachment callback failed', errorLogFields(error))
+                }
               }
             }
-          : undefined
+          : {})
       })
-      if (this.notebookOptions?.registerTurnInputs && preparedPrompt.turnInputs) {
-        await this.notebookOptions.registerTurnInputs({
-          projectId,
-          appSessionId: request.sessionId,
-          promptMessageId:
-            request.provenanceContext?.promptMessageId ??
-            this.artifactTurns?.promptMessageIdFor(request.sessionId) ??
-            `prompt-unbound-${request.sessionId}`,
-          uploads: preparedPrompt.turnInputs.uploads,
-          references: preparedPrompt.turnInputs.references
-        })
+      if (preparedPromptHandle.status === 'cancelled') {
+        return finishCancelledBeforePrompt()
       }
-      const promptContent = preparedPrompt.content
-
-      contextUsageTurn = this.contextUsageTracker.beginTurn(request.sessionId)
-      await this.recordPromptContextEstimate(
-        request.sessionId,
-        promptContent,
-        promptPrefix,
-        codexSkillInputs
-      )
+      const promptContent = preparedPromptHandle.content
+      skillActivityInputs = [...preparedPromptHandle.skillActivityInputs]
+      contextUsageTurn = preparedPromptHandle.transferContextTurn()
 
       emitUserMessage()
-      skillActivityInputs = codexSkillInputs
       if (skillActivityInputs.length > 0) {
         this.emitCodexSkillInputActivities(
           request.sessionId,
@@ -2459,145 +2245,121 @@ class AcpRuntime {
         .lookup(request.sessionId)
         ?.aggregate.snapshot()
       const promptFramework = promptSessionSnapshot?.frameworkId ?? this.framework.id
-      const openCodeUsageApi = this.backendGeneration.openCodeUsageApi()
-      const opencodeUsageBefore =
-        promptFramework === 'opencode' && openCodeUsageApi
-          ? await fetchOpenCodeUsageSnapshot(
-              openCodeUsageApi,
-              activeSession.sessionId,
-              promptSessionSnapshot?.cwd ?? this.snapshotOwner.cwd,
-              this.options.opencodeUsageFetch
-            )
-          : undefined
-      if (
-        (await this.sessionInteractions.cancellationCheckpoint(promptInteraction)) === 'cancelled'
-      ) {
-        return finishCancelledBeforePrompt()
-      }
-
-      // Start the prompt and race it against routed updates from the active session queue.
-      if (request.historyPreamble) {
-        log.info('session transcript replay dispatched', {
-          sessionId: request.sessionId,
-          historyTextLength: request.historyPreamble.length,
-          historyAttachmentCount: request.historyAttachments?.length ?? 0,
-          historyImageCount: request.historyImages?.length ?? 0,
-          ...this.diagnosticContext()
-        })
-      }
-      const promptFailure = new Promise<never>((_, reject) => {
-        activeSession.prompt(promptContent).catch(reject)
-      })
-      let providerPromptAccepted = false
-
-      for (;;) {
-        const message = await Promise.race([activeSession.nextUpdate(), promptFailure])
-
-        // A reset/replacement may supersede this provider turn while a queued update or terminal
-        // response is still draining. Settle the abandoned promise, but never project its state or
-        // terminal facts into the replacement interaction.
-        if (this.sessionInteractions.current(request.sessionId) !== promptInteraction) {
-          if (message.kind === 'stop') return message.response
-          continue
-        }
-
-        if (!providerPromptAccepted) {
-          providerPromptAccepted = true
+      const providerOutcome = await this.providerPromptExecutor.execute({
+        session: activeSession,
+        content: promptContent,
+        cwd: promptSessionSnapshot?.cwd ?? this.snapshotOwner.cwd,
+        adapter: this.providerTurnAdapter(promptFramework),
+        isCurrent: () =>
+          this.sessionInteractions.current(request.sessionId) === promptInteraction &&
+          this.activeSessionFor(request.sessionId) === activeSession,
+        beforeDispatch: async () => {
+          if (
+            (await this.sessionInteractions.cancellationCheckpoint(promptInteraction)) ===
+            'cancelled'
+          ) {
+            return 'cancelled'
+          }
+          if (request.historyPreamble) {
+            log.info('session transcript replay dispatched', {
+              sessionId: request.sessionId,
+              historyTextLength: request.historyPreamble.length,
+              historyAttachmentCount: request.historyAttachments?.length ?? 0,
+              historyImageCount: request.historyImages?.length ?? 0,
+              ...this.diagnosticContext()
+            })
+          }
+          return 'active'
+        },
+        captureStop: () => this.sessionInteractions.captureTerminal(promptInteraction, 'stop'),
+        onAccepted: () => {
           try {
             this.callbacks.onProviderPromptAccepted?.(request.sessionId, promptAttemptId)
           } catch (error) {
             safeLogError('provider-prompt-accepted callback failed', errorLogFields(error))
           }
-        }
-
-        if (skillActivitiesStarted && !skillActivitiesFinalized) {
-          this.emitCodexSkillInputActivities(
-            request.sessionId,
-            promptTurn,
-            skillActivityInputs,
-            'completed'
-          )
-          skillActivitiesFinalized = true
-        }
-
-        if (message.kind === 'stop') {
-          turnSkillOutcome = message.response.stopReason === 'cancelled' ? 'cancelled' : 'completed'
-          const codexTurnCount = message.response._meta?.[ACP_MODEL_TURN_COUNT_META_KEY]
-          const reportedTurnCount =
-            promptFramework === 'codex' &&
-            Number.isSafeInteger(codexTurnCount) &&
-            (codexTurnCount as number) > 0
-              ? (codexTurnCount as number)
-              : undefined
-          observedPromptStop = {
-            response: message.response,
-            turnUsage:
-              promptFramework === 'codex'
-                ? (toCodexTurnTokenUsage(message.response._meta?.[ACP_TURN_TOKEN_USAGE_META_KEY]) ??
-                  toCodexTurnTokenUsage(message.response.usage))
-                : toAcpTurnTokenUsage(message.response.usage),
-            ...(reportedTurnCount === undefined ? {} : { modelTurnCount: reportedTurnCount })
+          if (skillActivitiesStarted && !skillActivitiesFinalized) {
+            this.emitCodexSkillInputActivities(
+              request.sessionId,
+              promptTurn,
+              skillActivityInputs,
+              'completed'
+            )
+            skillActivitiesFinalized = true
           }
-          // Freeze provider-terminal time before artifact work and provider-specific usage fetching.
-          // The outcome remains authoritative through close/reset while usage facts are finalized.
-          if (!this.sessionInteractions.captureTerminal(promptInteraction, 'stop')) {
-            return message.response
-          }
-          this.recordCodexPromptResponseContextUsage(
-            request.sessionId,
-            message.response,
-            promptTurn
-          )
-          if (contextUsageTurn.complete()) this.emitState()
-          // Emit artifact metadata before stop so the renderer can attach files to the finished message.
-          await this.emitArtifactRunEvent(request.sessionId, artifactRun)
-          artifactEmitted = true
-          log.info('prompt stopped', {
-            sessionId: request.sessionId,
-            stopReason: message.stopReason
-          })
-          const opencodeTurnUsage =
-            promptFramework === 'opencode' && openCodeUsageApi
-              ? sumOpenCodeTurnUsage(
-                  opencodeUsageBefore,
-                  await fetchOpenCodeUsageSnapshot(
-                    openCodeUsageApi,
-                    activeSession.sessionId,
-                    this.sessionRegistry.lookup(request.sessionId)?.aggregate.snapshot().cwd ??
-                      this.snapshotOwner.cwd,
-                    this.options.opencodeUsageFetch
-                  )
-                )
-              : undefined
-          if (opencodeTurnUsage) observedPromptStop.turnUsage = opencodeTurnUsage
-          publishObservedPromptStop()
+        },
+        beforeStop: async (response) => {
+          const planExecutionBinding = this.planExecutionBindings.get(request.sessionId)
           if (
-            this.sessionInteractions.current(request.sessionId) === promptInteraction &&
-            this.activeSessionFor(request.sessionId) === activeSession &&
-            this.shouldAutoCompactContext(request.sessionId)
+            response.stopReason === 'end_turn' &&
+            this.planService &&
+            planExecutionBinding?.interactionSequence === promptInteraction.sequence
           ) {
-            try {
-              await this.performNativeContextCompaction(
-                activeSession,
-                request.sessionId,
-                'automatic'
+            const completion = await this.planService.checkTurnCompletion({
+              projectId: this.resolveSessionProjectName(request.sessionId),
+              sessionId: request.sessionId
+            })
+            if (!completion.allow) {
+              throw new Error(
+                `The active Session Plan is not complete (${completion.lifecycle ?? 'incomplete'}).`
               )
-            } catch (error) {
-              log.warn('automatic context compaction failed', {
-                sessionId: request.sessionId,
-                ...errorLogFields(error)
-              })
             }
           }
-          return message.response
-        }
+        },
+        routeNotification: (notification) =>
+          this.handleSessionUpdate(notification, request.sessionId),
+        reportBestEffortFailure: (stage, error) =>
+          log.warn('provider prompt observation failed', {
+            sessionId: request.sessionId,
+            stage,
+            ...errorLogFields(error)
+          })
+      })
 
-        // Route the update under the app-facing id so a session adopted onto a new agent (after a
-        // provider switch) still streams into the same conversation the renderer is watching. (No
-        // per-update log line here: it fires once per streamed chunk and floods the console for no
-        // signal — 'prompt start'/'prompt stopped' already bracket the turn.)
-        this.handleSessionUpdate(message.notification, request.sessionId)
+      if (providerOutcome.kind === 'not-dispatched') {
+        return finishCancelledBeforePrompt()
       }
+      if (providerOutcome.kind === 'superseded') {
+        return providerOutcome.response
+      }
+      const { response, facts } = providerOutcome
+      turnSkillOutcome = response.stopReason === 'cancelled' ? 'cancelled' : 'completed'
+      observedPromptStop = {
+        response,
+        ...(facts.turnUsage ? { turnUsage: facts.turnUsage } : {}),
+        ...(facts.modelTurnCount === undefined ? {} : { modelTurnCount: facts.modelTurnCount })
+      }
+      if (facts.contextUsedTokens !== undefined) {
+        this.recordProviderPromptContextUsage(
+          request.sessionId,
+          facts.contextUsedTokens,
+          promptTurn
+        )
+      }
+      if (contextUsageTurn.complete()) this.emitState()
+      // Emit artifact metadata before stop so the renderer can attach files to the finished message.
+      await this.emitArtifactRunEvent(request.sessionId, artifactRun)
+      artifactEmitted = true
+      log.info('prompt stopped', {
+        sessionId: request.sessionId,
+        stopReason: response.stopReason
+      })
+      publishObservedPromptStop()
+      if (
+        this.sessionInteractions.current(request.sessionId) === promptInteraction &&
+        this.activeSessionFor(request.sessionId) === activeSession &&
+        this.shouldAutoCompactContext(request.sessionId)
+      ) {
+        try {
+          await this.performNativeContextCompaction(activeSession, request.sessionId, 'automatic')
+        } catch (error) {
+          log.warn('automatic context compaction failed', {
+            sessionId: request.sessionId,
+            ...errorLogFields(error)
+          })
+        }
+      }
+      return response
     } catch (error) {
       if (observedPromptStop) {
         // Provider stop/cancellation already won the outcome race. App-side finalization failure,
@@ -2662,7 +2424,7 @@ class AcpRuntime {
       })
       throw error
     } finally {
-      revokeReferencedUploadGrant?.()
+      preparedPromptHandle?.close()
       // A turn that fails or is aborted never reaches the stop branch; still surface any files it
       // wrote so they are attached to a message instead of being orphaned in the pending directory.
       if (!artifactEmitted) {
@@ -2692,10 +2454,22 @@ class AcpRuntime {
       const ownsInteraction =
         this.sessionInteractions.current(request.sessionId) === promptInteraction
       if (ownsInteraction) {
+        const planBinding = this.planExecutionBindings.get(request.sessionId)
+        if (planBinding?.interactionSequence === promptInteraction.sequence) {
+          this.planExecutionBindings.delete(request.sessionId)
+        }
+        const planWaiter = this.planApprovalWaiters.get(request.sessionId)
+        if (planWaiter?.interactionId === promptInteraction.promptMessageId) {
+          this.rejectPlanApprovalWaiter(
+            request.sessionId,
+            'The Session Plan interaction ended before approval.'
+          )
+        }
         this.permissionContext.clearCorrelationsForSession(request.sessionId)
       }
       contextUsageTurn?.supersede()
       this.sessionInteractions.release(promptInteraction)
+      if (ownsInteraction) await this.publishTerminalPlanProjection(request.sessionId)
       if (ownsInteraction) {
         try {
           this.callbacks.onPromptEnded?.(request.sessionId, skillImportTurnToken)
@@ -2730,6 +2504,10 @@ class AcpRuntime {
             sessionId: activeSession.sessionId
           }),
         onAccepted: () => {
+          this.rejectPlanApprovalWaiter(
+            request.sessionId,
+            'The Session Plan interaction was cancelled.'
+          )
           this.cancelPermissionFlowForSession(request.sessionId)
           this.pushEvent({
             kind: 'system',
@@ -2757,69 +2535,9 @@ class AcpRuntime {
 
   // Closes the agent-side session when supported, then removes local routing state.
   async deleteSession(request: AcpDeleteSessionRequest): Promise<AcpStateSnapshot> {
-    const deletion = this.sessionRegistry.beginDelete(request.sessionId)
-    try {
-      return await this.withOperationLease(() => this.deleteSessionOperation(request, deletion))
-    } finally {
-      deletion.finish()
-    }
-  }
-
-  private async deleteSessionOperation(
-    request: AcpDeleteSessionRequest,
-    deletion: AcpSessionDeletion
-  ): Promise<AcpStateSnapshot> {
-    const target = this.sessionRegistry.lookup(request.sessionId)
-    const session = target?.attachment?.session
-
-    this.cancelPermissionFlowForSession(request.sessionId)
-
-    if (session) {
-      // Talk to the agent using its own session id: for an adopted session the underlying
-      // agent id (session.sessionId) differs from the app-facing request.sessionId.
-      if (this.connection && this.supportsSessionDelete) {
-        await this.connection.agent.request(acp.methods.agent.session.delete, {
-          sessionId: session.sessionId
-        })
-      } else if (this.connection && this.supportsSessionClose) {
-        await this.connection.agent.request(acp.methods.agent.session.close, {
-          sessionId: session.sessionId
-        })
-      } else {
-        await this.connection?.agent.notify(acp.methods.agent.session.cancel, {
-          sessionId: session.sessionId
-        })
-      }
-
-      session.dispose()
-      if (target?.attachment) this.sessionRegistry.detach(target.attachment, 'provider')
-    }
-
-    // App-session-keyed cleanup runs whether or not a live session is attached. A framework switch
-    // A disconnect detaches the provider but deliberately keeps framework/backend affinity, so deleting
-    // a session that was never re-adopted must remove its remaining Aggregate as well.
-    this.permissionContext.clearSession(request.sessionId)
-    this.sessionInteractions.supersedeCurrent(request.sessionId)
-    // Drop this session's MCP routes, aliases, and bearer ownership (idempotent for detached deletes).
-    this.sessionCapabilities.revokeSession(request.sessionId)
-    const removal = deletion.finish(target)
-    this.promptContentOwner.resetSession(request.sessionId)
-    this.handoffContinuity.clearSession(request.sessionId)
-    this.contextUsageTracker.deleteSession(request.sessionId)
-
-    // Only announce a deletion and shift the current session when something was actually attached; a
-    // detached cleanup (post-switch) must not emit a spurious event or move the current selection.
-    if (removal.wasActive) {
-      this.pushEvent({
-        kind: 'system',
-        level: 'info',
-        sessionId: request.sessionId,
-        title: 'Session deleted'
-      })
-      this.emitState()
-    }
-
-    return this.getSnapshot()
+    this.rejectPlanApprovalWaiter(request.sessionId, 'The Session Plan interaction was deleted.')
+    this.planExecutionBindings.delete(request.sessionId)
+    return this.sessionDeletion.delete(request.sessionId)
   }
 
   // Resolves or cancels one pending permission request from the renderer.
@@ -2883,51 +2601,13 @@ class AcpRuntime {
     }
   }
 
-  // Converts the user's explicit `@` selections into a turn-scoped capability for Skill import.
-  // Generic managed-path validation happens before the grant; the importer retains the stricter
-  // session-owner check for every path that was not selected in this turn.
-  private async authorizeReferencedSkillUploads(
-    sessionId: string,
-    references: FileReference[]
-  ): Promise<(() => void) | undefined> {
-    if (!this.sessionCapabilities.isSkillImportEnabled()) return undefined
-
-    const authorize = this.skillImportOptions?.authorizeReferencedUploads
-    if (!authorize) return undefined
-
-    const paths = references.flatMap((reference) => {
-      if (reference.source !== 'upload') return []
-      const normalizedName = reference.name.toLowerCase()
-      return normalizedName.endsWith('.skill') || normalizedName.endsWith('.zip')
-        ? [reference.path]
-        : []
-    })
-
-    return authorize(this.resolveSessionProjectName(sessionId), sessionId, paths)
-  }
-
   // Lazily initializes the process connection before session creation.
   private async ensureConnected(cwd: string): Promise<ClientConnection> {
     return this.connectionLifecycle.ensureConnected(cwd)
   }
 
   private observeClaudeSdkMessage(params: Record<string, unknown>): void {
-    if (typeof params.sessionId !== 'string') return
-    if (typeof params.message !== 'object' || params.message === null) return
-
-    const message = params.message as Record<string, unknown>
-    if (message.type !== 'result') return
-    const origin =
-      typeof message.origin === 'object' && message.origin !== null
-        ? (message.origin as Record<string, unknown>).kind
-        : undefined
-    if (typeof origin === 'string' && CLAUDE_AUTONOMOUS_RESULT_ORIGINS.has(origin)) return
-    if (!Number.isSafeInteger(message.num_turns) || (message.num_turns as number) <= 0) return
-
-    const appSessionId = this.sessionRegistry.resolveAppSessionId(params.sessionId)
-    const promptInteraction = this.currentPromptInteraction(appSessionId)
-    if (!promptInteraction) return
-    this.sessionInteractions.observeModelTurns(promptInteraction, message.num_turns as number)
+    this.providerPromptExecutor.observeProviderMessage(params)
   }
 
   // Looks up the workspace root bound to a session for filesystem operations.
@@ -2988,7 +2668,8 @@ class AcpRuntime {
       LARGE_DATA_FILE_SYSTEM_PROMPT_APPEND,
       ...(this.artifactToolingAvailable() ? [ARTIFACT_FILE_SYSTEM_PROMPT_APPEND] : []),
       ...(this.notebookToolingAvailable() ? [NOTEBOOK_SYSTEM_PROMPT_APPEND] : []),
-      ...(this.skillImportToolingAvailable() ? [SKILL_IMPORT_SYSTEM_PROMPT_APPEND] : [])
+      ...(this.skillImportToolingAvailable() ? [SKILL_IMPORT_SYSTEM_PROMPT_APPEND] : []),
+      ...(this.planService ? [SESSION_PLAN_SYSTEM_PROMPT_APPEND] : [])
     ]
   }
 
@@ -3005,68 +2686,6 @@ class AcpRuntime {
       ...this.backend.prompt.systemPromptAppends,
       ...(skillGuidance ? [skillGuidance] : [])
     ]
-  }
-
-  private async resolveCurrentSpecialistSkills(
-    sessionId: string,
-    specialistId = this.sessionRegistry.lookup(sessionId)?.aggregate.snapshot().specialistId
-  ): Promise<EffectiveSpecialistSkills | undefined> {
-    if (!specialistId || !this.options.resolveSpecialistSkills) return undefined
-    try {
-      return await this.options.resolveSpecialistSkills(specialistId)
-    } catch {
-      return { kind: 'unavailable', reason: 'The bound specialist is unavailable.' }
-    }
-  }
-
-  private buildSpecialistHandoffContinuationText(request: AcpPromptRequest): string {
-    const continuation = request.continuation
-    if (!continuation) return request.text
-
-    const outcome =
-      continuation.completion.kind === 'returned'
-        ? this.serializeHandoffValue(continuation.completion.value)
-        : continuation.completion.errorMessage
-    const outcomeLabel = continuation.completion.kind === 'returned' ? 'result' : 'error'
-    const target = continuation.targetName ?? 'Main Agent'
-    return [
-      `Continue the original user task as ${target}. Do not repeat work already shown before the handoff.`,
-      `Original user request:\n${request.text}`,
-      `Captured outer tool ${outcomeLabel}:\n${outcome}`
-    ].join('\n\n')
-  }
-
-  private serializeHandoffValue(value: unknown): string {
-    if (typeof value === 'string') return value
-    try {
-      return JSON.stringify(value)
-    } catch {
-      return String(value)
-    }
-  }
-
-  // Builds the ACP `_meta` argument for session/new and session/resume, delegating the framework-specific
-  // shape to the active framework. Claude applies its settingSources restriction, resolved backend
-  // options, and system-prompt appends; opencode returns no meta and uses a prompt prefix instead.
-  // `extraAppends` lets createSession inject a one-off specialist identity without touching the
-  // shared generation appends that apply to every session on this runtime generation.
-  private buildSessionMetaArg(
-    extraAppends: string[] = [],
-    specialistSkills?: EffectiveSpecialistSkills
-  ): { _meta?: Record<string, unknown> } {
-    const skillWhitelist =
-      specialistSkills?.kind === 'specialist'
-        ? specialistSkills.frameworkNames
-        : specialistSkills?.kind === 'unavailable'
-          ? []
-          : undefined
-    const setup = this.framework.buildSessionSetup({
-      systemPromptAppends: [...this.getSystemPromptAppends(), ...extraAppends],
-      sessionOptions: this.backend.session.options,
-      ...(skillWhitelist !== undefined ? { skillWhitelist } : {})
-    })
-
-    return setup.meta ? { _meta: setup.meta } : {}
   }
 
   // Resolves the artifact/notebook storage project for a session, defaulting to the runtime constant.
@@ -3281,26 +2900,36 @@ class AcpRuntime {
     this.permissionContext.cancelForSession(sessionId)
   }
 
-  // App-managed codex-acp emits the exact per-request numerator during generation. Codex's pinned
-  // adapter publishes uncached input and cached input as separate PromptResponse categories, so
-  // recombine them for the context numerator when applying the final per-request correction.
-  private recordCodexPromptResponseContextUsage(
+  private providerTurnAdapter(frameworkId: AgentFramework['id']): AcpProviderTurnAdapter {
+    if (frameworkId === 'claude-code') return claudeCodeTurnAdapter
+    if (frameworkId === 'codex') return createCodexTurnAdapter()
+
+    const usageApi = this.backendGeneration.openCodeUsageApi()
+    return new AcpOpenCodeTurnAdapter((providerSessionId, cwd) =>
+      usageApi
+        ? fetchOpenCodeUsageSnapshot(
+            usageApi,
+            providerSessionId,
+            cwd,
+            this.options.opencodeUsageFetch
+          )
+        : Promise.resolve(undefined)
+    )
+  }
+
+  // Provider adapters normalize an exact latest-request context numerator when one exists. Apply it
+  // only while the same app turn still owns the Session so a delayed old stop cannot rewrite a reset.
+  private recordProviderPromptContextUsage(
     sessionId: string,
-    response: PromptResponse,
+    used: number,
     promptTurn: number
   ): void {
     if (
-      this.framework.id !== 'codex' ||
       this.pendingProviderReconnect ||
       this.currentPromptInteraction(sessionId)?.sequence !== promptTurn
     ) {
       return
     }
-
-    const usage = toCodexTurnTokenUsage(response.usage)
-    if (!usage) return
-
-    const used = usage.inputTokens + usage.cacheTokens
     if (this.contextUsageTracker.reconcileUsed(sessionId, used)) this.emitState()
   }
 
@@ -3372,37 +3001,6 @@ class AcpRuntime {
     return this.contextUsageTracker.refreshUsage(sessionId, status, size)
   }
 
-  private async recordPromptContextEstimate(
-    sessionId: string,
-    promptContent: string | ContentBlock[],
-    promptPrefix: string | undefined,
-    codexSkillInputs: ReadonlyArray<{ name: string; path: string }>
-  ): Promise<void> {
-    this.ensureContextUsageTracking(sessionId)
-    this.contextUsageTracker.commitPendingAssistantOutput(sessionId)
-    this.contextUsageTracker.appendText(sessionId, 'system', promptPrefix ?? '')
-    this.contextUsageTracker.appendPromptContent(sessionId, promptContent, promptPrefix)
-
-    const promptSkillDocuments = (
-      await Promise.all(
-        codexSkillInputs.map(async ({ path }) => {
-          try {
-            return { path, text: await readFile(path, 'utf8') }
-          } catch (error) {
-            log.warn('context estimate could not read Codex Skill input', {
-              sessionId,
-              ...errorLogFields(error)
-            })
-            return undefined
-          }
-        })
-      )
-    ).filter((document): document is { path: string; text: string } => document !== undefined)
-    this.contextUsageTracker.replacePromptSkillDocuments(sessionId, promptSkillDocuments)
-
-    if (this.refreshEstimatedContextUsage(sessionId, 'preflight')) this.emitState()
-  }
-
   // Normalizes low-level session notifications into runtime/workspace events.
   private handleSessionUpdate(
     notification: SessionNotification,
@@ -3413,6 +3011,9 @@ class AcpRuntime {
     this.applySessionUpdateEffects(
       this.sessionUpdateProjector.project(notification, {
         kind: 'runtime',
+        framework:
+          this.sessionRegistry.lookup(sessionId)?.aggregate.snapshot().frameworkId ??
+          this.framework.id,
         appSessionId,
         eventId: this.nextEventId(),
         visible,
@@ -3657,39 +3258,9 @@ class AcpRuntime {
     })
   }
 
-  private renewPrimarySessionIdentityReservation(
-    reservation: AcpPrimarySessionIdentityReservation,
-    publishedAppSessionId?: string
-  ): boolean {
-    return reservation.renew(publishedAppSessionId)
-  }
-
-  private assertPrimarySessionIdentityReservation(
-    reservation: AcpPrimarySessionIdentityReservation
-  ): void {
-    reservation.assertCurrent()
-  }
-
   private assertCurrentConnectedConnection(connection: ClientConnection): void {
     if (this.connection !== connection || this.snapshotOwner.status !== 'connected') {
       throw new Error('ACP session startup was superseded.')
-    }
-  }
-
-  private releasePrimarySessionIdentityReservation(
-    reservation: AcpPrimarySessionIdentityReservation
-  ): void {
-    reservation.release()
-  }
-
-  private disposeSessionAfterFailure(session: ActiveSession, logMessage: string): void {
-    try {
-      session.dispose()
-    } catch (cleanupError) {
-      safeLogError(logMessage, {
-        ...diagnosticErrorFields(cleanupError),
-        sessionId: session.sessionId
-      })
     }
   }
 
