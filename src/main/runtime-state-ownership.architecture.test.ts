@@ -332,6 +332,52 @@ describe('runtime state ownership architecture', () => {
     }
   })
 
+  it('keeps live Session Plan state behind one Runtime owner', () => {
+    const source = readSource('src/main/acp/runtime.ts')
+
+    expect(source).not.toContain('planApprovalWaiters')
+    expect(source).not.toContain('planExecutionBindings')
+    expect(source.match(/new SessionPlanInteractionOwner\(\)/g)).toHaveLength(1)
+    expect(source).toContain('interactions: this.planInteractions')
+  })
+
+  it('keeps model application and attached resume behavior behind their workflows', () => {
+    const source = readSource('src/main/acp/runtime.ts')
+
+    expect(source).not.toContain('canApplyModelChange')
+    expect(source).not.toContain('modelChangeMatchesCurrent')
+    expect(source).not.toContain('applyModelTarget')
+    expect(source).not.toContain('resumeSessionOperation')
+    expect(source).toContain('return this.modelChanges.applyReasoningEffort(effort)')
+    expect(source).toContain('this.providerSessionResumer.resume(request)')
+    expect(source).toContain('currentConnection: () => this.connection')
+  })
+
+  it('keeps provider permission routing and reviewer preparation behind their owners', () => {
+    const source = readSource('src/main/acp/runtime.ts')
+
+    expect(source).not.toContain('private async handlePermissionRequest')
+    expect(source).not.toContain('private observePermissionToolContext')
+    expect(source).not.toContain('reviewerSessions.create(request, async')
+    expect(source).toContain('this.permissionContext.handleProviderRequest(params)')
+    expect(source).toContain('this.permissionContext.observeProviderUpdate(notification)')
+    expect(source).toContain('this.reviewerSessions.create(request)')
+  })
+
+  it('keeps provider selection and Context routing behind their prompt owners', () => {
+    const source = readSource('src/main/acp/runtime.ts')
+
+    expect(source).not.toContain('private providerTurnAdapter')
+    expect(source).not.toContain('private recordProviderPromptContextUsage')
+    expect(source).not.toContain('private contextUsageSelectionFor')
+    expect(source).not.toContain('private contextUsageEstimateInput')
+    expect(source).not.toContain('private selectedContextWindowFor')
+    expect(source).not.toContain('private handleSessionUpdate')
+    expect(source).not.toContain('private applySessionUpdateEffects')
+    expect(source).toContain('this.contextUsagePolicy.resolve(sessionId)')
+    expect(source).toContain('this.sessionUpdateProjector.route(notification')
+  })
+
   it('accepts declared interface imports for a future orchestration module', () => {
     const source = `
       import type { AcpApplicationCommandDependencies } from '../acp/application-commands'
@@ -362,6 +408,7 @@ describe('runtime state ownership architecture', () => {
     ['../acp/runtime', 'AcpRuntime'],
     ['../acp/runtime-coordinator.js', 'AcpRuntimeCoordinator'],
     ['../acp/reviewer-session-owner', 'ReviewerSessionOwner'],
+    ['../session-plan/session-plan-interaction-owner', 'SessionPlanInteractionOwner'],
     ['../settings/service', 'SettingsService'],
     ['../settings/backend-resolver', 'AgentBackendResolver'],
     ['../settings/ipc', 'registerSettingsIpcHandlers'],

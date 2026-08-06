@@ -1,13 +1,5 @@
 import * as acp from '@agentclientprotocol/sdk'
-import type {
-  ActiveSession,
-  ClientConnection,
-  PromptResponse,
-  RequestPermissionRequest,
-  RequestPermissionResponse,
-  SessionConfigOption,
-  SessionNotification
-} from '@agentclientprotocol/sdk'
+import type { ActiveSession, ClientConnection, PromptResponse } from '@agentclientprotocol/sdk'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { join, resolve } from 'node:path'
 
@@ -24,37 +16,25 @@ import type {
   AcpPromptRequest,
   AcpResumeSessionRequest,
   AcpRevokePermissionGrantRequest,
-  AcpContextUsage,
   AcpSetPermissionProfileRequest,
   AcpStateSnapshot
 } from '../../shared/acp'
 import { ACP_PROMPT_FAILED_EVENT_TITLE } from '../../shared/acp'
-import {
-  DEFAULT_PERMISSION_PROFILE,
-  normalizePermissionProfile,
-  type SessionPermissionProfileState
-} from '../../shared/permission-profiles'
+import { type SessionPermissionProfileState } from '../../shared/permission-profiles'
 import { type AgentFrameworkId } from '../../shared/settings'
 import type { EffectiveSpecialistSkills } from '../../shared/specialist'
 import type { ResolvedReasoningEffort } from '../../shared/reasoning-effort'
 import type { ApprovedSwitchReadBack, ClaudeCodeReplayInput } from '../agents/claude-code-handoff'
 import {
   claudeCodeFramework,
-  getAgentFramework,
   type AgentFramework,
   type AgentModelChangeTarget,
   type ResolvedAgentBackend
 } from '../agent-framework'
-import { resolveCanonicalMcpToolIdentity } from '../agent-framework/app-mcp-names'
 import { createLogger, diagnosticErrorFields, errorLogFields } from '../logger'
-import { extractProviderToolName } from './runtime-events'
-import { fetchOpenCodeUsageSnapshot } from './opencode-turn-usage'
-import { matchSessionModelOption, resolveSessionEffortOption } from './session-config'
 import { AcpRuntimeSnapshotOwner } from './runtime-snapshot-owner'
 import { ConversationPermissionGrantStore } from './permission-broker'
-import { isMcpToolName } from './permission-policy'
 import { AcpPermissionContext, HUMAN_PERMISSION_ACTION_ORIGIN } from './permission-context'
-import { applyCurrentModeUpdate } from './permission-profile-controller'
 import { AgentMcpHttpHost } from './mcp-http-host'
 import { ArtifactRepository } from '../artifacts/repository'
 import { ArtifactRunRegistry } from '../artifacts/run-registry'
@@ -69,8 +49,8 @@ import { getAppClaudeConfigDir } from '../settings/provider-env'
 import type { PermissionGrantRegistry } from '../permission-grants/registry'
 import { withDataRootWrite } from '../storage/migration-state'
 import { opencodeStorageDir } from '../agent-framework/opencode'
-import { ContextUsageTracker, type SessionEstimateInput } from './context-usage-tracker'
-import { contextUsageMcpSections } from './context-usage-static-context'
+import { ContextUsageTracker } from './context-usage-tracker'
+import { AcpContextUsagePolicy } from './context-usage-policy'
 import { createManagedFileReferenceResolver } from './file-reference-resolver'
 import type { UploadRepository } from '../uploads/repository'
 import { DEFAULT_UPLOAD_PROJECT_NAME, type UploadedAttachment } from '../../shared/uploads'
@@ -115,7 +95,7 @@ import {
   type AcpBackendGenerationView
 } from './backend-generation-owner'
 import { AcpSessionConfigurator } from './session-configurator'
-import { AcpSessionUpdateProjector, type AcpSessionUpdateEffect } from './session-update-projector'
+import { AcpSessionUpdateProjector } from './session-update-projector'
 import { AcpConnectionLifecycleWorkflow } from './connection-lifecycle-workflow'
 import { AcpConnectionCloseWorkflow, type CloseState } from './connection-close-workflow'
 import { AcpModelChangeWorkflow } from './model-change-workflow'
@@ -130,12 +110,9 @@ import { AcpContextCompactionWorkflow } from './context-compaction-workflow'
 import { AcpSessionPresentationPolicy } from './session-presentation-policy'
 import { AcpProviderPromptExecutor } from './provider-prompt-executor'
 import { AcpPromptOutcomeFinalizer } from './prompt-outcome-finalizer'
-import type { AcpProviderTurnAdapter } from './provider-turn-adapter'
-import { claudeCodeTurnAdapter } from './claude-turn-adapter'
-import { createCodexTurnAdapter } from './codex-turn-adapter'
-import { AcpOpenCodeTurnAdapter } from './opencode-turn-adapter'
 import { AcpTurnSkillOwner, type AcpTurnSkillHooks } from './turn-skill-owner'
 import { createProductionPlanService } from '../session-plan/production-plan-service'
+import { SessionPlanInteractionOwner } from '../session-plan/session-plan-interaction-owner'
 import { SESSION_PLAN_SYSTEM_PROMPT_APPEND } from '../session-plan/guidance'
 import type { PlanResponseResult, PlanService } from '../session-plan/plan-service'
 import type {
@@ -296,7 +273,10 @@ type AcpRuntimePlanOptions = {
   registerSessionAlias?: (aliasSessionId: string, sessionId: string) => void
   sessions: Pick<
     SessionPersistenceCoordinator,
-    'readSessionRuntimeContext' | 'patchSessionRuntimeContext' | 'appendUserMessageToInteraction'
+    | 'readSessionRuntimeContext'
+    | 'patchSessionRuntimeContext'
+    | 'appendUserMessageToInteraction'
+    | 'containsMessageOnActiveBranch'
   >
 }
 // An end_turn is final from the runtime's perspective, so promised work must be a tool call in the
@@ -380,6 +360,7 @@ const safeLogError = (message: string, data?: unknown): void => {
 class AcpRuntime {
   private readonly snapshotOwner: AcpRuntimeSnapshotOwner
   private readonly contextUsageTracker: ContextUsageTracker
+  private readonly contextUsagePolicy: AcpContextUsagePolicy
   private readonly connectionAdapter = new AcpAgentConnectionAdapter()
   private readonly connectionResources: AcpConnectionResourceOwner
   private readonly connectionTransitions: AcpConnectionTransitionOwner
@@ -400,8 +381,8 @@ class AcpRuntime {
   private readonly spawnAgent: (() => ChildProcessWithoutNullStreams) | undefined
   private readonly backendGeneration: AcpBackendGenerationOwner
   private readonly sessionConfigurator: AcpSessionConfigurator
-  private readonly sessionUpdateProjector = new AcpSessionUpdateProjector()
-  private readonly providerPromptExecutor = new AcpProviderPromptExecutor()
+  private readonly sessionUpdateProjector: AcpSessionUpdateProjector
+  private readonly providerPromptExecutor: AcpProviderPromptExecutor
   // Injectable lifecycle timers (defaults to real setTimeout/clearTimeout).
   private readonly setTimer: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>
   private readonly clearTimer: (handle: ReturnType<typeof setTimeout>) => void
@@ -409,19 +390,9 @@ class AcpRuntime {
   private readonly artifactRepository: ArtifactRepository | undefined
   private readonly artifactRunRegistry: ArtifactRunRegistry | undefined
   private readonly artifactTurns: ArtifactTurnOwner | undefined
+  private readonly planInteractions = new SessionPlanInteractionOwner()
   private readonly planService: PlanService | undefined
-  private readonly planApprovalWaiters = new Map<
-    string,
-    {
-      interactionId: string
-      resolve: (result: unknown) => void
-      reject: (error: Error) => void
-    }
-  >()
-  private readonly planExecutionBindings = new Map<
-    string,
-    { interactionSequence: number; artifactVersionId: string }
-  >()
+  private readonly planSessions: AcpRuntimePlanOptions['sessions'] | undefined
   private readonly promptContentOwner: AcpPromptContentOwner
   private readonly promptPreparation: AcpPromptPreparationOwner
   private readonly contextCompactionWorkflow: AcpContextCompactionWorkflow
@@ -465,6 +436,10 @@ class AcpRuntime {
     })
     this.spawnAgent = options.spawnAgent
     this.backendGeneration = new AcpBackendGenerationOwner(options.framework ?? claudeCodeFramework)
+    this.providerPromptExecutor = new AcpProviderPromptExecutor({
+      backendGeneration: this.backendGeneration,
+      opencodeUsageFetch: options.opencodeUsageFetch
+    })
     this.sessionConfigurator = new AcpSessionConfigurator({
       assertCurrentConnection: (connection) => this.assertCurrentConnectedConnection(connection),
       diagnosticContext: (backend) => this.diagnosticContext(backend.framework.id)
@@ -509,9 +484,11 @@ class AcpRuntime {
               : {})
           })
         : undefined
+    this.planSessions = options.plan?.sessions
     this.planService =
       options.plan && this.artifactTurns && options.artifacts?.provenance?.resolveVersionContent
         ? createProductionPlanService({
+            interactions: this.planInteractions,
             artifactTurns: this.artifactTurns,
             provenance: {
               resolveVersionContent: (request) =>
@@ -568,23 +545,75 @@ class AcpRuntime {
       },
       removeStartupBlocker: (token) => this.generationActivity.releaseStartup(token)
     })
+    this.contextUsagePolicy = new AcpContextUsagePolicy({
+      backend: () => this.backend,
+      appliedModel: (sessionId) =>
+        this.sessionRegistry.lookup(sessionId)?.aggregate.snapshot().appliedModel,
+      systemPromptAppends: () => this.getSystemPromptAppends(),
+      tooling: () => this.currentCapabilityAvailability()
+    })
+    this.sessionUpdateProjector = new AcpSessionUpdateProjector({
+      registry: this.sessionRegistry,
+      contextUsage: this.contextUsageTracker,
+      contextPolicy: this.contextUsagePolicy,
+      hasActiveSession: (sessionId) => this.activeSessionFor(sessionId) !== undefined,
+      currentFramework: () => this.framework.id,
+      reconnectPending: () => this.pendingProviderReconnect,
+      mcpServerNamesFor: (sessionId) => this.sessionCapabilities.mcpServerNamesFor(sessionId),
+      nextEventId: () => this.nextEventId(),
+      emitState: () => this.emitState(),
+      pushEvent: (event) => this.pushEvent(event),
+      reportToolFailure: (effect) =>
+        log.warn('tool call failed', {
+          tool: effect.tool,
+          toolCallId: effect.toolCallId,
+          sessionId: effect.sessionId,
+          reason: effect.reason
+        })
+    })
     this.permissionContext = new AcpPermissionContext({
       emitPermissionRequest: (request) => {
-        // Relabel to the app-facing id when this session was adopted onto a replaced agent.
-        const sessionId = this.sessionRegistry.resolveAppSessionId(request.sessionId)
-        const routed = sessionId === request.sessionId ? request : { ...request, sessionId }
-
         this.pushEvent({
           kind: 'permission',
           level: 'warning',
-          sessionId: routed.sessionId,
-          toolCallId: routed.toolCallId,
+          sessionId: request.sessionId,
+          toolCallId: request.toolCallId,
           title: 'Permission requested',
-          text: routed.title,
-          raw: routed
+          text: request.title,
+          raw: request
         })
-        this.callbacks.onPermissionRequest?.(routed)
+        this.callbacks.onPermissionRequest?.(request)
         this.emitState()
+      },
+      routing: {
+        resolveAppSessionId: (sessionId) => this.sessionRegistry.resolveAppSessionId(sessionId),
+        sessionSnapshot: (sessionId) => {
+          const snapshot = this.sessionRegistry.lookup(sessionId)?.aggregate.snapshot()
+          return snapshot
+            ? {
+                cwd: snapshot.cwd,
+                frameworkId: snapshot.frameworkId,
+                permissionProfile: snapshot.permissionProfile
+              }
+            : undefined
+        },
+        hasActivePrimarySession: (sessionId) => this.activeSessionFor(sessionId) !== undefined,
+        capturePrompt: (sessionId) => {
+          const scope = this.currentPromptInteraction(sessionId)
+          return scope
+            ? {
+                sequence: scope.sequence,
+                isCancellationAccepted: () => this.sessionInteractions.isCancellationAccepted(scope)
+              }
+            : undefined
+        },
+        currentInteractionSequence: (sessionId) =>
+          this.sessionInteractions.current(sessionId)?.sequence,
+        mcpServerNamesFor: (sessionId) => this.sessionCapabilities.mcpServerNamesFor(sessionId),
+        reviewerContextFor: (sessionId) => this.reviewerSessions.contextFor(sessionId),
+        resolveReviewerPermission: (request) => this.reviewerSessions.resolvePermission(request),
+        currentFramework: () => this.framework,
+        resolveProjectId: (sessionId) => this.resolveSessionProjectName(sessionId)
       },
       conversationGrants: options.permissionGrantStore,
       permissionGrantRegistry: options.permissionGrantRegistry,
@@ -596,9 +625,15 @@ class AcpRuntime {
     })
     this.reviewerSessions = new ReviewerSessionOwner({
       addStartupBlocker: (token) => this.generationActivity.acquireStartup(token),
+      assertCurrentConnection: (connection) => this.assertCurrentConnectedConnection(connection),
       clearPermissionCorrelations: (sessionId) =>
         this.permissionContext.clearCorrelationsForSession(sessionId),
+      currentSessionSetup: () => ({
+        framework: this.framework,
+        sessionOptions: this.backend.session.options
+      }),
       currentStartupGeneration: () => this.sessionRegistry.startupGeneration,
+      ensureConnected: (cwd) => this.ensureConnected(cwd),
       isPrimarySessionIdClaimed: (sessionId) => this.sessionRegistry.isIdentityClaimed(sessionId),
       onActiveSessionReleased: () => this.generationActivityChanged(),
       registerBridgeSession: (sessionId) =>
@@ -615,14 +650,19 @@ class AcpRuntime {
       interactions: this.sessionInteractions,
       context: this.contextUsageTracker,
       promptContent: this.promptContentOwner,
-      contextEstimateInput: (sessionId) => this.contextUsageEstimateInput(sessionId),
-      selectedContextWindow: (sessionId) => this.selectedContextWindowFor(sessionId),
+      contextEstimateInput: (sessionId) => this.contextUsagePolicy.resolve(sessionId).estimateInput,
+      selectedContextWindow: (sessionId) =>
+        this.contextUsagePolicy.resolve(sessionId).selectedWindow,
       routeHiddenNotification: (notification, sessionId) =>
-        this.handleSessionUpdate(notification, sessionId, false, () => {
-          try {
-            this.emitState()
-          } catch (error) {
-            safeLogError('compaction state callback failed', errorLogFields(error))
+        this.sessionUpdateProjector.route(notification, {
+          appSessionId: sessionId,
+          visible: false,
+          emitState: () => {
+            try {
+              this.emitState()
+            } catch (error) {
+              safeLogError('compaction state callback failed', errorLogFields(error))
+            }
           }
         }),
       pushEvent: (event) => this.pushEvent(event),
@@ -635,6 +675,8 @@ class AcpRuntime {
       skills: this.turnSkills,
       preparation: this.promptPreparation,
       executor: this.providerPromptExecutor,
+      contextUsage: this.contextUsageTracker,
+      providerReconnectPending: () => this.pendingProviderReconnect,
       finalizer: new AcpPromptOutcomeFinalizer(),
       permission: this.permissionContext,
       environment: {
@@ -642,15 +684,16 @@ class AcpRuntime {
         tooling: () => this.currentCapabilityAvailability(),
         bridgeSkillsAvailable: () => this.connectionResources.bridgeSkillsAvailable,
         skillImportEnabled: () => this.sessionCapabilities.isSkillImportEnabled(),
-        contextEstimateInput: (sessionId) => this.contextUsageEstimateInput(sessionId),
-        selectedContextWindow: (sessionId) => this.selectedContextWindowFor(sessionId),
-        providerAdapter: (frameworkId) => this.providerTurnAdapter(frameworkId),
+        contextEstimateInput: (sessionId) =>
+          this.contextUsagePolicy.resolve(sessionId).estimateInput,
+        selectedContextWindow: (sessionId) =>
+          this.contextUsagePolicy.resolve(sessionId).selectedWindow,
         emitSkillActivities: (sessionId, turn, inputs, status) =>
           this.emitCodexSkillInputActivities(sessionId, turn, inputs, status),
         onSkillImportAttachmentEligible: this.callbacks.onSkillImportAttachmentEligible,
         onProviderPromptAccepted: this.callbacks.onProviderPromptAccepted,
         routeNotification: (notification, sessionId) =>
-          this.handleSessionUpdate(notification, sessionId),
+          this.sessionUpdateProjector.route(notification, { appSessionId: sessionId }),
         diagnosticContext: () => this.diagnosticContext(),
         pushUserMessage: ({ sessionId, promptMessageId, text }) =>
           this.pushEvent({
@@ -677,8 +720,6 @@ class AcpRuntime {
         afterRelease: (sessionId) => this.publishTerminalPlanProjection(sessionId)
       },
       finalization: {
-        recordContextUsed: (sessionId, used, promptTurn) =>
-          this.recordProviderPromptContextUsage(sessionId, used, promptTurn),
         errorMessage,
         errorKind: acpErrorKind,
         pushEvent: (event) => this.pushEvent(event),
@@ -703,6 +744,8 @@ class AcpRuntime {
       invalidatePendingSessionStartups: () => this.invalidatePendingSessionStartups(),
       disposePermissionContext: () => this.permissionContext.dispose(),
       clearReviewerState: () => this.reviewerSessions.clear(),
+      clearPlanInteractions: () =>
+        this.planInteractions.clearAll('The Session Plan interaction was disconnected.'),
       settleActivePrompts: () => this.sessionInteractions.settleActivePrompts(),
       supersedeInteractions: () => this.sessionInteractions.supersedeAll(),
       clearContextUsage: () => this.contextUsageTracker.clear(),
@@ -757,16 +800,23 @@ class AcpRuntime {
       hasContextUsage: () => this.contextUsageTracker.hasUsage()
     }
     this.modelChanges = new AcpModelChangeWorkflow({
-      canApply: (target) => this.canApplyModelChange(target),
-      matchesCurrent: (target) => this.modelChangeMatchesCurrent(target),
+      backendGeneration: this.backendGeneration,
+      connectionResources: this.connectionResources,
+      registry: this.sessionRegistry,
+      configurator: this.sessionConfigurator,
+      contextUsage: this.contextUsageTracker,
+      currentStatus: () => this.snapshotOwner.status,
+      providerReconnectPending: () => this.pendingProviderReconnect,
       isGenerationBusy: () => this.generationActivity.blockers().retirement,
-      applyTarget: (target) => this.applyModelTarget(target),
+      contextEstimateInput: (sessionId) => this.contextUsagePolicy.resolve(sessionId).estimateInput,
+      emitState: () => this.emitState(),
       // Model-change fallback already owns its drain. Calling the close workflow here would ask the
       // same drain to await itself, so arm the authoritative transition directly.
       requestReconnect: () => this.connectionTransitions.requestProviderReconnect(),
       recoverFailedReconnect: () => this.connectionClose.recoverFailedDeferredDisconnect(),
       reportReconnectFailure: (error) =>
-        safeLogError('model-change reconnect failed', errorLogFields(error))
+        safeLogError('model-change reconnect failed', errorLogFields(error)),
+      diagnosticContext: () => this.diagnosticContext()
     })
     this.connectionClose = new AcpConnectionCloseWorkflow({
       currentGeneration: () => this.connectionGeneration,
@@ -879,6 +929,7 @@ class AcpRuntime {
       defaultCwd: options.defaultCwd,
       defaultProjectName: options.artifacts?.projectName || DEFAULT_UPLOAD_PROJECT_NAME,
       currentCwd: () => this.snapshotOwner.cwd,
+      currentConnection: () => this.connection,
       ensureConnected: (cwd) => this.ensureConnected(cwd),
       assertCurrentConnection: (connection) => this.assertCurrentConnectedConnection(connection),
       disconnectTimedOutConnection: async () => {
@@ -908,10 +959,6 @@ class AcpRuntime {
 
   private get framework(): AgentFramework {
     return this.backend.framework
-  }
-
-  private get backendId(): string | undefined {
-    return this.backend.backendId
   }
 
   private get connection(): ClientConnection | undefined {
@@ -1005,11 +1052,9 @@ class AcpRuntime {
     const service = this.planService
     if (!service) throw new Error('Session Plan capability is not configured.')
     if (input.operation === 'generate') {
-      if (this.planApprovalWaiters.has(input.sessionId)) {
-        throw new Error('A Session Plan is already awaiting approval.')
-      }
       const interactionId = this.artifactTurns?.promptMessageIdFor(input.sessionId)
       if (!interactionId) throw new Error('No active interaction can generate a Session Plan.')
+      this.planInteractions.reserveApproval(input.sessionId, interactionId)
       let result: Awaited<ReturnType<PlanService['generate']>>
       try {
         result = await service.generate({
@@ -1019,13 +1064,18 @@ class AcpRuntime {
           content: input.input as GeneratePlanContent
         })
       } catch (error) {
+        this.planInteractions.releaseApprovalReservation(input.sessionId, interactionId)
         const current = await service.getProjection(input.projectId, input.sessionId)
         if (current) this.publishPlanProjection(input.sessionId, current)
         throw error
       }
-      const approval = new Promise((resolve, reject) => {
-        this.planApprovalWaiters.set(input.sessionId, { interactionId, resolve, reject })
-      })
+      let approval: Promise<unknown>
+      try {
+        approval = this.planInteractions.parkReservedApproval(input.sessionId, interactionId)
+      } catch (error) {
+        this.planInteractions.release(input.sessionId, result.projection.artifactVersionId)
+        throw error
+      }
       this.publishPlanProjection(input.sessionId, result.projection)
       return approval
     }
@@ -1033,7 +1083,7 @@ class AcpRuntime {
       interactionIsLive: this.sessionInteractions.current(input.sessionId) !== undefined
     })
     if (!projection) throw new Error('The Session has no active Plan.')
-    this.assertPlanVisibleToActiveTurn(input.sessionId, projection)
+    await this.assertPlanVisibleToDurableBranch(input.projectId, input.sessionId, projection)
     const identity = {
       projectId: input.projectId,
       sessionId: input.sessionId,
@@ -1043,6 +1093,7 @@ class AcpRuntime {
     if (input.operation === 'approve' || input.operation === 'reject') {
       const interactionIsLive = this.sessionInteractions.current(input.sessionId) !== undefined
       const decision = input.operation === 'approve' ? 'approved' : 'rejected'
+      const executionBinding = this.planInteractions.executionBindingFor(input.sessionId)
       const result = await service.respond({
         ...identity,
         decision,
@@ -1054,9 +1105,14 @@ class AcpRuntime {
           result.projection.artifactVersionId
         )
       } else {
-        this.planExecutionBindings.delete(input.sessionId)
+        if (executionBinding) {
+          this.planInteractions.releaseExecution(
+            input.sessionId,
+            executionBinding.interactionSequence
+          )
+        }
       }
-      this.resolvePlanApprovalWaiter(input.sessionId, result)
+      this.planInteractions.resolveApproval(input.sessionId, result)
       this.publishPlanProjection(input.sessionId, result.projection)
       return result
     }
@@ -1073,7 +1129,7 @@ class AcpRuntime {
       )
     }
     const interaction = this.sessionInteractions.current(input.sessionId)
-    const binding = this.planExecutionBindings.get(input.sessionId)
+    const binding = this.planInteractions.executionBindingFor(input.sessionId)
     if (!binding) {
       throw new PlanCommandError(
         'continuation-required',
@@ -1120,15 +1176,19 @@ class AcpRuntime {
 
   async respondSessionPlan(input: PlanResponseCommand): Promise<PlanResponseResult> {
     if (!this.planService) throw new Error('Session Plan capability is not configured.')
-    if (input.decision === undefined && !this.planApprovalWaiters.has(input.sessionId)) {
+    if (
+      input.decision === undefined &&
+      !this.planInteractions.approvalInteractionIdFor(input.sessionId)
+    ) {
       throw new Error('The paused Session Plan interaction is no longer available.')
     }
-    const interactionIsLive = this.planApprovalWaiters.has(input.sessionId)
+    const interactionIsLive =
+      this.planInteractions.approvalInteractionIdFor(input.sessionId) !== undefined
     const projection = await this.planService.getProjection(input.projectId, input.sessionId, {
       interactionIsLive
     })
     if (!projection) throw new Error('The Session has no active Plan.')
-    this.assertPlanVisibleToActiveTurn(input.sessionId, projection)
+    await this.assertPlanVisibleToDurableBranch(input.projectId, input.sessionId, projection)
     const result = await this.planService.respond({ ...input, interactionIsLive })
     if ('projection' in result) {
       if (interactionIsLive && result.projection.approval === 'approved') {
@@ -1137,12 +1197,14 @@ class AcpRuntime {
           result.projection.artifactVersionId
         )
       }
-      if (interactionIsLive) this.resolvePlanApprovalWaiter(input.sessionId, result)
+      if (interactionIsLive) this.planInteractions.resolveApproval(input.sessionId, result)
       this.publishPlanProjection(input.sessionId, result.projection)
       return result
     }
-    const waiter = this.planApprovalWaiters.get(input.sessionId)
-    if (!waiter || waiter.interactionId !== result.routeToInteractionId) {
+    if (
+      this.planInteractions.approvalInteractionIdFor(input.sessionId) !==
+      result.routeToInteractionId
+    ) {
       throw new Error('The paused Session Plan interaction is no longer available.')
     }
     try {
@@ -1160,7 +1222,7 @@ class AcpRuntime {
     } catch (error) {
       safeLogError('Routed user Message projection callback failed', errorLogFields(error))
     }
-    this.resolvePlanApprovalWaiter(input.sessionId, result)
+    this.planInteractions.resolveApproval(input.sessionId, result)
     return result
   }
 
@@ -1197,57 +1259,35 @@ class AcpRuntime {
     }
   }
 
-  private resolvePlanApprovalWaiter(sessionId: string, result: unknown): void {
-    const waiter = this.planApprovalWaiters.get(sessionId)
-    if (!waiter) return
-    this.planApprovalWaiters.delete(sessionId)
-    waiter.resolve(result)
-  }
-
   private bindPlanExecutionToCurrentInteraction(
     sessionId: string,
     artifactVersionId: string
   ): void {
     const interaction = this.sessionInteractions.current(sessionId)
     if (!interaction || interaction.kind !== 'prompt') return
-    this.planExecutionBindings.set(sessionId, {
+    this.planInteractions.bindExecution({
+      sessionId,
       interactionSequence: interaction.sequence,
       artifactVersionId
     })
   }
 
-  private assertPlanVisibleToActiveTurn(sessionId: string, projection: ActivePlanProjection): void {
-    const origin = projection.originatingPromptMessageId
-    if (!origin || !this.artifactTurns?.containsMessageForActiveTurn(sessionId, origin)) {
-      throw new PlanCommandError(
-        'interaction-mismatch',
-        'The active Session Plan does not belong to this Message Branch.'
-      )
-    }
-  }
-
-  private assertPlanVisibleToPrompt(
-    request: AcpPromptRequest,
+  private async assertPlanVisibleToDurableBranch(
+    projectId: string,
+    sessionId: string,
     projection: ActivePlanProjection
-  ): void {
+  ): Promise<void> {
     const origin = projection.originatingPromptMessageId
-    const visibleMessageIds = new Set(request.provenanceContext?.messageAncestry ?? [])
-    if (request.provenanceContext?.promptMessageId) {
-      visibleMessageIds.add(request.provenanceContext.promptMessageId)
-    }
-    if (!origin || !visibleMessageIds.has(origin)) {
+    if (
+      !origin ||
+      !this.planSessions ||
+      !(await this.planSessions.containsMessageOnActiveBranch(projectId, sessionId, origin))
+    ) {
       throw new PlanCommandError(
         'interaction-mismatch',
-        'The Session Plan continuation does not belong to this Message Branch.'
+        'The active Session Plan does not belong to the durable active Message Branch.'
       )
     }
-  }
-
-  private rejectPlanApprovalWaiter(sessionId: string, reason: string): void {
-    const waiter = this.planApprovalWaiters.get(sessionId)
-    if (!waiter) return
-    this.planApprovalWaiters.delete(sessionId)
-    waiter.reject(new Error(reason))
   }
 
   // Lists sessions with an in-flight prompt, for the pre-migration active-session warning.
@@ -1331,166 +1371,6 @@ class AcpRuntime {
     return this.modelChanges.apply(target)
   }
 
-  private canApplyModelChange(target: AgentModelChangeTarget): boolean {
-    const backendCompatible =
-      this.backendId === target.backendId ||
-      (this.framework.id === 'claude-code' &&
-        target.route === 'claude-anthropic' &&
-        target.anthropicBridgeTargetId !== undefined &&
-        this.connectionResources.anthropicBridgeAvailable) ||
-      (target.providerTransportTargetId !== undefined &&
-        this.connectionResources.providerTransportAvailable)
-    return (
-      !this.connectionResources.isShuttingDown &&
-      !this.pendingProviderReconnect &&
-      this.snapshotOwner.status === 'connected' &&
-      this.connection !== undefined &&
-      this.activeSessionEntries().length > 0 &&
-      this.framework.id === target.frameworkId &&
-      backendCompatible &&
-      this.backend.modelRoute === target.route
-    )
-  }
-
-  private modelChangeMatchesCurrent(target: AgentModelChangeTarget): boolean {
-    return (
-      this.backendId === target.backendId &&
-      this.backend.context.model === target.model &&
-      this.backend.session.model === target.sessionModel &&
-      this.backend.context.supportsImageInput === target.supportsImageInput &&
-      (this.backend.session.effort ?? 'default') === target.reasoningEffort
-    )
-  }
-
-  private async applyModelTarget(target: AgentModelChangeTarget): Promise<boolean> {
-    const connection = this.connection
-    if (!connection) return false
-    if (
-      this.framework.id === 'codex' &&
-      target.route !== 'codex-bridge' &&
-      this.backendId !== target.backendId &&
-      this.backend.session.model === target.sessionModel
-    ) {
-      // Native Codex catalogs capability metadata by model slug. Two providers may reuse one slug
-      // for models with different image, context, or effort capabilities, which the live session
-      // cannot distinguish. Reconnect so the newly selected provider owns a fresh catalog entry.
-      return false
-    }
-    if (
-      this.backend.context.supportsImageInput &&
-      !target.supportsImageInput &&
-      (target.route === 'claude-anthropic' || target.route === 'codex-bridge')
-    ) {
-      // Claude retains opaque SDK history, while the Codex bridge keeps an image-capable transport
-      // model. Neither can prove that images from earlier turns will be removed for a text-only
-      // upstream model, so reuse the reconnect/resume path that already filters image history.
-      return false
-    }
-
-    try {
-      if (target.providerTransportTargetId) {
-        if (
-          !this.connectionResources.setProviderTransportTarget(target.providerTransportTargetId)
-        ) {
-          return false
-        }
-      }
-      if (target.anthropicBridgeTargetId) {
-        if (!this.connectionResources.setAnthropicBridgeTarget(target.anthropicBridgeTargetId)) {
-          return false
-        }
-      }
-      if (target.bridge) {
-        const bridgeUpdated = this.connectionResources.setBridgeModelTarget({
-          ...target.bridge,
-          ...(target.reasoningEffort === 'default'
-            ? { reasoningEffort: undefined }
-            : { reasoningEffort: target.reasoningEffort })
-        })
-        if (!bridgeUpdated) return false
-      }
-
-      const results = new Map<
-        string,
-        { appliedModel: string; configOptions: SessionConfigOption[] | null | undefined }
-      >()
-
-      for (const [appSessionId, session] of this.activeSessionEntries()) {
-        const priorOptions =
-          (this.sessionRegistry.lookup(appSessionId)?.aggregate.snapshot().configOptions as
-            readonly SessionConfigOption[] | undefined) ??
-          (session as { newSessionResponse?: { configOptions?: SessionConfigOption[] | null } })
-            .newSessionResponse?.configOptions
-        let configOptions: SessionConfigOption[] | null | undefined = priorOptions
-          ? structuredClone([...priorOptions])
-          : priorOptions
-        let appliedModel = target.sessionModel
-
-        // The Chat-to-Responses bridge keeps the ACP transport model fixed; only its upstream target
-        // changes. Other routes switch the session's advertised model option in place.
-        if (target.route !== 'codex-bridge') {
-          const selection = matchSessionModelOption(configOptions, target.sessionModel)
-          if (!selection) return false
-          appliedModel = selection.value
-
-          if (!selection.alreadyCurrent) {
-            this.assertCurrentConnectedConnection(connection)
-            const response = (await connection.agent.request(
-              acp.methods.agent.session.setConfigOption,
-              {
-                sessionId: session.sessionId,
-                configId: selection.configId,
-                value: selection.value
-              }
-            )) as { configOptions?: SessionConfigOption[] | null }
-            configOptions = response?.configOptions ?? configOptions
-          }
-
-          const shouldApplyEffort =
-            this.framework.supportsLiveEffortChange &&
-            (target.reasoningEffort !== 'default' || this.backend.session.effort !== undefined)
-          if (shouldApplyEffort) {
-            const effortSelection = resolveSessionEffortOption(
-              configOptions,
-              target.reasoningEffort
-            )
-            if (!effortSelection) return false
-            const response = (await connection.agent.request(
-              acp.methods.agent.session.setConfigOption,
-              {
-                sessionId: session.sessionId,
-                configId: effortSelection.configId,
-                value: effortSelection.value
-              }
-            )) as { configOptions?: SessionConfigOption[] | null }
-            configOptions = response?.configOptions ?? configOptions
-          }
-        }
-
-        results.set(appSessionId, { appliedModel, configOptions })
-      }
-
-      this.assertCurrentConnectedConnection(connection)
-      this.backendGeneration.updateModel(target)
-      for (const [appSessionId, result] of results) {
-        this.sessionRegistry
-          .lookup(appSessionId)
-          ?.aggregate.updateModel(result.appliedModel, result.configOptions, target.backendId)
-      }
-      this.contextUsageTracker.clear()
-      for (const appSessionId of results.keys()) this.ensureContextUsageTracking(appSessionId)
-      this.emitState()
-      log.info('session model change applied', this.diagnosticContext())
-      return true
-    } catch (error) {
-      log.warn('live session model change failed', {
-        ...diagnosticErrorFields(error),
-        ...this.diagnosticContext()
-      })
-      return false
-    }
-  }
-
   // Live-applies a reasoning-effort change to every open session — the ACP equivalent of a model
   // switch, no respawn. Returns false when the active framework only carries effort in its baked
   // spawn config (opencode advertises no thought_level option), or when applying to a session
@@ -1501,41 +1381,7 @@ class AcpRuntime {
   // either). On success the generation view tracks the new level, so sessions created later in
   // this process inherit it; the persisted setting covers the next respawn.
   async applyReasoningEffortChange(effort: ResolvedReasoningEffort): Promise<boolean> {
-    const modelChangeBarrier = this.modelChanges.barrier
-    if (modelChangeBarrier) {
-      await modelChangeBarrier
-      return this.applyReasoningEffortChange(effort)
-    }
-
-    // A provider/model switch may be waiting for an in-flight turn to finish. The incoming effort was
-    // resolved against that newly selected model, while this connection still owns the old one. Let
-    // the persisted setting reach the fresh backend after reconnect instead of leaking it here.
-    if (this.pendingProviderReconnect) return false
-
-    const backend = this.backendGeneration.updateReasoningEffort(effort)
-    this.connectionResources.setBridgeReasoningEffort(backend.session.effort)
-    const connection = this.connection
-    if (!connection) return backend.framework.supportsLiveEffortChange
-
-    const facts = await this.sessionConfigurator.applyLiveEffort({
-      backend,
-      connection,
-      effort,
-      sessions: this.activeSessionEntries().map(([appSessionId, session]) => ({
-        session,
-        configOptions:
-          (this.sessionRegistry.lookup(appSessionId)?.aggregate.snapshot().configOptions as
-            readonly SessionConfigOption[] | undefined) ??
-          (session as { newSessionResponse?: { configOptions?: SessionConfigOption[] | null } })
-            .newSessionResponse?.configOptions,
-        assertCurrent: () => {
-          if (this.activeSessionFor(appSessionId) !== session) {
-            throw new Error('ACP session startup was superseded.')
-          }
-        }
-      }))
-    })
-    return !facts.reconnectRequired
+    return this.modelChanges.applyReasoningEffort(effort)
   }
 
   // Starts a fresh agent process connection and initializes protocol capabilities.
@@ -1550,55 +1396,7 @@ class AcpRuntime {
 
   // Reattaches a persisted protocol session after an app restart so later prompts can stream.
   async resumeSession(request: AcpResumeSessionRequest): Promise<AcpCreateSessionResponse> {
-    return this.withOperationLease(() => this.resumeSessionOperation(request))
-  }
-
-  private async resumeSessionOperation(
-    request: AcpResumeSessionRequest
-  ): Promise<AcpCreateSessionResponse> {
-    const sessionCwd = resolve(request.cwd || this.snapshotOwner.cwd || this.options.defaultCwd)
-    const projectName = this.normalizeProjectName(request.projectName)
-
-    // If the runtime already attached this session, only refresh routing metadata.
-    const attachedSession = this.activeSessionFor(request.sessionId)
-
-    if (attachedSession) {
-      const aggregate = this.sessionRegistry.lookup(request.sessionId)?.aggregate
-      if (!aggregate) throw new Error(`ACP session is not registered: ${request.sessionId}`)
-      if (request.specialistId) {
-        aggregate.setSpecialistId(request.specialistId)
-      }
-      const connection = this.connection
-      if (!connection) throw new Error('ACP connection is not available.')
-      const permissionProfile = await this.sessionConfigurator.configurePermissionProfile({
-        backend: this.backend,
-        connection,
-        session: attachedSession,
-        permissionProfile: normalizePermissionProfile(
-          request.permissionProfile ??
-            aggregate.snapshot().permissionProfile?.selectedProfile ??
-            DEFAULT_PERMISSION_PROFILE
-        )
-      })
-      if (this.activeSessionFor(request.sessionId) !== attachedSession) {
-        throw new Error('ACP session startup was superseded.')
-      }
-      this.assertCurrentConnectedConnection(connection)
-      aggregate.setPermissionProfile(structuredClone(permissionProfile))
-      this.sessionRegistry.select(request.sessionId)
-      this.snapshotOwner.updateCwd(sessionCwd)
-      aggregate.updateLocation(sessionCwd, projectName)
-      this.emitState()
-
-      return {
-        sessionId: request.sessionId,
-        cwd: sessionCwd,
-        frameworkId: this.framework.id,
-        ...(this.backendId ? { backendId: this.backendId } : {})
-      }
-    }
-
-    return this.providerSessionResumer.resume(request)
+    return this.withOperationLease(() => this.providerSessionResumer.resume(request))
   }
 
   // Forcibly drops the agent-side context for a session whose accumulated history can no longer be sent
@@ -1756,9 +1554,6 @@ class AcpRuntime {
     emitClosedStatus = true,
     teardownGeneration = this.connectionGeneration
   ): Promise<AcpStateSnapshot> {
-    for (const sessionId of this.planApprovalWaiters.keys()) {
-      this.rejectPlanApprovalWaiter(sessionId, 'The Session Plan interaction was disconnected.')
-    }
     return this.connectionClose.disconnectCurrent(emitClosedStatus, teardownGeneration)
   }
 
@@ -1767,8 +1562,9 @@ class AcpRuntime {
     onFrameworkResolved: (framework: AgentFramework['id']) => void
   ): Promise<AcpAgentConnectionCandidate> {
     const hooks: AcpAgentConnectionHooks = {
-      requestPermission: (params) => this.handlePermissionRequest(params),
-      observeSessionUpdate: (notification) => this.observePermissionToolContext(notification),
+      requestPermission: (params) => this.permissionContext.handleProviderRequest(params),
+      observeSessionUpdate: (notification) =>
+        this.permissionContext.observeProviderUpdate(notification),
       observeClaudeSdkMessage: (params) => this.observeClaudeSdkMessage(params),
       filesystem: {
         resolveSessionCwd: (sessionId) => this.resolveSessionCwd(sessionId),
@@ -1862,15 +1658,19 @@ class AcpRuntime {
         sessionId: request.sessionId,
         artifactVersionId: continuation.artifactVersionId,
         expectedRevision: continuation.expectedRevision
-      }).then((authorized) => {
-        this.assertPlanVisibleToPrompt(request, authorized)
+      }).then(async (authorized) => {
+        await this.assertPlanVisibleToDurableBranch(
+          continuation.projectId,
+          request.sessionId,
+          authorized
+        )
         return Object.freeze({ authorized })
       })
     }
     if (!continuation) return Object.freeze({})
     return this.planService!.getProjection(continuation.projectId, request.sessionId, {
       interactionIsLive: false
-    }).then((protectedPending) => {
+    }).then(async (protectedPending) => {
       if (!protectedPending) {
         throw new PlanCommandError('no-active-plan', 'The Session has no active Plan.')
       }
@@ -1883,7 +1683,11 @@ class AcpRuntime {
       if (protectedPending.approval !== 'pending') {
         throw new PlanCommandError('approval-already-decided', 'Plan approval is irreversible.')
       }
-      this.assertPlanVisibleToPrompt(request, protectedPending)
+      await this.assertPlanVisibleToDurableBranch(
+        continuation.projectId,
+        request.sessionId,
+        protectedPending
+      )
       return Object.freeze({ protectedPending })
     })
   }
@@ -1898,7 +1702,8 @@ class AcpRuntime {
     const decision = continuation?.pendingAction
     const committed = (): AcpPromptTurnPlanContext => {
       if (authorized) {
-        this.planExecutionBindings.set(request.sessionId, {
+        this.planInteractions.bindExecution({
+          sessionId: request.sessionId,
           interactionSequence: interaction.sequence,
           artifactVersionId: authorized.artifactVersionId
         })
@@ -1909,6 +1714,7 @@ class AcpRuntime {
       })
     }
     if (continuation && (decision === 'approve' || decision === 'reject')) {
+      const executionBinding = this.planInteractions.executionBindingFor(request.sessionId)
       return this.planService!.respond({
         projectId: continuation.projectId,
         sessionId: request.sessionId,
@@ -1920,9 +1726,14 @@ class AcpRuntime {
         if (decision === 'approve') authorized = result.projection
         else {
           protectedPending = result.projection
-          this.planExecutionBindings.delete(request.sessionId)
+          if (executionBinding) {
+            this.planInteractions.releaseExecution(
+              request.sessionId,
+              executionBinding.interactionSequence
+            )
+          }
         }
-        this.resolvePlanApprovalWaiter(request.sessionId, result)
+        this.planInteractions.resolveApproval(request.sessionId, result)
         this.publishPlanProjection(request.sessionId, result.projection)
         return committed()
       })
@@ -1935,7 +1746,7 @@ class AcpRuntime {
     interaction: AcpPromptSessionInteractionScope,
     response: PromptResponse
   ): Promise<void> {
-    const binding = this.planExecutionBindings.get(sessionId)
+    const binding = this.planInteractions.executionBindingFor(sessionId)
     if (
       response.stopReason !== 'end_turn' ||
       !this.planService ||
@@ -1958,17 +1769,24 @@ class AcpRuntime {
     sessionId: string,
     interaction: AcpPromptSessionInteractionScope
   ): void {
-    const binding = this.planExecutionBindings.get(sessionId)
-    if (binding?.interactionSequence === interaction.sequence) {
-      this.planExecutionBindings.delete(sessionId)
-    }
-    const waiter = this.planApprovalWaiters.get(sessionId)
-    if (waiter?.interactionId === interaction.promptMessageId) {
-      this.rejectPlanApprovalWaiter(
+    this.planInteractions.releaseExecution(sessionId, interaction.sequence)
+    if (interaction.promptMessageId) {
+      this.rejectPlanApprovalForInteraction(
         sessionId,
+        interaction.promptMessageId,
         'The Session Plan interaction ended before approval.'
       )
     }
+  }
+
+  private rejectPlanApprovalForInteraction(
+    sessionId: string,
+    interactionId: string,
+    reason: string
+  ): void {
+    this.planInteractions.releaseApprovalReservation(sessionId, interactionId)
+    if (this.planInteractions.approvalInteractionIdFor(sessionId) !== interactionId) return
+    this.planInteractions.rejectApproval(sessionId, reason)
   }
 
   // Sends one prompt turn to the targeted session and streams updates until stop.
@@ -2004,6 +1822,9 @@ class AcpRuntime {
   async cancelPrompt(request: AcpCancelPromptRequest): Promise<AcpStateSnapshot> {
     const connection = this.connection
     const activeSession = this.activeSessionFor(request.sessionId)
+    const planInteractionId =
+      this.currentPromptInteraction(request.sessionId)?.promptMessageId ??
+      this.planInteractions.approvalInteractionIdFor(request.sessionId)
 
     if (connection && activeSession) {
       await this.sessionInteractions.cancelPrompt({
@@ -2013,10 +1834,13 @@ class AcpRuntime {
             sessionId: activeSession.sessionId
           }),
         onAccepted: () => {
-          this.rejectPlanApprovalWaiter(
-            request.sessionId,
-            'The Session Plan interaction was cancelled.'
-          )
+          if (planInteractionId) {
+            this.rejectPlanApprovalForInteraction(
+              request.sessionId,
+              planInteractionId,
+              'The Session Plan interaction was cancelled.'
+            )
+          }
           this.cancelPermissionFlowForSession(request.sessionId)
           this.pushEvent({
             kind: 'system',
@@ -2044,8 +1868,10 @@ class AcpRuntime {
 
   // Closes the agent-side session when supported, then removes local routing state.
   async deleteSession(request: AcpDeleteSessionRequest): Promise<AcpStateSnapshot> {
-    this.rejectPlanApprovalWaiter(request.sessionId, 'The Session Plan interaction was deleted.')
-    this.planExecutionBindings.delete(request.sessionId)
+    this.planInteractions.clearSession(
+      request.sessionId,
+      'The Session Plan interaction was deleted.'
+    )
     return this.sessionDeletion.delete(request.sessionId)
   }
 
@@ -2206,15 +2032,6 @@ class AcpRuntime {
     )
   }
 
-  // Normalizes a requested project name, falling back to the runtime default when absent.
-  private normalizeProjectName(requestedProjectName: string | undefined): string {
-    return (
-      requestedProjectName?.trim() ||
-      this.artifactOptions?.projectName ||
-      DEFAULT_UPLOAD_PROJECT_NAME
-    )
-  }
-
   // Marks a new assistant turn as the active artifact run before the model can call the MCP tool.
   private async activateArtifactRun(
     sessionId: string,
@@ -2280,337 +2097,8 @@ class AcpRuntime {
     )
   }
 
-  // Hands permission requests to the broker so the renderer can answer later. Any failure is logged with
-  // its real message before it propagates: the ACP SDK collapses a thrown handler error into a bare
-  // -32603 "Internal error" (real detail buried in `data.details`), so this is the only place the true
-  // cause is captured in the app log. The error is rethrown unchanged to preserve protocol behavior.
-  private async handlePermissionRequest(
-    params: RequestPermissionRequest
-  ): Promise<RequestPermissionResponse> {
-    // Fork point: a WebFetch/server-side tool that never reaches this line means the "Internal error"
-    // originated elsewhere. Info level so it's a visible audit line (one per prompt): if an MCP call
-    // runs without this appearing, the agent never asked (e.g. an un-gated permission config). Log the
-    // tool identity (name/kind) and whether it looks like MCP — never the title (a WebFetch title is the
-    // full URL with query params, i.e. user data).
-    const appSessionId = this.sessionRegistry.resolveAppSessionId(params.sessionId)
-    const reviewerContext = this.reviewerSessions.contextFor(params.sessionId)
-    const mcpServerNames =
-      reviewerContext?.mcpServerNames ?? this.sessionCapabilities.mcpServerNamesFor(appSessionId)
-    const promptInteraction = this.currentPromptInteraction(appSessionId)
-    const promptTurn = promptInteraction?.sequence
-    const aggregateSnapshot = this.sessionRegistry.lookup(appSessionId)?.aggregate.snapshot()
-    const framework = reviewerContext?.frameworkId ?? aggregateSnapshot?.frameworkId
-    const isPermissionContextCancelled = (): boolean =>
-      framework === 'opencode' &&
-      (promptTurn === undefined
-        ? this.activeSessionFor(appSessionId) !== undefined
-        : this.currentPromptInteraction(appSessionId)?.sequence !== promptTurn ||
-          (promptInteraction !== undefined &&
-            this.sessionInteractions.isCancellationAccepted(promptInteraction)))
-    const restoreContext = {
-      sessionId: appSessionId,
-      framework,
-      mcpServerNames,
-      isCancelled: isPermissionContextCancelled
-    }
-    const normalizedParams = await this.permissionContext.restoreToolCall(params, restoreContext)
-    if (
-      !normalizedParams ||
-      this.permissionContext.isPermissionRequestCancelled(
-        params.toolCall.toolCallId,
-        restoreContext
-      )
-    ) {
-      return { outcome: { outcome: 'cancelled' } }
-    }
-    const toolName = extractProviderToolName(normalizedParams.toolCall)
-    const isMcp =
-      isMcpToolName(normalizedParams.toolCall?.title, mcpServerNames) ||
-      isMcpToolName(toolName, mcpServerNames)
-    log.info('permission request received', {
-      tool:
-        this.toolIdentityForDiagnostics(toolName, appSessionId) ?? normalizedParams.toolCall?.kind,
-      isMcp,
-      toolCallId: normalizedParams.toolCall?.toolCallId,
-      sessionId: params.sessionId,
-      optionCount: params.options?.length
-    })
-
-    try {
-      // Background reviewer sessions run unattended and are intentionally absent from the primary
-      // Session Aggregate collection.
-      // Approve only their dedicated, scope-bounded MCP. Bash, filesystem, network, other MCP servers,
-      // and unknown tools are rejected without involving the renderer.
-      if (reviewerContext) {
-        const response = this.reviewerSessions.resolvePermission(normalizedParams)
-        if (response) return response
-        throw new Error(`Unknown ACP reviewer session: ${params.sessionId}`)
-      }
-
-      if (!this.activeSessionFor(appSessionId)) {
-        throw new Error(`Unknown ACP session: ${appSessionId}`)
-      }
-
-      const profileState = aggregateSnapshot?.permissionProfile
-      const permissionFrameworkId = aggregateSnapshot?.frameworkId ?? this.framework.id
-      const permissionFramework =
-        permissionFrameworkId === this.framework.id
-          ? this.framework
-          : getAgentFramework(permissionFrameworkId)
-
-      return await this.permissionContext.requestPermission(
-        appSessionId === normalizedParams.sessionId
-          ? normalizedParams
-          : { ...normalizedParams, sessionId: appSessionId },
-        {
-          profile: profileState?.selectedProfile ?? DEFAULT_PERMISSION_PROFILE,
-          // Source the framework from the per-session map, not the current generation view — an
-          // overlapping reconnect can move it off Codex mid-request and leak the amendment options.
-          frameworkId: permissionFrameworkId,
-          shellDialect: permissionFramework.commandShellDialect,
-          autoReviewStrategy: profileState?.autoReviewStrategy,
-          cwd: aggregateSnapshot?.cwd,
-          mcpServerNames,
-          projectId: this.resolveSessionProjectName(appSessionId)
-        }
-      )
-    } catch (error) {
-      log.error('permission request failed', {
-        message: errorMessage(error),
-        tool:
-          this.toolIdentityForDiagnostics(
-            extractProviderToolName(normalizedParams.toolCall),
-            appSessionId
-          ) ?? normalizedParams.toolCall?.kind,
-        toolCallId: params.toolCall?.toolCallId,
-        sessionId: params.sessionId
-      })
-      throw error
-    }
-  }
-
-  // Observes every ACP update before framework-specific consumers drain their ActiveSession queue.
-  // Reviewer updates are consumed outside handleSessionUpdate, so this shared boundary is the only
-  // place where a preceding tool_call can reliably enrich a later sparse permission request.
-  private observePermissionToolContext(notification: SessionNotification): void {
-    const sessionId = this.sessionRegistry.resolveAppSessionId(notification.sessionId)
-    const reviewerContext = this.reviewerSessions.contextFor(notification.sessionId)
-    const framework =
-      reviewerContext?.frameworkId ??
-      this.sessionRegistry.lookup(sessionId)?.aggregate.snapshot().frameworkId
-    this.applySessionUpdateEffects(
-      this.sessionUpdateProjector.project(notification, {
-        kind: 'permission',
-        appSessionId: sessionId,
-        framework,
-        mcpServerNames:
-          reviewerContext?.mcpServerNames ?? this.sessionCapabilities.mcpServerNamesFor(sessionId)
-      })
-    )
-  }
-
   private cancelPermissionFlowForSession(sessionId: string): void {
     this.permissionContext.cancelForSession(sessionId)
-  }
-
-  private providerTurnAdapter(frameworkId: AgentFramework['id']): AcpProviderTurnAdapter {
-    if (frameworkId === 'claude-code') return claudeCodeTurnAdapter
-    if (frameworkId === 'codex') return createCodexTurnAdapter()
-
-    const usageApi = this.backendGeneration.openCodeUsageApi()
-    return new AcpOpenCodeTurnAdapter((providerSessionId, cwd) =>
-      usageApi
-        ? fetchOpenCodeUsageSnapshot(
-            usageApi,
-            providerSessionId,
-            cwd,
-            this.options.opencodeUsageFetch
-          )
-        : Promise.resolve(undefined)
-    )
-  }
-
-  // Provider adapters normalize an exact latest-request context numerator when one exists. Apply it
-  // only while the same app turn still owns the Session so a delayed old stop cannot rewrite a reset.
-  private recordProviderPromptContextUsage(
-    sessionId: string,
-    used: number,
-    promptTurn: number
-  ): void {
-    if (
-      this.pendingProviderReconnect ||
-      this.currentPromptInteraction(sessionId)?.sequence !== promptTurn
-    ) {
-      return
-    }
-    if (this.contextUsageTracker.reconcileUsed(sessionId, used)) this.emitState()
-  }
-
-  private contextUsageSelectionFor(sessionId?: string): {
-    model?: string
-    contextWindow?: number
-  } {
-    const appliedModel = sessionId
-      ? this.sessionRegistry.lookup(sessionId)?.aggregate.snapshot().appliedModel
-      : undefined
-    // OpenCode applies the requested provider model through the optional ACP model config. If the
-    // option was absent or rejected, the agent kept its own default and the requested model is unsafe
-    // for both tokenization and window sizing. Other frameworks configure their upstream model
-    // through env or an app-owned bridge, independently of the ACP transport model.
-    const selectedModelConfirmed = !(
-      this.framework.id === 'opencode' &&
-      this.backend.session.model &&
-      !appliedModel
-    )
-    if (!selectedModelConfirmed) return {}
-
-    const model = this.backend.context.model ?? appliedModel
-    return {
-      ...(model ? { model } : {}),
-      ...(this.backend.context.window ? { contextWindow: this.backend.context.window } : {})
-    }
-  }
-
-  private contextUsageEstimateInput(sessionId?: string): SessionEstimateInput {
-    const { model } = this.contextUsageSelectionFor(sessionId)
-    const sessionSetup = this.framework.buildSessionSetup({
-      systemPromptAppends: this.backend.prompt.persistentSystemPrompt
-        ? []
-        : this.getSystemPromptAppends(),
-      sessionOptions: this.backend.session.options
-    })
-    const persistentSystemPrompt =
-      this.backend.prompt.persistentSystemPrompt ?? sessionSetup.persistentSystemPrompt
-    const persistentSections = contextUsageMcpSections(this.framework.id, {
-      artifacts: this.artifactToolingAvailable(),
-      notebook: this.notebookToolingAvailable(),
-      skillImport: this.skillImportToolingAvailable(),
-      codexBridgeAliases: this.backend.adapter.bridgeMcpAliasesEnabled
-    }).map(({ sectionId, text }) => ({ sectionId, category: 'mcp' as const, text }))
-
-    return {
-      frameworkId: this.framework.id,
-      ...(model ? { model } : {}),
-      ...(persistentSystemPrompt ? { persistentSystemPrompt: [persistentSystemPrompt] } : {}),
-      ...(persistentSections.length > 0 ? { persistentSections } : {})
-    }
-  }
-
-  private selectedContextWindowFor(sessionId: string): number | undefined {
-    return this.contextUsageSelectionFor(sessionId).contextWindow
-  }
-
-  private ensureContextUsageTracking(sessionId: string): void {
-    if (!this.activeSessionFor(sessionId)) return
-    this.contextUsageTracker.beginSession(sessionId, this.contextUsageEstimateInput(sessionId))
-  }
-
-  private refreshEstimatedContextUsage(
-    sessionId: string,
-    status: NonNullable<AcpContextUsage['breakdown']>['status']
-  ): boolean {
-    const selectedSize = this.selectedContextWindowFor(sessionId)
-    const size = selectedSize ?? this.contextUsageTracker.usage(sessionId)?.size
-    return this.contextUsageTracker.refreshUsage(sessionId, status, size)
-  }
-
-  // Normalizes low-level session notifications into runtime/workspace events.
-  private handleSessionUpdate(
-    notification: SessionNotification,
-    appSessionId?: string,
-    visible = true,
-    emitState: () => void = () => this.emitState()
-  ): void {
-    const sessionId = appSessionId ?? notification.sessionId
-    this.applySessionUpdateEffects(
-      this.sessionUpdateProjector.project(notification, {
-        kind: 'runtime',
-        framework:
-          this.sessionRegistry.lookup(sessionId)?.aggregate.snapshot().frameworkId ??
-          this.framework.id,
-        appSessionId,
-        eventId: this.nextEventId(),
-        visible,
-        reconnectPending: this.pendingProviderReconnect,
-        mcpServerNames: this.sessionCapabilities.mcpServerNamesFor(sessionId)
-      }),
-      emitState
-    )
-  }
-
-  private applySessionUpdateEffects(
-    effects: readonly AcpSessionUpdateEffect[],
-    emitState: () => void = () => this.emitState()
-  ): void {
-    for (const effect of effects) {
-      switch (effect.kind) {
-        case 'permission-tool-correlation':
-          this.permissionContext.observeToolCall(effect.notification, effect.context)
-          break
-        case 'context-observation':
-          this.ensureContextUsageTracking(effect.sessionId)
-          this.contextUsageTracker.observeSessionUpdate(
-            effect.sessionId,
-            effect.notification,
-            effect.observation
-          )
-          break
-        case 'current-mode': {
-          const aggregate = this.sessionRegistry.lookup(effect.sessionId)?.aggregate
-          const profileState = aggregate?.snapshot().permissionProfile
-          if (profileState) {
-            aggregate.setPermissionProfile(
-              applyCurrentModeUpdate(
-                profileState as SessionPermissionProfileState,
-                effect.currentModeId
-              )
-            )
-            emitState()
-          }
-          break
-        }
-        case 'provider-usage':
-          this.contextUsageTracker.reconcileProviderUsage(
-            effect.sessionId,
-            effect.usage,
-            this.selectedContextWindowFor(effect.sessionId)
-          )
-          emitState()
-          break
-        case 'context-refresh':
-          if (
-            this.contextUsageTracker.usage(effect.sessionId)?.breakdown?.status !== 'reconciled'
-          ) {
-            this.refreshEstimatedContextUsage(effect.sessionId, 'preflight')
-          }
-          break
-        case 'tool-failure-diagnostic':
-          log.warn('tool call failed', {
-            tool: effect.tool,
-            toolCallId: effect.toolCallId,
-            sessionId: effect.sessionId,
-            reason: effect.reason
-          })
-          break
-        case 'visible-event':
-          this.pushEvent(effect.event)
-          break
-      }
-    }
-  }
-
-  private toolIdentityForDiagnostics(
-    providerToolName: string | undefined,
-    sessionId: string
-  ): string | undefined {
-    if (!providerToolName) return undefined
-
-    return (
-      resolveCanonicalMcpToolIdentity(
-        providerToolName,
-        this.sessionCapabilities.mcpServerNamesFor(sessionId)
-      ) ?? providerToolName
-    )
   }
 
   private processEventDisposition(
@@ -2740,18 +2228,7 @@ class AcpRuntime {
   // appear in the snapshot, and callers are responsible for disposing it. This allows background
   // review to run in parallel with the main session without affecting the main state machine.
   async buildReviewerSession(request: ReviewerSessionRequest): Promise<ReviewerSessionResult> {
-    return this.withOperationLease(() =>
-      this.reviewerSessions.create(request, async () => {
-        const connection = await this.ensureConnected(request.cwd)
-        this.assertCurrentConnectedConnection(connection)
-        return {
-          connection,
-          framework: this.framework,
-          sessionOptions: this.backend.session.options,
-          startupGeneration: this.sessionRegistry.startupGeneration
-        }
-      })
-    )
+    return this.withOperationLease(() => this.reviewerSessions.create(request))
   }
 
   private invalidatePendingSessionStartups(): void {
