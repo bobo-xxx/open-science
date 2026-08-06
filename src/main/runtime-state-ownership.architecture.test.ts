@@ -332,17 +332,36 @@ describe('runtime state ownership architecture', () => {
     }
   })
 
-  it('keeps live Session Plan state behind one Runtime owner', () => {
-    const source = readSource('src/main/acp/runtime.ts')
+  it('keeps live Session Plan state behind one owner and application workflow', () => {
+    const runtime = readSource('src/main/acp/runtime.ts')
+    const composition = readSource('src/main/acp/runtime-base-composition.ts')
+    const planComposition = readSource('src/main/acp/runtime-plan-composition.ts')
+    const source = runtime + composition + planComposition
 
     expect(source).not.toContain('planApprovalWaiters')
     expect(source).not.toContain('planExecutionBindings')
     expect(source.match(/new SessionPlanInteractionOwner\(\)/g)).toHaveLength(1)
-    expect(source).toContain('interactions: this.planInteractions')
+    expect(composition).toContain('interactions: planInteractions')
+    expect(runtime).not.toMatch(/private readonly (?:planInteractions|planService)/)
+    expect(runtime).not.toContain('this.planInteractions = base.planInteractions')
+    expect(runtime).not.toContain('this.planService = base.planService')
+    expect(runtime).not.toContain('private readonly planSessions')
+    expect(runtime).toContain('composeAcpRuntimePlanWorkflow(options, base, session)')
+    expect(runtime).toContain('plan: this.sessionPlanWorkflow.prompt')
+    expect(runtime).toContain('this.sessionPlanWorkflow.capturePromptCancellation(')
+    expect(runtime).toContain('this.sessionPlanWorkflow.sessionDeleted(request.sessionId)')
+    expect(runtime).toContain('return this.sessionPlanWorkflow.call(input)')
+    expect(runtime).toContain('return this.sessionPlanWorkflow.projection(projectId, sessionId)')
+    expect(runtime).toContain('return this.sessionPlanWorkflow.respond(input)')
+    expect(planComposition).toContain('const interactions = base.planInteractions')
+    expect(planComposition).toContain('const service = base.planService')
+    expect(planComposition).not.toMatch(/AcpRuntime\.prototype|from ['"]electron['"]/)
   })
 
   it('keeps model application and attached resume behavior behind their workflows', () => {
-    const source = readSource('src/main/acp/runtime.ts')
+    const runtime = readSource('src/main/acp/runtime.ts')
+    const providerSessions = readSource('src/main/acp/runtime-provider-session-composition.ts')
+    const source = runtime + providerSessions
 
     expect(source).not.toContain('canApplyModelChange')
     expect(source).not.toContain('modelChangeMatchesCurrent')
@@ -350,7 +369,58 @@ describe('runtime state ownership architecture', () => {
     expect(source).not.toContain('resumeSessionOperation')
     expect(source).toContain('return this.modelChanges.applyReasoningEffort(effort)')
     expect(source).toContain('this.providerSessionResumer.resume(request)')
-    expect(source).toContain('currentConnection: () => this.connection')
+    expect(providerSessions).toContain(
+      'const currentConnection = (): ClientConnection | undefined => base.connectionResources.connection'
+    )
+  })
+
+  it('constructs the model and connection lifecycle cycle outside Runtime', () => {
+    const runtime = readSource('src/main/acp/runtime.ts')
+    const composition = readSource('src/main/acp/runtime-lifecycle-composition.ts')
+
+    expect(runtime).not.toMatch(
+      /new (?:AcpModelChangeWorkflow|AcpConnectionCloseWorkflow|AcpConnectionLifecycleWorkflow)/
+    )
+    expect(runtime).toContain('composeAcpRuntimeLifecycleOwners(options, base, session, {')
+    expect(composition.match(/new AcpModelChangeWorkflow\(/g)).toHaveLength(1)
+    expect(composition.match(/new AcpConnectionCloseWorkflow\(/g)).toHaveLength(1)
+    expect(composition.match(/new AcpConnectionLifecycleWorkflow\(/g)).toHaveLength(1)
+    expect(composition).not.toContain('AcpRuntime.prototype')
+  })
+
+  it('constructs Provider Session workflows outside Runtime with one shared adopter', () => {
+    const runtime = readSource('src/main/acp/runtime.ts')
+    const composition = readSource('src/main/acp/runtime-provider-session-composition.ts')
+
+    expect(runtime).not.toMatch(
+      /new (?:AcpProviderSessionCreator|AcpProviderSessionAdopter|AcpProviderSessionResumer|AcpSessionReplacementWorkflow|AcpSessionDeletionWorkflow)/
+    )
+    expect(runtime).toContain('composeAcpRuntimeProviderSessionOwners(')
+    expect(composition.match(/new AcpProviderSessionCreator\(/g)).toHaveLength(1)
+    expect(composition.match(/new AcpProviderSessionAdopter\(/g)).toHaveLength(1)
+    expect(composition.match(/new AcpProviderSessionResumer\(/g)).toHaveLength(1)
+    expect(composition.match(/new AcpSessionReplacementWorkflow\(/g)).toHaveLength(1)
+    expect(composition.match(/new AcpSessionDeletionWorkflow\(/g)).toHaveLength(1)
+    expect(composition.match(/adopter: providerSessionAdopter/g)).toHaveLength(2)
+    expect(composition).toContain('await lifecycle.connectionClose.disconnect(false)')
+    expect(composition).not.toMatch(/AcpRuntime\.prototype|from ['"]electron['"]/)
+  })
+
+  it('constructs Prompt workflows outside Runtime with a private preparation owner', () => {
+    const runtime = readSource('src/main/acp/runtime.ts')
+    const composition = readSource('src/main/acp/runtime-prompt-composition.ts')
+
+    expect(runtime).not.toMatch(
+      /new (?:AcpPromptPreparationOwner|AcpContextCompactionWorkflow|AcpPromptTurnWorkflow)/
+    )
+    expect(runtime).toContain('composeAcpRuntimePromptOwners(options, base, session, {')
+    expect(composition.match(/new AcpPromptPreparationOwner\(/g)).toHaveLength(1)
+    expect(composition.match(/new AcpContextCompactionWorkflow\(/g)).toHaveLength(1)
+    expect(composition.match(/new AcpPromptTurnWorkflow\(/g)).toHaveLength(1)
+    expect(composition).toContain(
+      'return Object.freeze({ contextCompactionWorkflow, promptTurnWorkflow })'
+    )
+    expect(composition).not.toMatch(/AcpRuntime\.prototype|from ['"]electron['"]/)
   })
 
   it('keeps provider permission routing and reviewer preparation behind their owners', () => {
@@ -361,11 +431,14 @@ describe('runtime state ownership architecture', () => {
     expect(source).not.toContain('reviewerSessions.create(request, async')
     expect(source).toContain('this.permissionContext.handleProviderRequest(params)')
     expect(source).toContain('this.permissionContext.observeProviderUpdate(notification)')
-    expect(source).toContain('this.reviewerSessions.create(request)')
+    expect(source).toContain('this.reviewerSessions.create(request, {')
+    expect(source).toContain('ensureConnected: (cwd) => this.ensureConnected(cwd)')
   })
 
   it('keeps provider selection and Context routing behind their prompt owners', () => {
-    const source = readSource('src/main/acp/runtime.ts')
+    const runtime = readSource('src/main/acp/runtime.ts')
+    const promptComposition = readSource('src/main/acp/runtime-prompt-composition.ts')
+    const source = runtime + promptComposition
 
     expect(source).not.toContain('private providerTurnAdapter')
     expect(source).not.toContain('private recordProviderPromptContextUsage')
@@ -374,8 +447,8 @@ describe('runtime state ownership architecture', () => {
     expect(source).not.toContain('private selectedContextWindowFor')
     expect(source).not.toContain('private handleSessionUpdate')
     expect(source).not.toContain('private applySessionUpdateEffects')
-    expect(source).toContain('this.contextUsagePolicy.resolve(sessionId)')
-    expect(source).toContain('this.sessionUpdateProjector.route(notification')
+    expect(promptComposition).toContain('session.contextUsagePolicy.resolve(sessionId)')
+    expect(promptComposition).toContain('session.sessionUpdateProjector.route(notification')
   })
 
   it('accepts declared interface imports for a future orchestration module', () => {

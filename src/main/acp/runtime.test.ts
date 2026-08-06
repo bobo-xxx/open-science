@@ -15,8 +15,12 @@ import { join, resolve } from 'node:path'
 import { PassThrough, Readable, Writable } from 'node:stream'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { AcpRuntime } from './runtime'
+import { AcpRuntime } from './runtime.test-utils'
 import type { AcpAgentConnectionAdapter } from './agent-connection-adapter'
+import type { AcpConnectionCloseWorkflow } from './connection-close-workflow'
+import { composeAcpRuntimePlanWorkflow } from './runtime-plan-composition'
+import { SessionPlanInteractionOwner } from '../session-plan/session-plan-interaction-owner'
+import { composeAcpRuntimeBaseOwners } from './runtime-base-composition'
 import { AcpPermissionContext } from './permission-context'
 import { ContextUsageTracker, type TokenCounter } from './context-usage-tracker'
 import {
@@ -764,9 +768,13 @@ const startPermissionProbeAgent = (
 const mcpServerNamesFor = (runtime: AcpRuntime, sessionId: string): readonly string[] =>
   (
     runtime as unknown as {
-      sessionCapabilities: { mcpServerNamesFor: (sessionId: string) => readonly string[] }
+      providerSessionCreator: {
+        deps: {
+          capabilities: { mcpServerNamesFor: (sessionId: string) => readonly string[] }
+        }
+      }
     }
-  ).sessionCapabilities.mcpServerNamesFor(sessionId)
+  ).providerSessionCreator.deps.capabilities.mcpServerNamesFor(sessionId)
 
 const activeSessionForTest = (
   runtime: AcpRuntime,
@@ -778,11 +786,21 @@ const activeSessionForTest = (
     }
   ).activeSessionFor(sessionId)
 
+const providerReconnectPending = (runtime: AcpRuntime): boolean =>
+  (
+    runtime as unknown as {
+      connectionTransitions: { providerReconnectPending: boolean }
+    }
+  ).connectionTransitions.providerReconnectPending
+
 const contextUsageMap = (
   runtime: AcpRuntime
 ): { set: (sessionId: string, usage: AcpContextUsage) => void } => {
-  const tracker = (runtime as unknown as { contextUsageTracker: ContextUsageTracker })
-    .contextUsageTracker
+  const tracker = (
+    runtime as unknown as {
+      contextCompactionWorkflow: { options: { context: ContextUsageTracker } }
+    }
+  ).contextCompactionWorkflow.options.context
   return {
     set: (sessionId, usage) => tracker.reconcileProviderUsage(sessionId, usage)
   }
@@ -793,16 +811,20 @@ const promptContentLifecycle = (
 ): { resetSession: (sessionId: string) => void } =>
   (
     runtime as unknown as {
-      promptContentOwner: { resetSession: (sessionId: string) => void }
+      contextCompactionWorkflow: {
+        options: { promptContent: { resetSession: (sessionId: string) => void } }
+      }
     }
-  ).promptContentOwner
+  ).contextCompactionWorkflow.options.promptContent
 
 const resolveArtifactRunClaim = (runtime: AcpRuntime, claimId: string): ArtifactRunClaim =>
   (
     runtime as unknown as {
-      artifactRunRegistry: { resolve: (id: string) => ArtifactRunClaim }
+      artifactTurns: {
+        options: { runRegistry: { resolve: (id: string) => ArtifactRunClaim } }
+      }
     }
-  ).artifactRunRegistry.resolve(claimId)
+  ).artifactTurns.options.runRegistry.resolve(claimId)
 
 const handleSessionUpdate = (runtime: AcpRuntime, notification: SessionNotification): void =>
   (
@@ -854,6 +876,22 @@ const openCodeUsageApiForTest = (runtime: AcpRuntime): unknown =>
       backendGeneration: { openCodeUsageApi: () => unknown }
     }
   ).backendGeneration.openCodeUsageApi()
+
+const connectionCloseForTest = (
+  runtime: AcpRuntime
+): Pick<AcpConnectionCloseWorkflow, 'disconnectCurrent'> =>
+  (runtime as unknown as { connectionClose: AcpConnectionCloseWorkflow }).connectionClose
+
+const invalidatePendingSessionStartupsForTest = (runtime: AcpRuntime): void => {
+  const owners = runtime as unknown as {
+    generationActivity: { invalidateStartups: () => void }
+    reviewerSessions: { invalidatePending: () => void }
+    sessionRegistry: { invalidatePending: () => void }
+  }
+  owners.generationActivity.invalidateStartups()
+  owners.sessionRegistry.invalidatePending()
+  owners.reviewerSessions.invalidatePending()
+}
 
 const codexMcpToolIdentitiesMap = (runtime: AcpRuntime): Map<string, Map<string, unknown>> =>
   (
@@ -1103,11 +1141,8 @@ describe('ACP runtime migration write-gate', () => {
       spawnAgent
     })
     await runtime.createSession({ cwd: '/workspace' })
-    const internal = runtime as unknown as {
-      disconnectCurrent: (emitClosedStatus?: boolean) => Promise<AcpStateSnapshot>
-    }
     const disconnectCurrentSpy = vi
-      .spyOn(internal, 'disconnectCurrent')
+      .spyOn(connectionCloseForTest(runtime), 'disconnectCurrent')
       .mockRejectedValueOnce(new Error('disconnect failed before detach'))
 
     try {
@@ -1633,6 +1668,37 @@ describe('ACP runtime session management', () => {
     )
   })
 
+  const installPromptPlanTestWorkflow = (
+    runtime: AcpRuntime,
+    planService: unknown,
+    sessions = durablePlanSessions()
+  ): void => {
+    const internals = runtime as unknown as {
+      sessionInteractions: unknown
+      artifactTurns: unknown
+      publication: unknown
+      sessionEnvironment: unknown
+      sessionPlanWorkflow: unknown
+      promptTurnWorkflow: { options: { plan: unknown } }
+    }
+    const planInteractions = new SessionPlanInteractionOwner()
+    const sessionPlanWorkflow = composeAcpRuntimePlanWorkflow(
+      { plan: { sessions } } as unknown as Parameters<typeof composeAcpRuntimePlanWorkflow>[0],
+      {
+        planService,
+        planInteractions,
+        sessionInteractions: internals.sessionInteractions,
+        artifactTurns: internals.artifactTurns
+      } as unknown as Parameters<typeof composeAcpRuntimePlanWorkflow>[1],
+      {
+        publication: internals.publication,
+        sessionEnvironment: internals.sessionEnvironment
+      } as unknown as Parameters<typeof composeAcpRuntimePlanWorkflow>[2]
+    )
+    Object.assign(internals, { sessionPlanWorkflow })
+    Object.assign(internals.promptTurnWorkflow.options, { plan: sessionPlanWorkflow.prompt })
+  }
+
   it('activates one interaction before durably approving a restored Plan', async () => {
     const process = new FakeAgentProcess()
     const fakeAgent = startFakeAgent(process, ['s1'])
@@ -1648,13 +1714,10 @@ describe('ACP runtime session management', () => {
     const pending = restoredPlanProjection('pending', 4)
     const respond = vi.fn(async () => ({ projection: approved, changed: true }))
     const checkTurnCompletion = vi.fn(async () => ({ allow: true }))
-    Object.assign(runtime as unknown as { planService: unknown }, {
-      planSessions: durablePlanSessions(),
-      planService: {
-        respond,
-        checkTurnCompletion,
-        getProjection: vi.fn(async () => pending)
-      }
+    installPromptPlanTestWorkflow(runtime, {
+      respond,
+      checkTurnCompletion,
+      getProjection: vi.fn(async () => pending)
     })
 
     await runtime.createSession({ cwd: '/workspace', projectName: 'project-1' })
@@ -1705,10 +1768,7 @@ describe('ACP runtime session management', () => {
     const pending = restoredPlanProjection('pending', 4)
     const getProjection = vi.fn(async () => pending)
     const respond = vi.fn()
-    Object.assign(runtime as unknown as { planService: unknown }, {
-      planSessions: durablePlanSessions(),
-      planService: { getProjection, respond }
-    })
+    installPromptPlanTestWorkflow(runtime, { getProjection, respond })
 
     await runtime.createSession({ cwd: '/workspace', projectName: 'project-1' })
     await runtime.sendPrompt({
@@ -1764,12 +1824,9 @@ describe('ACP runtime session management', () => {
     const rejected = restoredPlanProjection('rejected', 5)
     const pending = restoredPlanProjection('pending', 4)
     const respond = vi.fn(async () => ({ projection: rejected, changed: true }))
-    Object.assign(runtime as unknown as { planService: unknown }, {
-      planSessions: durablePlanSessions(),
-      planService: {
-        respond,
-        getProjection: vi.fn(async () => pending)
-      }
+    installPromptPlanTestWorkflow(runtime, {
+      respond,
+      getProjection: vi.fn(async () => pending)
     })
 
     await runtime.createSession({ cwd: '/workspace', projectName: 'project-1' })
@@ -1953,12 +2010,9 @@ describe('ACP runtime session management', () => {
       })
     })
     await runtime.connect({ cwd: '/workspace' })
-    vi.spyOn(
-      runtime as unknown as {
-        disconnectCurrent: () => Promise<AcpStateSnapshot>
-      },
-      'disconnectCurrent'
-    ).mockRejectedValueOnce(new Error('disconnect teardown failed'))
+    vi.spyOn(connectionCloseForTest(runtime), 'disconnectCurrent').mockRejectedValueOnce(
+      new Error('disconnect teardown failed')
+    )
 
     await expect(runtime.disconnect()).rejects.toThrow('disconnect teardown failed')
 
@@ -3857,10 +3911,9 @@ describe('ACP runtime session management', () => {
       stepStates: { Analyze: { status: 'blocked', notes: 'Input missing' } },
       counts: { phases: 1, delegations: 1, steps: 1, completed: 0, inProgress: 0 }
     } satisfies ActivePlanProjection
-    Object.assign(runtime as unknown as { planService: unknown }, {
-      planService: { getProjection: vi.fn(async () => projection) }
+    installPromptPlanTestWorkflow(runtime, {
+      getProjection: vi.fn(async () => projection)
     })
-
     const session = await runtime.createSession({ cwd: '/workspace', projectName: 'project-1' })
     await runtime.compactSession({ sessionId: session.sessionId })
 
@@ -8916,12 +8969,7 @@ describe('ACP runtime session management', () => {
     })
     await runtime.connect({ cwd: '/workspace' })
     const disconnectCurrentSpy = vi
-      .spyOn(
-        runtime as unknown as {
-          disconnectCurrent: (emitClosedStatus?: boolean) => Promise<AcpStateSnapshot>
-        },
-        'disconnectCurrent'
-      )
+      .spyOn(connectionCloseForTest(runtime), 'disconnectCurrent')
       .mockRejectedValueOnce(new Error('disconnect teardown failed'))
     const stale = runtime.createSession({
       cwd: '/workspace',
@@ -9040,12 +9088,7 @@ describe('ACP runtime session management', () => {
     await runtime.connect({ cwd: '/workspace' })
     const disposeSpy = vi.spyOn(acp.ActiveSession.prototype, 'dispose')
     const disconnectCurrentSpy = vi
-      .spyOn(
-        runtime as unknown as {
-          disconnectCurrent: (emitClosedStatus?: boolean) => Promise<AcpStateSnapshot>
-        },
-        'disconnectCurrent'
-      )
+      .spyOn(connectionCloseForTest(runtime), 'disconnectCurrent')
       .mockRejectedValueOnce(new Error('disconnect teardown failed'))
     const pending = runtime.createSession({ cwd: '/workspace' })
     await pendingModeStarted.promise
@@ -9094,9 +9137,7 @@ describe('ACP runtime session management', () => {
     await runtime.requestProviderReconnect()
 
     expect(process.killed).toBe(false)
-    expect(
-      (runtime as unknown as { pendingProviderReconnect: boolean }).pendingProviderReconnect
-    ).toBe(true)
+    expect(providerReconnectPending(runtime)).toBe(true)
 
     releasePendingMode.resolve()
     await expect(pending).resolves.toMatchObject({ sessionId: 'pending-primary' })
@@ -9171,9 +9212,7 @@ describe('ACP runtime session management', () => {
     try {
       await runtime.requestProviderReconnect()
 
-      expect(
-        (runtime as unknown as { pendingProviderReconnect: boolean }).pendingProviderReconnect
-      ).toBe(true)
+      expect(providerReconnectPending(runtime)).toBe(true)
       expect(pendingReviewerSessionIds(runtime).has('pending-reviewer')).toBe(true)
 
       releaseReviewerMode.resolve()
@@ -9232,9 +9271,7 @@ describe('ACP runtime session management', () => {
     expect(
       (runtime as unknown as { reconnectBarrier?: Promise<void> }).reconnectBarrier
     ).toBeUndefined()
-    expect(
-      (runtime as unknown as { pendingProviderReconnect: boolean }).pendingProviderReconnect
-    ).toBe(false)
+    expect(providerReconnectPending(runtime)).toBe(false)
     await expect(runtime.createSession({ cwd: '/workspace' })).resolves.toMatchObject({
       sessionId: 'fresh-primary'
     })
@@ -9314,18 +9351,14 @@ describe('ACP runtime session management', () => {
 
     try {
       await runtime.requestProviderReconnect()
-      expect(
-        (runtime as unknown as { pendingProviderReconnect: boolean }).pendingProviderReconnect
-      ).toBe(true)
+      expect(providerReconnectPending(runtime)).toBe(true)
       expect(
         (runtime as unknown as { reconnectBarrier?: Promise<void> }).reconnectBarrier
       ).toBeDefined()
 
       releaseOldClose.resolve()
       await oldDisconnect
-      expect(
-        (runtime as unknown as { pendingProviderReconnect: boolean }).pendingProviderReconnect
-      ).toBe(true)
+      expect(providerReconnectPending(runtime)).toBe(true)
       expect(
         (runtime as unknown as { reconnectBarrier?: Promise<void> }).reconnectBarrier
       ).toBeDefined()
@@ -9489,9 +9522,7 @@ describe('ACP runtime session management', () => {
     expect(
       (runtime as unknown as { reconnectBarrier?: Promise<void> }).reconnectBarrier
     ).toBeUndefined()
-    expect(
-      (runtime as unknown as { pendingProviderReconnect: boolean }).pendingProviderReconnect
-    ).toBe(false)
+    expect(providerReconnectPending(runtime)).toBe(false)
     expect(runtime.getSnapshot().sessionIds).toEqual([])
   })
 
@@ -9599,12 +9630,7 @@ describe('ACP runtime session management', () => {
       })
       await runtime.connect({ cwd: '/workspace' })
       const disconnectCurrentSpy = vi
-        .spyOn(
-          runtime as unknown as {
-            disconnectCurrent: (emitClosedStatus?: boolean) => Promise<AcpStateSnapshot>
-          },
-          'disconnectCurrent'
-        )
+        .spyOn(connectionCloseForTest(runtime), 'disconnectCurrent')
         .mockRejectedValueOnce(new Error('disconnect teardown failed'))
       const sessionId = '123e4567-e89b-42d3-a456-426614174000'
       const stale = runtime.resumeSession({
@@ -9694,9 +9720,7 @@ describe('ACP runtime session management', () => {
       (error: unknown) => ({ value: undefined, error })
     )
     await staleResumeStarted.promise
-    ;(
-      runtime as unknown as { invalidatePendingSessionStartups: () => void }
-    ).invalidatePendingSessionStartups()
+    invalidatePendingSessionStartupsForTest(runtime)
     const successor = await runtime.resumeSession({ sessionId, cwd: '/workspace' })
 
     try {
@@ -10072,9 +10096,9 @@ describe('ACP runtime session management', () => {
     const replacementConnection = createDeferred<unknown>()
     const internal = runtime as unknown as {
       connection: unknown
-      ensureConnected: (cwd: string) => Promise<unknown>
+      connectionLifecycle: { ensureConnected: (cwd: string) => Promise<unknown> }
     }
-    vi.spyOn(internal, 'ensureConnected').mockImplementationOnce(async () => {
+    vi.spyOn(internal.connectionLifecycle, 'ensureConnected').mockImplementationOnce(async () => {
       ensureConnectedStarted.resolve()
       return replacementConnection.promise
     })
@@ -11470,6 +11494,35 @@ describe('ACP runtime session management', () => {
     })
   })
 
+  it('publishes an explicit provenance prompt as the routed user message identity', async () => {
+    const process = new FakeAgentProcess()
+    startFakeAgent(process, ['session-1'])
+    const messageEvents: AcpRuntimeEvent[] = []
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      callbacks: {
+        onEvent: (event) => {
+          if (event.kind === 'message') messageEvents.push(event)
+        }
+      }
+    })
+    const session = await runtime.createSession({ cwd: '/workspace' })
+
+    await runtime.sendPrompt({
+      sessionId: session.sessionId,
+      text: '[Auditor] Correct the generated file.',
+      provenanceContext: { promptMessageId: 'auditor-prompt-1' }
+    })
+
+    expect(messageEvents.find((event) => event.role === 'user')).toMatchObject({
+      messageId: 'auditor-prompt-1',
+      promptMessageId: 'auditor-prompt-1',
+      text: '[Auditor] Correct the generated file.'
+    })
+  })
+
   it('retains staged Claude replay after failed adoption and commits it after success', async () => {
     const process = new FakeAgentProcess()
     const fakeAgent = startFakeAgent(
@@ -12648,9 +12701,7 @@ describe('ACP runtime session management', () => {
       counts: { phases: 1, delegations: 1, steps: 1, completed: 0, inProgress: 0 }
     } satisfies ActivePlanProjection
     const getProjection = vi.fn(async () => interruptedProjection)
-    Object.assign(runtime as unknown as { planService: unknown }, {
-      planService: { getProjection }
-    })
+    installPromptPlanTestWorkflow(runtime, { getProjection })
 
     await runtime.createSession({ cwd: '/workspace', projectName: 'project-1' })
     await expect(runtime.sendPrompt({ sessionId: 's1', text: 'run the plan' })).rejects.toThrow()
@@ -12718,13 +12769,10 @@ describe('ACP runtime session management', () => {
         counts: { phases: 1, delegations: 1, steps: 1, completed: 0, inProgress: 0 }
       } satisfies ActivePlanProjection
       const authorizeContinuation = vi.fn(async () => active)
-      Object.assign(runtime as unknown as { planService: unknown }, {
-        planSessions: durablePlanSessions(),
-        planService: {
-          authorizeContinuation,
-          checkTurnCompletion: vi.fn(async () => ({ allow: true })),
-          getProjection: vi.fn(async () => active)
-        }
+      installPromptPlanTestWorkflow(runtime, {
+        authorizeContinuation,
+        checkTurnCompletion: vi.fn(async () => ({ allow: true })),
+        getProjection: vi.fn(async () => active)
       })
 
       await runtime.createSession({ cwd: '/workspace', projectName: 'project-1' })
@@ -12765,10 +12813,11 @@ describe('ACP runtime session management', () => {
       framework: opencodeFramework
     })
     const active = restoredPlanProjection('approved', 4)
-    Object.assign(runtime as unknown as { planService: unknown }, {
-      planSessions: durablePlanSessions(['branch-b-root', 'branch-b-message']),
-      planService: { authorizeContinuation: vi.fn(async () => active) }
-    })
+    installPromptPlanTestWorkflow(
+      runtime,
+      { authorizeContinuation: vi.fn(async () => active) },
+      durablePlanSessions(['branch-b-root', 'branch-b-message'])
+    )
 
     await runtime.createSession({ cwd: '/workspace', projectName: 'project-1' })
     await expect(
@@ -12845,13 +12894,10 @@ describe('ACP runtime session management', () => {
         stepStates: { Analyze: { status: 'not_started' } },
         counts: { phases: 1, delegations: 1, steps: 1, completed: 0, inProgress: 0 }
       } satisfies ActivePlanProjection
-      Object.assign(runtime as unknown as { planService: unknown }, {
-        planSessions: durablePlanSessions(),
-        planService: {
-          authorizeContinuation: vi.fn(async () => authorized),
-          checkTurnCompletion,
-          getProjection
-        }
+      installPromptPlanTestWorkflow(runtime, {
+        authorizeContinuation: vi.fn(async () => authorized),
+        checkTurnCompletion,
+        getProjection
       })
 
       await runtime.createSession({ cwd: '/workspace', projectName: 'project-1' })
@@ -12890,8 +12936,9 @@ describe('ACP runtime session management', () => {
       allow: false,
       lifecycle: 'approved' as const
     }))
-    Object.assign(runtime as unknown as { planService: unknown }, {
-      planService: { checkTurnCompletion, getProjection: vi.fn(async () => null) }
+    installPromptPlanTestWorkflow(runtime, {
+      checkTurnCompletion,
+      getProjection: vi.fn(async () => null)
     })
 
     await runtime.createSession({ cwd: '/workspace', projectName: 'project-1' })
@@ -12924,9 +12971,7 @@ describe('ACP runtime session management', () => {
           lifecycle: 'interrupted'
         }) as ActivePlanProjection
     )
-    Object.assign(runtime as unknown as { planService: unknown }, {
-      planService: { checkTurnCompletion, getProjection }
-    })
+    installPromptPlanTestWorkflow(runtime, { checkTurnCompletion, getProjection })
 
     await runtime.createSession({ cwd: '/workspace', projectName: 'project-1' })
     await expect(
@@ -14353,15 +14398,19 @@ describe('ACP runtime session management', () => {
       const connectionReady = createDeferred()
       const releaseEnsureConnected = createDeferred()
       const internal = runtime as unknown as {
-        ensureConnected: (cwd: string) => Promise<unknown>
+        connectionLifecycle: { ensureConnected: (cwd: string) => Promise<unknown> }
       }
-      const ensureConnected = internal.ensureConnected.bind(runtime)
-      vi.spyOn(internal, 'ensureConnected').mockImplementationOnce(async (cwd) => {
-        const connection = await ensureConnected(cwd)
-        connectionReady.resolve()
-        await releaseEnsureConnected.promise
-        return connection
-      })
+      const ensureConnected = internal.connectionLifecycle.ensureConnected.bind(
+        internal.connectionLifecycle
+      )
+      vi.spyOn(internal.connectionLifecycle, 'ensureConnected').mockImplementationOnce(
+        async (cwd) => {
+          const connection = await ensureConnected(cwd)
+          connectionReady.resolve()
+          await releaseEnsureConnected.promise
+          return connection
+        }
+      )
 
       const pending =
         operation === 'context reset'
@@ -18940,10 +18989,7 @@ describe('ACP runtime — session-creation and spawn diagnostics', () => {
       }
     })
     // First disconnectCurrent (pre-connect teardown) succeeds; the catch-path cleanup then throws.
-    const disconnectSpy = vi.spyOn(
-      runtime as unknown as { disconnectCurrent: () => Promise<unknown> },
-      'disconnectCurrent'
-    )
+    const disconnectSpy = vi.spyOn(connectionCloseForTest(runtime), 'disconnectCurrent')
     disconnectSpy.mockResolvedValueOnce(runtime.getSnapshot())
     disconnectSpy.mockRejectedValueOnce(new Error('cleanup boom'))
 
@@ -19295,10 +19341,7 @@ describe('ACP runtime — failure-path robustness (errorMessage coercion + sync-
         env: {}
       })
     })
-    const disconnectSpy = vi.spyOn(
-      runtime as unknown as { disconnectCurrent: () => Promise<unknown> },
-      'disconnectCurrent'
-    )
+    const disconnectSpy = vi.spyOn(connectionCloseForTest(runtime), 'disconnectCurrent')
     errorLogSpy.mockImplementation(() => {
       throw new Error('logger boom')
     })
@@ -19821,7 +19864,7 @@ describe('Specialist Skill scoping', () => {
       version: 1,
       revision: 0
     }
-    const runtime = new AcpRuntime({
+    const owners = composeAcpRuntimeBaseOwners({
       appVersion: '0.1.0',
       defaultCwd: '/workspace',
       artifacts: {
@@ -19849,37 +19892,7 @@ describe('Specialist Skill scoping', () => {
         }
       }
     })
-    const internals = runtime as unknown as {
-      artifactTurns: {
-        open(request: {
-          appSessionId: string
-          artifactStorageSessionId: string
-          projectId: string
-          agentName: string
-        }): Promise<unknown>
-        dispose(handle: unknown): Promise<void>
-      }
-      planService: {
-        generate(input: {
-          projectId: string
-          sessionId: string
-          interactionId: string
-          content: {
-            task_summary: string
-            phases: Array<{
-              name: string
-              delegations: Array<{
-                name: string
-                steps: Array<{ title: string; description: string }>
-              }>
-            }>
-            desired_outputs: string[]
-            feasibility: { confidence: 'high'; rationale: string }
-          }
-        }): Promise<{ projection: { artifactVersionId: string } }>
-      }
-    }
-    const turn = await internals.artifactTurns.open({
+    const turn = await owners.artifactTurns!.open({
       appSessionId: 'session-1',
       artifactStorageSessionId: 'session-1',
       projectId: 'project-1',
@@ -19888,7 +19901,7 @@ describe('Specialist Skill scoping', () => {
 
     try {
       await expect(
-        internals.planService.generate({
+        owners.planService!.generate({
           projectId: 'project-1',
           sessionId: 'session-1',
           interactionId: 'interaction-1',
@@ -19911,7 +19924,7 @@ describe('Specialist Skill scoping', () => {
         })
       ).resolves.toMatchObject({ projection: { artifactVersionId: 'version-1' } })
     } finally {
-      await internals.artifactTurns.dispose(turn)
+      await owners.artifactTurns!.dispose(turn)
     }
   })
 })

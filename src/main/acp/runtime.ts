@@ -1,7 +1,7 @@
 import * as acp from '@agentclientprotocol/sdk'
 import type { ActiveSession, ClientConnection, PromptResponse } from '@agentclientprotocol/sdk'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
-import { join, resolve } from 'node:path'
+import { join } from 'node:path'
 
 import type {
   AcpCancelPromptRequest,
@@ -19,110 +19,90 @@ import type {
   AcpSetPermissionProfileRequest,
   AcpStateSnapshot
 } from '../../shared/acp'
-import { ACP_PROMPT_FAILED_EVENT_TITLE } from '../../shared/acp'
-import { type SessionPermissionProfileState } from '../../shared/permission-profiles'
 import { type AgentFrameworkId } from '../../shared/settings'
 import type { EffectiveSpecialistSkills } from '../../shared/specialist'
 import type { ResolvedReasoningEffort } from '../../shared/reasoning-effort'
 import type { ApprovedSwitchReadBack, ClaudeCodeReplayInput } from '../agents/claude-code-handoff'
 import {
-  claudeCodeFramework,
   type AgentFramework,
   type AgentModelChangeTarget,
   type ResolvedAgentBackend
 } from '../agent-framework'
 import { createLogger, diagnosticErrorFields, errorLogFields } from '../logger'
-import { AcpRuntimeSnapshotOwner } from './runtime-snapshot-owner'
+import type { AcpRuntimeSnapshotOwner } from './runtime-snapshot-owner'
 import { ConversationPermissionGrantStore } from './permission-broker'
-import { AcpPermissionContext, HUMAN_PERMISSION_ACTION_ORIGIN } from './permission-context'
+import { HUMAN_PERMISSION_ACTION_ORIGIN } from './permission-context'
+import type { AcpPermissionContext } from './permission-context'
 import { AgentMcpHttpHost } from './mcp-http-host'
 import { ArtifactRepository } from '../artifacts/repository'
 import { ArtifactRunRegistry } from '../artifacts/run-registry'
-import { NOTEBOOK_SYSTEM_PROMPT_APPEND, type NotebookRpcConnection } from '../notebook/mcp-server'
+import type { NotebookRpcConnection } from '../notebook/mcp-server'
 import type { NotebookHandoffContext } from '../notebook/runtime-service'
-import {
-  SKILL_IMPORT_SYSTEM_PROMPT_APPEND,
-  type SkillImportRpcConnection
-} from '../skills/mcp-server'
+import type { SkillImportRpcConnection } from '../skills/mcp-server'
 import { codexStorageDir, codexSubscriptionStorageDir } from '../agent-framework/codex'
 import { getAppClaudeConfigDir } from '../settings/provider-env'
 import type { PermissionGrantRegistry } from '../permission-grants/registry'
 import { withDataRootWrite } from '../storage/migration-state'
 import { opencodeStorageDir } from '../agent-framework/opencode'
-import { ContextUsageTracker } from './context-usage-tracker'
-import { AcpContextUsagePolicy } from './context-usage-policy'
-import { createManagedFileReferenceResolver } from './file-reference-resolver'
 import type { UploadRepository } from '../uploads/repository'
-import { DEFAULT_UPLOAD_PROJECT_NAME, type UploadedAttachment } from '../../shared/uploads'
+import type { UploadedAttachment } from '../../shared/uploads'
 import type { ArtifactFile, FileReference } from '../../shared/artifacts'
 import type { ArtifactRpcCapabilityBinding } from '../../shared/artifact-provenance'
 import type { AcpRuntimeActivity, AcpRuntimeActivityOptions } from './runtime-activity'
-import {
+import type { ContextUsageTracker } from './context-usage-tracker'
+import type {
   ReviewerSessionOwner,
-  type ReviewerSessionDisposition,
-  type ReviewerSessionRequest,
-  type ReviewerSessionResult
+  ReviewerSessionDisposition,
+  ReviewerSessionRequest,
+  ReviewerSessionResult
 } from './reviewer-session-owner'
-import {
-  AcpSessionCapabilityOwner,
-  CURRENT_PRIMARY_SESSION_CAPABILITY_POLICY
-} from './session-capability-owner'
-import { ArtifactTurnOwner, type ArtifactTurnHandle } from './artifact-turn-owner'
-import { AcpPromptContentOwner } from './prompt-content-owner'
-import {
-  AcpSessionInteractionOwner,
-  type AcpPromptSessionInteractionScope
-} from './session-interaction-owner'
-import {
-  AcpSessionRegistry,
-  type AcpPrimarySessionIdentityReservation,
-  type AcpPrimarySessionIdentityReservationResult
-} from './session-registry'
-import {
+import type { ArtifactTurnOwner } from './artifact-turn-owner'
+import type { AcpSessionInteractionOwner } from './session-interaction-owner'
+import type { AcpSessionRegistry } from './session-registry'
+import type {
   AcpConnectionResourceOwner,
-  type AcpConnectionResourceAttempt
+  AcpConnectionResourceAttempt
 } from './connection-resource-owner'
 import {
   AcpAgentConnectionAdapter,
   type AcpAgentConnectionCandidate,
   type AcpAgentConnectionHooks
 } from './agent-connection-adapter'
-import { AcpConnectionTransitionOwner } from './connection-transition-owner'
-import { AcpGenerationActivityOwner } from './generation-activity-owner'
-import { AcpHandoffContinuityOwner } from './handoff-continuity-owner'
-import {
-  AcpBackendGenerationOwner,
-  type AcpBackendGenerationView
-} from './backend-generation-owner'
-import { AcpSessionConfigurator } from './session-configurator'
-import { AcpSessionUpdateProjector } from './session-update-projector'
-import { AcpConnectionLifecycleWorkflow } from './connection-lifecycle-workflow'
-import { AcpConnectionCloseWorkflow, type CloseState } from './connection-close-workflow'
-import { AcpModelChangeWorkflow } from './model-change-workflow'
-import { AcpProviderSessionCreator } from './provider-session-creator'
-import { AcpProviderSessionAdopter } from './provider-session-adopter'
-import { AcpProviderSessionResumer } from './provider-session-resumer'
-import { AcpSessionReplacementWorkflow } from './session-replacement-workflow'
-import { AcpSessionDeletionWorkflow } from './session-deletion-workflow'
-import { AcpPromptPreparationOwner } from './prompt-preparation-owner'
-import { AcpPromptTurnWorkflow, type AcpPromptTurnPlanContext } from './prompt-turn-workflow'
-import { AcpContextCompactionWorkflow } from './context-compaction-workflow'
-import { AcpSessionPresentationPolicy } from './session-presentation-policy'
-import { AcpProviderPromptExecutor } from './provider-prompt-executor'
-import { AcpPromptOutcomeFinalizer } from './prompt-outcome-finalizer'
-import { AcpTurnSkillOwner, type AcpTurnSkillHooks } from './turn-skill-owner'
-import { createProductionPlanService } from '../session-plan/production-plan-service'
-import { SessionPlanInteractionOwner } from '../session-plan/session-plan-interaction-owner'
-import { SESSION_PLAN_SYSTEM_PROMPT_APPEND } from '../session-plan/guidance'
-import type { PlanResponseResult, PlanService } from '../session-plan/plan-service'
+import type { AcpConnectionTransitionOwner } from './connection-transition-owner'
+import type { AcpGenerationActivityOwner } from './generation-activity-owner'
+import type { AcpHandoffContinuityOwner } from './handoff-continuity-owner'
 import type {
-  ActivePlanProjection,
-  GeneratePlanContent,
-  PlanResponseCommand
-} from '../../shared/session-plan/contract'
-import { PlanCommandError } from '../../shared/session-plan/contract'
-import type { SessionPlanStepStatus } from '../../shared/session-persistence'
+  AcpBackendGenerationOwner,
+  AcpBackendGenerationView
+} from './backend-generation-owner'
+import type { AcpSessionConfigurator } from './session-configurator'
+import type { AcpSessionUpdateProjector } from './session-update-projector'
+import type { AcpConnectionLifecycleWorkflow } from './connection-lifecycle-workflow'
+import type { AcpConnectionCloseWorkflow } from './connection-close-workflow'
+import type { AcpModelChangeWorkflow } from './model-change-workflow'
+import type { AcpProviderSessionCreator } from './provider-session-creator'
+import type { AcpProviderSessionResumer } from './provider-session-resumer'
+import type { AcpSessionReplacementWorkflow } from './session-replacement-workflow'
+import type { AcpSessionDeletionWorkflow } from './session-deletion-workflow'
+import type { AcpPromptTurnWorkflow } from './prompt-turn-workflow'
+import type { AcpContextCompactionWorkflow } from './context-compaction-workflow'
+import type { AcpProviderPromptExecutor } from './provider-prompt-executor'
+import type { AcpTurnSkillHooks, AcpTurnSkillOwner } from './turn-skill-owner'
+import type { PlanResponseResult } from '../session-plan/plan-service'
+import type { ActivePlanProjection, PlanResponseCommand } from '../../shared/session-plan/contract'
 import type { SessionPersistenceCoordinator } from '../session-persistence/coordinator'
+import type { AcpRuntimeBaseOwners } from './runtime-base-composition'
+import type { AcpRuntimePublicationOwner } from './runtime-publication-owner'
+import type { AcpRuntimeSessionOwners } from './runtime-session-composition'
+import type { AcpSessionEnvironmentPolicy } from './session-environment-policy'
+import { composeAcpRuntimeLifecycleOwners } from './runtime-lifecycle-composition'
+import { composeAcpRuntimeProviderSessionOwners } from './runtime-provider-session-composition'
+import { composeAcpRuntimePromptOwners } from './runtime-prompt-composition'
+import {
+  composeAcpRuntimePlanWorkflow,
+  type AcpRuntimePlanWorkflow,
+  type AcpSessionPlanCall
+} from './runtime-plan-composition'
 
 export type AcpRuntimeCallbacks = {
   onStateChanged?: (state: AcpStateSnapshot) => void
@@ -279,40 +259,6 @@ type AcpRuntimePlanOptions = {
     | 'containsMessageOnActiveBranch'
   >
 }
-// An end_turn is final from the runtime's perspective, so promised work must be a tool call in the
-// current turn or an explicit request for user input rather than text that implies later execution.
-const TURN_CONTINUITY_SYSTEM_PROMPT_APPEND = [
-  '<open_science_turn_continuity_instructions>',
-  'Do not describe a tool-backed action as future work and then end the turn. If you say you will download, install, run, edit, analyze, or otherwise perform an action that needs a tool, issue the corresponding tool call in this same turn.',
-  'If a required tool cannot be used or its operation fails, do not promise another attempt. Clearly state that the turn has stopped, what prevented progress, and what the user can do next.',
-  '</open_science_turn_continuity_instructions>'
-].join('\n')
-// Appends artifact tool guidance as system prompt metadata so user prompts stay untouched.
-const ARTIFACT_FILE_SYSTEM_PROMPT_APPEND = [
-  '<open_science_artifact_instructions>',
-  'When this turn creates or saves local user-facing files such as images, documents, reports, data exports, XML, SVG, HTML, CSV, PDF, or archives, you MUST save them through the MCP tool `write_artifact_file` from the `open-science-artifacts` server.',
-  'Do not save generated user-facing files directly into the workspace or current directory unless the user explicitly asks to modify project files.',
-  'Pass the filename, MIME type, and either inline content or a local source path to `write_artifact_file`; the app assigns the project, session, Artifact run, and final message location.',
-  'If a Notebook, REPL, or shell execution produced the file, also pass `producerRunId` with the exact `runId` returned by the execution that created or last modified it. Omit `producerRunId` only when no Notebook execution produced the file; never use the Artifact run ID as the producer.',
-  'Only claim a generated file is available after `write_artifact_file` succeeds. If it fails or is denied, state that the local file may exist but was not saved as an Artifact, and do not present it as downloadable.',
-  'After using the tool, mention the generated filename rather than an absolute filesystem path. The app will display the generated file list below your message.',
-  'Never write files inside a skill directory — loaded skills are read-only; route any file a skill generates through `write_artifact_file`.',
-  '</open_science_artifact_instructions>'
-].join('\n')
-
-// Steers the agent away from reading large attached data files in their entirety, since a single big
-// read (esp. under frameworks whose read/bash tools do not hard-cap output) can exceed the provider's
-// request-size limit and break the conversation. Framework-neutral: Claude carries it in the system
-// prompt preset, opencode as a prompt prefix.
-const LARGE_DATA_FILE_SYSTEM_PROMPT_APPEND = [
-  '<open_science_large_file_instructions>',
-  'Large attached data files (CSV, TSV, TXT, JSON, FASTA/FASTQ, VCF, and similar tabular or text data) are provided as a file reference plus a short preview, not as full inline content.',
-  'Never read, cat, or print such a file in its entirety — a single large read can exceed the request-size limit and break the conversation.',
-  'Inspect structure first (columns, row count, a few sample rows), then read only the specific line ranges, rows, or columns you need.',
-  'To analyze, filter, or aggregate over a large file, load it in the notebook (e.g. pandas) and compute there instead of reading its contents into the conversation.',
-  '</open_science_large_file_instructions>'
-].join('\n')
-
 // Converts unknown thrown values into user-visible error text. Total AND always returns a string: a
 // hostile message getter or a throwing String() coercion (e.g. a Proxy-wrapped Error) must not escape,
 // and a non-string message (object/bigint/Symbol/undefined) must be coerced — this text flows into the
@@ -325,21 +271,6 @@ const errorMessage = (error: unknown): string => {
     return typeof raw === 'string' ? raw : String(raw)
   } catch {
     return 'unknown error'
-  }
-}
-
-// The ACP agent tags a provider-relayed failure with the upstream error type in `data.errorKind`
-// (e.g. `request_too_large` for an HTTP 413). Read it so the overflow check can match the slug even
-// when the message text comes in a wording the pattern does not cover. Total: any shape but a string
-// kind collapses to undefined, and a hostile getter never escapes.
-const acpErrorKind = (error: unknown): string | undefined => {
-  try {
-    const data = (error as { data?: unknown } | null)?.data
-    const kind = (data as { errorKind?: unknown } | null | undefined)?.errorKind
-
-    return typeof kind === 'string' ? kind : undefined
-  } catch {
-    return undefined
   }
 }
 
@@ -359,9 +290,7 @@ const safeLogError = (message: string, data?: unknown): void => {
 // Runtime retains protocol startup, Session/Permission/Notebook cleanup, and status/event projection.
 class AcpRuntime {
   private readonly snapshotOwner: AcpRuntimeSnapshotOwner
-  private readonly contextUsageTracker: ContextUsageTracker
-  private readonly contextUsagePolicy: AcpContextUsagePolicy
-  private readonly connectionAdapter = new AcpAgentConnectionAdapter()
+  private readonly connectionAdapter: AcpAgentConnectionAdapter
   private readonly connectionResources: AcpConnectionResourceOwner
   private readonly connectionTransitions: AcpConnectionTransitionOwner
   private readonly generationActivity: AcpGenerationActivityOwner
@@ -370,587 +299,87 @@ class AcpRuntime {
   private readonly sessionRegistry: AcpSessionRegistry
   // App-owned MCP construction, routing aliases, and bearer lease ownership are kept behind one
   // explicit role policy. Connection/process lifetime remains with the connection resource owner.
-  private readonly sessionCapabilities: AcpSessionCapabilityOwner
   private readonly sessionInteractions: AcpSessionInteractionOwner
   // Ephemeral Reviewer identity, isolation, permission, and resource state lives behind one owner.
   private readonly reviewerSessions: ReviewerSessionOwner
   private readonly turnSkills: AcpTurnSkillOwner
-  private readonly handoffContinuity = new AcpHandoffContinuityOwner()
+  private readonly handoffContinuity: AcpHandoffContinuityOwner
   private readonly permissionContext: AcpPermissionContext
-  private readonly callbacks: AcpRuntimeCallbacks
+  private readonly publication: AcpRuntimePublicationOwner
+  private readonly sessionEnvironment: AcpSessionEnvironmentPolicy
   private readonly spawnAgent: (() => ChildProcessWithoutNullStreams) | undefined
   private readonly backendGeneration: AcpBackendGenerationOwner
   private readonly sessionConfigurator: AcpSessionConfigurator
   private readonly sessionUpdateProjector: AcpSessionUpdateProjector
   private readonly providerPromptExecutor: AcpProviderPromptExecutor
-  // Injectable lifecycle timers (defaults to real setTimeout/clearTimeout).
-  private readonly setTimer: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>
-  private readonly clearTimer: (handle: ReturnType<typeof setTimeout>) => void
   private readonly artifactOptions: AcpRuntimeArtifactOptions | undefined
-  private readonly artifactRepository: ArtifactRepository | undefined
-  private readonly artifactRunRegistry: ArtifactRunRegistry | undefined
   private readonly artifactTurns: ArtifactTurnOwner | undefined
-  private readonly planInteractions = new SessionPlanInteractionOwner()
-  private readonly planService: PlanService | undefined
-  private readonly planSessions: AcpRuntimePlanOptions['sessions'] | undefined
-  private readonly promptContentOwner: AcpPromptContentOwner
-  private readonly promptPreparation: AcpPromptPreparationOwner
+  private readonly sessionPlanWorkflow: AcpRuntimePlanWorkflow
   private readonly contextCompactionWorkflow: AcpContextCompactionWorkflow
   private readonly promptTurnWorkflow: AcpPromptTurnWorkflow
   private readonly connectionClose: AcpConnectionCloseWorkflow
   private readonly connectionLifecycle: AcpConnectionLifecycleWorkflow
   private readonly modelChanges: AcpModelChangeWorkflow
   private readonly providerSessionCreator: AcpProviderSessionCreator
-  private readonly providerSessionAdopter: AcpProviderSessionAdopter
   private readonly providerSessionResumer: AcpProviderSessionResumer
   private readonly sessionReplacement: AcpSessionReplacementWorkflow
   private readonly sessionDeletion: AcpSessionDeletionWorkflow
 
   // Wires runtime dependencies and forwards permission prompts into the event stream.
-  constructor(private readonly options: AcpRuntimeOptions) {
-    this.snapshotOwner = new AcpRuntimeSnapshotOwner(resolve(options.defaultCwd))
-    this.callbacks = options.callbacks ?? {}
-    this.connectionResources = new AcpConnectionResourceOwner({
-      closeMcpHost: async () => {
-        await options.mcpHttpHost?.close()
-      }
-    })
-    this.generationActivity = new AcpGenerationActivityOwner({
-      activityChanged: () => this.generationActivityChanged(),
-      hasActivePrompts: () => this.sessionInteractions.snapshot().length > 0,
-      hasActiveReviewerSessions: () => this.reviewerSessions.hasActiveSessions()
-    })
-    this.connectionTransitions = new AcpConnectionTransitionOwner({
-      blockers: () => this.generationActivity.blockers(),
-      connectionGeneration: () => this.connectionGeneration,
-      disconnect: (emitClosedStatus) => this.disconnect(emitClosedStatus),
-      onRetired: () => this.callbacks.onRetired?.(),
-      publishIdle: () => this.setStatus('idle'),
-      recoverFailedDeferredDisconnect: () => this.connectionClose.recoverFailedDeferredDisconnect(),
-      reportFailure: (message, error) => safeLogError(message, errorLogFields(error))
-    })
-    this.turnSkills = new AcpTurnSkillOwner({
-      resolveSpecialistSkills: options.resolveSpecialistSkills,
-      skills: options.skills,
-      requestSkillsReload: () => this.connectionTransitions.requestSkillsReload()
-    })
+  constructor(
+    private readonly options: AcpRuntimeOptions,
+    base: AcpRuntimeBaseOwners,
+    session: AcpRuntimeSessionOwners
+  ) {
     this.spawnAgent = options.spawnAgent
-    this.backendGeneration = new AcpBackendGenerationOwner(options.framework ?? claudeCodeFramework)
-    this.providerPromptExecutor = new AcpProviderPromptExecutor({
-      backendGeneration: this.backendGeneration,
-      opencodeUsageFetch: options.opencodeUsageFetch
-    })
-    this.sessionConfigurator = new AcpSessionConfigurator({
-      assertCurrentConnection: (connection) => this.assertCurrentConnectedConnection(connection),
-      diagnosticContext: (backend) => this.diagnosticContext(backend.framework.id)
-    })
-    this.contextUsageTracker = options.contextUsageTracker ?? new ContextUsageTracker()
-    this.setTimer = options.setTimer ?? ((fn, ms) => setTimeout(fn, ms))
-    this.clearTimer = options.clearTimer ?? ((handle) => clearTimeout(handle))
-    this.sessionInteractions = new AcpSessionInteractionOwner({
-      cancelTimeoutMs: options.cancelTimeoutMs,
-      setTimer: this.setTimer,
-      clearTimer: this.clearTimer
-    })
     this.artifactOptions = options.artifacts
-    this.sessionCapabilities = new AcpSessionCapabilityOwner({
-      artifacts: options.artifacts,
-      notebook: options.notebook,
-      skillImport: options.skillImport,
-      plan: options.plan,
-      mcpHttpHost: options.mcpHttpHost
-    })
-    this.artifactRepository = options.artifacts
-      ? (options.artifacts.repository ?? new ArtifactRepository(options.artifacts.dataRoot))
-      : undefined
-    this.artifactRunRegistry = options.artifacts
-      ? (options.artifacts.runRegistry ?? new ArtifactRunRegistry())
-      : undefined
-    this.artifactTurns =
-      options.artifacts && this.artifactRepository && this.artifactRunRegistry
-        ? new ArtifactTurnOwner({
-            dataRoot: options.artifacts.dataRoot,
-            repository: this.artifactRepository,
-            runRegistry: this.artifactRunRegistry,
-            issueRpcCapability: options.artifacts.issueRpcCapability,
-            revokeRpcCapability: options.artifacts.revokeRpcCapability,
-            provenance: options.artifacts.provenance,
-            ...(options.notebook
-              ? {
-                  notebook: {
-                    setArtifactProvenanceContext: options.notebook.setArtifactProvenanceContext
-                  }
-                }
-              : {})
-          })
-        : undefined
-    this.planSessions = options.plan?.sessions
-    this.planService =
-      options.plan && this.artifactTurns && options.artifacts?.provenance?.resolveVersionContent
-        ? createProductionPlanService({
-            interactions: this.planInteractions,
-            artifactTurns: this.artifactTurns,
-            provenance: {
-              resolveVersionContent: (request) =>
-                options.artifacts!.provenance!.resolveVersionContent!(request)
-            },
-            sessions: options.plan.sessions
-          })
-        : undefined
-    const uploadRepository = options.uploads?.repository
-    const fileReferenceResolver = createManagedFileReferenceResolver({
-      uploads: uploadRepository,
-      artifacts: this.artifactRepository,
-      artifactVersions: options.artifacts?.provenance
-    })
-    this.promptContentOwner = new AcpPromptContentOwner({
-      uploadRepository,
-      fileReferenceResolver,
-      inlineImageBudgetBytes: options.inlineImageBudgetBytes
-    })
-    this.promptPreparation = new AcpPromptPreparationOwner({
-      promptContent: this.promptContentOwner,
-      presentation: new AcpSessionPresentationPolicy(),
-      contextUsage: this.contextUsageTracker,
-      selectBridgeSkills: async (text, catalog, signal) =>
-        (await this.connectionResources.selectBridgeSkills(text, catalog, signal)) ?? [],
-      authorizeReferencedUploads: options.skillImport?.authorizeReferencedUploads,
-      ...(options.notebook
-        ? {
-            notebook: {
-              peekHandoffContext: options.notebook.peekHandoffContext,
-              registerTurnInputs: options.notebook.registerTurnInputs
-            }
-          }
-        : {}),
-      emitState: () => this.emitState()
-    })
-    this.sessionRegistry = new AcpSessionRegistry({
-      addStartupBlocker: (token) => this.generationActivity.acquireStartup(token),
-      foreignIdentityCollision: (sessionIds) => {
-        const pendingReviewerCollision = sessionIds.find((sessionId) =>
-          this.reviewerSessions.hasPendingSessionId(sessionId)
-        )
-        if (pendingReviewerCollision) {
-          return new Error(
-            `Primary session id collision with pending reviewer: ${pendingReviewerCollision}`
-          )
-        }
-        const activeReviewerCollision = sessionIds.find((sessionId) =>
-          this.reviewerSessions.hasActiveSessionId(sessionId)
-        )
-        return activeReviewerCollision
-          ? new Error(`Primary session id collision with reviewer: ${activeReviewerCollision}`)
-          : undefined
-      },
-      removeStartupBlocker: (token) => this.generationActivity.releaseStartup(token)
-    })
-    this.contextUsagePolicy = new AcpContextUsagePolicy({
-      backend: () => this.backend,
-      appliedModel: (sessionId) =>
-        this.sessionRegistry.lookup(sessionId)?.aggregate.snapshot().appliedModel,
-      systemPromptAppends: () => this.getSystemPromptAppends(),
-      tooling: () => this.currentCapabilityAvailability()
-    })
-    this.sessionUpdateProjector = new AcpSessionUpdateProjector({
-      registry: this.sessionRegistry,
-      contextUsage: this.contextUsageTracker,
-      contextPolicy: this.contextUsagePolicy,
-      hasActiveSession: (sessionId) => this.activeSessionFor(sessionId) !== undefined,
-      currentFramework: () => this.framework.id,
-      reconnectPending: () => this.pendingProviderReconnect,
-      mcpServerNamesFor: (sessionId) => this.sessionCapabilities.mcpServerNamesFor(sessionId),
-      nextEventId: () => this.nextEventId(),
-      emitState: () => this.emitState(),
-      pushEvent: (event) => this.pushEvent(event),
-      reportToolFailure: (effect) =>
-        log.warn('tool call failed', {
-          tool: effect.tool,
-          toolCallId: effect.toolCallId,
-          sessionId: effect.sessionId,
-          reason: effect.reason
-        })
-    })
-    this.permissionContext = new AcpPermissionContext({
-      emitPermissionRequest: (request) => {
-        this.pushEvent({
-          kind: 'permission',
-          level: 'warning',
-          sessionId: request.sessionId,
-          toolCallId: request.toolCallId,
-          title: 'Permission requested',
-          text: request.title,
-          raw: request
-        })
-        this.callbacks.onPermissionRequest?.(request)
-        this.emitState()
-      },
-      routing: {
-        resolveAppSessionId: (sessionId) => this.sessionRegistry.resolveAppSessionId(sessionId),
-        sessionSnapshot: (sessionId) => {
-          const snapshot = this.sessionRegistry.lookup(sessionId)?.aggregate.snapshot()
-          return snapshot
-            ? {
-                cwd: snapshot.cwd,
-                frameworkId: snapshot.frameworkId,
-                permissionProfile: snapshot.permissionProfile
-              }
-            : undefined
-        },
-        hasActivePrimarySession: (sessionId) => this.activeSessionFor(sessionId) !== undefined,
-        capturePrompt: (sessionId) => {
-          const scope = this.currentPromptInteraction(sessionId)
-          return scope
-            ? {
-                sequence: scope.sequence,
-                isCancellationAccepted: () => this.sessionInteractions.isCancellationAccepted(scope)
-              }
-            : undefined
-        },
-        currentInteractionSequence: (sessionId) =>
-          this.sessionInteractions.current(sessionId)?.sequence,
-        mcpServerNamesFor: (sessionId) => this.sessionCapabilities.mcpServerNamesFor(sessionId),
-        reviewerContextFor: (sessionId) => this.reviewerSessions.contextFor(sessionId),
-        resolveReviewerPermission: (request) => this.reviewerSessions.resolvePermission(request),
-        currentFramework: () => this.framework,
-        resolveProjectId: (sessionId) => this.resolveSessionProjectName(sessionId)
-      },
-      conversationGrants: options.permissionGrantStore,
-      permissionGrantRegistry: options.permissionGrantRegistry,
-      setTimer: this.setTimer,
-      clearTimer: this.clearTimer,
-      onOpenCodeWaitTimeout: ({ sessionId, toolCallId, waitMs }) => {
-        log.warn('OpenCode permission context wait timed out', { sessionId, toolCallId, waitMs })
+    this.snapshotOwner = base.snapshotOwner
+    this.connectionAdapter = base.connectionAdapter
+    this.connectionResources = base.connectionResources
+    this.backendGeneration = base.backendGeneration
+    this.providerPromptExecutor = base.providerPromptExecutor
+    this.sessionInteractions = base.sessionInteractions
+    this.artifactTurns = base.artifactTurns
+    this.handoffContinuity = base.handoffContinuity
+    this.generationActivity = base.generationActivity
+    this.connectionTransitions = base.connectionTransitions
+    this.turnSkills = base.turnSkills
+    this.sessionConfigurator = base.sessionConfigurator
+    this.sessionRegistry = session.sessionRegistry
+    this.sessionEnvironment = session.sessionEnvironment
+    this.publication = session.publication
+    this.permissionContext = session.permissionContext
+    this.reviewerSessions = session.reviewerSessions
+    this.sessionUpdateProjector = session.sessionUpdateProjector
+    this.sessionPlanWorkflow = composeAcpRuntimePlanWorkflow(options, base, session)
+    const prompt = composeAcpRuntimePromptOwners(options, base, session, {
+      plan: this.sessionPlanWorkflow.prompt,
+      reload: {
+        disconnect: () => this.disconnect(false),
+        resume: (request) => this.resumeSession(request)
       }
     })
-    this.reviewerSessions = new ReviewerSessionOwner({
-      addStartupBlocker: (token) => this.generationActivity.acquireStartup(token),
-      assertCurrentConnection: (connection) => this.assertCurrentConnectedConnection(connection),
-      clearPermissionCorrelations: (sessionId) =>
-        this.permissionContext.clearCorrelationsForSession(sessionId),
-      currentSessionSetup: () => ({
-        framework: this.framework,
-        sessionOptions: this.backend.session.options
-      }),
-      currentStartupGeneration: () => this.sessionRegistry.startupGeneration,
-      ensureConnected: (cwd) => this.ensureConnected(cwd),
-      isPrimarySessionIdClaimed: (sessionId) => this.sessionRegistry.isIdentityClaimed(sessionId),
-      onActiveSessionReleased: () => this.generationActivityChanged(),
-      registerBridgeSession: (sessionId) =>
-        this.connectionResources.registerBridgeReviewerSession(sessionId),
-      removeStartupBlocker: (token) => this.generationActivity.releaseStartup(token),
-      unregisterBridgeSession: (sessionId) =>
-        this.connectionResources.unregisterBridgeReviewerSession(sessionId)
-    })
-    this.contextCompactionWorkflow = new AcpContextCompactionWorkflow({
-      sessions: {
-        activeSession: (sessionId) => this.activeSessionFor(sessionId),
-        currentFramework: () => this.framework
-      },
-      interactions: this.sessionInteractions,
-      context: this.contextUsageTracker,
-      promptContent: this.promptContentOwner,
-      contextEstimateInput: (sessionId) => this.contextUsagePolicy.resolve(sessionId).estimateInput,
-      selectedContextWindow: (sessionId) =>
-        this.contextUsagePolicy.resolve(sessionId).selectedWindow,
-      routeHiddenNotification: (notification, sessionId) =>
-        this.sessionUpdateProjector.route(notification, {
-          appSessionId: sessionId,
-          visible: false,
-          emitState: () => {
-            try {
-              this.emitState()
-            } catch (error) {
-              safeLogError('compaction state callback failed', errorLogFields(error))
-            }
-          }
-        }),
-      pushEvent: (event) => this.pushEvent(event),
-      emitState: () => this.emitState(),
-      errorMessage
-    })
-    this.promptTurnWorkflow = new AcpPromptTurnWorkflow({
-      registry: this.sessionRegistry,
-      interactions: this.sessionInteractions,
-      skills: this.turnSkills,
-      preparation: this.promptPreparation,
-      executor: this.providerPromptExecutor,
-      contextUsage: this.contextUsageTracker,
-      providerReconnectPending: () => this.pendingProviderReconnect,
-      finalizer: new AcpPromptOutcomeFinalizer(),
-      permission: this.permissionContext,
-      environment: {
-        backend: () => this.backend,
-        tooling: () => this.currentCapabilityAvailability(),
-        bridgeSkillsAvailable: () => this.connectionResources.bridgeSkillsAvailable,
-        skillImportEnabled: () => this.sessionCapabilities.isSkillImportEnabled(),
-        contextEstimateInput: (sessionId) =>
-          this.contextUsagePolicy.resolve(sessionId).estimateInput,
-        selectedContextWindow: (sessionId) =>
-          this.contextUsagePolicy.resolve(sessionId).selectedWindow,
-        emitSkillActivities: (sessionId, turn, inputs, status) =>
-          this.emitCodexSkillInputActivities(sessionId, turn, inputs, status),
-        onSkillImportAttachmentEligible: this.callbacks.onSkillImportAttachmentEligible,
-        onProviderPromptAccepted: this.callbacks.onProviderPromptAccepted,
-        routeNotification: (notification, sessionId) =>
-          this.sessionUpdateProjector.route(notification, { appSessionId: sessionId }),
-        diagnosticContext: () => this.diagnosticContext(),
-        pushUserMessage: ({ sessionId, promptMessageId, text }) =>
-          this.pushEvent({
-            kind: 'message',
-            level: 'info',
-            sessionId,
-            ...(promptMessageId ? { promptMessageId } : {}),
-            role: 'user',
-            text
-          })
-      },
-      artifacts: {
-        open: (sessionId, provenance) => this.activateArtifactRun(sessionId, provenance),
-        promptMessageIdFor: (sessionId) => this.artifactTurns?.promptMessageIdFor(sessionId),
-        publish: (sessionId, artifact, onPublished) =>
-          this.emitArtifactRunEvent(sessionId, artifact, onPublished),
-        dispose: (artifact) => this.clearArtifactRun(artifact)
-      },
-      planLifecycle: {
-        beforeStop: (sessionId, interaction, response) =>
-          this.checkPromptPlanCompletion(sessionId, interaction, response),
-        beforeRelease: (sessionId, interaction) =>
-          this.releasePromptPlanBinding(sessionId, interaction),
-        afterRelease: (sessionId) => this.publishTerminalPlanProjection(sessionId)
-      },
-      finalization: {
-        errorMessage,
-        errorKind: acpErrorKind,
-        pushEvent: (event) => this.pushEvent(event),
-        onPromptEnded: (sessionId, turnToken) =>
-          this.callbacks.onPromptEnded?.(sessionId, turnToken),
-        generationActivityChanged: () => this.generationActivityChanged(),
-        autoCompact: (sessionId, session, interaction) =>
-          this.contextCompactionWorkflow.compactAutomatic({ sessionId, session, interaction })
-      },
-      currentCwd: () => this.snapshotOwner.cwd,
-      resolveProjectName: (sessionId) => this.resolveSessionProjectName(sessionId),
-      preflightPlan: (request) => this.preflightPromptPlan(request),
-      admitPlan: (request, interaction, plan) => this.admitPromptPlan(request, interaction, plan),
-      disconnectForReload: () => this.disconnect(false),
-      resumeAfterReload: (request) => this.resumeSession(request),
-      recordAdmittedPrompt: (request) => this.handoffContinuity.recordAdmittedPrompt(request),
-      onPromptStarted: (sessionId, turnToken, promptAttemptId) =>
-        this.callbacks.onPromptStarted?.(sessionId, turnToken, promptAttemptId),
-      emitState: () => this.emitState()
-    })
-    const closeState: CloseState = {
-      invalidatePendingSessionStartups: () => this.invalidatePendingSessionStartups(),
-      disposePermissionContext: () => this.permissionContext.dispose(),
-      clearReviewerState: () => this.reviewerSessions.clear(),
-      clearPlanInteractions: () =>
-        this.planInteractions.clearAll('The Session Plan interaction was disconnected.'),
-      settleActivePrompts: () => this.sessionInteractions.settleActivePrompts(),
-      supersedeInteractions: () => this.sessionInteractions.supersedeAll(),
-      clearContextUsage: () => this.contextUsageTracker.clear(),
-      clearAppliedSessionModels: () => this.clearAppliedSessionModels(),
-      activeSessionIds: () => this.activeSessionIds(),
-      disposeSessionCapabilities: (sessionIds) => this.sessionCapabilities.dispose(sessionIds),
-      disposeActiveSessions: (recordFailure) => {
-        for (const session of this.activeSessions()) {
-          try {
-            session.dispose()
-          } catch (error) {
-            recordFailure('primary-session', error)
-          }
-        }
-      },
-      detachSessionConnections: (clearPermissionProfile) => {
-        for (const entry of this.sessionRegistry.entries()) {
-          if (entry.attachment) this.sessionRegistry.detach(entry.attachment, 'connection')
-          else entry.aggregate.detachConnection()
-          if (clearPermissionProfile) entry.aggregate.setPermissionProfile(undefined)
-        }
-      },
-      clearPromptContent: () => this.promptContentOwner.clear(),
-      clearHandoffContinuity: () => this.handoffContinuity.clearGeneration(),
-      clearSessionProjection: () => this.sessionUpdateProjector.clearGeneration(),
-      disposeSessionProjection: () => this.sessionUpdateProjector.dispose(),
-      clearHttpRoutes: () => this.sessionCapabilities.clearHttpRoutes(),
-      selectSession: () => this.sessionRegistry.select(undefined),
-      publishInterruptedPromptFailures: (prompts) => {
-        for (const { scope, terminal } of prompts as ReturnType<
-          AcpSessionInteractionOwner['settleActivePrompts']
-        >) {
-          try {
-            this.pushEvent({
-              kind: 'error',
-              level: 'error',
-              providerError: false,
-              sessionId: scope.sessionId,
-              ...(scope.promptMessageId ? { promptMessageId: scope.promptMessageId } : {}),
-              timestamp: terminal.timestamp,
-              title: ACP_PROMPT_FAILED_EVENT_TITLE,
-              text: 'ACP connection closed'
-            })
-          } catch (error) {
-            safeLogError('connection-close prompt event failed', errorLogFields(error))
-          }
-        }
-      },
-      setStatus: (status) => this.setStatus(status),
-      transitionStatus: (status) => this.snapshotOwner.transitionStatus(status),
-      emitState: () => this.emitState(),
-      hasContextUsage: () => this.contextUsageTracker.hasUsage()
-    }
-    this.modelChanges = new AcpModelChangeWorkflow({
-      backendGeneration: this.backendGeneration,
-      connectionResources: this.connectionResources,
-      registry: this.sessionRegistry,
-      configurator: this.sessionConfigurator,
-      contextUsage: this.contextUsageTracker,
-      currentStatus: () => this.snapshotOwner.status,
-      providerReconnectPending: () => this.pendingProviderReconnect,
-      isGenerationBusy: () => this.generationActivity.blockers().retirement,
-      contextEstimateInput: (sessionId) => this.contextUsagePolicy.resolve(sessionId).estimateInput,
-      emitState: () => this.emitState(),
-      // Model-change fallback already owns its drain. Calling the close workflow here would ask the
-      // same drain to await itself, so arm the authoritative transition directly.
-      requestReconnect: () => this.connectionTransitions.requestProviderReconnect(),
-      recoverFailedReconnect: () => this.connectionClose.recoverFailedDeferredDisconnect(),
-      reportReconnectFailure: (error) =>
-        safeLogError('model-change reconnect failed', errorLogFields(error)),
-      diagnosticContext: () => this.diagnosticContext()
-    })
-    this.connectionClose = new AcpConnectionCloseWorkflow({
-      currentGeneration: () => this.connectionGeneration,
-      currentStatus: () => this.snapshotOwner.status,
-      getSnapshot: () => this.getSnapshot(),
-      disconnectCurrent: (emitClosedStatus, generation) =>
-        this.disconnectCurrent(emitClosedStatus, generation),
-      transitions: this.connectionTransitions,
-      resources: this.connectionResources,
-      backendGeneration: this.backendGeneration,
-      modelChanges: this.modelChanges,
-      state: closeState,
-      reportFailure: (message, error) => safeLogError(message, errorLogFields(error))
-    })
-    this.connectionLifecycle = new AcpConnectionLifecycleWorkflow({
-      appVersion: options.appVersion,
-      defaultCwd: options.defaultCwd,
-      currentConnection: () => this.connection,
-      currentStatus: () => this.snapshotOwner.status,
-      currentGeneration: () => this.connectionGeneration,
-      currentFramework: () => this.framework.id,
-      reconnectBarrier: () => this.reconnectBarrier,
+    this.contextCompactionWorkflow = prompt.contextCompactionWorkflow
+    this.promptTurnWorkflow = prompt.promptTurnWorkflow
+    const lifecycle = composeAcpRuntimeLifecycleOwners(options, base, session, {
       connect: (request) => this.connect(request),
-      getSnapshot: () => this.getSnapshot(),
-      connectResources: this.connectionResources,
-      invalidatePendingSessionStartups: () => this.invalidatePendingSessionStartups(),
-      disconnectCurrent: (emitClosedStatus, generation) =>
-        this.disconnectCurrent(emitClosedStatus, generation),
-      updateCwd: (cwd) => this.snapshotOwner.updateCwd(cwd),
-      updateError: (error) => this.snapshotOwner.updateError(error),
-      setStatus: (status) => this.setStatus(status),
-      pushEvent: (event) => this.pushEvent(event),
-      transitionStatus: (status) => this.snapshotOwner.transitionStatus(status),
-      emitState: () => this.emitState(),
-      diagnosticContext: (framework, generation) => this.diagnosticContext(framework, generation),
-      openCandidate: (attempt, onFrameworkResolved) =>
+      disconnect: (emitClosedStatus) => this.disconnect(emitClosedStatus),
+      openAgentConnection: (attempt, onFrameworkResolved) =>
         this.openAgentConnection(attempt, onFrameworkResolved)
     })
-    this.providerSessionCreator = new AcpProviderSessionCreator({
-      defaultCwd: options.defaultCwd,
-      defaultProjectName: options.artifacts?.projectName || DEFAULT_UPLOAD_PROJECT_NAME,
-      currentCwd: () => this.snapshotOwner.cwd,
-      ensureConnected: (cwd) => this.ensureConnected(cwd),
-      assertCurrentConnection: (connection) => this.assertCurrentConnectedConnection(connection),
-      currentBackend: () => this.backend,
-      registry: this.sessionRegistry,
-      reserveIdentity: (sessionId, startupGeneration) =>
-        this.reservePrimarySessionIds(undefined, [sessionId], undefined, startupGeneration),
-      capabilities: this.sessionCapabilities,
-      configurator: this.sessionConfigurator,
-      resolveSpecialistIdentity: options.resolveSpecialistIdentity,
-      resolveSpecialistSkills: options.resolveSpecialistSkills,
-      registerSessionSpecialist: options.notebook?.registerSessionSpecialist,
-      updateCwd: (cwd) => this.snapshotOwner.updateCwd(cwd),
-      pushEvent: (event) => this.pushEvent(event),
-      emitState: () => this.emitState(),
-      diagnosticContext: () => this.diagnosticContext()
-    })
-    this.providerSessionAdopter = new AcpProviderSessionAdopter({
-      currentBackend: () => this.backend,
-      registry: this.sessionRegistry,
-      reserveIdentity: (reservation, sessionIds) =>
-        this.reservePrimarySessionIds(reservation, sessionIds),
-      capabilities: this.sessionCapabilities,
-      configurator: this.sessionConfigurator,
-      resolveSpecialistIdentity: options.resolveSpecialistIdentity,
-      resolveSpecialistSkills: options.resolveSpecialistSkills,
-      peekClaudeReplay: (sessionId) => this.handoffContinuity.peekClaudeReplay(sessionId),
-      commitClaudeReplay: (sessionId) => this.handoffContinuity.commitClaudeReplay(sessionId),
-      updateCwd: (cwd) => this.snapshotOwner.updateCwd(cwd),
-      emitState: () => this.emitState(),
-      diagnosticContext: () => this.diagnosticContext()
-    })
-    this.sessionReplacement = new AcpSessionReplacementWorkflow({
-      defaultCwd: options.defaultCwd,
-      defaultProjectName: options.artifacts?.projectName || DEFAULT_UPLOAD_PROJECT_NAME,
-      currentCwd: () => this.snapshotOwner.cwd,
-      currentFrameworkId: () => this.framework.id,
-      ensureConnected: (cwd) => this.ensureConnected(cwd),
-      assertCurrentConnection: (connection) => this.assertCurrentConnectedConnection(connection),
-      registry: this.sessionRegistry,
-      reserveIdentity: (sessionId, publishedAppSessionId) =>
-        this.reservePrimarySessionIds(undefined, [sessionId], publishedAppSessionId),
-      adopter: this.providerSessionAdopter,
-      permission: this.permissionContext,
-      promptContent: this.promptContentOwner,
-      contextUsage: this.contextUsageTracker,
-      interactions: this.sessionInteractions,
-      resolveSpecialistIdentity: options.resolveSpecialistIdentity,
-      registerSessionSpecialist: options.notebook?.registerSessionSpecialist
-    })
-    this.sessionDeletion = new AcpSessionDeletionWorkflow({
-      registry: this.sessionRegistry,
-      withOperation: (work) => this.withOperationLease(work),
-      currentConnection: () => this.connection,
-      supportsSessionDelete: () => this.connectionResources.capabilities.delete,
-      supportsSessionClose: () => this.connectionResources.capabilities.close,
-      permission: this.permissionContext,
-      interactions: this.sessionInteractions,
-      capabilities: this.sessionCapabilities,
-      promptContent: this.promptContentOwner,
-      handoff: this.handoffContinuity,
-      contextUsage: this.contextUsageTracker,
-      projector: this.sessionUpdateProjector,
-      pushEvent: (event) => this.pushEvent(event),
-      emitState: () => this.emitState(),
-      getSnapshot: () => this.getSnapshot()
-    })
-    this.providerSessionResumer = new AcpProviderSessionResumer({
-      defaultCwd: options.defaultCwd,
-      defaultProjectName: options.artifacts?.projectName || DEFAULT_UPLOAD_PROJECT_NAME,
-      currentCwd: () => this.snapshotOwner.cwd,
-      currentConnection: () => this.connection,
-      ensureConnected: (cwd) => this.ensureConnected(cwd),
-      assertCurrentConnection: (connection) => this.assertCurrentConnectedConnection(connection),
-      disconnectTimedOutConnection: async () => {
-        await this.disconnect(false)
-      },
-      resumeCapabilityAdvertised: () => this.connectionResources.capabilities.resume,
-      currentBackend: () => this.backend,
-      registry: this.sessionRegistry,
-      reserveIdentity: (sessionId) => this.reservePrimarySessionIds(undefined, [sessionId]),
-      capabilities: this.sessionCapabilities,
-      configurator: this.sessionConfigurator,
-      adopter: this.providerSessionAdopter,
-      resolveSpecialistSkills: options.resolveSpecialistSkills,
-      updateCwd: (cwd) => this.snapshotOwner.updateCwd(cwd),
-      pushEvent: (event) => this.pushEvent(event),
-      emitState: () => this.emitState(),
-      resumeTimeoutMs: options.resumeTimeoutMs ?? 30_000,
-      setTimer: this.setTimer,
-      clearTimer: this.clearTimer,
-      diagnosticContext: () => this.diagnosticContext()
-    })
+    this.modelChanges = lifecycle.modelChanges
+    this.connectionClose = lifecycle.connectionClose
+    this.connectionLifecycle = lifecycle.connectionLifecycle
+    const providerSessions = composeAcpRuntimeProviderSessionOwners(
+      options,
+      base,
+      session,
+      lifecycle
+    )
+    this.providerSessionCreator = providerSessions.providerSessionCreator
+    this.providerSessionResumer = providerSessions.providerSessionResumer
+    this.sessionReplacement = providerSessions.sessionReplacement
+    this.sessionDeletion = providerSessions.sessionDeletion
   }
 
   private get backend(): AcpBackendGenerationView {
@@ -965,17 +394,8 @@ class AcpRuntime {
     return this.connectionResources.connection
   }
 
-  private get pendingProviderReconnect(): boolean {
-    return this.connectionTransitions.providerReconnectPending
-  }
-
   private get reconnectBarrier(): Promise<void> | undefined {
     return this.connectionTransitions.barrier
-  }
-
-  private generationActivityChanged(): void {
-    this.connectionTransitions.activityChanged()
-    this.modelChanges.activityChanged()
   }
 
   private get connectionGeneration(): number {
@@ -998,14 +418,6 @@ class AcpRuntime {
     return this.activeSessionEntries().map(([appSessionId]) => appSessionId)
   }
 
-  private activeSessions(): ActiveSession[] {
-    return this.activeSessionEntries().map(([, session]) => session)
-  }
-
-  private clearAppliedSessionModels(): void {
-    this.sessionRegistry.clearAppliedModels()
-  }
-
   // Boundary-safe context for session-creation and process-spawn diagnostics. Keep this list explicit:
   // workspace paths, request/provider payloads, model research content, and credentials do not belong
   // in these lifecycle records.
@@ -1018,276 +430,22 @@ class AcpRuntime {
 
   // Returns an immutable renderer-facing view of connection and session state.
   getSnapshot(): AcpStateSnapshot {
-    const sessionIds = this.activeSessionIds()
-    const promptInFlightSessionIds = this.getInFlightSessionIds()
-    const permissionProfiles: Record<string, SessionPermissionProfileState> = {}
-    for (const { appSessionId: sessionId, aggregate } of this.sessionRegistry.entries()) {
-      const profile = aggregate.snapshot().permissionProfile
-      // getSnapshot() is an immutable projection even though the legacy shared shape is mutable.
-      if (profile) permissionProfiles[sessionId] = profile as SessionPermissionProfileState
-    }
-
-    return this.snapshotOwner.snapshot({
-      sessionId: this.sessionRegistry.currentSessionId,
-      sessionIds,
-      pendingPermissions: this.permissionContext.getPendingRequests(),
-      permissionProfiles,
-      permissionGrants: Object.fromEntries(
-        sessionIds.map((sessionId) => [sessionId, this.permissionContext.listGrants(sessionId)])
-      ),
-      contextUsageBySession: this.contextUsageTracker.usageSnapshot(),
-      nativeContextCompactionSessionIds:
-        this.framework.contextCompaction.kind === 'native-command' ? sessionIds : [],
-      promptInFlight: promptInFlightSessionIds.length > 0,
-      promptInFlightSessionIds
-    })
+    return this.publication.getSnapshot()
   }
 
-  async callSessionPlan(input: {
-    projectId: string
-    sessionId: string
-    operation: 'generate' | 'approve' | 'reject' | 'updateStepStatus'
-    input?: unknown
-  }): Promise<unknown> {
-    const service = this.planService
-    if (!service) throw new Error('Session Plan capability is not configured.')
-    if (input.operation === 'generate') {
-      const interactionId = this.artifactTurns?.promptMessageIdFor(input.sessionId)
-      if (!interactionId) throw new Error('No active interaction can generate a Session Plan.')
-      this.planInteractions.reserveApproval(input.sessionId, interactionId)
-      let result: Awaited<ReturnType<PlanService['generate']>>
-      try {
-        result = await service.generate({
-          projectId: input.projectId,
-          sessionId: input.sessionId,
-          interactionId,
-          content: input.input as GeneratePlanContent
-        })
-      } catch (error) {
-        this.planInteractions.releaseApprovalReservation(input.sessionId, interactionId)
-        const current = await service.getProjection(input.projectId, input.sessionId)
-        if (current) this.publishPlanProjection(input.sessionId, current)
-        throw error
-      }
-      let approval: Promise<unknown>
-      try {
-        approval = this.planInteractions.parkReservedApproval(input.sessionId, interactionId)
-      } catch (error) {
-        this.planInteractions.release(input.sessionId, result.projection.artifactVersionId)
-        throw error
-      }
-      this.publishPlanProjection(input.sessionId, result.projection)
-      return approval
-    }
-    const projection = await service.getProjection(input.projectId, input.sessionId, {
-      interactionIsLive: this.sessionInteractions.current(input.sessionId) !== undefined
-    })
-    if (!projection) throw new Error('The Session has no active Plan.')
-    await this.assertPlanVisibleToDurableBranch(input.projectId, input.sessionId, projection)
-    const identity = {
-      projectId: input.projectId,
-      sessionId: input.sessionId,
-      artifactVersionId: projection.artifactVersionId,
-      expectedRevision: projection.revision
-    }
-    if (input.operation === 'approve' || input.operation === 'reject') {
-      const interactionIsLive = this.sessionInteractions.current(input.sessionId) !== undefined
-      const decision = input.operation === 'approve' ? 'approved' : 'rejected'
-      const executionBinding = this.planInteractions.executionBindingFor(input.sessionId)
-      const result = await service.respond({
-        ...identity,
-        decision,
-        interactionIsLive
-      })
-      if (decision === 'approved') {
-        this.bindPlanExecutionToCurrentInteraction(
-          input.sessionId,
-          result.projection.artifactVersionId
-        )
-      } else {
-        if (executionBinding) {
-          this.planInteractions.releaseExecution(
-            input.sessionId,
-            executionBinding.interactionSequence
-          )
-        }
-      }
-      this.planInteractions.resolveApproval(input.sessionId, result)
-      this.publishPlanProjection(input.sessionId, result.projection)
-      return result
-    }
-    const update = input.input as {
-      title: string
-      status: SessionPlanStepStatus
-      notes?: string
-      expectedArtifactVersionId?: string
-    }
-    if (projection.approval !== 'approved') {
-      throw new PlanCommandError(
-        'plan-not-approved',
-        'The Plan is still pending. Interpret the user Message, then call generate_plan with decision:"approved" or decision:"rejected" before updating steps.'
-      )
-    }
-    const interaction = this.sessionInteractions.current(input.sessionId)
-    const binding = this.planInteractions.executionBindingFor(input.sessionId)
-    if (!binding) {
-      throw new PlanCommandError(
-        'continuation-required',
-        'Continuing this Plan requires an explicit user continuation.'
-      )
-    }
-    if (!interaction || binding.interactionSequence !== interaction.sequence) {
-      throw new PlanCommandError(
-        'interaction-mismatch',
-        'This interaction is not authorized to execute the active Plan.'
-      )
-    }
-    if (
-      binding.artifactVersionId !== projection.artifactVersionId ||
-      (update.expectedArtifactVersionId !== undefined &&
-        update.expectedArtifactVersionId !== binding.artifactVersionId)
-    ) {
-      throw new PlanCommandError(
-        'interaction-mismatch',
-        'This interaction is bound to a different Plan Artifact Version.'
-      )
-    }
-    const result = await service.updateStepStatus({
-      ...identity,
-      artifactVersionId: update.expectedArtifactVersionId ?? identity.artifactVersionId,
-      title: update.title,
-      status: update.status,
-      ...(update.notes ? { notes: update.notes } : {})
-    })
-    this.publishPlanProjection(input.sessionId, result.projection)
-    return result
+  callSessionPlan(input: AcpSessionPlanCall): Promise<unknown> {
+    return this.sessionPlanWorkflow.call(input)
   }
 
   getSessionPlanProjection(
     projectId: string,
     sessionId: string
   ): Promise<ActivePlanProjection | null> {
-    return (
-      this.planService?.getProjection(projectId, sessionId, {
-        interactionIsLive: this.sessionInteractions.current(sessionId) !== undefined
-      }) ?? Promise.resolve(null)
-    )
+    return this.sessionPlanWorkflow.projection(projectId, sessionId)
   }
 
-  async respondSessionPlan(input: PlanResponseCommand): Promise<PlanResponseResult> {
-    if (!this.planService) throw new Error('Session Plan capability is not configured.')
-    if (
-      input.decision === undefined &&
-      !this.planInteractions.approvalInteractionIdFor(input.sessionId)
-    ) {
-      throw new Error('The paused Session Plan interaction is no longer available.')
-    }
-    const interactionIsLive =
-      this.planInteractions.approvalInteractionIdFor(input.sessionId) !== undefined
-    const projection = await this.planService.getProjection(input.projectId, input.sessionId, {
-      interactionIsLive
-    })
-    if (!projection) throw new Error('The Session has no active Plan.')
-    await this.assertPlanVisibleToDurableBranch(input.projectId, input.sessionId, projection)
-    const result = await this.planService.respond({ ...input, interactionIsLive })
-    if ('projection' in result) {
-      if (interactionIsLive && result.projection.approval === 'approved') {
-        this.bindPlanExecutionToCurrentInteraction(
-          input.sessionId,
-          result.projection.artifactVersionId
-        )
-      }
-      if (interactionIsLive) this.planInteractions.resolveApproval(input.sessionId, result)
-      this.publishPlanProjection(input.sessionId, result.projection)
-      return result
-    }
-    if (
-      this.planInteractions.approvalInteractionIdFor(input.sessionId) !==
-      result.routeToInteractionId
-    ) {
-      throw new Error('The paused Session Plan interaction is no longer available.')
-    }
-    try {
-      this.pushEvent({
-        id: `session-user-message-${result.message.id}`,
-        timestamp: result.message.createdAt,
-        kind: 'message',
-        level: 'info',
-        sessionId: input.sessionId,
-        promptMessageId: result.message.responseToMessageId,
-        messageId: result.message.id,
-        role: 'user',
-        text: result.message.content
-      })
-    } catch (error) {
-      safeLogError('Routed user Message projection callback failed', errorLogFields(error))
-    }
-    this.planInteractions.resolveApproval(input.sessionId, result)
-    return result
-  }
-
-  private publishPlanProjection(
-    sessionId: string,
-    projection: import('../../shared/session-plan/contract').ActivePlanProjection
-  ): void {
-    try {
-      this.pushEvent({
-        id: `session-plan-${projection.artifactVersionId}-${projection.revision}`,
-        timestamp: Date.now(),
-        kind: 'plan',
-        level: 'info',
-        sessionId,
-        title: 'Session Plan updated',
-        planProjection: projection
-      })
-    } catch (error) {
-      safeLogError('Session Plan projection callback failed', errorLogFields(error))
-    }
-  }
-
-  private async publishTerminalPlanProjection(sessionId: string): Promise<void> {
-    if (!this.planService) return
-    try {
-      const projection = await this.planService.getProjection(
-        this.resolveSessionProjectName(sessionId),
-        sessionId,
-        { interactionIsLive: false }
-      )
-      if (projection) this.publishPlanProjection(sessionId, projection)
-    } catch (error) {
-      safeLogError('Session Plan terminal projection failed', errorLogFields(error))
-    }
-  }
-
-  private bindPlanExecutionToCurrentInteraction(
-    sessionId: string,
-    artifactVersionId: string
-  ): void {
-    const interaction = this.sessionInteractions.current(sessionId)
-    if (!interaction || interaction.kind !== 'prompt') return
-    this.planInteractions.bindExecution({
-      sessionId,
-      interactionSequence: interaction.sequence,
-      artifactVersionId
-    })
-  }
-
-  private async assertPlanVisibleToDurableBranch(
-    projectId: string,
-    sessionId: string,
-    projection: ActivePlanProjection
-  ): Promise<void> {
-    const origin = projection.originatingPromptMessageId
-    if (
-      !origin ||
-      !this.planSessions ||
-      !(await this.planSessions.containsMessageOnActiveBranch(projectId, sessionId, origin))
-    ) {
-      throw new PlanCommandError(
-        'interaction-mismatch',
-        'The active Session Plan does not belong to the durable active Message Branch.'
-      )
-    }
+  respondSessionPlan(input: PlanResponseCommand): Promise<PlanResponseResult> {
+    return this.sessionPlanWorkflow.respond(input)
   }
 
   // Lists sessions with an in-flight prompt, for the pre-migration active-session warning.
@@ -1347,13 +505,6 @@ class AcpRuntime {
 
   private hasSessionInteractionInFlight(sessionId: string): boolean {
     return this.sessionInteractions.current(sessionId) !== undefined
-  }
-
-  private currentPromptInteraction(
-    sessionId: string
-  ): AcpPromptSessionInteractionScope | undefined {
-    const interaction = this.sessionInteractions.current(sessionId)
-    return interaction?.kind === 'prompt' ? interaction : undefined
   }
 
   // Run ids of turns currently in flight, from live in-memory state (not the persisted current-run
@@ -1550,13 +701,6 @@ class AcpRuntime {
     return this.generationActivity.withOperation(work)
   }
 
-  private disconnectCurrent(
-    emitClosedStatus = true,
-    teardownGeneration = this.connectionGeneration
-  ): Promise<AcpStateSnapshot> {
-    return this.connectionClose.disconnectCurrent(emitClosedStatus, teardownGeneration)
-  }
-
   private openAgentConnection(
     identity: AcpConnectionResourceAttempt,
     onFrameworkResolved: (framework: AgentFramework['id']) => void
@@ -1622,7 +766,9 @@ class AcpRuntime {
             ? { framework: this.framework, executablePath: '', env: {} }
             : await this.options.resolveBackend?.({
                 forcedSkillIds: [...this.turnSkills.backendPreparation().forcedSkillIds],
-                systemPromptAppends: await this.getBackendSystemPromptAppends()
+                systemPromptAppends: [
+                  ...(await this.sessionEnvironment.backendSystemPromptAppends())
+                ]
               })
           if (!backend) throw new Error('ACP agent spawn configuration is not available.')
           return backend
@@ -1634,159 +780,6 @@ class AcpRuntime {
       },
       hooks
     )
-  }
-
-  private preflightPromptPlan(
-    request: AcpPromptRequest
-  ): AcpPromptTurnPlanContext | Promise<AcpPromptTurnPlanContext> {
-    if (
-      request.planContinuation &&
-      request.planContinuation.projectId !== this.resolveSessionProjectName(request.sessionId)
-    ) {
-      throw new PlanCommandError(
-        'interaction-mismatch',
-        'The Plan continuation belongs to a different Project.'
-      )
-    }
-    if (request.planContinuation && !this.planService) {
-      throw new Error('Session Plan capability is not configured.')
-    }
-    const continuation = request.planContinuation
-    if (continuation?.pendingAction === undefined && continuation) {
-      return this.planService!.authorizeContinuation({
-        projectId: continuation.projectId,
-        sessionId: request.sessionId,
-        artifactVersionId: continuation.artifactVersionId,
-        expectedRevision: continuation.expectedRevision
-      }).then(async (authorized) => {
-        await this.assertPlanVisibleToDurableBranch(
-          continuation.projectId,
-          request.sessionId,
-          authorized
-        )
-        return Object.freeze({ authorized })
-      })
-    }
-    if (!continuation) return Object.freeze({})
-    return this.planService!.getProjection(continuation.projectId, request.sessionId, {
-      interactionIsLive: false
-    }).then(async (protectedPending) => {
-      if (!protectedPending) {
-        throw new PlanCommandError('no-active-plan', 'The Session has no active Plan.')
-      }
-      if (protectedPending.artifactVersionId !== continuation.artifactVersionId) {
-        throw new PlanCommandError('stale-plan', 'A newer Plan is active.')
-      }
-      if (protectedPending.revision !== continuation.expectedRevision) {
-        throw new PlanCommandError('revision-conflict', 'The Plan revision is stale.')
-      }
-      if (protectedPending.approval !== 'pending') {
-        throw new PlanCommandError('approval-already-decided', 'Plan approval is irreversible.')
-      }
-      await this.assertPlanVisibleToDurableBranch(
-        continuation.projectId,
-        request.sessionId,
-        protectedPending
-      )
-      return Object.freeze({ protectedPending })
-    })
-  }
-
-  private admitPromptPlan(
-    request: AcpPromptRequest,
-    interaction: AcpPromptSessionInteractionScope,
-    plan: AcpPromptTurnPlanContext
-  ): AcpPromptTurnPlanContext | Promise<AcpPromptTurnPlanContext> {
-    let { authorized, protectedPending } = plan
-    const continuation = request.planContinuation
-    const decision = continuation?.pendingAction
-    const committed = (): AcpPromptTurnPlanContext => {
-      if (authorized) {
-        this.planInteractions.bindExecution({
-          sessionId: request.sessionId,
-          interactionSequence: interaction.sequence,
-          artifactVersionId: authorized.artifactVersionId
-        })
-      }
-      return Object.freeze({
-        ...(authorized ? { authorized } : {}),
-        ...(protectedPending ? { protectedPending } : {})
-      })
-    }
-    if (continuation && (decision === 'approve' || decision === 'reject')) {
-      const executionBinding = this.planInteractions.executionBindingFor(request.sessionId)
-      return this.planService!.respond({
-        projectId: continuation.projectId,
-        sessionId: request.sessionId,
-        artifactVersionId: continuation.artifactVersionId,
-        expectedRevision: continuation.expectedRevision,
-        decision: decision === 'approve' ? 'approved' : 'rejected',
-        interactionIsLive: true
-      }).then((result) => {
-        if (decision === 'approve') authorized = result.projection
-        else {
-          protectedPending = result.projection
-          if (executionBinding) {
-            this.planInteractions.releaseExecution(
-              request.sessionId,
-              executionBinding.interactionSequence
-            )
-          }
-        }
-        this.planInteractions.resolveApproval(request.sessionId, result)
-        this.publishPlanProjection(request.sessionId, result.projection)
-        return committed()
-      })
-    }
-    return committed()
-  }
-
-  private async checkPromptPlanCompletion(
-    sessionId: string,
-    interaction: AcpPromptSessionInteractionScope,
-    response: PromptResponse
-  ): Promise<void> {
-    const binding = this.planInteractions.executionBindingFor(sessionId)
-    if (
-      response.stopReason !== 'end_turn' ||
-      !this.planService ||
-      binding?.interactionSequence !== interaction.sequence
-    ) {
-      return
-    }
-    const completion = await this.planService.checkTurnCompletion({
-      projectId: this.resolveSessionProjectName(sessionId),
-      sessionId
-    })
-    if (!completion.allow) {
-      throw new Error(
-        `The active Session Plan is not complete (${completion.lifecycle ?? 'incomplete'}).`
-      )
-    }
-  }
-
-  private releasePromptPlanBinding(
-    sessionId: string,
-    interaction: AcpPromptSessionInteractionScope
-  ): void {
-    this.planInteractions.releaseExecution(sessionId, interaction.sequence)
-    if (interaction.promptMessageId) {
-      this.rejectPlanApprovalForInteraction(
-        sessionId,
-        interaction.promptMessageId,
-        'The Session Plan interaction ended before approval.'
-      )
-    }
-  }
-
-  private rejectPlanApprovalForInteraction(
-    sessionId: string,
-    interactionId: string,
-    reason: string
-  ): void {
-    this.planInteractions.releaseApprovalReservation(sessionId, interactionId)
-    if (this.planInteractions.approvalInteractionIdFor(sessionId) !== interactionId) return
-    this.planInteractions.rejectApproval(sessionId, reason)
   }
 
   // Sends one prompt turn to the targeted session and streams updates until stop.
@@ -1822,9 +815,9 @@ class AcpRuntime {
   async cancelPrompt(request: AcpCancelPromptRequest): Promise<AcpStateSnapshot> {
     const connection = this.connection
     const activeSession = this.activeSessionFor(request.sessionId)
-    const planInteractionId =
-      this.currentPromptInteraction(request.sessionId)?.promptMessageId ??
-      this.planInteractions.approvalInteractionIdFor(request.sessionId)
+    const cancelPlanInteraction = this.sessionPlanWorkflow.capturePromptCancellation(
+      request.sessionId
+    )
 
     if (connection && activeSession) {
       await this.sessionInteractions.cancelPrompt({
@@ -1834,13 +827,7 @@ class AcpRuntime {
             sessionId: activeSession.sessionId
           }),
         onAccepted: () => {
-          if (planInteractionId) {
-            this.rejectPlanApprovalForInteraction(
-              request.sessionId,
-              planInteractionId,
-              'The Session Plan interaction was cancelled.'
-            )
-          }
+          cancelPlanInteraction()
           this.cancelPermissionFlowForSession(request.sessionId)
           this.pushEvent({
             kind: 'system',
@@ -1868,10 +855,7 @@ class AcpRuntime {
 
   // Closes the agent-side session when supported, then removes local routing state.
   async deleteSession(request: AcpDeleteSessionRequest): Promise<AcpStateSnapshot> {
-    this.planInteractions.clearSession(
-      request.sessionId,
-      'The Session Plan interaction was deleted.'
-    )
+    this.sessionPlanWorkflow.sessionDeleted(request.sessionId)
     return this.sessionDeletion.delete(request.sessionId)
   }
 
@@ -1914,28 +898,6 @@ class AcpRuntime {
     return this.permissionContext.requestAppApproval(input)
   }
 
-  // Native UserInput::Skill entries are consumed inside Codex and may not emit a filesystem read
-  // lifecycle over ACP. Project the same compact activity explicitly so selected and auto-routed
-  // Skills remain visible without sending their path or document to renderer state or persistence.
-  private emitCodexSkillInputActivities(
-    sessionId: string,
-    promptTurn: number,
-    inputs: ReadonlyArray<{ name: string }>,
-    status: 'in_progress' | 'completed' | 'failed'
-  ): void {
-    for (const [index, { name }] of inputs.entries()) {
-      this.pushEvent({
-        kind: 'tool',
-        level: status === 'failed' ? 'error' : 'info',
-        sessionId,
-        toolCallId: `open-science-skill-${promptTurn}-${index}`,
-        providerToolName: 'skill',
-        title: `Loaded skill: ${name}`,
-        status
-      })
-    }
-  }
-
   // Lazily initializes the process connection before session creation.
   private async ensureConnected(cwd: string): Promise<ClientConnection> {
     return this.connectionLifecycle.ensureConnected(cwd)
@@ -1971,87 +933,9 @@ class AcpRuntime {
     ]
   }
 
-  // Collects the system-prompt guidance appended to every session, plus app tooling
-  // instructions when those services are wired. Skill privacy is enforced at the presentation layer;
-  // agent prompts must not block native progressive loading of a selected SKILL.md.
-  private notebookToolingAvailable(): boolean {
-    return this.currentCapabilityAvailability().notebook
-  }
-
-  private skillImportToolingAvailable(): boolean {
-    return this.currentCapabilityAvailability().skillImport
-  }
-
-  private artifactToolingAvailable(): boolean {
-    return this.currentCapabilityAvailability().artifacts
-  }
-
-  private currentCapabilityAvailability(): ReturnType<
-    AcpSessionCapabilityOwner['toolingAvailability']
-  > {
-    return this.sessionCapabilities.toolingAvailability({
-      framework: this.framework,
-      nativeMcpEnabled: this.backend.adapter.nativeMcpEnabled,
-      bridgeMcpAliasesEnabled: this.backend.adapter.bridgeMcpAliasesEnabled,
-      policy: CURRENT_PRIMARY_SESSION_CAPABILITY_POLICY
-    })
-  }
-
-  private getAppSystemPromptAppends(): string[] {
-    return [
-      TURN_CONTINUITY_SYSTEM_PROMPT_APPEND,
-      LARGE_DATA_FILE_SYSTEM_PROMPT_APPEND,
-      ...(this.artifactToolingAvailable() ? [ARTIFACT_FILE_SYSTEM_PROMPT_APPEND] : []),
-      ...(this.notebookToolingAvailable() ? [NOTEBOOK_SYSTEM_PROMPT_APPEND] : []),
-      ...(this.skillImportToolingAvailable() ? [SKILL_IMPORT_SYSTEM_PROMPT_APPEND] : []),
-      ...(this.planService ? [SESSION_PLAN_SYSTEM_PROMPT_APPEND] : [])
-    ]
-  }
-
-  private async getBackendSystemPromptAppends(): Promise<string[]> {
-    await this.sessionCapabilities.refreshDynamicAvailability()
-    return this.getAppSystemPromptAppends()
-  }
-
-  private getSystemPromptAppends(skillGuidance?: string): string[] {
-    // Each append names MCP tools that only exist when that tooling is actually wired for this session;
-    // omit it otherwise so the agent isn't told to use tools it wasn't given.
-    return [
-      ...this.getAppSystemPromptAppends(),
-      ...this.backend.prompt.systemPromptAppends,
-      ...(skillGuidance ? [skillGuidance] : [])
-    ]
-  }
-
   // Resolves the artifact/notebook storage project for a session, defaulting to the runtime constant.
   private resolveSessionProjectName(sessionId: string): string {
-    return (
-      this.sessionRegistry.lookup(sessionId)?.aggregate.snapshot().projectName ??
-      this.artifactOptions?.projectName ??
-      DEFAULT_UPLOAD_PROJECT_NAME
-    )
-  }
-
-  // Marks a new assistant turn as the active artifact run before the model can call the MCP tool.
-  private async activateArtifactRun(
-    sessionId: string,
-    provenanceContext: AcpPromptRequest['provenanceContext']
-  ): Promise<ArtifactTurnHandle | undefined> {
-    if (!this.artifactTurns) return undefined
-
-    return this.artifactTurns.open({
-      appSessionId: sessionId,
-      artifactStorageSessionId:
-        this.sessionCapabilities.artifactRoutingIdFor(sessionId) ?? sessionId,
-      projectId: this.resolveSessionProjectName(sessionId),
-      agentName: this.framework.displayName,
-      provenanceContext
-    })
-  }
-
-  // Clears the handoff file after the prompt so late MCP writes cannot attach to a completed turn.
-  private async clearArtifactRun(artifactRun: ArtifactTurnHandle | undefined): Promise<void> {
-    if (artifactRun) await this.artifactTurns?.dispose(artifactRun)
+    return this.sessionEnvironment.projectName(sessionId)
   }
 
   // Writes an inline file into the in-flight turn's pending artifact run so it attaches to the resulting
@@ -2069,32 +953,6 @@ class AcpRuntime {
       throw new Error('No active assistant turn to attach a generated file to.')
     }
     return this.artifactTurns.writeForActiveTurn(sessionId, input)
-  }
-
-  // Publishes pending files as a claim event; the renderer later supplies the final message id.
-  private async emitArtifactRunEvent(
-    sessionId: string,
-    artifactRun: ArtifactTurnHandle | undefined,
-    onPublished?: () => void
-  ): Promise<void> {
-    if (!artifactRun || !this.artifactTurns) return
-    const publication = await this.artifactTurns.finalize(artifactRun)
-    if (!publication) return
-
-    this.pushEvent(
-      {
-        kind: 'artifact',
-        level: 'info',
-        sessionId,
-        title: 'Generated files',
-        runId: publication.runId,
-        promptMessageId: publication.promptMessageId,
-        artifactSessionId: publication.artifactStorageSessionId,
-        artifactClaimId: publication.artifactClaimId,
-        artifacts: publication.artifacts
-      },
-      onPublished
-    )
   }
 
   private cancelPermissionFlowForSession(sessionId: string): void {
@@ -2200,27 +1058,12 @@ class AcpRuntime {
     event: Omit<AcpRuntimeEvent, 'id' | 'timestamp'> & Partial<AcpRuntimeEvent>,
     onAppended?: () => void
   ): void {
-    const currentPromptMessageId = event.sessionId
-      ? this.currentPromptInteraction(event.sessionId)?.promptMessageId
-      : undefined
-    const scopedEvent =
-      currentPromptMessageId && !event.promptMessageId
-        ? { ...event, promptMessageId: currentPromptMessageId }
-        : event
-    const runtimeEvent = this.snapshotOwner.appendEvent(scopedEvent)
-    onAppended?.()
-    this.callbacks.onEvent?.(runtimeEvent)
-    this.emitState()
-  }
-
-  // Generates monotonically increasing event ids for this runtime instance.
-  private nextEventId(): string {
-    return this.snapshotOwner.nextEventId()
+    this.publication.pushEvent(event, onAppended)
   }
 
   // Broadcasts the latest runtime snapshot if a listener is registered.
   private emitState(): void {
-    this.callbacks.onStateChanged?.(this.getSnapshot())
+    this.publication.emitState()
   }
 
   // Creates an ephemeral reviewer ACP session using the existing agent connection. The reviewer
@@ -2228,31 +1071,11 @@ class AcpRuntime {
   // appear in the snapshot, and callers are responsible for disposing it. This allows background
   // review to run in parallel with the main session without affecting the main state machine.
   async buildReviewerSession(request: ReviewerSessionRequest): Promise<ReviewerSessionResult> {
-    return this.withOperationLease(() => this.reviewerSessions.create(request))
-  }
-
-  private invalidatePendingSessionStartups(): void {
-    this.generationActivity.invalidateStartups()
-    this.sessionRegistry.invalidatePending()
-    this.reviewerSessions.invalidatePending()
-  }
-
-  private reservePrimarySessionIds(
-    reservation: AcpPrimarySessionIdentityReservation | undefined,
-    sessionIds: string[],
-    publishedAppSessionId?: string,
-    startupGeneration = this.sessionRegistry.startupGeneration
-  ): AcpPrimarySessionIdentityReservationResult {
-    return this.sessionRegistry.reserve({
-      reservation,
-      sessionIds,
-      publishedAppSessionId,
-      startupGeneration,
-      mayRenewAfterConnectionSetup: Boolean(
-        this.reconnectBarrier || !this.connection || this.snapshotOwner.status !== 'connected'
-      ),
-      blockStartup: !this.reconnectBarrier
-    })
+    return this.withOperationLease(() =>
+      this.reviewerSessions.create(request, {
+        ensureConnected: (cwd) => this.ensureConnected(cwd)
+      })
+    )
   }
 
   private assertCurrentConnectedConnection(connection: ClientConnection): void {
@@ -2273,4 +1096,5 @@ class AcpRuntime {
 }
 
 export { AcpRuntime }
+export type { AcpRuntimeOptions }
 export type { ReviewerSessionDisposition } from './reviewer-session-owner'

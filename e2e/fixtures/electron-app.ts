@@ -8,10 +8,29 @@ import { RendererFailureGate } from './renderer-failure-gate'
 
 const APP_ROOT = resolve(process.cwd())
 const FAKE_AGENT_PATH = resolve(APP_ROOT, 'e2e', 'fixtures', 'fake-opencode.mjs')
+const FAKE_REMOTEIT_PATH = resolve(APP_ROOT, 'e2e', 'fixtures', 'fake-remoteit.cjs')
 const FAKE_PROVIDER_NAME = 'Electron E2E provider'
+
+const electronLaunchTarget = (
+  userDataRoot: string,
+  environment: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform
+): { args: string[]; executablePath?: string } => {
+  const executablePath = environment.OPEN_SCIENCE_E2E_EXECUTABLE
+  return {
+    args: [
+      `--user-data-dir=${userDataRoot}`,
+      ...(platform === 'linux' ? ['--password-store=basic'] : []),
+      ...(executablePath ? [] : [APP_ROOT])
+    ],
+    ...(executablePath ? { executablePath } : {})
+  }
+}
 
 type LaunchRoots = {
   fakeAgentBinRoot: string
+  fakeRemoteItRoot: string
+  fakeRemoteItState: string
   storageRoot: string
   userDataRoot: string
 }
@@ -22,6 +41,8 @@ type ElectronApp = {
   readonly page: Page
   completeOnboarding: () => Promise<Page>
   configureFakeAgent: () => Promise<Page>
+  createTestDirectory: (name: string) => Promise<string>
+  enableFakeRemoteIt: () => Promise<Page>
   findOverlayIsVisible: () => Promise<boolean>
   launchSecondInstance: () => Promise<Page>
   mainWindowState: () => Promise<{ minimized: boolean; visible: boolean }>
@@ -33,7 +54,8 @@ type ElectronApp = {
 const launchEnvironment = (
   storageRoot: string,
   fakeAgentBinRoot?: string,
-  inheritedEnvironment: NodeJS.ProcessEnv = process.env
+  inheritedEnvironment: NodeJS.ProcessEnv = process.env,
+  fakeRemoteItRoot?: string
 ): Record<string, string> => {
   const environment: Record<string, string> = {}
 
@@ -42,6 +64,10 @@ const launchEnvironment = (
   }
 
   environment.OPEN_SCIENCE_STORAGE_ROOT = storageRoot
+  if (fakeRemoteItRoot) {
+    environment.OPEN_SCIENCE_FAKE_REMOTEIT_STATE = join(storageRoot, 'fake-remoteit-state.json')
+    environment.OPEN_SCIENCE_REMOTEIT_BIN = process.execPath
+  }
   if (fakeAgentBinRoot) {
     const inheritedPath = Object.entries(environment).find(
       ([key]) => key.toLowerCase() === 'path'
@@ -55,15 +81,31 @@ const launchEnvironment = (
   return environment
 }
 
-const launchOpenScience = (
+const launchOpenScience = async (
   { storageRoot, userDataRoot, fakeAgentBinRoot }: LaunchRoots,
-  fakeAgentEnabled: boolean
-): Promise<ElectronApplication> =>
-  electron.launch({
-    args: [`--user-data-dir=${userDataRoot}`, APP_ROOT],
-    cwd: APP_ROOT,
-    env: launchEnvironment(storageRoot, fakeAgentEnabled ? fakeAgentBinRoot : undefined)
+  fakeAgentEnabled: boolean,
+  fakeRemoteItEnabled: boolean,
+  fakeRemoteItRoot: string
+): Promise<ElectronApplication> => {
+  const application = await electron.launch({
+    ...electronLaunchTarget(userDataRoot),
+    cwd: fakeRemoteItEnabled ? fakeRemoteItRoot : APP_ROOT,
+    env: launchEnvironment(
+      storageRoot,
+      fakeAgentEnabled ? fakeAgentBinRoot : undefined,
+      process.env,
+      fakeRemoteItEnabled ? fakeRemoteItRoot : undefined
+    )
   })
+
+  if (process.platform === 'linux') {
+    await application.evaluate(({ safeStorage }) => {
+      safeStorage.setUsePlainTextEncryption(true)
+    })
+  }
+
+  return application
+}
 
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`
 
@@ -86,6 +128,16 @@ const writeFakeAgentLauncher = async (binRoot: string): Promise<void> => {
     'utf8'
   )
   await chmod(launcher, 0o755)
+}
+
+const writeFakeRemoteItCommands = async (root: string): Promise<void> => {
+  await mkdir(root, { recursive: true })
+  const source = `require(${JSON.stringify(FAKE_REMOTEIT_PATH)})\n`
+  await Promise.all(
+    ['exec-gql', 'service', 'status', 'version'].map((command) =>
+      writeFile(join(root, command), source, 'utf8')
+    )
+  )
 }
 
 const makeTreeWritable = async (root: string): Promise<void> => {
@@ -115,6 +167,7 @@ class ElectronAppHarness implements ElectronApp {
   private application: ElectronApplication | undefined
   private currentPage: Page | undefined
   private fakeAgentEnabled = false
+  private fakeRemoteItEnabled = false
   private readonly rendererFailures = new RendererFailureGate()
 
   private constructor(
@@ -126,10 +179,15 @@ class ElectronAppHarness implements ElectronApp {
     const testRoot = await mkdtemp(join(tmpdir(), 'open-science-electron-e2e-'))
     const harness = new ElectronAppHarness(testRoot, {
       fakeAgentBinRoot: join(testRoot, 'fake-agent-bin'),
+      fakeRemoteItRoot: join(testRoot, 'fake-remoteit'),
+      fakeRemoteItState: join(testRoot, 'storage', 'fake-remoteit-state.json'),
       storageRoot: join(testRoot, 'storage'),
       userDataRoot: join(testRoot, 'electron-profile')
     })
+    await mkdir(harness.roots.storageRoot, { recursive: true })
+    await writeFile(harness.roots.fakeRemoteItState, JSON.stringify({ services: [] }), 'utf8')
     await writeFakeAgentLauncher(harness.roots.fakeAgentBinRoot)
+    await writeFakeRemoteItCommands(harness.roots.fakeRemoteItRoot)
     await harness.launch()
     return harness
   }
@@ -187,6 +245,18 @@ class ElectronAppHarness implements ElectronApp {
     return this.restart()
   }
 
+  async createTestDirectory(name: string): Promise<string> {
+    if (!/^[a-z0-9-]+$/.test(name)) throw new Error(`Invalid E2E directory name: ${name}`)
+    const path = join(this.testRoot, name)
+    await mkdir(path, { recursive: true })
+    return path
+  }
+
+  async enableFakeRemoteIt(): Promise<Page> {
+    this.fakeRemoteItEnabled = true
+    return this.restart()
+  }
+
   async findOverlayIsVisible(): Promise<boolean> {
     return this.runningApplication.evaluate(({ BrowserWindow }) => {
       const mainWindow = BrowserWindow.getAllWindows()[0]
@@ -214,14 +284,23 @@ class ElectronAppHarness implements ElectronApp {
       executable: process.execPath
     }))
     await new Promise<void>((resolveLaunch, rejectLaunch) => {
-      const child = spawn(executable, [`--user-data-dir=${this.roots.userDataRoot}`, appPath], {
-        cwd: APP_ROOT,
-        env: launchEnvironment(
-          this.roots.storageRoot,
-          this.fakeAgentEnabled ? this.roots.fakeAgentBinRoot : undefined
-        ),
-        stdio: 'ignore'
-      })
+      const child = spawn(
+        executable,
+        [
+          `--user-data-dir=${this.roots.userDataRoot}`,
+          ...(process.env.OPEN_SCIENCE_E2E_EXECUTABLE ? [] : [appPath])
+        ],
+        {
+          cwd: APP_ROOT,
+          env: launchEnvironment(
+            this.roots.storageRoot,
+            this.fakeAgentEnabled ? this.roots.fakeAgentBinRoot : undefined,
+            process.env,
+            this.fakeRemoteItEnabled ? this.roots.fakeRemoteItRoot : undefined
+          ),
+          stdio: 'ignore'
+        }
+      )
       child.once('error', rejectLaunch)
       child.once('exit', (code, signal) => {
         if (code === 0) resolveLaunch()
@@ -275,7 +354,12 @@ class ElectronAppHarness implements ElectronApp {
   }
 
   private async launch(): Promise<void> {
-    this.application = await launchOpenScience(this.roots, this.fakeAgentEnabled)
+    this.application = await launchOpenScience(
+      this.roots,
+      this.fakeAgentEnabled,
+      this.fakeRemoteItEnabled,
+      this.roots.fakeRemoteItRoot
+    )
     this.currentPage = await openMainWindow(this.application, this.rendererFailures)
   }
 
@@ -308,5 +392,5 @@ const test = base.extend<{ app: ElectronApp }>({
   }
 })
 
-export { launchEnvironment, test }
+export { electronLaunchTarget, launchEnvironment, test }
 export type { ElectronApp }
