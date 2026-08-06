@@ -135,6 +135,7 @@ const api: OpenScienceAPI = {
     // Persists a single sanitized session file.
     saveSession: (session, options) =>
       electronRendererContracts.invoke('sessions.saveSession', session, options),
+    updateArchive: (request) => electronRendererContracts.invoke('sessions.updateArchive', request),
     // Removes one session file.
     deleteSession: (request) => electronRendererContracts.invoke('sessions.deleteSession', request),
     // Persists the last-open project/session pointer.
@@ -391,6 +392,7 @@ const api: OpenScienceAPI = {
     get: (id) => electronRendererContracts.invoke('projects.get', id),
     create: (request) => electronRendererContracts.invoke('projects.create', request),
     update: (request) => electronRendererContracts.invoke('projects.update', request),
+    updateArchive: (request) => electronRendererContracts.invoke('projects.updateArchive', request),
     delete: (request) => electronRendererContracts.invoke('projects.delete', request),
     onCreated: (listener) => electronRendererContracts.subscribe('projects.onCreated', listener),
     onUpdated: (listener) => electronRendererContracts.subscribe('projects.onUpdated', listener),
@@ -509,6 +511,10 @@ const api: OpenScienceAPI = {
       electronRendererContracts.invoke('artifacts.getVersionMessages', request),
     getVersionReview: (request) =>
       electronRendererContracts.invoke('artifacts.getVersionReview', request),
+    getCodeReconstruction: (request) =>
+      electronRendererContracts.invoke('artifacts.getCodeReconstruction', request),
+    generateCodeReconstruction: (request) =>
+      electronRendererContracts.invoke('artifacts.generateCodeReconstruction', request),
     resolveVersionDescriptors: (request) =>
       electronRendererContracts.invoke('artifacts.resolveVersionDescriptors', request)
   },
@@ -588,8 +594,10 @@ const api: OpenScienceAPI = {
   },
   notebookEnv: {
     getStatus: () => electronRendererContracts.invoke('notebookEnv.getStatus'),
-    provision: (lang) => electronRendererContracts.invoke('notebookEnv.provision', lang),
-    repair: (lang) => electronRendererContracts.invoke('notebookEnv.repair', lang),
+    provision: (lang, operationId) =>
+      electronRendererContracts.invoke('notebookEnv.provision', lang, operationId),
+    repair: (lang, operationId) =>
+      electronRendererContracts.invoke('notebookEnv.repair', lang, operationId),
     cancel: (lang?: NotebookLanguage) =>
       electronRendererContracts.invoke('notebookEnv.cancel', lang),
     onProgress: (listener) =>

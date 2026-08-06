@@ -86,6 +86,11 @@ type TaskAgentPromptRequest = {
 }
 
 type TaskAgentPort = {
+  withSessionAvailable<Result>(
+    projectId: string,
+    sessionId: string,
+    operation: () => Promise<Result>
+  ): Promise<Result>
   listAttachedSessionIds(): Promise<string[]>
   createSession(request: TaskAgentCreateSessionRequest): Promise<TaskAgentSession>
   resumeSession(request: TaskAgentResumeSessionRequest): Promise<TaskAgentSession>
@@ -315,13 +320,16 @@ class TaskRunner {
         `Session ${existing.id} does not belong to project ${project.id}.`
       )
     }
-
     const userMessageId = this.dependencies.createId()
     const runId = this.dependencies.createId()
     if (existing) this.reserveSession(existing.id, runId)
     let prepared: Awaited<ReturnType<TaskRunner['prepareSession']>>
     try {
-      prepared = await this.prepareSession(project, existing, request, prompt, userMessageId)
+      const prepare = (): ReturnType<TaskRunner['prepareSession']> =>
+        this.prepareSession(project, existing, request, prompt, userMessageId)
+      prepared = existing
+        ? await this.dependencies.agent.withSessionAvailable(project.id, existing.id, prepare)
+        : await prepare()
       this.reserveSession(prepared.session.id, runId)
     } catch (error) {
       if (existing) this.releaseSession(existing.id, runId)
@@ -662,12 +670,14 @@ class TaskRunner {
     for (const event of events) {
       if (event.kind !== 'tool' || !event.toolCallId) continue
       const existing = activities.get(event.toolCallId)
+      const isTerminal = existing?.status === 'completed' || existing?.status === 'failed'
       activities.set(event.toolCallId, {
         id: event.toolCallId,
         kind: 'tool',
         title: event.title?.trim() || existing?.title || 'Tool call',
-        status:
-          event.status === 'failed'
+        status: isTerminal
+          ? existing.status
+          : event.status === 'failed'
             ? 'failed'
             : event.status === 'completed'
               ? 'completed'
@@ -682,8 +692,8 @@ class TaskRunner {
         rawOutput: event.rawOutput ?? existing?.rawOutput,
         terminalOutput: event.terminalOutput ?? existing?.terminalOutput,
         terminalExitCode: event.terminalExitCode ?? existing?.terminalExitCode,
-        createdAt: existing?.createdAt ?? now,
-        updatedAt: now
+        createdAt: existing?.createdAt ?? event.timestamp,
+        updatedAt: isTerminal ? existing.updatedAt : event.timestamp
       })
     }
     return [...activities.values()]

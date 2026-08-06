@@ -37,6 +37,11 @@ import type {
   GetArtifactVersionProvenanceRequest
 } from '../shared/artifact-provenance'
 import type {
+  ArtifactCodeReconstructionState,
+  GenerateArtifactCodeReconstructionRequest,
+  GetArtifactCodeReconstructionRequest
+} from '../shared/artifact-code-reconstruction'
+import type {
   SaveBlobFileRequest,
   SaveBlobFileResult,
   SaveManagedFileRequest,
@@ -139,6 +144,7 @@ import type {
   CreateProjectRequest,
   DeleteProjectRequest,
   Project,
+  UpdateProjectArchiveRequest,
   UpdateProjectRequest
 } from '../shared/projects'
 import type {
@@ -157,7 +163,8 @@ import type {
   LoadAllSessionsResult,
   PersistedChatSession,
   SaveSessionOptions,
-  SaveSessionManifestRequest
+  SaveSessionManifestRequest,
+  UpdateSessionArchiveRequest
 } from '../shared/session-persistence'
 import type {
   SessionPersistenceFlushRequest,
@@ -358,6 +365,7 @@ export interface OpenScienceAPI {
       session: PersistedChatSession,
       options?: SaveSessionOptions
     ): Promise<PersistedChatSession>
+    updateArchive(request: UpdateSessionArchiveRequest): Promise<PersistedChatSession>
     deleteSession(request: DeleteSessionRequest): Promise<void>
     saveManifest(request: SaveSessionManifestRequest): Promise<void>
     exportConversation(request: ExportConversationRequest): Promise<ExportConversationResult>
@@ -544,6 +552,7 @@ export interface OpenScienceAPI {
     get(id: string): Promise<Project | null>
     create(request: CreateProjectRequest): Promise<Project>
     update(request: UpdateProjectRequest): Promise<Project>
+    updateArchive(request: UpdateProjectArchiveRequest): Promise<Project>
     delete(request: DeleteProjectRequest): Promise<void>
     onCreated(listener: AcpListener<Project>): RemoveListener
     onUpdated(listener: AcpListener<Project>): RemoveListener
@@ -641,6 +650,12 @@ export interface OpenScienceAPI {
     getVersionReview(
       request: GetArtifactVersionProvenanceRequest
     ): Promise<ArtifactVersionReviewProvenance>
+    getCodeReconstruction(
+      request: GetArtifactCodeReconstructionRequest
+    ): Promise<ArtifactCodeReconstructionState>
+    generateCodeReconstruction(
+      request: GenerateArtifactCodeReconstructionRequest
+    ): Promise<ArtifactCodeReconstructionState>
     resolveVersionDescriptors(
       request: ResolveArtifactVersionDescriptorsRequest
     ): Promise<ArtifactVersionDescriptor[]>
@@ -713,8 +728,8 @@ export interface OpenScienceAPI {
   }
   notebookEnv: {
     getStatus(): Promise<ProvisionStatus>
-    provision(lang: NotebookLanguage): Promise<void>
-    repair(lang: NotebookLanguage): Promise<void>
+    provision(lang: NotebookLanguage, operationId?: string): Promise<void>
+    repair(lang: NotebookLanguage, operationId?: string): Promise<void>
     cancel(lang?: NotebookLanguage): Promise<void>
     onProgress(listener: (progress: ProvisionProgress) => void): RemoveListener
   }

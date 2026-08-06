@@ -78,6 +78,8 @@ const createDependencies = () => {
     getVersionExecution: vi.fn(),
     getVersionMessages: vi.fn(),
     getVersionReview: vi.fn(),
+    getCodeReconstruction: vi.fn(),
+    generateCodeReconstruction: vi.fn(),
     resolveVersionDescriptors: vi.fn(async () => [])
   }
   const events = { publish: vi.fn() }
@@ -119,6 +121,7 @@ const createDependencies = () => {
     delete: vi.fn(async () => undefined),
     get: vi.fn(async () => project),
     list: vi.fn(async () => [project]),
+    updateArchive: vi.fn(async () => project),
     update: vi.fn(async () => project)
   }
   const session = {
@@ -135,7 +138,8 @@ const createDependencies = () => {
     loadAll: vi.fn(),
     saveSession: vi.fn(async () => ({ created: true, session })),
     deleteSession: vi.fn(),
-    saveManifest: vi.fn()
+    saveManifest: vi.fn(),
+    updateArchive: vi.fn(async () => session)
   }
   const attachment = {
     id: 'upload-1',
@@ -231,10 +235,12 @@ const dispatchCommand = (
 }
 
 describe('Data and content application commands', () => {
-  it('owns exactly the 44 current data and content invoke channels', () => {
+  it('owns exactly the 46 current data and content invoke channels', () => {
     expect(registeredCommands()).toEqual(
       [
         'artifacts:finalize-run',
+        'artifacts:generate-code-reconstruction',
+        'artifacts:get-code-reconstruction',
         'artifacts:get-lineage',
         'artifacts:get-version-execution',
         'artifacts:get-version-messages',
@@ -258,6 +264,7 @@ describe('Data and content application commands', () => {
         'project-files:repair-index',
         'project-files:search-artifacts',
         'projects:create',
+        'projects:update-archive',
         'projects:delete',
         'projects:get',
         'projects:list',
@@ -266,6 +273,7 @@ describe('Data and content application commands', () => {
         'sessions:export-conversation',
         'sessions:load-all',
         'sessions:save-manifest',
+        'sessions:update-archive',
         'sessions:save-session',
         'uploads:abort-transfer',
         'uploads:append-transfer',
@@ -308,6 +316,16 @@ describe('Data and content application commands', () => {
     registerDataContentApplicationCommands(router.registrar, deps.dependencies)
     const request = (key: string): Readonly<{ key: string }> => Object.freeze({ key })
     const cases = [
+      {
+        key: 'artifactGenerateCodeReconstruction',
+        args: [request('generate-code-reconstruction')],
+        owner: deps.artifacts.generateCodeReconstruction
+      },
+      {
+        key: 'artifactGetCodeReconstruction',
+        args: [request('get-code-reconstruction')],
+        owner: deps.artifacts.getCodeReconstruction
+      },
       {
         key: 'artifactGetLineage',
         args: [request('lineage')],
@@ -401,6 +419,16 @@ describe('Data and content application commands', () => {
       },
       { key: 'projectGet', args: ['project-1'], owner: deps.projects.get },
       { key: 'projectList', args: [], owner: deps.projects.list },
+      {
+        key: 'projectUpdateArchive',
+        args: [request('project-update-archive')],
+        owner: deps.projects.updateArchive
+      },
+      {
+        key: 'sessionUpdateArchive',
+        args: [request('session-update-archive')],
+        owner: deps.sessions.updateArchive
+      },
       {
         key: 'uploadAbortTransfer',
         args: [request('upload-abort')],

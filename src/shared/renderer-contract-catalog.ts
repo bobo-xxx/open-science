@@ -171,7 +171,8 @@ export const RENDERER_CONTRACT_GROUPS = Object.freeze([
     ['respondPlan', 'acp:respond-plan'], ['revokePermissionGrant', 'acp:revoke-permission-grant'], ['sendPrompt', 'acp:send-prompt'], ['setPermissionProfile', 'acp:set-permission-profile'],
   ]),
   group('artifacts', 'artifacts', [
-    ['finalizeRunArtifacts', 'artifacts:finalize-run'], ['getLineage', 'artifacts:get-lineage'], ['getVersionExecution', 'artifacts:get-version-execution'],
+    ['finalizeRunArtifacts', 'artifacts:finalize-run'], ['generateCodeReconstruction', 'artifacts:generate-code-reconstruction'], ['getCodeReconstruction', 'artifacts:get-code-reconstruction'],
+    ['getLineage', 'artifacts:get-lineage'], ['getVersionExecution', 'artifacts:get-version-execution'],
     ['getVersionMessages', 'artifacts:get-version-messages'], ['getVersionProvenance', 'artifacts:get-version-provenance'],
     ['getVersionReview', 'artifacts:get-version-review'], ['listProjectFiles', 'artifacts:list-project-files'], ['openFile', 'artifacts:open-file', LOCAL],
     ['readPreview', 'artifacts:read-preview'], ['reconcilePendingArtifacts', 'artifacts:reconcile-pending'],
@@ -248,7 +249,7 @@ export const RENDERER_CONTRACT_GROUPS = Object.freeze([
   ]),
   group('projects', 'projects', [
     ['onCreated', 'project:created', EVENT], ['onDeleted', 'project:deleted', EVENT], ['onUpdated', 'project:updated', EVENT], ['create', 'projects:create'],
-    ['delete', 'projects:delete'], ['get', 'projects:get'], ['list', 'projects:list'], ['update', 'projects:update'],
+    ['delete', 'projects:delete'], ['get', 'projects:get'], ['list', 'projects:list'], ['updateArchive', 'projects:update-archive'], ['update', 'projects:update'],
   ]),
   group('remote-access', 'remoteAccess', [
     ['onChanged', 'remote-access:changed', EVENT], ['approve', 'remote-access:approve'], ['detect', 'remote-access:detect'],
@@ -293,7 +294,7 @@ export const RENDERER_CONTRACT_GROUPS = Object.freeze([
     ['exportConversation', 'sessions:export-conversation', MAPPED_ELECTRON], ['onCreated', 'session:created', EVENT], ['onDeleted', 'session:deleted', EVENT],
     ['onFlushRequest', 'sessions:flush-request', ELECTRON_EVENT], ['onUpdated', 'session:updated', EVENT], ['deleteSession', 'sessions:delete-session'],
     ['loadAll', 'sessions:load-all'], ['saveManifest', 'sessions:save-manifest'],
-    ['saveSession', 'sessions:save-session', WEB, SESSION_SAVE, SESSION_SAVE_JSON], ['sendFlushResponse', 'sessions:flush-response', SEND],
+    ['saveSession', 'sessions:save-session', WEB, SESSION_SAVE, SESSION_SAVE_JSON], ['updateArchive', 'sessions:update-archive'], ['sendFlushResponse', 'sessions:flush-response', SEND],
   ]),
   group('settings', 'settings', [
     ['addCustomServer', 'settings:add-custom-server'], ['authenticateCustomServer', 'settings:authenticate-custom-server', LOCAL], ['cancelCustomServerAuthentication', 'settings:cancel-custom-server-authentication', LOCAL], ['cancelClaudeLogin', 'settings:cancel-claude-login', LOCAL],
