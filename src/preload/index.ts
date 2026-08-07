@@ -186,6 +186,8 @@ const api: OpenScienceAPI = {
       electronRendererContracts.invoke('settings.setConversationSkillImportEnabled', request),
     setClosePreference: (request) =>
       electronRendererContracts.invoke('settings.setClosePreference', request),
+    setDefaultPermissionProfile: (request) =>
+      electronRendererContracts.invoke('settings.setDefaultPermissionProfile', request),
     setAppIconVariant: (request) =>
       electronRendererContracts.invoke('settings.setAppIconVariant', request),
     listAppIcons: () => electronRendererContracts.invoke('settings.listAppIcons'),
@@ -373,6 +375,10 @@ const api: OpenScienceAPI = {
   },
   github: {
     getStars: () => electronRendererContracts.invoke('github.getStars')
+  },
+  network: {
+    getInfo: () => electronRendererContracts.invoke('network.getInfo'),
+    checkConnectivity: () => electronRendererContracts.invoke('network.checkConnectivity')
   },
   cli: {
     getStatus: () => electronRendererContracts.invoke('cli.getStatus'),

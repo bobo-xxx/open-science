@@ -2,7 +2,16 @@
   "schemaVersion": 1,
   "modules": {
     "session_renderer": {
-      "ownerPaths": ["src/renderer/src/stores/session-store.ts"],
+      "ownerPaths": [
+        "src/renderer/src/stores/session-store.ts",
+        "src/renderer/src/stores/session-store-persistence-owner.ts",
+        "src/renderer/src/stores/session-store-message-graph-owner.ts",
+        "src/renderer/src/stores/session-store-message-graph-helpers.ts",
+        "src/renderer/src/stores/session-store-run-projection-owner.ts",
+        "src/renderer/src/stores/session-store-run-output-helpers.ts",
+        "src/renderer/src/stores/session-store-run-activity-helpers.ts",
+        "src/renderer/src/stores/session-store-run-terminal-helpers.ts"
+      ],
       "interfacePaths": ["src/renderer/src/stores/session-store.ts"],
       "consumerModules": ["workspace_runtime", "project_files_view", "workspace_page"],
       "testFiles": {
@@ -57,7 +66,16 @@
       "fallbackCapability": "renderer_view"
     },
     "artifact_storage": {
-      "ownerPaths": ["src/main/artifacts/repository.ts"],
+      "ownerPaths": [
+        "src/main/artifacts/compatibility-owner.ts",
+        "src/main/artifacts/pending-file-transaction.ts",
+        "src/main/artifacts/publication-owner.ts",
+        "src/main/artifacts/publication-types.ts",
+        "src/main/artifacts/repository.ts",
+        "src/main/artifacts/run-marker-codec.ts",
+        "src/main/artifacts/storage-access.ts",
+        "src/main/artifacts/storage-layout.ts"
+      ],
       "interfacePaths": ["src/main/artifacts/repository.ts"],
       "consumerModules": ["artifact_provenance"],
       "testFiles": {
@@ -72,25 +90,55 @@
       "fallbackCapability": "main_runtime"
     },
     "upload_repository": {
-      "ownerPaths": ["src/main/uploads/repository.ts"],
+      "ownerPaths": [
+        "src/main/uploads/repository.ts",
+        "src/main/uploads/active-transfer-owner.ts",
+        "src/main/uploads/legacy-recovery-owner.ts",
+        "src/main/uploads/managed-upload-resolver.ts",
+        "src/main/uploads/staged-publication-owner.ts",
+        "src/main/uploads/storage-helpers.ts",
+        "src/main/uploads/verified-legacy-cleanup-owner.ts"
+      ],
       "interfacePaths": ["src/main/uploads/repository.ts"],
       "consumerModules": ["session_persistence"],
       "testFiles": {
-        "owner": ["src/main/uploads/repository.test.ts"],
-        "contract": ["src/main/uploads/ipc.test.ts"],
-        "consumer": ["src/main/session-persistence/deletion-integration.test.ts"]
+        "owner": [
+          "src/main/uploads/repository.test.ts",
+          "src/main/uploads/repository.characterization.test.ts",
+          "src/main/uploads/repository.architecture.test.ts"
+        ],
+        "contract": ["src/main/uploads/ipc.test.ts", "src/main/uploads/command-owner.test.ts"],
+        "consumer": [
+          "src/main/session-persistence/deletion-integration.test.ts",
+          "src/main/acp/file-reference-resolver.test.ts",
+          "src/main/acp/prompt-content-owner.test.ts",
+          "src/main/skills/conversation-import.test.ts"
+        ]
       },
       "capabilityOverlays": ["windows_sensitive"],
       "fallbackCapability": "main_runtime"
     },
     "project_files_repository": {
-      "ownerPaths": ["src/main/project-files/repository.ts"],
+      "ownerPaths": [
+        "src/main/project-files/mutation-owner.ts",
+        "src/main/project-files/mutation-projection.ts",
+        "src/main/project-files/query-owner.ts",
+        "src/main/project-files/query-support.ts",
+        "src/main/project-files/repository.ts"
+      ],
       "interfacePaths": ["src/main/project-files/repository.ts"],
       "consumerModules": ["session_persistence"],
       "testFiles": {
-        "owner": ["src/main/project-files/repository.test.ts"],
+        "owner": [
+          "src/main/project-files/repository.architecture.test.ts",
+          "src/main/project-files/repository.test.ts"
+        ],
         "contract": ["src/main/project-files/ipc.test.ts"],
-        "consumer": ["src/main/session-persistence/deletion-integration.test.ts"]
+        "consumer": [
+          "src/main/session-persistence/coordinator.test.ts",
+          "src/main/session-persistence/deletion-integration.test.ts",
+          "src/main/session-persistence/artifact-finalization-recovery.integration.test.ts"
+        ]
       },
       "capabilityOverlays": ["windows_sensitive"],
       "fallbackCapability": "main_runtime"
@@ -100,7 +148,10 @@
       "interfacePaths": ["src/main/artifacts/provenance-repository.ts"],
       "consumerModules": ["session_persistence"],
       "testFiles": {
-        "owner": ["src/main/artifacts/provenance-repository.test.ts"],
+        "owner": [
+          "src/main/artifacts/provenance-repository.test.ts",
+          "src/main/artifacts/provenance-write-contract.test.ts"
+        ],
         "contract": ["src/main/artifacts/ipc.test.ts"],
         "consumer": [
           "src/main/session-persistence/artifact-finalization-recovery.integration.test.ts"
