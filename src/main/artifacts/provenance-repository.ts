@@ -1,15 +1,5 @@
-import { createHash, randomUUID } from 'node:crypto'
-import {
-  copyFile,
-  mkdir,
-  readFile,
-  readdir,
-  realpath,
-  rename,
-  rm,
-  stat,
-  writeFile
-} from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
@@ -20,19 +10,14 @@ import type {
   ArtifactLineageProvenance,
   ArtifactMessageSnapshotFile,
   ArtifactVersionDescriptor,
-  ArtifactVersionEnvironmentEvidence,
   ArtifactVersionEvidence,
   ArtifactVersionFile,
-  ArtifactVersionInputEvidence,
   ArtifactVersionProvenance,
-  ArtifactProducerUnavailableReason,
   CreateArtifactVersionRequest,
   FinalizeArtifactVersionsRequest,
   GetArtifactLineageRequest,
   GetArtifactVersionProvenanceRequest,
   PersistedArtifactExecutionSnapshot,
-  ProvenanceNotebookRun,
-  ProvenanceNotebookOutput,
   ProvenanceExecutionInputFile,
   ReplayArtifactVersionRequest
 } from '../../shared/artifact-provenance'
@@ -46,15 +31,29 @@ import {
   type PendingArtifactRunPublication
 } from './repository'
 import { defaultArtifactDurability, type ArtifactDurability } from './durability'
+import {
+  ArtifactProvenanceVersionWriter,
+  normalizeArtifactFilename as normalizeFilename,
+  type CompatibilityRoutingPublicationOptions,
+  type PersistedVersionFileRecord,
+  type PublishCompatibilityRouting,
+  type StagingArtifactVersionRecord
+} from './provenance-version-writer'
 import { NotebookRunRepository } from '../notebook/repository'
-import type {
-  NotebookEnvironmentManifest,
-  NotebookEnvironmentPackage,
-  NotebookOutput,
-  NotebookRunEnvironmentCapture,
-  NotebookRunInputFile,
-  NotebookRunRecord
-} from '../../shared/notebook'
+import type { NotebookRunInputFile } from '../../shared/notebook'
+import { canonicalJson, sha256, type CanonicalJson } from './provenance-canonical'
+import { ArtifactProvenanceProducerCapture } from './provenance-producer-capture'
+import {
+  parseArtifactExecutionSnapshot,
+  validateArtifactExecutionSnapshot
+} from './provenance-execution-evidence'
+import {
+  ArtifactFinalizationProofError,
+  ArtifactOwnershipPersistenceRaceError,
+  ArtifactProvenanceMessageFinalizer,
+  validateDurableMessageOwnership,
+  type ArtifactFinalizationProofReason
+} from './provenance-message-finalization'
 import { toCheck, toReview } from '../reviewer/repository'
 import { selectReviewChainForArtifactVersion } from '../reviewer/artifact-version-review'
 import { flagStaleReviews } from '../reviewer/stale-reviews'
@@ -77,41 +76,6 @@ const SAFE_SEGMENT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
 // inserting its staging row. Only rowless directories older than a full hour are proven abandoned.
 const ORPHAN_STAGING_GRACE_MS = 60 * 60 * 1_000
 const SHA256_PATTERN = /^[a-f0-9]{64}$/
-const VERSION_ALLOCATION_MAX_ATTEMPTS = 3
-const MAX_EXECUTION_SNAPSHOT_BYTES = 4 * 1024 * 1024
-const MAX_EXECUTION_SNAPSHOT_RUNS = 128
-const MAX_EXECUTION_SNAPSHOT_OUTPUTS = 256
-const MAX_EXECUTION_SNAPSHOT_INPUTS = 256
-const MAX_EXECUTION_OUTPUT_BYTES = 64 * 1024
-
-const isRetryableLineageVersionConflict = (error: unknown): boolean => {
-  if (typeof error !== 'object' || error === null || !('code' in error) || error.code !== 'P2002') {
-    return false
-  }
-  const meta =
-    'meta' in error && typeof error.meta === 'object' && error.meta ? error.meta : undefined
-  const target = meta && 'target' in meta ? meta.target : undefined
-  const fields = Array.isArray(target) ? target.map(String) : [String(target ?? '')]
-  const joined = fields.join(' ')
-  return (
-    (joined.includes('artifactId') && joined.includes('versionNumber')) ||
-    (joined.includes('projectId') &&
-      joined.includes('sessionId') &&
-      joined.includes('normalizedFilename'))
-  )
-}
-
-const withVersionAllocationRetry = async <T>(operation: () => Promise<T>): Promise<T> => {
-  for (let attempt = 1; ; attempt += 1) {
-    try {
-      return await operation()
-    } catch (error) {
-      if (attempt >= VERSION_ALLOCATION_MAX_ATTEMPTS || !isRetryableLineageVersionConflict(error)) {
-        throw error
-      }
-    }
-  }
-}
 
 type ArtifactProvenanceRepositoryOptions = {
   storageRoot: string
@@ -126,16 +90,6 @@ type ArtifactProvenanceRepositoryOptions = {
   now?: () => Date
   durability?: ArtifactDurability
 }
-
-type CompatibilityRoutingPublicationOptions = {
-  allowRoutingReplacement?: boolean
-  replaceUnroutedBytes?: boolean
-}
-
-type PublishCompatibilityRouting = (
-  version: PersistedVersionFileRecord,
-  options?: CompatibilityRoutingPublicationOptions
-) => Promise<void>
 
 export type WriteAppGeneratedArtifactVersionRequest = Omit<
   CreateArtifactVersionRequest,
@@ -153,53 +107,6 @@ export type WriteAppGeneratedArtifactVersionRequest = Omit<
   contentType?: string
   kind?: 'plan'
 }
-
-type PersistedVersionFileRecord = {
-  id: string
-  artifactId: string
-  versionNumber: number
-  filename: string
-  artifactRunId: string
-  contentStorageKey: string
-  contentType: string | null
-  sizeBytes: bigint
-  checksum: string
-  createdAt: Date
-  producerRunId: string | null
-  executionSnapshotJson: string | null
-}
-
-type StagingArtifactVersionRecord = PersistedVersionFileRecord & {
-  state: string
-  evidenceStorageKey: string
-  evidenceJson: string
-  evidenceChecksum: string
-  executionSnapshotChecksum: string | null
-  executionSnapshotStorageKey: string | null
-  artifact: { id: string; filename: string }
-}
-
-type ProducerCapture =
-  | {
-      state: 'unavailable'
-      reason: ArtifactProducerUnavailableReason
-    }
-  | {
-      state: 'available'
-      notebookSessionId: string
-      producerRunId: string
-      producerRunIndex: number
-      associationMethod: 'agent-declared-and-session-validated' | 'server-inferred-file-observation'
-      kernelKind: NotebookRunRecord['kernelKind']
-      environmentName?: string
-      reproductionCode: string
-      executionJson: string
-      executionChecksum: string
-      inputFiles: NotebookRunInputFile[]
-      environmentCapture: NotebookRunEnvironmentCapture
-      environmentManifest?: NotebookEnvironmentManifest
-      environmentManifestChecksum?: string
-    }
 
 type ArtifactStorageReconciliationResult = {
   recoveredVersionIds: string[]
@@ -220,126 +127,10 @@ export type ArtifactProjectReconciliationSnapshot = {
   readonly [artifactProjectReconciliationState]: ArtifactProjectReconciliationState
 }
 
-type ArtifactFinalizationContext = Pick<
+type PreparedArtifactFinalizationContext = Pick<
   FinalizeArtifactVersionsRequest,
-  | 'rootFrameId'
-  | 'agentFrameId'
-  | 'messageBranchId'
-  | 'runtimeSegmentId'
-  | 'promptMessageId'
-  | 'messageId'
+  'rootFrameId' | 'agentFrameId' | 'messageBranchId' | 'runtimeSegmentId' | 'promptMessageId'
 >
-
-type PreparedArtifactFinalizationContext = Omit<ArtifactFinalizationContext, 'messageId'>
-
-export class ArtifactFinalizationProofError extends Error {
-  constructor(message: string, cause?: unknown) {
-    super(message, cause === undefined ? undefined : { cause })
-    this.name = 'ArtifactFinalizationProofError'
-  }
-}
-
-export class ArtifactOwnershipPersistenceRaceError extends ArtifactFinalizationProofError {
-  constructor(message = 'Artifact finalization ownership is not durable yet.') {
-    super(message)
-    this.name = 'ArtifactOwnershipPersistenceRaceError'
-  }
-}
-
-type ArtifactFinalizationProofRequest = FinalizeArtifactVersionsRequest
-
-type ArtifactFinalizationProofVersion = PersistedVersionFileRecord & {
-  messageId: string | null
-  rootFrameId: string
-  agentFrameId: string
-  messageBranchId: string
-  runtimeSegmentId: string
-  promptMessageId: string
-  notebookSessionId: string | null
-  producerRunIndex: number | null
-  executionSnapshotChecksum: string | null
-  executionSnapshotStorageKey: string | null
-  executionSnapshotSchemaVersion: number | null
-  evidenceJson: string
-  artifact: { projectId: string; sessionId: string }
-}
-
-const validateDurableMessageOwnership = (
-  session: PersistedChatSession,
-  context: ArtifactFinalizationContext
-): { messageBranchAncestry: string[]; messageAncestry: string[] } => {
-  const graph = materializeSessionConversationGraph(session).conversationGraph!
-  if (graph.rootFrameId !== context.rootFrameId) {
-    throw new ArtifactFinalizationProofError(
-      'Artifact finalization root Frame does not match the durable Session graph.'
-    )
-  }
-  const frame = graph.frames.find((candidate) => candidate.id === context.agentFrameId)
-  const branch = graph.branches.find((candidate) => candidate.id === context.messageBranchId)
-  if (!frame || !branch || branch.agentFrameId !== frame.id) {
-    throw new ArtifactFinalizationProofError(
-      'Artifact finalization Branch does not belong to the declared Agent Frame.'
-    )
-  }
-  const segment = graph.runtimeSegments.find(
-    (candidate) =>
-      candidate.id === context.runtimeSegmentId && candidate.agentFrameId === context.agentFrameId
-  )
-  if (!segment) {
-    throw new ArtifactFinalizationProofError(
-      'Artifact finalization Runtime Segment is not durable.'
-    )
-  }
-  const path = resolveMessageBranchPath(graph, context.messageBranchId)
-  const promptIndex = path.findIndex((message) => message.id === context.promptMessageId)
-  const finalIndex = path.findIndex((message) => message.id === context.messageId)
-  const promptMessage = path[promptIndex]
-  const finalMessage = path[finalIndex]
-  // Message status is lifecycle state, not ownership proof. The runtime creates an Artifact claim only
-  // after the provider turn terminates, while the renderer may not have applied its following stop event
-  // yet; an internal disk load can also normalize that still-streaming node to error. Frame, Branch,
-  // Runtime Segment, role, and ordered path identity remain the fail-closed ownership boundary.
-  if (
-    promptIndex < 0 ||
-    !promptMessage ||
-    promptMessage.role !== 'user' ||
-    promptMessage.status !== 'complete' ||
-    promptMessage.agentFrameId !== context.agentFrameId ||
-    promptMessage.introducedOnBranchId !== context.messageBranchId ||
-    promptMessage.runtimeSegmentId !== context.runtimeSegmentId
-  ) {
-    throw new ArtifactFinalizationProofError(
-      'Artifact finalization prompt does not match the declared durable ownership.'
-    )
-  }
-  if (finalIndex < 0 || !finalMessage) {
-    throw new ArtifactOwnershipPersistenceRaceError(
-      'Artifact finalization message is not durable yet.'
-    )
-  }
-  if (
-    finalIndex <= promptIndex ||
-    finalMessage.role !== 'agent' ||
-    finalMessage.agentFrameId !== context.agentFrameId ||
-    finalMessage.introducedOnBranchId !== context.messageBranchId ||
-    finalMessage.runtimeSegmentId !== context.runtimeSegmentId
-  ) {
-    throw new ArtifactFinalizationProofError(
-      'Artifact finalization message does not match the declared durable ownership.'
-    )
-  }
-  const branches = new Map(graph.branches.map((candidate) => [candidate.id, candidate]))
-  const branchAncestry: string[] = []
-  let current: typeof branch | undefined = branch
-  while (current) {
-    branchAncestry.unshift(current.id)
-    current = current.parentBranchId ? branches.get(current.parentBranchId) : undefined
-  }
-  return {
-    messageBranchAncestry: branchAncestry,
-    messageAncestry: path.slice(0, finalIndex + 1).map((message) => message.id)
-  }
-}
 
 // Resolves the one agent message produced by the prepared prompt turn. It deliberately considers only
 // messages before the next user prompt on the declared Branch and Runtime Segment; choosing a latest
@@ -398,208 +189,11 @@ const isArtifactLinkedToDurableMessage = (
   )
 }
 
-type CanonicalJson =
-  null | boolean | number | string | CanonicalJson[] | { [key: string]: CanonicalJson }
-
 const assertSafeSegment = (value: string, label: string): string => {
   if (!SAFE_SEGMENT_PATTERN.test(value)) {
     throw new Error(`Invalid ${label}: ${value}`)
   }
   return value
-}
-
-const assertChecksum = (value: string, label: string): string => {
-  if (!SHA256_PATTERN.test(value)) {
-    throw new Error(`Invalid ${label}: expected lowercase SHA-256`)
-  }
-  return value
-}
-
-// JavaScript has no native toCaseFold. Locale-independent lowercase plus the multi-character and
-// positional folds that differ on supported filenames covers the portability cases that ordinary
-// lowercasing misses (notably German sharp-s and Greek final sigma).
-const normalizeFilename = (filename: string): string =>
-  filename
-    .normalize('NFC')
-    .toLocaleLowerCase('und')
-    .replace(/\u00df/gu, 'ss')
-    .replace(/\u03c2/gu, '\u03c3')
-
-const canonicalize = (value: CanonicalJson): CanonicalJson => {
-  if (Array.isArray(value)) return value.map(canonicalize)
-  if (value === null || typeof value !== 'object') return value
-
-  return Object.fromEntries(
-    Object.entries(value)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, entry]) => [key, canonicalize(entry)])
-  )
-}
-
-const canonicalJson = (value: CanonicalJson): string => JSON.stringify(canonicalize(value))
-
-const sha256 = (value: Buffer | string): string => createHash('sha256').update(value).digest('hex')
-
-const normalizeArtifactFinalizationProofRequest = (
-  request: ArtifactFinalizationProofRequest
-): ArtifactFinalizationProofRequest => {
-  if (!Array.isArray(request.artifactVersionIds) || request.artifactVersionIds.length === 0) {
-    throw new ArtifactFinalizationProofError('Artifact Version ids are required for finalization.')
-  }
-  const artifactVersionIds = request.artifactVersionIds.map((versionId) =>
-    assertSafeSegment(versionId, 'artifact version id')
-  )
-  if (new Set(artifactVersionIds).size !== artifactVersionIds.length) {
-    throw new ArtifactFinalizationProofError('Artifact Version ids must be unique.')
-  }
-
-  return {
-    ...request,
-    artifactVersionIds,
-    projectId: assertSafeSegment(request.projectId, 'project id'),
-    appSessionId: assertSafeSegment(request.appSessionId, 'session id'),
-    artifactRunId: assertSafeSegment(request.artifactRunId, 'artifact run id'),
-    rootFrameId: assertSafeSegment(request.rootFrameId, 'root frame id'),
-    agentFrameId: assertSafeSegment(request.agentFrameId, 'agent frame id'),
-    messageBranchId: assertSafeSegment(request.messageBranchId, 'message branch id'),
-    runtimeSegmentId: assertSafeSegment(request.runtimeSegmentId, 'runtime segment id'),
-    promptMessageId: assertSafeSegment(request.promptMessageId, 'prompt message id'),
-    messageId: assertSafeSegment(request.messageId, 'message id')
-  }
-}
-
-const loadArtifactFinalizationProofVersions = async (
-  client: Pick<PrismaClient, 'artifactVersion'>,
-  request: ArtifactFinalizationProofRequest
-): Promise<ArtifactFinalizationProofVersion[]> =>
-  client.artifactVersion.findMany({
-    where: {
-      artifactRunId: request.artifactRunId,
-      rootFrameId: request.rootFrameId,
-      agentFrameId: request.agentFrameId,
-      messageBranchId: request.messageBranchId,
-      runtimeSegmentId: request.runtimeSegmentId,
-      promptMessageId: request.promptMessageId,
-      state: { in: ['pending', 'finalized'] },
-      artifact: { is: { projectId: request.projectId, sessionId: request.appSessionId } }
-    },
-    include: { artifact: true },
-    orderBy: [{ artifactId: 'asc' }, { versionNumber: 'asc' }]
-  })
-
-const validateArtifactFinalizationProof = (
-  matching: readonly ArtifactFinalizationProofVersion[],
-  request: ArtifactFinalizationProofRequest
-): void => {
-  const matchingIds = new Set(matching.map((version) => version.id))
-  const expectedIds = new Set(request.artifactVersionIds)
-  const missingExpectedVersionId = request.artifactVersionIds.find(
-    (versionId) => !matchingIds.has(versionId)
-  )
-  if (missingExpectedVersionId) {
-    throw new ArtifactFinalizationProofError(
-      `Artifact Version is no longer eligible for finalization: ${missingExpectedVersionId}`
-    )
-  }
-  const unexpectedMatchingVersion = matching.find((version) => !expectedIds.has(version.id))
-  if (unexpectedMatchingVersion) {
-    throw new ArtifactFinalizationProofError(
-      `Artifact Version was omitted from the finalization claim: ${unexpectedMatchingVersion.id}`
-    )
-  }
-
-  const conflicting = matching.find(
-    (version) => version.messageId && version.messageId !== request.messageId
-  )
-  if (conflicting) {
-    throw new ArtifactFinalizationProofError(
-      `Artifact Version ${conflicting.id} is already finalized to a different message.`
-    )
-  }
-
-  const durableBranchIds = new Set(request.messageBranchAncestry ?? [request.messageBranchId])
-  const durableMessageIds = new Set(
-    request.messageAncestry ?? [request.promptMessageId, request.messageId]
-  )
-  for (const version of matching) {
-    try {
-      const parsedEvidence = JSON.parse(version.evidenceJson) as Partial<ArtifactVersionEvidence>
-      if (
-        !parsedEvidence ||
-        typeof parsedEvidence !== 'object' ||
-        (parsedEvidence.producer?.state !== 'available' &&
-          parsedEvidence.producer?.state !== 'unavailable')
-      ) {
-        throw new ArtifactFinalizationProofError(
-          `Artifact Version evidence is invalid: ${version.id}`
-        )
-      }
-      const evidence = parsedEvidence as ArtifactVersionEvidence
-
-      if (!version.executionSnapshotJson) {
-        const hasProducerOrExecutionFields =
-          version.notebookSessionId !== null ||
-          version.producerRunId !== null ||
-          version.producerRunIndex !== null ||
-          version.executionSnapshotChecksum !== null ||
-          version.executionSnapshotStorageKey !== null ||
-          version.executionSnapshotSchemaVersion !== null
-        const isProvenUnavailableWithoutExecution =
-          evidence.producer.state === 'unavailable' &&
-          evidence.execution_status?.state === 'unavailable' &&
-          Array.isArray(evidence.inputs) &&
-          evidence.inputs.length === 0 &&
-          evidence.execution_snapshot_checksum === undefined &&
-          evidence.reproduction_code === undefined
-        if (hasProducerOrExecutionFields || !isProvenUnavailableWithoutExecution) {
-          throw new ArtifactFinalizationProofError(
-            `Artifact Version execution snapshot is missing: ${version.id}`
-          )
-        }
-        continue
-      }
-
-      if (
-        !version.executionSnapshotChecksum ||
-        sha256(version.executionSnapshotJson) !== version.executionSnapshotChecksum
-      ) {
-        throw new ArtifactFinalizationProofError(
-          `Artifact Version execution snapshot is corrupt: ${version.id}`
-        )
-      }
-      const snapshot = parseArtifactExecutionSnapshot(version.executionSnapshotJson)
-      validateArtifactExecutionSnapshot(snapshot, {
-        rootFrameId: version.rootFrameId,
-        agentFrameId: version.agentFrameId,
-        messageBranchId: version.messageBranchId,
-        promptMessageId: version.promptMessageId,
-        producerRunId: version.producerRunId,
-        producerRunIndex: version.producerRunIndex,
-        executionSnapshotChecksum: version.executionSnapshotChecksum,
-        evidence
-      })
-      const outsideDurableAncestry = snapshot.runs.some(
-        (run) =>
-          !durableBranchIds.has(run.messageBranchId) ||
-          (run.promptMessageId
-            ? !durableMessageIds.has(run.promptMessageId)
-            : run.messageBranchId !== request.messageBranchId)
-      )
-      if (outsideDurableAncestry) {
-        throw new ArtifactFinalizationProofError(
-          `Artifact Version execution snapshot is outside the durable Branch ancestry: ${version.id}`
-        )
-      }
-    } catch (error) {
-      if (error instanceof ArtifactFinalizationProofError) throw error
-      throw new ArtifactFinalizationProofError(
-        error instanceof Error
-          ? error.message
-          : `Artifact Version execution snapshot is invalid: ${version.id}`,
-        error
-      )
-    }
-  }
 }
 
 const storageKey = (...segments: string[]): string => segments.join('/')
@@ -651,18 +245,6 @@ const moveDirectoryIfPresent = async (source: string, destination: string): Prom
   }
 }
 
-const clipText = (value: string, maxLength = 16_000): string =>
-  value.length <= maxLength ? value : `${value.slice(0, maxLength)}\n…[truncated]`
-
-const provenanceTextOutput = (value: string): ProvenanceNotebookOutput => {
-  const clipped = clipText(value)
-  return {
-    type: 'text',
-    text: clipped,
-    ...(clipped !== value ? { truncated: true } : {})
-  }
-}
-
 const recordValue = (value: unknown): Record<string, unknown> | undefined =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -683,152 +265,6 @@ const stringValue = (value: unknown): string | undefined =>
 
 const numberValue = (value: unknown): number | undefined =>
   typeof value === 'number' && Number.isFinite(value) ? value : undefined
-
-const normalizeStoredProvenanceOutput = (value: unknown): ProvenanceNotebookOutput[] => {
-  const output = recordValue(value)
-  if (output?.type === 'text' && typeof output.text === 'string') {
-    return [
-      {
-        type: 'text',
-        text: output.text,
-        ...(output.truncated === true ? { truncated: true } : {})
-      }
-    ]
-  }
-  if (output?.type === 'error') {
-    const name = stringValue(output.name)
-    const message = stringValue(output.message) ?? name ?? 'Notebook execution failed.'
-    const traceback = Array.isArray(output.traceback)
-      ? output.traceback.filter((line): line is string => typeof line === 'string')
-      : typeof output.traceback === 'string' && output.traceback
-        ? output.traceback.split('\n')
-        : undefined
-    return [
-      { type: 'error', ...(name ? { name } : {}), message, ...(traceback ? { traceback } : {}) }
-    ]
-  }
-  if (output?.type === 'table') {
-    const columns = Array.isArray(output.columns)
-      ? output.columns.filter((column): column is string => typeof column === 'string')
-      : []
-    const previewRows = Array.isArray(output.previewRows)
-      ? output.previewRows.filter((row): row is unknown[] => Array.isArray(row))
-      : []
-    const rowCount = numberValue(output.rowCount)
-    return columns.length > 0 && rowCount !== undefined
-      ? [{ type: 'table', columns, rowCount, previewRows }]
-      : []
-  }
-  if (output?.type === 'omitted-media') {
-    const mimeTypes =
-      typeof output.mimeType === 'string'
-        ? [output.mimeType]
-        : Array.isArray(output.mime_types)
-          ? output.mime_types.filter((mimeType): mimeType is string => typeof mimeType === 'string')
-          : []
-    return mimeTypes.map((mimeType) => ({
-      type: 'omitted-media',
-      mimeType,
-      ...(typeof output.byteLength === 'number' ? { byteLength: output.byteLength } : {})
-    }))
-  }
-  return []
-}
-
-const parseArtifactExecutionSnapshot = (value: string): PersistedArtifactExecutionSnapshot => {
-  const parsed = JSON.parse(value) as unknown
-  const snapshot = recordValue(parsed)
-  const truncation = recordValue(snapshot?.truncation)
-  if (
-    snapshot?.schemaVersion !== 2 ||
-    typeof snapshot.rootFrameId !== 'string' ||
-    typeof snapshot.agentFrameId !== 'string' ||
-    typeof snapshot.messageBranchId !== 'string' ||
-    typeof snapshot.terminalPromptMessageId !== 'string' ||
-    typeof snapshot.producerRunId !== 'string' ||
-    typeof snapshot.producerRunIndex !== 'number' ||
-    !Number.isSafeInteger(snapshot.producerRunIndex) ||
-    typeof snapshot.createdAt !== 'string' ||
-    !Array.isArray(snapshot.inputFiles) ||
-    !Array.isArray(snapshot.runs) ||
-    (snapshot.truncation !== undefined &&
-      (!truncation ||
-        truncation.reason !== 'payload-limit' ||
-        !Number.isSafeInteger(truncation.omittedLeadingRunCount) ||
-        Number(truncation.omittedLeadingRunCount) < 0 ||
-        !Number.isSafeInteger(truncation.omittedOutputCount) ||
-        Number(truncation.omittedOutputCount) < 0 ||
-        !Number.isSafeInteger(truncation.omittedInputCount) ||
-        Number(truncation.omittedInputCount) < 0)) ||
-    snapshot.runs.some((run) => {
-      const candidate = recordValue(run)
-      return (
-        !candidate ||
-        typeof candidate.runId !== 'string' ||
-        typeof candidate.runIndex !== 'number' ||
-        !Number.isSafeInteger(candidate.runIndex) ||
-        typeof candidate.kernelKind !== 'string' ||
-        typeof candidate.script !== 'string' ||
-        typeof candidate.status !== 'string' ||
-        typeof candidate.startedAt !== 'string' ||
-        !Array.isArray(candidate.outputs) ||
-        !Array.isArray(candidate.inputFileVersionKeys)
-      )
-    })
-  ) {
-    throw new Error('Artifact Version execution snapshot schema is invalid.')
-  }
-  const normalized = parsed as PersistedArtifactExecutionSnapshot
-  return {
-    ...normalized,
-    runs: normalized.runs.map((run) => ({
-      ...run,
-      outputs: (run.outputs as unknown[]).flatMap(normalizeStoredProvenanceOutput)
-    }))
-  }
-}
-
-const validateArtifactExecutionSnapshot = (
-  snapshot: PersistedArtifactExecutionSnapshot,
-  expected: {
-    rootFrameId: string
-    agentFrameId: string
-    messageBranchId: string
-    promptMessageId: string
-    producerRunId: string | null
-    producerRunIndex: number | null
-    executionSnapshotChecksum: string
-    evidence: ArtifactVersionEvidence
-  }
-): void => {
-  const producer = expected.evidence.producer
-  const runIndexes = snapshot.runs.map((run) => run.runIndex)
-  const indexesAreStrictlyIncreasing = runIndexes.every(
-    (runIndex, index) => index === 0 || runIndex > runIndexes[index - 1]!
-  )
-  const terminalRun = snapshot.runs.at(-1)
-  if (
-    snapshot.rootFrameId !== expected.rootFrameId ||
-    snapshot.agentFrameId !== expected.agentFrameId ||
-    snapshot.messageBranchId !== expected.messageBranchId ||
-    snapshot.terminalPromptMessageId !== expected.promptMessageId ||
-    expected.producerRunId === null ||
-    expected.producerRunIndex === null ||
-    snapshot.producerRunId !== expected.producerRunId ||
-    snapshot.producerRunIndex !== expected.producerRunIndex ||
-    expected.evidence.execution_snapshot_checksum !== expected.executionSnapshotChecksum ||
-    producer.state !== 'available' ||
-    producer.producer_run_id !== expected.producerRunId ||
-    producer.run_index !== expected.producerRunIndex ||
-    snapshot.runs.length === 0 ||
-    !indexesAreStrictlyIncreasing ||
-    runIndexes.some((runIndex) => runIndex > expected.producerRunIndex!) ||
-    terminalRun?.runId !== expected.producerRunId ||
-    terminalRun.runIndex !== expected.producerRunIndex
-  ) {
-    throw new Error('Artifact Version execution snapshot metadata mismatch.')
-  }
-}
 
 type PersistedExecutionInputRow = {
   ordinal: number
@@ -913,419 +349,49 @@ const validRecoveryFilename = (value: string): boolean =>
   !value.includes('/') &&
   !value.includes('\\')
 
-const tableCell = (value: unknown): CanonicalJson => {
-  if (
-    value === null ||
-    typeof value === 'boolean' ||
-    typeof value === 'number' ||
-    typeof value === 'string'
-  ) {
-    return value
-  }
-  const serialized = JSON.stringify(value)
-  return serialized === undefined ? null : clipText(serialized, 2_000)
-}
-
-const tabularJsonOutput = (value: unknown): ProvenanceNotebookOutput | undefined => {
-  if (!Array.isArray(value) || value.length === 0 || value.some((row) => !recordValue(row))) {
-    return undefined
-  }
-  const previewRecords = value.slice(0, 100).map((row) => recordValue(row)!)
-  const columns = [...new Set(previewRecords.flatMap((row) => Object.keys(row)))].slice(0, 50)
-  if (columns.length === 0) return undefined
-  return {
-    type: 'table',
-    columns,
-    rowCount: value.length,
-    previewRows: previewRecords.map((row) => columns.map((column) => tableCell(row[column])))
-  }
-}
-
-const omittedMediaByteLength = (mimeType: string, value: string): number =>
-  mimeType.startsWith('image/') || mimeType === 'application/pdf'
-    ? Buffer.from(value, 'base64').byteLength
-    : Buffer.byteLength(value)
-
-const boundExecutionOutput = (output: ProvenanceNotebookOutput): ProvenanceNotebookOutput =>
-  Buffer.byteLength(JSON.stringify(output), 'utf8') <= MAX_EXECUTION_OUTPUT_BYTES
-    ? output
-    : {
-        type: 'text',
-        text: '[output omitted because it exceeded the execution evidence limit]',
-        truncated: true
-      }
-
-const sanitizeOutput = (output: NotebookOutput): ProvenanceNotebookOutput[] => {
-  if (output.type === 'display') {
-    const entries = Object.entries(output.data)
-    return [
-      ...entries
-        .filter(([mimeType]) => mimeType.startsWith('text/'))
-        .sort(([left], [right]) => left.localeCompare(right))
-        .map(([, value]) => provenanceTextOutput(value)),
-      ...entries
-        .filter(([mimeType]) => !mimeType.startsWith('text/'))
-        .sort(([left], [right]) => left.localeCompare(right))
-        .map<ProvenanceNotebookOutput>(([mimeType, value]) => ({
-          type: 'omitted-media',
-          mimeType,
-          byteLength: omittedMediaByteLength(mimeType, value)
-        }))
-    ]
-  }
-  if (output.type === 'json') {
-    return [
-      tabularJsonOutput(output.data) ?? provenanceTextOutput(JSON.stringify(output.data) ?? 'null')
-    ]
-  }
-  if (output.type === 'error') {
-    const traceback = clipText(output.traceback)
-    return [
-      {
-        type: 'error',
-        ...(output.name ? { name: output.name } : {}),
-        message: clipText(output.message ?? output.name ?? 'Notebook execution failed.'),
-        ...(traceback ? { traceback: traceback.split('\n') } : {})
-      }
-    ]
-  }
-  return [provenanceTextOutput(output.text)]
-}
-
-const sanitizeRun = (
-  run: NotebookRunRecord,
-  runIndex: number,
-  outputs: ProvenanceNotebookOutput[] = run.outputs.flatMap(sanitizeOutput)
-): ProvenanceNotebookRun => {
-  const script = clipText(run.script)
-  return {
-    runId: run.runId,
-    runIndex,
-    agentFrameId: run.agentFrameId ?? '',
-    messageBranchId: run.messageBranchId ?? '',
-    runtimeSegmentId: run.runtimeSegmentId ?? '',
-    promptMessageId: run.promptMessageId ?? '',
-    kernelKind: run.kernelKind,
-    ...(run.environment ? { environmentName: run.environment } : {}),
-    script,
-    ...(script !== run.script ? { scriptTruncated: true } : {}),
-    status: run.status,
-    ...(run.executionCount !== undefined ? { executionCount: run.executionCount } : {}),
-    startedAt: new Date(run.startedAt).toISOString(),
-    ...(run.endedAt !== undefined ? { completedAt: new Date(run.endedAt).toISOString() } : {}),
-    outputs,
-    inputFileVersionKeys: (run.inputFiles ?? []).map((input) => ({
-      sourceKind: input.sourceKind,
-      inputFileVersionId: input.inputFileVersionId
-    })),
-    ...(run.workingFiles.length > 0 ? { hasOmittedFiles: true } : {})
-  }
-}
-
-const mergeExecutionInputs = (
-  runs: Array<{ run: NotebookRunRecord; runIndex: number }>
-): NotebookRunInputFile[] => {
-  const inputs = new Map<string, NotebookRunInputFile>()
-  for (const { run } of runs) {
-    for (const input of run.inputFiles ?? []) {
-      const key = `${input.sourceKind}\0${input.inputFileVersionId}`
-      const existing = inputs.get(key)
-      inputs.set(key, {
-        ...input,
-        association:
-          existing?.association === 'resolver-accessed' || input.association === 'resolver-accessed'
-            ? 'resolver-accessed'
-            : 'turn-attached'
-      })
-    }
-  }
-  return [...inputs.values()]
-}
-
-const buildBoundedExecutionSnapshot = (
-  base: Omit<PersistedArtifactExecutionSnapshot, 'inputFiles' | 'runs' | 'truncation'>,
-  eligibleRuns: Array<{ run: NotebookRunRecord; runIndex: number }>
-): PersistedArtifactExecutionSnapshot => {
-  let omittedLeadingRunCount = Math.max(0, eligibleRuns.length - MAX_EXECUTION_SNAPSHOT_RUNS)
-  let omittedOutputCount = 0
-  const selectedRuns = eligibleRuns.slice(-MAX_EXECUTION_SNAPSHOT_RUNS)
-  let remainingOutputs = MAX_EXECUTION_SNAPSHOT_OUTPUTS
-  const runs = selectedRuns.map(({ run, runIndex }) => ({
-    run,
-    runIndex,
-    outputs: [] as ProvenanceNotebookOutput[]
-  }))
-  for (let index = runs.length - 1; index >= 0; index -= 1) {
-    const candidate = runs[index]!
-    const outputs = candidate.run.outputs.flatMap(sanitizeOutput).map(boundExecutionOutput)
-    const retainedCount = Math.min(outputs.length, remainingOutputs)
-    candidate.outputs = outputs.slice(0, retainedCount)
-    const omittedForRun = outputs.length - retainedCount
-    omittedOutputCount += omittedForRun
-    remainingOutputs -= retainedCount
-  }
-
-  const allInputs = mergeExecutionInputs(eligibleRuns)
-  let inputFiles = allInputs.slice(0, MAX_EXECUTION_SNAPSHOT_INPUTS)
-  let omittedInputCount = allInputs.length - inputFiles.length
-  const materializedRuns = runs.map(({ run, runIndex, outputs }) => {
-    const materialized = sanitizeRun(run, runIndex, outputs)
-    const omittedForRun = run.outputs.flatMap(sanitizeOutput).length - outputs.length
-    if (omittedForRun > 0) materialized.omittedOutputCount = omittedForRun
-    return materialized
-  })
-
-  const retainedInputKeys = (): Set<string> =>
-    new Set(inputFiles.map((input) => `${input.sourceKind}\0${input.inputFileVersionId}`))
-  const filterRunInputKeys = (): void => {
-    const retained = retainedInputKeys()
-    for (const run of materializedRuns) {
-      const filtered = run.inputFileVersionKeys.filter((input) =>
-        retained.has(`${input.sourceKind}\0${input.inputFileVersionId}`)
-      )
-      if (filtered.length !== run.inputFileVersionKeys.length) run.hasOmittedInputs = true
-      run.inputFileVersionKeys = filtered
-    }
-  }
-  filterRunInputKeys()
-
-  const snapshot = (): PersistedArtifactExecutionSnapshot => ({
-    ...base,
-    inputFiles,
-    runs: materializedRuns,
-    ...(omittedLeadingRunCount > 0 || omittedOutputCount > 0 || omittedInputCount > 0
-      ? {
-          truncation: {
-            reason: 'payload-limit' as const,
-            omittedLeadingRunCount,
-            omittedOutputCount,
-            omittedInputCount
-          }
-        }
-      : {})
-  })
-  const snapshotBytes = (): number =>
-    Buffer.byteLength(canonicalJson(snapshot() as unknown as CanonicalJson), 'utf8')
-
-  while (snapshotBytes() > MAX_EXECUTION_SNAPSHOT_BYTES && materializedRuns.length > 1) {
-    materializedRuns.shift()
-    omittedLeadingRunCount += 1
-  }
-  while (snapshotBytes() > MAX_EXECUTION_SNAPSHOT_BYTES) {
-    const runWithOutput = materializedRuns.find((run) => run.outputs.length > 0)
-    if (!runWithOutput) break
-    runWithOutput.outputs.pop()
-    runWithOutput.omittedOutputCount = (runWithOutput.omittedOutputCount ?? 0) + 1
-    omittedOutputCount += 1
-  }
-  while (snapshotBytes() > MAX_EXECUTION_SNAPSHOT_BYTES && inputFiles.length > 0) {
-    inputFiles = inputFiles.slice(0, Math.floor(inputFiles.length / 2))
-    omittedInputCount = allInputs.length - inputFiles.length
-    filterRunInputKeys()
-  }
-  if (snapshotBytes() > MAX_EXECUTION_SNAPSHOT_BYTES) {
-    const producer = materializedRuns.at(-1)
-    if (producer) {
-      producer.script = clipText(producer.script, 1_000)
-      producer.scriptTruncated = true
-    }
-  }
-  if (snapshotBytes() > MAX_EXECUTION_SNAPSHOT_BYTES) {
-    throw new Error('Artifact execution evidence exceeds the bounded snapshot limit.')
-  }
-  return snapshot()
-}
-
-const inputEvidence = (
-  input: NotebookRunInputFile,
-  ordinal: number
-): ArtifactVersionInputEvidence => ({
-  ordinal,
-  input_file_version_id: input.inputFileVersionId,
-  source_kind: input.sourceKind,
-  source_file_id: input.sourceFileId,
-  ...(input.sourceVersionNumber !== undefined
-    ? { source_version_number: input.sourceVersionNumber }
-    : {}),
-  ...(input.sourceCreatedAt ? { source_created_at: input.sourceCreatedAt } : {}),
-  source_project_id: input.sourceProjectId,
-  source_session_id: input.sourceSessionId,
-  filename: input.filename,
-  ...(input.contentType ? { content_type: input.contentType } : {}),
-  size_bytes: input.sizeBytes,
-  checksum: input.checksum,
-  storage_key: input.storageKey,
-  strongest_association: input.association
-})
-
-const environmentPackageEvidence = (
-  pkg: NotebookEnvironmentPackage
-): ArtifactVersionEnvironmentEvidence['packages'][number] => ({
-  name: pkg.name,
-  ...(pkg.version ? { version: pkg.version } : {}),
-  version_status: pkg.versionStatus,
-  ecosystem: pkg.ecosystem,
-  evidence_sources: pkg.evidenceSources,
-  loaded_state: pkg.loadedState ?? 'unknown',
-  ...(pkg.libraryRank !== undefined ? { library_rank: pkg.libraryRank } : {}),
-  ...(pkg.libraryScope ? { library_scope: pkg.libraryScope } : {}),
-  ...(pkg.builtForRuntime ? { built_for_runtime: pkg.builtForRuntime } : {}),
-  ...(pkg.priority ? { priority: pkg.priority } : {})
-})
-
-const environmentEvidence = (
-  manifest: NotebookEnvironmentManifest,
-  checksum: string
-): ArtifactVersionEnvironmentEvidence => ({
-  capture_kind: manifest.captureKind,
-  environment_name: manifest.environmentName,
-  kernel_kind: manifest.kernelKind,
-  runtime_source: manifest.runtimeSource,
-  ...(manifest.runtimeVersion ? { runtime_version: manifest.runtimeVersion } : {}),
-  ...(manifest.platform ? { platform: manifest.platform } : {}),
-  ...(manifest.architecture ? { architecture: manifest.architecture } : {}),
-  packages: manifest.packages.map(environmentPackageEvidence),
-  ...(manifest.kernelKind === 'python' && manifest.runtimeVersion
-    ? { python_version: manifest.runtimeVersion }
-    : {}),
-  ...(manifest.kernelKind === 'r' && manifest.runtimeVersion
-    ? { r_version: manifest.runtimeVersion }
-    : {}),
-  inventory_sources: manifest.inventorySources,
-  installed_inventory: {
-    captured_at: manifest.installedInventory.capturedAt,
-    source: manifest.installedInventory.source,
-    validation: manifest.installedInventory.validation
-  },
-  ...(manifest.operationLog
-    ? {
-        op_log: manifest.operationLog.map((operation) => ({
-          operation_id: operation.operationId,
-          timestamp: operation.timestamp,
-          operation: operation.operation,
-          packages: operation.packages,
-          result: operation.result,
-          attempts: (operation.attempts ?? []).map((attempt) => ({
-            group_ordinal: attempt.groupOrdinal,
-            installer: attempt.installer,
-            packages: attempt.packages,
-            status: attempt.status,
-            mutation_risk: attempt.mutationRisk,
-            ...(attempt.reason ? { reason: attempt.reason } : {})
-          })),
-          fallback_used: operation.fallbackUsed ?? false,
-          inventory_refresh: operation.inventoryRefresh ?? 'published',
-          inventory_refresh_attempts: operation.inventoryRefreshAttempts ?? [],
-          ...(operation.packageChanges
-            ? {
-                package_changes: operation.packageChanges.map((change) => ({
-                  name: change.name,
-                  ecosystem: change.ecosystem,
-                  relationship: change.relationship,
-                  change: change.change,
-                  ...(change.beforeVersion ? { before_version: change.beforeVersion } : {}),
-                  ...(change.afterVersion ? { after_version: change.afterVersion } : {}),
-                  ...(change.libraryRank !== undefined ? { library_rank: change.libraryRank } : {}),
-                  ...(change.libraryScope ? { library_scope: change.libraryScope } : {})
-                }))
-              }
-            : {})
-        }))
-      }
-    : {}),
-  ...(manifest.operationLogTruncation
-    ? {
-        op_log_truncation: {
-          omitted_count: manifest.operationLogTruncation.omittedCount,
-          ...(manifest.operationLogTruncation.earliestRetainedAt
-            ? { earliest_retained_at: manifest.operationLogTruncation.earliestRetainedAt }
-            : {})
-        }
-      }
-    : {}),
-  captured_at: manifest.capturedAt,
-  source_manifest_checksum: checksum,
-  complete: manifest.complete,
-  capture_status: manifest.captureStatus,
-  ...(manifest.warnings ? { warnings: manifest.warnings } : {})
-})
-
-const resolveRunEnvironmentCapture = (
-  run: NotebookRunRecord
-): {
-  capture: NotebookRunEnvironmentCapture
-  manifest?: NotebookEnvironmentManifest
-  checksum?: string
-} => {
-  const manifest = run.environmentManifest
-  const checksum = run.environmentManifestChecksum
-  const serialized = manifest ? `${JSON.stringify(manifest, null, 2)}\n` : undefined
-  const manifestState = manifest?.captureStatus === 'complete' ? 'available' : 'partial'
-  const manifestIsValid =
-    serialized !== undefined &&
-    checksum !== undefined &&
-    sha256(serialized) === checksum &&
-    manifest?.captureKind === 'completed-run' &&
-    manifest.kernelKind === run.kernelKind &&
-    manifest.environmentName === run.environment &&
-    manifest.complete === (manifest.captureStatus === 'complete')
-
-  if (run.environmentCapture) {
-    if (run.environmentCapture.state === 'unavailable') {
-      return { capture: { ...run.environmentCapture } }
-    }
-    if (
-      manifestIsValid &&
-      checksum === run.environmentCapture.manifestChecksum &&
-      manifestState === run.environmentCapture.state
-    ) {
-      return {
-        capture: { ...run.environmentCapture },
-        manifest,
-        checksum
-      }
-    }
-    // A malformed available/partial tuple cannot be emitted as trustworthy evidence, but it also
-    // must not invalidate the Artifact bytes. Collapse only this corrupt publication state.
-    return {
-      capture: { state: 'unavailable', reason: 'environment-manifest-publication-failed' }
-    }
-  }
-
-  if (manifestIsValid && manifest && checksum) {
-    return {
-      capture: {
-        state: manifestState,
-        manifestChecksum: checksum,
-        ...(manifest.warnings?.length ? { warnings: [...manifest.warnings] } : {})
-      },
-      manifest,
-      checksum
-    }
-  }
-  return {
-    capture: { state: 'unavailable', reason: 'legacy-environment-reference-unavailable' }
-  }
-}
-
 class ArtifactProvenanceRepository {
   private readonly compatibilityRepository: ArtifactRepository
-  private readonly notebookRepository: Pick<NotebookRunRepository, 'findExisting'>
   private readonly createId: () => string
   private readonly now: () => Date
   private readonly durability: ArtifactDurability
-  // Repository instances can coexist over separate Prisma clients for the same database. Serialize
-  // lineage identity allocation process-wide so those clients cannot race a case-folded filename.
-  private static readonly lineageWrites = new Map<string, Promise<void>>()
+  private readonly messageFinalizer: ArtifactProvenanceMessageFinalizer
+  private readonly producerCapture: ArtifactProvenanceProducerCapture
+  private readonly versionWriter: ArtifactProvenanceVersionWriter
 
   constructor(private readonly options: ArtifactProvenanceRepositoryOptions) {
     this.compatibilityRepository =
       options.compatibilityRepository ?? new ArtifactRepository(options.storageRoot)
-    this.notebookRepository =
+    const notebookRepository =
       options.notebookRepository ?? new NotebookRunRepository(options.storageRoot)
     this.createId = options.createId ?? randomUUID
     this.now = options.now ?? (() => new Date())
     this.durability = options.durability ?? defaultArtifactDurability
+    this.producerCapture = new ArtifactProvenanceProducerCapture({
+      getClient: options.getClient,
+      notebookRepository,
+      createId: this.createId
+    })
+    this.messageFinalizer = new ArtifactProvenanceMessageFinalizer({
+      getClient: options.getClient,
+      loadSession: options.loadSession,
+      projectVersionFile: (version, projectId, appSessionId) =>
+        this.toArtifactVersionFile(version, projectId, appSessionId)
+    })
+    this.versionWriter = new ArtifactProvenanceVersionWriter({
+      storageRoot: options.storageRoot,
+      getClient: options.getClient,
+      compatibilityRepository: this.compatibilityRepository,
+      createId: this.createId,
+      now: this.now,
+      durability: this.durability,
+      captureProducer: (request, createdAt, checksum) =>
+        this.producerCapture.captureProducer(request, createdAt, checksum),
+      prepareVersionPersistence: (input) => this.producerCapture.prepareVersionPersistence(input),
+      recoverStagingVersion: (version, projectId, appSessionId, filename, publish) =>
+        this.recoverStagingVersion(version, projectId, appSessionId, filename, publish),
+      projectVersionFile: (version, projectId, appSessionId) =>
+        this.toArtifactVersionFile(version, projectId, appSessionId)
+    })
   }
 
   private async syncAndVerifyFile(
@@ -1412,7 +478,7 @@ class ArtifactProvenanceRepository {
           })
         )
 
-        const version = await this.createVersionWithOptions(
+        const version = await this.versionWriter.writeVersion(
           {
             ...versionRequest,
             writeOperationId,
@@ -1438,7 +504,7 @@ class ArtifactProvenanceRepository {
   }
 
   async createVersion(request: CreateArtifactVersionRequest): Promise<ArtifactVersionFile> {
-    return this.createVersionWithOptions(
+    return this.versionWriter.writeVersion(
       request,
       this.compatibilityRoutingPublisher(
         request.projectId,
@@ -1446,30 +512,6 @@ class ArtifactProvenanceRepository {
         request.filename
       )
     )
-  }
-
-  private async createVersionWithOptions(
-    request: CreateArtifactVersionRequest,
-    publishCompatibilityRouting: PublishCompatibilityRouting
-  ): Promise<ArtifactVersionFile> {
-    const lineageKey = `${this.options.storageRoot}\0${request.projectId}\0${request.appSessionId}\0${normalizeFilename(request.filename)}`
-    const previous = ArtifactProvenanceRepository.lineageWrites.get(lineageKey) ?? Promise.resolve()
-    let release = (): void => undefined
-    const current = new Promise<void>((resolveCurrent) => {
-      release = resolveCurrent
-    })
-    const tail = previous.then(() => current)
-    ArtifactProvenanceRepository.lineageWrites.set(lineageKey, tail)
-    await previous
-
-    try {
-      return await this.createVersionSerialized(request, publishCompatibilityRouting)
-    } finally {
-      release()
-      if (ArtifactProvenanceRepository.lineageWrites.get(lineageKey) === tail) {
-        ArtifactProvenanceRepository.lineageWrites.delete(lineageKey)
-      }
-    }
   }
 
   async replayVersion(
@@ -1528,365 +570,6 @@ class ArtifactProvenanceRepository {
       )
     }
     return this.toArtifactVersionFile(existing, projectId, appSessionId)
-  }
-
-  private async createVersionSerialized(
-    request: CreateArtifactVersionRequest,
-    publishCompatibilityRouting: PublishCompatibilityRouting
-  ): Promise<ArtifactVersionFile> {
-    const projectId = assertSafeSegment(request.projectId, 'project id')
-    const appSessionId = assertSafeSegment(request.appSessionId, 'session id')
-    const artifactStorageSessionId = assertSafeSegment(
-      request.artifactStorageSessionId,
-      'artifact storage session id'
-    )
-    const artifactRunId = assertSafeSegment(request.artifactRunId, 'artifact run id')
-    const writeOperationId = assertSafeSegment(request.writeOperationId, 'write operation id')
-    const writeRequestChecksum = assertChecksum(
-      request.writeRequestChecksum,
-      'write request checksum'
-    )
-    const normalizedFilename = normalizeFilename(request.filename)
-    const client = await this.options.getClient()
-    const existing = await client.artifactVersion.findUnique({
-      where: { writeOperationId },
-      include: {
-        artifact: true,
-        messageSnapshot: true,
-        inputs: { orderBy: { ordinal: 'asc' } }
-      }
-    })
-
-    if (existing) {
-      if (
-        existing.writeRequestChecksum !== writeRequestChecksum ||
-        existing.artifact.projectId !== projectId ||
-        existing.artifact.sessionId !== appSessionId
-      ) {
-        throw new Error(
-          `Artifact write operation was reused for a different request: ${writeOperationId}`
-        )
-      }
-      if (existing.state === 'staging') {
-        return this.recoverStagingVersion(
-          existing,
-          projectId,
-          appSessionId,
-          request.filename,
-          publishCompatibilityRouting
-        )
-      }
-      if (existing.state !== 'pending' && existing.state !== 'finalized') {
-        throw new Error(`Artifact write has an invalid lifecycle state: ${writeOperationId}`)
-      }
-
-      if (existing.state === 'pending') {
-        await publishCompatibilityRouting(existing, { replaceUnroutedBytes: true })
-      }
-      return this.toArtifactVersionFile(existing, projectId, appSessionId)
-    }
-
-    const pendingFiles = await this.compatibilityRepository.listPendingRunFiles({
-      projectName: projectId,
-      sessionId: artifactStorageSessionId,
-      runId: artifactRunId
-    })
-    const matchingPendingFiles = pendingFiles.filter(
-      (file) => normalizeFilename(file.name) === normalizedFilename
-    )
-    const pendingFile =
-      matchingPendingFiles.find((file) => file.name === request.filename) ??
-      (matchingPendingFiles.length === 1 ? matchingPendingFiles[0] : undefined)
-
-    if (!pendingFile) {
-      if (matchingPendingFiles.length > 1) {
-        throw new Error(`Pending artifact filename is ambiguous: ${request.filename}`)
-      }
-      throw new Error(`Pending artifact file not found: ${request.filename}`)
-    }
-
-    const versionId = this.createId()
-    const stagingStorageKey = storageKey(
-      'artifacts',
-      projectId,
-      appSessionId,
-      '.provenance',
-      '.staging',
-      'versions',
-      versionId
-    )
-    const stagingDirectory = join(this.options.storageRoot, ...stagingStorageKey.split('/'))
-    const stagingContentPath = join(stagingDirectory, 'content')
-
-    await mkdir(stagingDirectory, { recursive: true })
-    await copyFile(pendingFile.path, stagingContentPath)
-
-    let stagingRowPersisted = false
-    try {
-      await this.durability.syncFile(stagingContentPath)
-      const content = await readFile(stagingContentPath)
-      const checksum = sha256(content)
-      const createdAt = this.now()
-      const producer = await this.captureProducer(request, createdAt, checksum)
-      const persisted = await withVersionAllocationRetry(() =>
-        client.$transaction(async (transaction) => {
-          const origin = await transaction.fileOriginSession.upsert({
-            where: { projectId_sessionId: { projectId, sessionId: appSessionId } },
-            create: {
-              projectId,
-              sessionId: appSessionId,
-              titleSnapshot: request.titleSnapshot
-            },
-            update: request.titleSnapshot ? { titleSnapshot: request.titleSnapshot } : {}
-          })
-          if (origin.state !== 'active') {
-            throw new Error('Artifact origin Session is being deleted and cannot accept a Version.')
-          }
-
-          let lineage = await transaction.artifactLineage.findUnique({
-            where: {
-              projectId_sessionId_normalizedFilename: {
-                projectId,
-                sessionId: appSessionId,
-                normalizedFilename
-              }
-            }
-          })
-          if (!lineage) {
-            lineage = await transaction.artifactLineage.create({
-              data: {
-                id: this.createId(),
-                projectId,
-                sessionId: appSessionId,
-                normalizedFilename,
-                filename: request.filename
-              }
-            })
-          }
-
-          const latest = await transaction.artifactVersion.aggregate({
-            where: { artifactId: lineage.id },
-            _max: { versionNumber: true }
-          })
-          const versionNumber = (latest._max.versionNumber ?? 0) + 1
-          const contentStorageKey = storageKey(
-            'artifacts',
-            projectId,
-            appSessionId,
-            '.provenance',
-            lineage.id,
-            'versions',
-            versionId,
-            'content'
-          )
-          const evidenceStorageKey = storageKey(
-            'artifacts',
-            projectId,
-            appSessionId,
-            '.provenance',
-            lineage.id,
-            'versions',
-            versionId,
-            'evidence.json'
-          )
-          const executionSnapshotStorageKey =
-            producer.state === 'available'
-              ? storageKey(
-                  'artifacts',
-                  projectId,
-                  appSessionId,
-                  '.provenance',
-                  lineage.id,
-                  'versions',
-                  versionId,
-                  'execution.json'
-                )
-              : undefined
-          const evidence: ArtifactVersionEvidence = {
-            app_session_id: appSessionId,
-            artifact_id: lineage.id,
-            checksum,
-            ...(request.contentType ? { content_type: request.contentType } : {}),
-            conversation: {
-              agent_frame_id: request.agentFrameId,
-              message_branch_id: request.messageBranchId,
-              prompt_message_id: request.promptMessageId,
-              root_frame_id: request.rootFrameId,
-              runtime_segment_id: request.runtimeSegmentId
-            },
-            created_at: createdAt.toISOString(),
-            environment_status:
-              producer.state !== 'available'
-                ? { reason: producer.reason, state: 'unavailable' }
-                : producer.environmentCapture.state === 'unavailable'
-                  ? { reason: producer.environmentCapture.reason, state: 'unavailable' }
-                  : { state: producer.environmentCapture.state },
-            ...(producer.state === 'available' &&
-            producer.environmentManifest &&
-            producer.environmentManifestChecksum
-              ? {
-                  environment: environmentEvidence(
-                    producer.environmentManifest,
-                    producer.environmentManifestChecksum
-                  )
-                }
-              : {}),
-            execution_status:
-              producer.state === 'available'
-                ? { state: 'available' }
-                : { reason: producer.reason, state: 'unavailable' },
-            ...(producer.state === 'available'
-              ? {
-                  execution_snapshot_checksum: producer.executionChecksum,
-                  reproduction_code: producer.reproductionCode
-                }
-              : {}),
-            filename: request.filename,
-            inputs:
-              producer.state === 'available'
-                ? producer.inputFiles.map((input, ordinal) => inputEvidence(input, ordinal))
-                : [],
-            is_user_upload: false,
-            ...(request.agentName ? { agent_name: request.agentName } : {}),
-            producer:
-              producer.state === 'available'
-                ? {
-                    association_method: producer.associationMethod,
-                    kernel_kind: producer.kernelKind,
-                    notebook_session_id: producer.notebookSessionId,
-                    producer_run_id: producer.producerRunId,
-                    run_index: producer.producerRunIndex,
-                    ...(producer.environmentCapture.state !== 'unavailable'
-                      ? {
-                          environment_manifest_checksum:
-                            producer.environmentCapture.manifestChecksum
-                        }
-                      : {}),
-                    state: 'available'
-                  }
-                : { reason: producer.reason, state: 'unavailable' },
-            project_id: projectId,
-            schema_version: 1,
-            size_bytes: content.byteLength,
-            version_id: versionId,
-            version_number: versionNumber
-          }
-          const evidenceJson = canonicalJson(evidence as unknown as CanonicalJson)
-
-          return transaction.artifactVersion.create({
-            data: {
-              id: versionId,
-              artifactId: lineage.id,
-              versionNumber,
-              filename: request.filename,
-              artifactRunId,
-              writeOperationId,
-              writeRequestChecksum,
-              rootFrameId: assertSafeSegment(request.rootFrameId, 'root frame id'),
-              agentFrameId: assertSafeSegment(request.agentFrameId, 'agent frame id'),
-              messageBranchId: assertSafeSegment(request.messageBranchId, 'message branch id'),
-              runtimeSegmentId: assertSafeSegment(request.runtimeSegmentId, 'runtime segment id'),
-              promptMessageId: assertSafeSegment(request.promptMessageId, 'prompt message id'),
-              notebookSessionId:
-                producer.state === 'available' ? producer.notebookSessionId : undefined,
-              producerRunId: producer.state === 'available' ? producer.producerRunId : undefined,
-              producerRunIndex:
-                producer.state === 'available' ? producer.producerRunIndex : undefined,
-              state: 'staging',
-              contentStorageKey,
-              evidenceStorageKey,
-              contentType: request.contentType,
-              sizeBytes: BigInt(content.byteLength),
-              checksum,
-              evidenceJson,
-              evidenceChecksum: sha256(evidenceJson),
-              executionSnapshotJson:
-                producer.state === 'available' ? producer.executionJson : undefined,
-              executionSnapshotChecksum:
-                producer.state === 'available' ? producer.executionChecksum : undefined,
-              executionSnapshotStorageKey,
-              executionSnapshotSchemaVersion: producer.state === 'available' ? 2 : undefined,
-              ...(producer.state === 'available' && producer.inputFiles.length > 0
-                ? {
-                    inputs: {
-                      create: producer.inputFiles.map((input, ordinal) => ({
-                        id: this.createId(),
-                        ordinal,
-                        inputFileVersionId: input.inputFileVersionId,
-                        sourceKind: input.sourceKind,
-                        sourceFileId: input.sourceFileId,
-                        ...(input.sourceKind === 'artifact-version'
-                          ? { sourceArtifactVersionId: input.inputFileVersionId }
-                          : { sourceUploadVersionId: input.inputFileVersionId }),
-                        sourceVersionNumber: input.sourceVersionNumber,
-                        sourceCreatedAt: input.sourceCreatedAt
-                          ? new Date(input.sourceCreatedAt)
-                          : undefined,
-                        sourceProjectId: input.sourceProjectId,
-                        sourceSessionId: input.sourceSessionId,
-                        filename: input.filename,
-                        contentType: input.contentType,
-                        sizeBytes: BigInt(input.sizeBytes),
-                        checksum: input.checksum,
-                        storageKey: input.storageKey,
-                        strongestAssociation: input.association
-                      }))
-                    }
-                  }
-                : {}),
-              createdAt
-            }
-          })
-        })
-      )
-      stagingRowPersisted = true
-
-      const evidencePath = join(stagingDirectory, 'evidence.json')
-      await writeFile(evidencePath, persisted.evidenceJson, 'utf8')
-      await this.syncAndVerifyFile(
-        evidencePath,
-        persisted.evidenceChecksum,
-        `Artifact Version evidence mirror is corrupt: ${persisted.id}`
-      )
-      if (persisted.executionSnapshotJson) {
-        const executionPath = join(stagingDirectory, 'execution.json')
-        await writeFile(executionPath, persisted.executionSnapshotJson, 'utf8')
-        await this.syncAndVerifyFile(
-          executionPath,
-          persisted.executionSnapshotChecksum!,
-          `Artifact Version execution mirror is corrupt: ${persisted.id}`
-        )
-      }
-      const finalContentPath = join(
-        this.options.storageRoot,
-        ...persisted.contentStorageKey.split('/')
-      )
-      await mkdir(dirname(dirname(finalContentPath)), { recursive: true })
-      await this.durability.syncDirectory(stagingDirectory)
-      const finalDirectory = dirname(finalContentPath)
-      await rename(stagingDirectory, finalDirectory)
-      await this.durability.syncDirectory(dirname(finalDirectory))
-
-      await publishCompatibilityRouting(persisted, { allowRoutingReplacement: true })
-      const finalized = await client.$transaction(async (transaction) => {
-        await transaction.artifactLineage.update({
-          where: { id: persisted.artifactId },
-          data: { filename: request.filename }
-        })
-        return transaction.artifactVersion.update({
-          where: { id: persisted.id },
-          data: { state: 'pending' }
-        })
-      })
-      return this.toArtifactVersionFile(finalized, projectId, appSessionId)
-    } catch (error) {
-      // Once SQLite owns the staging row, its copied bytes are recovery state for an idempotent
-      // transport retry. Removing them here would force a retry to reread a mutable pending source.
-      if (!stagingRowPersisted) {
-        await rm(stagingDirectory, { recursive: true, force: true })
-      }
-      throw error
-    }
   }
 
   private async recoverStagingVersion(
@@ -2045,356 +728,6 @@ class ArtifactProvenanceRepository {
     return value
   }
 
-  private async captureProducer(
-    request: CreateArtifactVersionRequest,
-    createdAt: Date,
-    artifactChecksum: string
-  ): Promise<ProducerCapture> {
-    // Local files require an app-side observation before an Agent-declared run may become evidence.
-    // Inline bytes have no file observation, so they retain the declared run only after the durable
-    // Notebook Session and graph-scope checks below succeed.
-    if (
-      request.producerRunId &&
-      !request.sourceFileObservation &&
-      request.sourceKind !== 'inline'
-    ) {
-      return { state: 'unavailable', reason: 'producer-source-unverifiable' }
-    }
-    if (request.producerRunId && !request.notebookSessionId) {
-      throw new Error('producerRunId requires notebookSessionId in the active Artifact run.')
-    }
-    if (!request.notebookSessionId) {
-      return { state: 'unavailable', reason: 'producer-not-supplied' }
-    }
-    if (!request.producerRunId && !request.sourceFileObservation) {
-      return { state: 'unavailable', reason: 'producer-not-supplied' }
-    }
-
-    const document = await this.notebookRepository.findExisting(
-      request.projectId,
-      request.notebookSessionId
-    )
-    const sourceFileObservation = request.sourceFileObservation
-      ? await this.verifySourceFileObservation(
-          document,
-          request.sourceFileObservation,
-          artifactChecksum
-        )
-      : undefined
-    if (request.sourceFileObservation && !sourceFileObservation) {
-      return { state: 'unavailable', reason: 'producer-source-unverifiable' }
-    }
-    const expected = {
-      rootFrameId: request.rootFrameId,
-      agentFrameId: request.agentFrameId,
-      messageBranchId: request.messageBranchId,
-      runtimeSegmentId: request.runtimeSegmentId,
-      promptMessageId: request.promptMessageId
-    }
-    const inferredProducerRunId = request.producerRunId
-      ? undefined
-      : await this.inferProducerRunId(document, sourceFileObservation, expected)
-    const producerRunId = request.producerRunId ?? inferredProducerRunId
-    if (!producerRunId) {
-      return {
-        state: 'unavailable',
-        reason: request.sourceFileObservation
-          ? 'producer-source-unverifiable'
-          : 'producer-not-supplied'
-      }
-    }
-    const producerRunIndex = document?.runs.findIndex((run) => run.runId === producerRunId) ?? -1
-    const producerRun = document?.runs[producerRunIndex]
-
-    if (!document || !producerRun || producerRunIndex < 0) {
-      throw new Error(`Notebook producer run not found: ${producerRunId}`)
-    }
-    for (const [field, value] of Object.entries(expected)) {
-      if (producerRun[field as keyof typeof expected] !== value) {
-        throw new Error(
-          `Notebook producer run does not belong to the active Artifact ${field}: ${producerRunId}`
-        )
-      }
-    }
-    if (request.producerRunId && sourceFileObservation) {
-      const observedOwners = await this.findObservedWorkingFileRunIds(
-        document,
-        sourceFileObservation,
-        expected
-      )
-      if (observedOwners.length > 0 && !observedOwners.includes(request.producerRunId)) {
-        throw new Error(
-          `Declared producer source belongs to another Notebook run: ${observedOwners.join(', ')}`
-        )
-      }
-      if (observedOwners.length !== 1) {
-        return { state: 'unavailable', reason: 'producer-source-unverifiable' }
-      }
-    }
-
-    const eligibleBranchIds = new Set(
-      request.messageBranchAncestry?.length
-        ? request.messageBranchAncestry
-        : [request.messageBranchId]
-    )
-    if (!eligibleBranchIds.has(request.messageBranchId)) {
-      throw new Error('Artifact Branch ancestry does not contain the active Branch.')
-    }
-    const eligibleMessageIds = request.messageAncestry?.length
-      ? new Set(request.messageAncestry)
-      : undefined
-    if (eligibleMessageIds && !eligibleMessageIds.has(request.promptMessageId)) {
-      throw new Error('Artifact Message ancestry does not contain the producer prompt.')
-    }
-    const eligibleRuns = document.runs
-      .slice(0, producerRunIndex + 1)
-      .map((run, runIndex) => ({ run, runIndex }))
-      .filter(
-        ({ run }) =>
-          run.agentFrameId === request.agentFrameId &&
-          !!run.messageBranchId &&
-          eligibleBranchIds.has(run.messageBranchId) &&
-          (eligibleMessageIds
-            ? run.promptMessageId
-              ? eligibleMessageIds.has(run.promptMessageId)
-              : run.messageBranchId === request.messageBranchId
-            : true)
-      )
-    const executionSnapshot = buildBoundedExecutionSnapshot(
-      {
-        schemaVersion: 2,
-        rootFrameId: request.rootFrameId,
-        agentFrameId: request.agentFrameId,
-        messageBranchId: request.messageBranchId,
-        terminalPromptMessageId: request.promptMessageId,
-        producerRunId,
-        producerRunIndex,
-        createdAt: createdAt.toISOString()
-      },
-      eligibleRuns
-    )
-    const inputFiles = executionSnapshot.inputFiles
-    await this.validateInputReferences(request.projectId, inputFiles)
-    const executionJson = canonicalJson(executionSnapshot as unknown as CanonicalJson)
-    const environment = resolveRunEnvironmentCapture(producerRun)
-
-    return {
-      state: 'available',
-      notebookSessionId: request.notebookSessionId,
-      producerRunId,
-      producerRunIndex,
-      associationMethod: request.producerRunId
-        ? 'agent-declared-and-session-validated'
-        : 'server-inferred-file-observation',
-      kernelKind: producerRun.kernelKind,
-      environmentName: producerRun.environment,
-      reproductionCode: producerRun.script,
-      executionJson,
-      executionChecksum: sha256(executionJson),
-      inputFiles,
-      environmentCapture: environment.capture,
-      ...(environment.manifest && environment.checksum
-        ? {
-            environmentManifest: environment.manifest,
-            environmentManifestChecksum: environment.checksum
-          }
-        : {})
-    }
-  }
-
-  private async inferProducerRunId(
-    document: Awaited<ReturnType<NotebookRunRepository['findExisting']>>,
-    observation: CreateArtifactVersionRequest['sourceFileObservation'],
-    expected: {
-      rootFrameId: string
-      agentFrameId: string
-      messageBranchId: string
-      runtimeSegmentId: string
-      promptMessageId: string
-    }
-  ): Promise<string | undefined> {
-    if (!document || !observation) return undefined
-    const matches = await this.findObservedWorkingFileRunIds(document, observation, expected)
-    return matches.length === 1 ? matches[0] : undefined
-  }
-
-  // Treat the RPC observation as an untrusted path hint. Main re-observes the source under the
-  // Notebook's durable roots and proves that its bytes are exactly the immutable Artifact content
-  // before the hint may participate in producer attribution.
-  private async verifySourceFileObservation(
-    document: Awaited<ReturnType<NotebookRunRepository['findExisting']>>,
-    observation: NonNullable<CreateArtifactVersionRequest['sourceFileObservation']>,
-    artifactChecksum: string
-  ): Promise<NonNullable<CreateArtifactVersionRequest['sourceFileObservation']> | undefined> {
-    if (
-      !document ||
-      !Number.isFinite(observation.sizeBytes) ||
-      observation.sizeBytes < 0 ||
-      !Number.isFinite(observation.mtimeMs) ||
-      observation.mtimeMs < 0
-    ) {
-      return undefined
-    }
-
-    const observedPath = await realpath(resolve(observation.path)).catch(() => undefined)
-    if (!observedPath) return undefined
-    const roots = await Promise.all(
-      [document.notebookSessionRoot, document.workspaceCwd].map((root) =>
-        realpath(resolve(root)).catch(() => resolve(root))
-      )
-    )
-    if (
-      !roots.some((root) => {
-        const relativePath = relative(root, observedPath)
-        return (
-          relativePath !== '' &&
-          relativePath !== '..' &&
-          !relativePath.startsWith(`..${sep}`) &&
-          !isAbsolute(relativePath)
-        )
-      })
-    ) {
-      return undefined
-    }
-
-    const before = await stat(observedPath).catch(() => undefined)
-    if (
-      !before?.isFile() ||
-      before.size !== observation.sizeBytes ||
-      before.mtimeMs !== observation.mtimeMs
-    ) {
-      return undefined
-    }
-    const bytes = await readFile(observedPath).catch(() => undefined)
-    const after = await stat(observedPath).catch(() => undefined)
-    if (
-      !bytes ||
-      !after?.isFile() ||
-      after.size !== before.size ||
-      after.mtimeMs !== before.mtimeMs ||
-      sha256(bytes) !== artifactChecksum
-    ) {
-      return undefined
-    }
-
-    return { path: observedPath, sizeBytes: after.size, mtimeMs: after.mtimeMs }
-  }
-
-  private async findObservedWorkingFileRunIds(
-    document: NonNullable<Awaited<ReturnType<NotebookRunRepository['findExisting']>>>,
-    observation: NonNullable<CreateArtifactVersionRequest['sourceFileObservation']>,
-    expected: {
-      rootFrameId: string
-      agentFrameId: string
-      messageBranchId: string
-      runtimeSegmentId: string
-      promptMessageId: string
-    }
-  ): Promise<string[]> {
-    if (
-      !Number.isFinite(observation.sizeBytes) ||
-      observation.sizeBytes < 0 ||
-      !Number.isFinite(observation.mtimeMs) ||
-      observation.mtimeMs < 0
-    ) {
-      return []
-    }
-
-    const canonicalPath = async (path: string): Promise<string> =>
-      realpath(resolve(path)).catch(() => resolve(path))
-    const observedPath = await canonicalPath(observation.path)
-    const documentRoots = await Promise.all(
-      [document.notebookSessionRoot, document.workspaceCwd].map(canonicalPath)
-    )
-    const isInsideDocumentRoot = documentRoots.some((root) => {
-      const relativePath = relative(root, observedPath)
-      return (
-        relativePath !== '' &&
-        relativePath !== '..' &&
-        !relativePath.startsWith(`..${sep}`) &&
-        !isAbsolute(relativePath)
-      )
-    })
-    if (!isInsideDocumentRoot) return []
-
-    const candidates = document.runs.filter((run) =>
-      Object.entries(expected).every(
-        ([field, value]) => run[field as keyof typeof expected] === value
-      )
-    )
-    const workingFileMatches = (
-      await Promise.all(
-        candidates.map(async (run) => {
-          for (const file of run.workingFiles) {
-            if (
-              (await canonicalPath(file.path)) === observedPath &&
-              file.createdByRunId === run.runId &&
-              file.size === observation.sizeBytes &&
-              file.mtimeMs === observation.mtimeMs
-            ) {
-              return run.runId
-            }
-          }
-          return undefined
-        })
-      )
-    ).filter((runId): runId is string => runId !== undefined)
-
-    // mtime is diagnostic context, not a causal execution receipt. Only a WorkingFile observation
-    // attributed to one run may promote an omitted declaration to available producer evidence.
-    return [...new Set(workingFileMatches)]
-  }
-
-  private async validateInputReferences(
-    projectId: string,
-    inputs: NotebookRunInputFile[]
-  ): Promise<void> {
-    const client = await this.options.getClient()
-    for (const input of inputs) {
-      if (input.sourceProjectId !== projectId) {
-        throw new Error(`Notebook input belongs to another Project: ${input.inputFileVersionId}`)
-      }
-      if (input.sourceKind === 'upload-version') {
-        const version = await client.uploadVersion.findUnique({
-          where: { id: input.inputFileVersionId },
-          include: { uploadFile: true }
-        })
-        if (
-          !version ||
-          version.state !== 'ready' ||
-          version.uploadFileId !== input.sourceFileId ||
-          version.uploadFile.projectId !== input.sourceProjectId ||
-          version.uploadFile.sessionId !== input.sourceSessionId ||
-          version.versionNumber !== input.sourceVersionNumber ||
-          version.contentStorageKey !== input.storageKey ||
-          version.checksum !== input.checksum ||
-          Number(version.sizeBytes) !== input.sizeBytes
-        ) {
-          throw new Error(`Notebook Upload input identity is corrupt: ${input.inputFileVersionId}`)
-        }
-        continue
-      }
-
-      const version = await client.artifactVersion.findUnique({
-        where: { id: input.inputFileVersionId },
-        include: { artifact: true }
-      })
-      if (
-        !version ||
-        version.state !== 'finalized' ||
-        version.artifactId !== input.sourceFileId ||
-        version.artifact.projectId !== input.sourceProjectId ||
-        version.artifact.sessionId !== input.sourceSessionId ||
-        version.versionNumber !== input.sourceVersionNumber ||
-        version.contentStorageKey !== input.storageKey ||
-        version.checksum !== input.checksum ||
-        Number(version.sizeBytes) !== input.sizeBytes
-      ) {
-        throw new Error(`Notebook Artifact input identity is corrupt: ${input.inputFileVersionId}`)
-      }
-    }
-  }
-
   private async projectExecutionInput(
     input: NotebookRunInputFile
   ): Promise<ProvenanceExecutionInputFile> {
@@ -2412,75 +745,12 @@ class ArtifactProvenanceRepository {
     }
   }
 
-  private async loadFinalizationSession(
-    request: FinalizeArtifactVersionsRequest
-  ): Promise<PersistedChatSession> {
-    if (!this.options.loadSession) {
-      throw new Error('Artifact finalization requires the durable Session graph authority.')
-    }
-    const durableSession = await this.options.loadSession(request.projectId, request.appSessionId)
-    if (
-      !durableSession ||
-      durableSession.projectId !== request.projectId ||
-      durableSession.id !== request.appSessionId
-    ) {
-      throw new Error('Artifact finalization durable Session graph is unavailable.')
-    }
-    return durableSession
-  }
-
   async validateFinalizationOwnership(request: FinalizeArtifactVersionsRequest): Promise<void> {
-    const durableSession = await this.loadFinalizationSession(request)
-    validateDurableMessageOwnership(durableSession, request)
+    return this.messageFinalizer.validateOwnership(request)
   }
 
   async finalizeRun(request: FinalizeArtifactVersionsRequest): Promise<ArtifactVersionFile[]> {
-    const durableSession = await this.loadFinalizationSession(request)
-    return this.finalizeRunWithDurableSession(request, durableSession)
-  }
-
-  private async finalizeRunWithDurableSession(
-    request: FinalizeArtifactVersionsRequest,
-    durableSession: PersistedChatSession
-  ): Promise<ArtifactVersionFile[]> {
-    const ancestry = validateDurableMessageOwnership(durableSession, request)
-    return this.finalizeVerifiedRun({ ...request, ...ancestry })
-  }
-
-  private async finalizeVerifiedRun(
-    request: ArtifactFinalizationProofRequest
-  ): Promise<ArtifactVersionFile[]> {
-    const normalizedRequest = normalizeArtifactFinalizationProofRequest(request)
-    const client = await this.options.getClient()
-    const versions = await client.$transaction(async (transaction) => {
-      const matching = await loadArtifactFinalizationProofVersions(transaction, normalizedRequest)
-      // Validate the complete proof from the same transaction that commits message ownership. Recovery
-      // does not touch compatibility storage until this transaction succeeds.
-      validateArtifactFinalizationProof(matching, normalizedRequest)
-
-      await transaction.artifactVersion.updateMany({
-        where: {
-          id: { in: matching.map((version) => version.id) },
-          state: 'pending'
-        },
-        data: { state: 'finalized', messageId: normalizedRequest.messageId }
-      })
-
-      return transaction.artifactVersion.findMany({
-        where: {
-          id: { in: matching.map((version) => version.id) },
-          state: 'finalized'
-        },
-        include: { artifact: true },
-        orderBy: [{ artifactId: 'asc' }, { versionNumber: 'asc' }]
-      })
-    })
-
-    return Promise.all(
-      versions.map((version) =>
-        this.toArtifactVersionFile(version, version.artifact.projectId, version.artifact.sessionId)
-      )
-    )
+    return this.messageFinalizer.finalizeRun(request)
   }
 
   async listRunVersions(request: {
@@ -2733,22 +1003,17 @@ class ArtifactProvenanceRepository {
         ) {
           continue
         }
-        let proof:
-          | {
-              messageId: string
-              ancestry: ReturnType<typeof validateDurableMessageOwnership>
-            }
-          | undefined
+        let proof: { messageId: string } | undefined
         try {
           const messageId =
             marker.messageId ?? inferDurableFinalizationMessageId(durableSession, markerContext)
           if (messageId) {
+            validateDurableMessageOwnership(durableSession, {
+              ...markerContext,
+              messageId
+            })
             proof = {
-              messageId,
-              ancestry: validateDurableMessageOwnership(durableSession, {
-                ...markerContext,
-                messageId
-              })
+              messageId
             }
           }
         } catch {
@@ -2764,13 +1029,12 @@ class ArtifactProvenanceRepository {
         // consumed verbatim, so recovery can never widen or narrow a modern runtime claim.
         const markerVersionIds =
           marker.artifactVersionIds ?? runVersions.map((version) => version.id)
-        const finalizationRequest: ArtifactFinalizationProofRequest = {
+        const finalizationRequest: FinalizeArtifactVersionsRequest = {
           projectId,
           appSessionId,
           artifactRunId,
           ...markerContext,
           messageId: proof.messageId,
-          ...proof.ancestry,
           artifactVersionIds: markerVersionIds
         }
         let finalized: ArtifactVersionFile[]
@@ -2778,7 +1042,10 @@ class ArtifactProvenanceRepository {
           // Commit complete ownership and execution proof before the irreversible compatibility move.
           // A crash or I/O failure after this point leaves a finalized-but-unlinked Version, which the
           // candidate selector above deliberately retries on the next startup.
-          finalized = await this.finalizeVerifiedRun(finalizationRequest)
+          finalized = await this.messageFinalizer.finalizeRunWithDurableSession(
+            finalizationRequest,
+            durableSession
+          )
         } catch (error) {
           if (error instanceof ArtifactFinalizationProofError) continue
           throw error
@@ -3887,5 +2154,9 @@ class ArtifactProvenanceRepository {
   }
 }
 
-export { ArtifactProvenanceRepository }
-export type { ArtifactProvenanceRepositoryOptions }
+export {
+  ArtifactFinalizationProofError,
+  ArtifactOwnershipPersistenceRaceError,
+  ArtifactProvenanceRepository
+}
+export type { ArtifactFinalizationProofReason, ArtifactProvenanceRepositoryOptions }
