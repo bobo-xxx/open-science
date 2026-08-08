@@ -26,13 +26,22 @@
       "fallbackCapability": "renderer_view"
     },
     "workspace_runtime": {
-      "ownerPaths": ["src/renderer/src/lib/acp/useWorkspaceAgentRuntime.ts"],
+      "ownerPaths": [
+        "src/renderer/src/lib/acp/useWorkspaceAgentRuntime.ts",
+        "src/renderer/src/lib/acp/workspace-events.ts",
+        "src/renderer/src/lib/acp/workspace-runtime-event-owner.ts",
+        "src/renderer/src/lib/acp/workspace-runtime-prompt-preparation-owner.ts",
+        "src/renderer/src/lib/acp/workspace-runtime-command-owner.ts",
+        "src/renderer/src/lib/acp/workspace-runtime-session-lifecycle-owner.ts"
+      ],
       "interfacePaths": ["src/renderer/src/lib/acp/useWorkspaceAgentRuntime.ts"],
       "consumerModules": ["workspace_page"],
       "testFiles": {
         "owner": [
           "src/renderer/src/lib/acp/useWorkspaceAgentRuntime.test.ts",
-          "src/renderer/src/lib/acp/useWorkspaceAgentRuntime.characterization.test.tsx"
+          "src/renderer/src/lib/acp/useWorkspaceAgentRuntime.architecture.test.ts",
+          "src/renderer/src/lib/acp/useWorkspaceAgentRuntime.characterization.test.tsx",
+          "src/renderer/src/lib/acp/workspace-events.test.ts"
         ],
         "contract": [
           "src/renderer/src/lib/acp/useWorkspaceAgentRuntime.first-output.render.test.tsx"
@@ -43,13 +52,26 @@
       "fallbackCapability": "renderer_view"
     },
     "project_files_view": {
-      "ownerPaths": ["src/renderer/src/pages/workspace/ProjectFilesView.tsx"],
+      "ownerPaths": [
+        "src/renderer/src/pages/workspace/ProjectFilesView.tsx",
+        "src/renderer/src/pages/workspace/project-files-presentation-owner.tsx",
+        "src/renderer/src/pages/workspace/project-files-preview-owner.ts",
+        "src/renderer/src/pages/workspace/project-files-query-model.ts",
+        "src/renderer/src/pages/workspace/use-project-files-index.ts"
+      ],
       "interfacePaths": ["src/renderer/src/pages/workspace/ProjectFilesView.tsx"],
       "consumerModules": ["workspace_page"],
       "testFiles": {
-        "owner": ["src/renderer/src/pages/workspace/ProjectFilesView.test.tsx"],
+        "owner": [
+          "src/renderer/src/pages/workspace/ProjectFilesView.test.tsx",
+          "src/renderer/src/pages/workspace/workspace-components.test.tsx",
+          "src/renderer/src/pages/workspace/use-project-files-index.test.tsx"
+        ],
         "contract": ["src/renderer/src/pages/workspace/PreviewFileSurface.test.tsx"],
-        "consumer": []
+        "consumer": [
+          "src/renderer/src/pages/workspace/previews/PreviewToolContent.test.tsx",
+          "src/renderer/src/pages/workspace/previews/PreviewToolContent.plan.test.tsx"
+        ]
       },
       "capabilityOverlays": ["renderer_state"],
       "fallbackCapability": "renderer_view"

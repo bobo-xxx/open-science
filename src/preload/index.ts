@@ -15,6 +15,7 @@ import type {
   ExportSkillRequest,
   ImportAgentHomeSkillsRequest,
   ImportSkillRequest,
+  SaveGitHubTokenRequest,
   ImportSkillZipBatchRequest,
   ImportSkillZipRequest,
   InstallCodexRequest,
@@ -218,6 +219,10 @@ const api: OpenScienceAPI = {
     setPackageMirror: (request) =>
       electronRendererContracts.invoke('settings.setPackageMirror', request),
     listSkills: () => electronRendererContracts.invoke('settings.listSkills'),
+    getGitHubTokenStatus: () => electronRendererContracts.invoke('settings.getGitHubTokenStatus'),
+    saveGitHubToken: (request: SaveGitHubTokenRequest) =>
+      electronRendererContracts.invoke('settings.saveGitHubToken', request),
+    removeGitHubToken: () => electronRendererContracts.invoke('settings.removeGitHubToken'),
     getSkillDetail: (id: string) => electronRendererContracts.invoke('settings.getSkillDetail', id),
     exportSkill: (request: ExportSkillRequest) =>
       electronRendererContracts.invoke('settings.exportSkill', request),
@@ -285,6 +290,8 @@ const api: OpenScienceAPI = {
       electronRendererContracts.subscribe('settings.onSkillImportApprovalSettled', listener),
     replayPendingSkillImportApprovals: () =>
       electronRendererContracts.invoke('settings.replayPendingSkillImportApprovals'),
+    replayConnectorApproval: (id: string) =>
+      electronRendererContracts.invoke('settings.replayConnectorApproval', id),
     respondSkillImportApproval: (response) =>
       electronRendererContracts.invoke('settings.respondSkillImportApproval', response),
     respondConnectorApproval: (request: RespondApprovalRequest) =>
@@ -364,6 +371,12 @@ const api: OpenScienceAPI = {
     revealInFolder: () => electronRendererContracts.invoke('logs.revealInFolder')
   },
   notifications: {
+    getSnapshot: () => electronRendererContracts.invoke('notifications.getSnapshot'),
+    markAllRead: (request) =>
+      electronRendererContracts.invoke('notifications.markAllRead', request),
+    markRead: (request) => electronRendererContracts.invoke('notifications.markRead', request),
+    onChanged: (listener) =>
+      electronRendererContracts.subscribe('notifications.onChanged', listener),
     // Main-process task notifications route their click through this channel.
     onOpenSession: (listener) =>
       electronRendererContracts.subscribe('notifications.onOpenSession', listener),
@@ -456,6 +469,7 @@ const api: OpenScienceAPI = {
     // Renderer sends back the user's decision (once / conversation / project / deny).
     respondApproval: (request: { id: string; decision: ComputeApprovalDecision }) =>
       electronRendererContracts.invoke('compute.respondApproval', request),
+    replayApproval: (id: string) => electronRendererContracts.invoke('compute.replayApproval', id),
     listDir: (providerId, path) =>
       electronRendererContracts.invoke('compute.listDir', providerId, path),
     bookmarksGet: (providerId) =>
