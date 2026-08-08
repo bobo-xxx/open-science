@@ -9,6 +9,7 @@ import {
   createInitialPreviewWorkbenchState,
   usePreviewWorkbenchStore
 } from '../../stores/preview-workbench-store'
+import { useNavigationStore } from '../../stores/navigation-store'
 import {
   createInitialSessionState,
   toPersistedSession,
@@ -74,9 +75,11 @@ describe('workspace runtime events', () => {
     resetWorkspaceRuntimeEventOwnerForTests()
     useSessionStore.setState(createInitialSessionState())
     usePreviewWorkbenchStore.setState(createInitialPreviewWorkbenchState())
+    useNavigationStore.setState({ view: 'home', activeProjectId: undefined })
     useSessionStore.getState().appendUserMessage({
       sessionId: 'transport-session-1',
-      content: 'Summarize this'
+      content: 'Summarize this',
+      projectId: 'default-project'
     })
   })
 
@@ -992,6 +995,112 @@ describe('workspace runtime events', () => {
       openRequestVersion: 0,
       items: []
     })
+  })
+
+  it('merges and persists elicitation state on its tool activity', async () => {
+    await applyWorkspaceRuntimeEvent(
+      createEvent({
+        id: 'elicitation-event-1',
+        kind: 'tool',
+        toolCallId: 'tool-ask-1',
+        title: 'Choose an approach',
+        status: 'pending',
+        elicitation: {
+          message: 'Choose an approach',
+          state: 'pending',
+          fields: [
+            {
+              id: 'approach',
+              label: 'Approach',
+              kind: 'single-select',
+              options: [{ value: 'minimal', label: 'Minimal change' }]
+            }
+          ]
+        }
+      })
+    )
+    await applyWorkspaceRuntimeEvent(
+      createEvent({
+        id: 'elicitation-event-2',
+        kind: 'tool',
+        toolCallId: 'tool-ask-1',
+        status: 'pending',
+        elicitation: {
+          message: 'Choose an approach',
+          state: 'answered',
+          fields: [
+            {
+              id: 'approach',
+              label: 'Approach',
+              kind: 'single-select',
+              options: [{ value: 'minimal', label: 'Minimal change' }]
+            }
+          ],
+          answers: [{ fieldId: 'approach', value: 'minimal' }],
+          respondedAt: 1710000001000
+        }
+      })
+    )
+
+    const session = useSessionStore.getState().sessions[0]
+    expect(session.activities).toEqual([
+      expect.objectContaining({
+        id: 'tool-ask-1',
+        eventIds: ['elicitation-event-1', 'elicitation-event-2'],
+        elicitation: expect.objectContaining({
+          state: 'answered',
+          answers: [{ fieldId: 'approach', value: 'minimal' }]
+        })
+      })
+    ])
+    expect(toPersistedSession(session).activities).toEqual([
+      expect.objectContaining({
+        elicitation: expect.objectContaining({ state: 'answered' })
+      })
+    ])
+  })
+
+  it('finishes a turn normally while a durable user choice remains pending', async () => {
+    const promptMessageId = useSessionStore.getState().sessions[0].activeRun?.promptMessageId
+    await applyWorkspaceRuntimeEvent(
+      createEvent({
+        id: 'choice-pending',
+        kind: 'tool',
+        toolCallId: 'choice-tool',
+        promptMessageId,
+        status: 'pending',
+        elicitation: {
+          message: 'Choose an approach',
+          state: 'pending',
+          durable: {
+            kind: 'agent-user-choice',
+            requestId: 'choice-request',
+            ...(promptMessageId ? { promptMessageId } : {})
+          },
+          fields: [
+            {
+              id: 'question_0',
+              label: 'Approach',
+              kind: 'single-select',
+              options: [
+                { value: 'minimal', label: 'Minimal' },
+                { value: 'expanded', label: 'Expanded' }
+              ]
+            },
+            { id: 'question_0_custom', label: 'Other', kind: 'text' }
+          ]
+        }
+      })
+    )
+    await applyWorkspaceRuntimeEvent(
+      createEvent({ id: 'choice-turn-stop', kind: 'stop', text: 'end_turn', promptMessageId })
+    )
+
+    const session = useSessionStore.getState().sessions[0]
+    expect(session.status).toBe('idle')
+    expect(session.interrupted).toBeUndefined()
+    expect(session.resumeRecovery).toBeUndefined()
+    expect(session.activities?.[0].elicitation?.state).toBe('pending')
   })
 
   it('attaches artifact events to the current message and finalizes their file paths', async () => {
@@ -1988,6 +2097,8 @@ describe('workspace runtime events', () => {
   })
 
   it('auto-opens a generated molecule artifact in the preview panel', async () => {
+    useNavigationStore.setState({ view: 'workspace', activeProjectId: 'default-project' })
+    usePreviewWorkbenchStore.getState().activateProject('default-project')
     const finalizedArtifact = createArtifactFile({
       id: 'artifact-version-2',
       artifactId: 'artifact-lineage-1',
@@ -2034,6 +2145,88 @@ describe('workspace runtime events', () => {
         name: 'aspirin.mol'
       })
     ])
+  })
+
+  it('waits for the foreground project preview slice before auto-opening a molecule', async () => {
+    useNavigationStore.setState({ view: 'workspace', activeProjectId: 'default-project' })
+    const finalizedArtifact = createArtifactFile({
+      id: 'artifact-version-activating',
+      artifactId: 'artifact-lineage-activating',
+      versionId: 'artifact-version-activating',
+      versionNumber: 1,
+      sessionId: 'transport-session-1',
+      messageId: 'message-1',
+      runId: undefined,
+      name: 'activating.mol'
+    })
+
+    await applyWorkspaceRuntimeEvent(createEvent({ id: 'stop-before-activating', kind: 'stop' }))
+    await applyWorkspaceRuntimeEvent(
+      createEvent({
+        id: 'artifact-event-activating',
+        kind: 'artifact',
+        runId: 'run-activating',
+        artifactSessionId: 'artifact-session-activating',
+        artifactClaimId: 'claim-activating',
+        artifacts: [createArtifactFile({ name: 'activating.mol' })]
+      }),
+      {
+        finalizeRunArtifacts: vi.fn().mockResolvedValue([finalizedArtifact]),
+        saveSession: vi.fn().mockResolvedValue(undefined)
+      }
+    )
+
+    expect(usePreviewWorkbenchStore.getState().items).toEqual([])
+
+    usePreviewWorkbenchStore.getState().activateProject('default-project')
+
+    expect(usePreviewWorkbenchStore.getState()).toMatchObject({
+      activeItemId: 'artifact-lineage-activating',
+      panelState: 'open',
+      activeProjectId: 'default-project',
+      items: [
+        expect.objectContaining({
+          id: 'artifact-lineage-activating',
+          selectedVersionId: 'artifact-version-activating',
+          format: 'molecule'
+        })
+      ]
+    })
+  })
+
+  it('does not auto-open a generated molecule artifact while Home is visible', async () => {
+    const finalizedArtifact = createArtifactFile({
+      id: 'artifact-version-home',
+      artifactId: 'artifact-lineage-home',
+      versionId: 'artifact-version-home',
+      versionNumber: 1,
+      sessionId: 'transport-session-1',
+      messageId: 'message-1',
+      runId: undefined,
+      name: 'background.mol'
+    })
+    const finalizeRunArtifacts = vi.fn().mockResolvedValue([finalizedArtifact])
+    const saveSession = vi.fn().mockResolvedValue(undefined)
+
+    await applyWorkspaceRuntimeEvent(createEvent({ id: 'stop-before-home-molecule', kind: 'stop' }))
+    await applyWorkspaceRuntimeEvent(
+      createEvent({
+        id: 'artifact-event-home',
+        kind: 'artifact',
+        runId: 'run-home',
+        artifactSessionId: 'artifact-session-home',
+        artifactClaimId: 'claim-home',
+        artifacts: [createArtifactFile({ name: 'background.mol' })]
+      }),
+      { finalizeRunArtifacts, saveSession }
+    )
+
+    expect(finalizeRunArtifacts).toHaveBeenCalledOnce()
+    expect(usePreviewWorkbenchStore.getState()).toMatchObject({
+      activeItemId: undefined,
+      panelState: 'collapsed',
+      items: []
+    })
   })
 
   it('does not auto-open non-molecule artifacts', async () => {

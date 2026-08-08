@@ -14,12 +14,13 @@ import { resetWorkspaceRuntimeEventOwnerForTests } from './workspace-runtime-eve
 ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
 const runtimeMock = vi.hoisted(() => ({ current: {} as unknown }))
+const useAcpRuntimeMock = vi.hoisted(() => vi.fn())
 
 vi.mock('./useAcpRuntime', () => ({
-  useAcpRuntime: () => runtimeMock.current
+  useAcpRuntime: useAcpRuntimeMock
 }))
 
-import { useWorkspaceAgentRuntime } from './useWorkspaceAgentRuntime'
+import { useWorkspaceAgentRuntime, WorkspaceAgentRuntimeProvider } from './useWorkspaceAgentRuntime'
 
 const workspacePath = join('workspace', 'project')
 
@@ -29,6 +30,7 @@ const createSnapshot = (overrides: Partial<AcpStateSnapshot> = {}): AcpStateSnap
   sessionIds: [],
   events: [],
   pendingPermissions: [],
+  pendingElicitations: [],
   permissionProfiles: {},
   permissionGrants: {},
   contextUsageBySession: {},
@@ -50,6 +52,7 @@ type RuntimeMock = {
   cancel: Mock
   deleteSession: Mock
   respondToPermission: Mock
+  respondToElicitation: Mock
   setPermissionProfile: Mock
   revokePermissionGrant: Mock
 }
@@ -66,6 +69,7 @@ const createRuntime = (state: AcpStateSnapshot): RuntimeMock => ({
   cancel: vi.fn(),
   deleteSession: vi.fn(),
   respondToPermission: vi.fn().mockResolvedValue(state),
+  respondToElicitation: vi.fn().mockResolvedValue(state),
   setPermissionProfile: vi.fn(),
   revokePermissionGrant: vi.fn().mockResolvedValue(state)
 })
@@ -92,7 +96,13 @@ describe('workspace Agent Runtime hook contract', () => {
   }
 
   const render = async (): Promise<void> => {
-    await act(async () => root.render(<Probe />))
+    await act(async () =>
+      root.render(
+        <WorkspaceAgentRuntimeProvider>
+          <Probe />
+        </WorkspaceAgentRuntimeProvider>
+      )
+    )
   }
 
   beforeEach(() => {
@@ -101,6 +111,8 @@ describe('workspace Agent Runtime hook contract', () => {
     useSessionStore.setState(createInitialSessionState())
     useSettingsStore.setState(createInitialSettingsState())
     runtimeMock.current = createRuntime(createSnapshot())
+    useAcpRuntimeMock.mockReset()
+    useAcpRuntimeMock.mockImplementation(() => runtimeMock.current)
     window.api = {
       acp: { getState: vi.fn().mockResolvedValue(createSnapshot()) }
     } as never
@@ -126,6 +138,15 @@ describe('workspace Agent Runtime hook contract', () => {
           options: []
         }
       ],
+      pendingElicitations: [
+        {
+          requestId: 'elicitation-1',
+          sessionId: 'session-1',
+          toolCallId: 'tool-choice-1',
+          message: 'Choose an approach',
+          fields: []
+        }
+      ],
       permissionProfiles: {
         'session-1': {
           selectedProfile: 'ask',
@@ -149,6 +170,8 @@ describe('workspace Agent Runtime hook contract', () => {
     }
 
     await render()
+
+    expect(useAcpRuntimeMock).toHaveBeenCalledOnce()
 
     expect(Object.keys(latest).sort()).toEqual(
       [
