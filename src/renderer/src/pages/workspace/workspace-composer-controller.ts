@@ -657,4 +657,4 @@ const useWorkspaceComposerController = ({
   }
 }
 
-export { useWorkspaceComposerController }
+export { useWorkspaceComposerController, type WorkspaceComposerController }
