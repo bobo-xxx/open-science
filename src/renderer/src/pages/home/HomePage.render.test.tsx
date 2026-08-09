@@ -3,6 +3,7 @@ import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type { ProjectFilesChangedEvent } from '../../../../shared/project-files'
 import type { Project } from '../../../../shared/projects'
 import type { EnvironmentCheckResult } from '../../../../shared/settings'
 import { EMPTY_SNAPSHOT, useNotificationInboxStore } from '@/stores/notification-inbox-store'
@@ -22,6 +23,9 @@ vi.mock('@/components/UpdateCapsule', () => ({ UpdateCapsule: () => null }))
 
 let container: HTMLDivElement
 let root: Root
+let getProjectFilesOverview: ReturnType<typeof vi.fn>
+let onProjectFilesChanged: ((event: ProjectFilesChangedEvent) => void) | undefined
+let removeProjectFilesChanged: ReturnType<typeof vi.fn>
 
 const project: Project = {
   id: 'project-1',
@@ -63,6 +67,27 @@ const environment = (checks: EnvironmentCheckResult['checks']): EnvironmentCheck
 })
 
 beforeEach(() => {
+  onProjectFilesChanged = undefined
+  removeProjectFilesChanged = vi.fn()
+  getProjectFilesOverview = vi.fn().mockResolvedValue({
+    totalCount: 0,
+    uploadCount: 0,
+    artifactCount: 0,
+    artifactGroupCount: 0,
+    isIndexComplete: true
+  })
+  Object.defineProperty(window, 'api', {
+    configurable: true,
+    value: {
+      projectFiles: {
+        getOverview: getProjectFilesOverview,
+        onChanged: vi.fn((listener: (event: ProjectFilesChangedEvent) => void) => {
+          onProjectFilesChanged = listener
+          return removeProjectFilesChanged
+        })
+      }
+    }
+  })
   useProjectStore.setState(createInitialProjectState())
   useNavigationStore.setState({ pendingProjectCreation: false })
   useSessionStore.setState(createInitialSessionState())
@@ -290,7 +315,12 @@ describe('HomePage activity overview', () => {
     expect(menu?.className).toContain('text-popover-foreground')
     expect(menu?.className).toContain('w-max')
     expect(menu?.className).toContain('min-w-0')
-    expect(items.map((item) => item.textContent?.trim())).toEqual(['Settings', 'Archive', 'Delete'])
+    expect(items.map((item) => item.textContent?.trim())).toEqual([
+      'Pin project',
+      'Settings',
+      'Archive',
+      'Delete'
+    ])
 
     const settingsItem = items.find((item) => item.textContent?.trim() === 'Settings')
     clickRadixMenuItem(settingsItem)
@@ -300,6 +330,138 @@ describe('HomePage activity overview', () => {
     expect(document.body.textContent).toContain('Update this project’s name and description.')
     expect(document.body.textContent).toContain('Save')
     expect(document.body.textContent).not.toContain('Save changes')
+  })
+
+  it('pins and unpins a Project from the first menu action', async () => {
+    const updateProject = vi.fn(async ({ pinned }: { pinned?: boolean }) => {
+      const updated = { ...project, pinned }
+      useProjectStore.setState({ projects: [updated] })
+      return updated
+    })
+    useProjectStore.setState({
+      ...createInitialProjectState(),
+      projects: [project],
+      isLoaded: true,
+      updateProject
+    } as never)
+
+    await act(async () =>
+      root.render(
+        <HomePage canDeleteProjects hasCompleteSessionCatalog onOpenGlobalSearch={vi.fn()} />
+      )
+    )
+
+    openRadixMenu(
+      container.querySelector<HTMLButtonElement>('[aria-label="Open actions for Research project"]')
+    )
+    clickRadixMenuItem(
+      Array.from(document.body.querySelectorAll<HTMLElement>('[role="menuitem"]')).find(
+        (item) => item.textContent?.trim() === 'Pin project'
+      )
+    )
+    await act(async () => Promise.resolve())
+
+    expect(updateProject).toHaveBeenCalledWith({ id: project.id, pinned: true })
+    expect(container.textContent).toContain('Pinned project')
+
+    openRadixMenu(
+      container.querySelector<HTMLButtonElement>('[aria-label="Open actions for Research project"]')
+    )
+    const unpinItem = Array.from(
+      document.body.querySelectorAll<HTMLElement>('[role="menuitem"]')
+    ).find((item) => item.textContent?.trim() === 'Unpin project')
+    expect(unpinItem).toBeDefined()
+    clickRadixMenuItem(unpinItem)
+    await act(async () => Promise.resolve())
+
+    expect(updateProject).toHaveBeenLastCalledWith({ id: project.id, pinned: false })
+  })
+
+  it('groups pinned Projects first while preserving recent activity order inside both groups', async () => {
+    const projects: Project[] = [
+      { ...project, id: 'unpinned-new', name: 'Unpinned new', updatedAt: 400 },
+      { ...project, id: 'pinned-old', name: 'Pinned old', pinned: true, updatedAt: 100 },
+      { ...project, id: 'unpinned-old', name: 'Unpinned old', updatedAt: 300 },
+      { ...project, id: 'pinned-new', name: 'Pinned new', pinned: true, updatedAt: 200 }
+    ]
+    useProjectStore.setState({
+      ...createInitialProjectState(),
+      projects,
+      isLoaded: true
+    })
+
+    await act(async () =>
+      root.render(
+        <HomePage canDeleteProjects hasCompleteSessionCatalog onOpenGlobalSearch={vi.fn()} />
+      )
+    )
+
+    expect(
+      Array.from(container.querySelectorAll<HTMLElement>('[aria-label^="Open actions for "]')).map(
+        (action) => action.getAttribute('aria-label')
+      )
+    ).toEqual([
+      'Open actions for Pinned new',
+      'Open actions for Pinned old',
+      'Open actions for Unpinned new',
+      'Open actions for Unpinned old'
+    ])
+  })
+
+  it('shows complete artifact counts only while the entire Recent sessions list is empty', async () => {
+    getProjectFilesOverview.mockResolvedValue({
+      totalCount: 114,
+      uploadCount: 0,
+      artifactCount: 114,
+      artifactGroupCount: 1,
+      isIndexComplete: true
+    })
+    useProjectStore.setState({
+      ...createInitialProjectState(),
+      projects: [project],
+      isLoaded: true
+    })
+
+    await act(async () =>
+      root.render(
+        <HomePage canDeleteProjects hasCompleteSessionCatalog onOpenGlobalSearch={vi.fn()} />
+      )
+    )
+    await act(async () => Promise.resolve())
+
+    expect(container.textContent).toContain('114 artifacts')
+    expect(getProjectFilesOverview).toHaveBeenCalledWith({ projectId: project.id })
+
+    getProjectFilesOverview.mockResolvedValue({
+      totalCount: 115,
+      uploadCount: 0,
+      artifactCount: 115,
+      artifactGroupCount: 1,
+      isIndexComplete: true
+    })
+    await act(async () => {
+      onProjectFilesChanged?.({
+        projectId: project.id,
+        sessionId: 'session-1',
+        sources: ['artifact'],
+        kind: 'upsert'
+      })
+      await Promise.resolve()
+    })
+
+    expect(container.textContent).toContain('115 artifacts')
+    expect(getProjectFilesOverview).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      useSessionStore.setState({
+        ...createInitialSessionState(),
+        sessions: [session('recent', 'Recent analysis', 'idle', 600_000)]
+      })
+    })
+
+    expect(container.textContent).not.toContain('114 artifacts')
+    expect(container.textContent).not.toContain('115 artifacts')
+    expect(removeProjectFilesChanged).toHaveBeenCalledOnce()
   })
 
   it('opens global search from the header and uses the selected Projects icon', async () => {
@@ -351,13 +513,16 @@ describe('HomePage activity overview', () => {
     )
 
     const activeSection = container.querySelector<HTMLElement>('[aria-label="Session updates"]')
-    const scroller = activeSection?.firstElementChild
+    const home = container.querySelector('main')
+    const cardGrid = activeSection?.firstElementChild
     const cards = activeSection?.querySelectorAll<HTMLButtonElement>('button') ?? []
-    expect(scroller?.classList.contains('overflow-x-auto')).toBe(true)
-    expect(scroller?.classList.contains('-mx-2')).toBe(true)
-    expect(scroller?.classList.contains('scroll-px-2')).toBe(true)
-    expect(scroller?.classList.contains('px-2')).toBe(true)
-    expect(cards[0]?.classList.contains('shrink-0')).toBe(true)
+    expect(home?.classList.contains('h-svh')).toBe(true)
+    expect(home?.classList.contains('overflow-y-auto')).toBe(true)
+    expect(cardGrid?.classList.contains('grid')).toBe(true)
+    expect(cardGrid?.classList.contains('grid-cols-1')).toBe(true)
+    expect(cardGrid?.classList.contains('md:grid-cols-2')).toBe(true)
+    expect(cardGrid?.classList.contains('overflow-x-auto')).toBe(false)
+    expect(cards[0]?.classList.contains('cursor-pointer')).toBe(true)
     expect([...cards].map((card) => card.getAttribute('aria-label'))).toEqual([
       'Open session Plan review, needs you',
       'Open session Permission request, needs you',
@@ -379,6 +544,9 @@ describe('HomePage activity overview', () => {
     expect(runningBadge?.classList.contains('bg-session-running/10')).toBe(true)
     expect(runningBadge?.classList.contains('text-session-running')).toBe(true)
     expect(runningBadge?.querySelector('svg')?.classList.contains('animate-spin')).toBe(true)
+    expect(runningCard?.querySelector('.home-session-title-running')?.textContent?.trim()).toBe(
+      'Running analysis'
+    )
     expect(
       runningBadge?.querySelector('svg')?.classList.contains('motion-reduce:animate-none')
     ).toBe(true)
@@ -420,10 +588,11 @@ describe('HomePage activity overview', () => {
     ).not.toBeNull()
   })
 
-  it('shows an unread completed session until its result is marked read', async () => {
+  it('dismisses every backend completion for a session without opening it', async () => {
     const now = 600_000
     const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(now)
     const openSession = vi.fn()
+    const markSessionCompletionsRead = vi.fn().mockResolvedValue(undefined)
     const completedItem = {
       id: 'completed-1',
       sequence: 1,
@@ -446,11 +615,21 @@ describe('HomePage activity overview', () => {
       sessions: [session('finished', 'Finished analysis', 'idle', now - 10 * 60_000)]
     })
     useNotificationInboxStore.setState({
-      revision: 1,
-      unreadCount: 1,
-      latestSequence: 1,
+      revision: 2,
+      unreadCount: 2,
+      latestSequence: 2,
       status: 'ready',
-      items: [completedItem]
+      items: [
+        completedItem,
+        {
+          ...completedItem,
+          id: 'completed-2',
+          sequence: 2,
+          dedupeKey: 'task:completed:finished:follow-up',
+          createdAt: now - 1
+        }
+      ],
+      markSessionCompletionsRead
     })
     useNavigationStore.setState({ openSession } as never)
 
@@ -470,6 +649,30 @@ describe('HomePage activity overview', () => {
     expect(completedCard?.textContent).toContain('just now')
     expect(completedBadge?.classList.contains('text-success-000')).toBe(true)
     expect(completedBadge?.querySelector('svg')?.classList.contains('animate-spin')).toBe(false)
+    expect(completedCard?.classList.contains('cursor-pointer')).toBe(true)
+
+    const dismissButton = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Mark completed session Finished analysis as read"]'
+    )
+    expect(dismissButton?.classList.contains('home-session-dismiss')).toBe(true)
+    expect(dismissButton?.classList.contains('cursor-pointer')).toBe(true)
+
+    await act(async () => dismissButton?.click())
+
+    expect(markSessionCompletionsRead).toHaveBeenCalledWith(['finished'])
+    expect(openSession).not.toHaveBeenCalled()
+
+    markSessionCompletionsRead.mockRejectedValueOnce(new Error('read failed'))
+    await act(async () => dismissButton?.click())
+
+    expect(
+      container.querySelector(
+        '[aria-label="Retry marking completed session Finished analysis as read"]'
+      )
+    ).not.toBeNull()
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+      'Could not mark this completed session as read.'
+    )
 
     await act(async () => completedCard?.click())
 
@@ -477,9 +680,19 @@ describe('HomePage activity overview', () => {
 
     await act(async () => {
       useNotificationInboxStore.setState({
-        revision: 2,
+        revision: 3,
         unreadCount: 0,
-        items: [{ ...completedItem, readAt: now }]
+        items: [
+          { ...completedItem, readAt: now },
+          {
+            ...completedItem,
+            id: 'completed-2',
+            sequence: 2,
+            dedupeKey: 'task:completed:finished:follow-up',
+            createdAt: now - 1,
+            readAt: now
+          }
+        ]
       })
     })
 

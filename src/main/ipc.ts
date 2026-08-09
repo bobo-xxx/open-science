@@ -161,7 +161,8 @@ import { SETTINGS_INSTALL_LOG_CHANNEL, registerSettingsIpcHandlers } from './set
 import { registerLocalFsIpcHandlers } from './local-fs/ipc'
 import { LocalFsService } from './local-fs/service'
 import { getAppClaudeConfigDir } from './settings/provider-env'
-import { createDefaultSettingsService } from './settings/service'
+import { SettingsService } from './settings/service'
+import { SettingsRepository } from './settings/repository'
 import type { NotebookRuntimeSettings } from './settings/capabilities'
 import type { WindowSettingsCapabilities } from './settings/service-capabilities'
 import { createSettingsWorkflows } from './settings/workflows'
@@ -242,6 +243,7 @@ import {
   type NamedElectronSurfaceAdapter
 } from './runtime-electron-wiring'
 import { ConversationSkillImporter, SkillImportApprovalBroker } from './skills/conversation-import'
+import { HostSkillsService, type HostSkillsCatalog } from './skills/host-skills-service'
 import type { ConversationSkillImportApprovalResponse } from '../shared/settings'
 import type { TaskAgentPort } from './tasks/task-runner'
 
@@ -335,8 +337,9 @@ const createApplicationModules = async (
     createApplicationEventModule
   )
   // One settings service backs both the settings IPC and the ACP spawn config (single source of truth).
+  const settingsRepository = new SettingsRepository(resolveStorageRoot())
   const settingsService = await modules.add(undefined, () => ({
-    capability: createDefaultSettingsService()
+    capability: new SettingsService({ repository: settingsRepository })
   }))
   const storedSettings = await settingsService.getStoredSettings()
   const storageLog = createLogger('storage')
@@ -959,7 +962,8 @@ const createApplicationModules = async (
     computeArtifactResolver,
     undefined,
     taskNotifications,
-    permissionGrantRegistry
+    permissionGrantRegistry,
+    settingsRepository
   )
   surfaceAdapters = beforeAcpAdapters
   const {
@@ -1062,6 +1066,29 @@ const createApplicationModules = async (
       await sessionPersistenceCoordinator.saveSessionSpecialistBinding(session, specialistId)
     }
   })
+  const hostSkillsCatalog: HostSkillsCatalog = {
+    list: () => settingsService.listHostSkills(),
+    withSkillRead: (id, read) => settingsService.withHostSkillRead(id, read),
+    publishPersonalDirectory: (slug, sourcePath, overwrite) =>
+      settingsService.publishHostSkill(slug, sourcePath, overwrite),
+    deletePublished: async (id) => {
+      await settingsService.deleteSkill({ id })
+    }
+  }
+  const hostSkillsService = new HostSkillsService({
+    storageRoot: configRoot,
+    catalog: hostSkillsCatalog,
+    approveDelete: async (payload, session) => {
+      const runtime = runtimeRef.current
+      if (!session.sessionId || !runtime) return false
+      return runtime.requestAppApproval({
+        sessionId: session.sessionId,
+        title: `Delete ${payload.name}?`,
+        rawInput: { skillApproval: { kind: 'delete', ...payload } }
+      })
+    },
+    onPublishedSkillsChanged: () => void runtimeRef.current?.requestSkillsReload()
+  })
   const notebookRpcServer = await modules.add(
     new NotebookLocalRpcServer(notebookLocalRpc, {
       onSessionReleased: (sessionId) => completionGateCoordinator.releaseSession(sessionId),
@@ -1095,7 +1122,8 @@ const createApplicationModules = async (
           )
       },
       inputRegistry: notebookInputRegistry,
-      agentsService
+      agentsService,
+      skillsService: hostSkillsService
     }),
     createNotebookLocalRpcModule
   )
@@ -1923,6 +1951,8 @@ const createApplicationModules = async (
         getSnapshot: () => notificationInbox.getSnapshot(),
         markRead: (request) => notificationInbox.markRead(request.ids),
         markAllRead: (request) => notificationInbox.markAllRead(request.throughSequence),
+        markSessionCompletionsRead: (request) =>
+          notificationInbox.markSessionCompletionsRead(request.sessionIds),
         peekPendingOpenSession: () => taskNotifications.peekPendingOpenSession(),
         takePendingOpenSession: (expectedToken) =>
           taskNotifications.takePendingOpenSession(expectedToken)

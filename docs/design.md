@@ -443,6 +443,7 @@ Workspace-only tokens without a shadcn counterpart, plus shadow tokens. For shar
 - Session row wrapper owns hover/active visuals only: `group mx-1.5 rounded-md px-2.5 py-1.5 text-sm text-text-000 hover:bg-bg-300 select-none`; active adds `bg-bg-300`.
 - Session title button is the row click target: `flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left`.
 - Session status dots are decorative and `aria-hidden`; provide adjacent `sr-only` text such as `Session status: Running`.
+- Session groups appear in `Pinned`, `Active`, `Today`, `Yesterday`, `This week`, `Older` order and omit empty headings. Pinning has priority over every activity or date group. `Active` includes running and user-waiting Sessions plus idle Sessions for 15 minutes after their latest activity; selection and Side chat activity alone do not make a Session active. Date groups use the device's local calendar, with `This week` beginning Monday at 00:00, and refresh at local midnight.
 - Footer settings area uses a top fade `bg-gradient-to-t from-rail-card-bg to-rail-card-bg/0` and a `h-8 w-8` icon button.
 
 ### Message Center
@@ -480,7 +481,7 @@ Workspace-only tokens without a shadcn counterpart, plus shadow tokens. For shar
 - User bubble: `ml-auto max-w-[90%] md:max-w-[min(85%,56rem)] rounded-2xl bg-bg-300 px-3.5 py-2 md:px-4 md:py-2.5 text-sm md:text-[15px] text-message-user-text`.
 - Assistant wrapper: `w-full max-w-[56rem] text-sm md:text-[15px] leading-relaxed text-text-000`.
 - Message metadata uses `text-[11px] text-text-000/70 tabular-nums` below the content so timestamps and elapsed status meet WCAG contrast on workspace surfaces. The visible timestamp format is fixed to English `MMM D, h:mm AM/PM`: User Messages show `Sent ...`, completed Agent Messages show `Completed ...`, and failed Agent Messages show `Failed ...`. Terminal timestamps are persisted separately from mutable record update times. Agent footers keep terminal time, elapsed time, and `Usage` on one line without a separator (`Completed ... Elapsed 2m 5s Usage`). `Usage` uses a dashed underline and reveals a compact Context-window-style popover on pointer hover or keyboard focus. The popover has a proportional color bar above its token rows and a divided `Total` row below them. When an adapter reports a reliable agentic model-turn count, show `1 turn` or `N turns` as smaller muted text aligned to the right of the popover title; omit it rather than estimating when unavailable. Show Input, Cache, and Output when only aggregate cache data is available; split Cache into Cache read and Cache write, with distinct colors and bar segments, only when the agent reports both categories. The displayed categories are mutually exclusive and `Total` is their sum.
-- Agent loading surface is transparent and keeps `px-3 py-2` for stable transcript geometry; elapsed and status text use `text-text-000/70`, while the brand indicator uses `text-text-300`. A silent foreground prompt shows `[indicator] · thinking` with elapsed time and the existing slow-response hint. Active tools and permission waits show `[indicator] · interacting with tools` without a timer. Visible assistant text or images hide the indicator; when the current tool transitions to a terminal state, Thinking returns with a fresh timer until the next visible output. Runtime stop, failure, disconnect, and compaction clear the transient indicator state. Historical, duplicate, and late tool events must not revive it or reorder the activity timeline.
+- Agent loading surface is transparent and keeps `px-3 py-2` for stable transcript geometry; elapsed and status text use `text-text-000/70`, while the brand indicator uses `text-text-300`. A silent foreground prompt shows `[indicator] · Thinking` with elapsed time and the existing slow-response hint. Active tools show `[indicator] · Interacting with tools` without a timer. Permission and Plan approval waits show `[indicator] · Waiting for your approval`; pending ask-user elicitation shows `[indicator] · Waiting for your response`. User waits take precedence over visible assistant output and remain untimed until resolved. Outside those waits, visible assistant text or images hide the indicator; when the current tool transitions to a terminal state, Thinking returns with a fresh timer until the next visible output. Runtime stop, failure, disconnect, and compaction clear the transient indicator state. Historical, duplicate, and late tool events must not revive it or reorder the activity timeline.
 - User Message copy and edit actions sit immediately left of the bubble and use the standard inline-action opacity transition on row hover or keyboard focus. When editing creates multiple Branches, keep the Branch navigation persistently visible at the right end of the metadata footer below the bubble, after the sent time, with previous/next controls around a Branch icon and the current/total count. Let the footer wrap on narrow surfaces so the navigation remains the final bottom row without colliding with the sent time.
 - Tool row: `h-8 rounded-lg px-2 text-[13px] hover:bg-foreground/[0.04]`.
 - Context compaction is a standalone, non-interactive activity row rather than a generic Tool group.
@@ -547,33 +548,40 @@ Workspace-only tokens without a shadcn counterpart, plus shadow tokens. For shar
 - Projects title: use `GalleryVerticalEnd`; activity counters sit beside each Project name and split
   `running` from `waiting on you` rather than presenting one ambiguous total.
 - Project actions: use the shared Session dropdown styling and size the surface to its content so
-  inline padding stays balanced. The first action is `Settings`, opening `Project Settings` for Name
-  and Description; its edit action is labelled `Save`.
+  inline padding stays balanced. The first action is `Pin project` / `Unpin project`, using an outline
+  / filled star; `Settings` opens `Project Settings` for Name and Description, and its edit action is
+  labelled `Save`. Pinned Projects form the first group while each pinned and unpinned group retains
+  the existing most-recent-activity ordering.
 - Project description: explain that the optional description is shown in the Project list for the
   user's reference and is not included in the agent prompt.
-- Session updates: show a single-row horizontal card scroller above the Project/Recent columns for
+- Session updates: show a responsive card grid above the Project/Recent columns for
   every non-archived Session that is `running`, `waiting-permission`, `waiting-plan-approval`, or has
   an unread `task.completed` notification while idle. Cards occupy one column on compact screens and
-  half the row on desktop. Waiting Sessions come first, then running Sessions, then completed
-  Sessions. The track extends beyond the content grid by the same amount as its inline and scroll
-  snap padding, keeping the cards aligned with the columns while the first and last outlines and
-  shadows remain visible at either scroll edge. Every card opens its Session and contains only the
-  Session title, Project name, state, and state-relative time. Opening a completed Session marks its
-  task outcome read, so that card no longer appears when the user returns Home.
+  two columns on desktop, filling rows from top to bottom. Waiting Sessions come first, then running
+  Sessions, then completed Sessions. Every card opens its Session and contains only the Session title,
+  Project name, state, and state-relative time. Cards use the clickable pointer cursor. Opening a
+  completed Session marks its task outcome read, so that card no longer appears when the user returns
+  Home. A completed card also reveals a dismiss action on pointer hover or keyboard focus; dismissing
+  marks every unread completion outcome for that Session read without opening it, and the action stays
+  visible on touch devices.
 - Home reads live Session projections from the application-level runtime owner; it does not mount
   Workspace commands or preview side effects. Background artifacts remain durable, but only the
   foreground Workspace for their owning Project may auto-open a molecule preview.
 - Session activity labels: `running` maps to `Running`; `waiting-permission` and
   `waiting-plan-approval` map to `Needs you`; unread successful outcomes map to `Completed`. Use the
   existing `session-running`, `session-waiting`, and `success-000` tokens. `session-running` is blue
-  in both themes; Running uses a rotating loader in Session update cards and Project counts, with a
-  static loader under reduced motion. Needs you keeps its amber pulse, while Completed uses a static
-  green check in both the Session update card and message center.
+  in both themes; Running uses a rotating loader in Session update cards and Project counts plus an
+  intermittent left-to-right light sweep over the card title, with both title and loader static under
+  reduced motion. Needs you keeps its amber pulse, while Completed uses a static green check in both
+  the Session update card and message center.
 - Session update cards and the Projects / Recent sessions containers use `shadow-card` without an
   additional border, so its built-in hairline ring matches the New project button instead of
   stacking into a heavier outline.
 - Recent sessions: the secondary line is always the owning Project name, never a prompt preview or a
-  repeat of the Session title.
+  repeat of the Session title. Once the Session catalog is complete, if the entire Recent sessions
+  list is empty, each Project row also shows its artifact count from a complete Project Files index;
+  partial index counts are omitted. While those counts are visible, Project Files change events
+  refresh the affected Project so index repair and file changes do not leave stale totals.
 - List row: `h-10 rounded-lg px-3 hover:bg-accent hover:text-accent-foreground`.
 - Inline more actions: default `opacity-0`, then `opacity-100` on hover or focus-visible.
 

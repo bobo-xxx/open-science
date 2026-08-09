@@ -3156,7 +3156,139 @@ describe('ACP runtime session management', () => {
     }
   )
 
-  it('declines a repeated Codex MCP approval after its correlation is consumed', async () => {
+  it.each([
+    {
+      label: 'REPL execution',
+      toolCallId: 'call-large-repl',
+      tool: 'repl_execute',
+      arguments: { code: 'A'.repeat(8_500) },
+      expectedPermissionInput: {
+        language: 'javascript',
+        code: 'A'.repeat(7_500),
+        inputTruncated: true
+      }
+    },
+    {
+      label: 'skill edit',
+      toolCallId: 'call-large-skill-edit',
+      tool: 'host.skills.edit',
+      arguments: { path: 'pubmed-trend-piechart/SKILL.md', content: 'A'.repeat(8_500) },
+      expectedPermissionInput: undefined
+    }
+  ])(
+    'routes an oversized Codex MCP $label through permission controls without publishing it',
+    async ({ toolCallId, tool, arguments: toolArguments, expectedPermissionInput }) => {
+      const process = new FakeAgentProcess()
+      const fakeAgent = startFakeAgent(process, ['codex-large-approval-session'], {
+        modes: createModes(['read-only', 'agent', 'agent-full-access'], 'read-only'),
+        codexMcpToolCallBeforeElicitation: {
+          toolCallId,
+          server: 'open-science-notebook',
+          tool,
+          arguments: toolArguments
+        },
+        elicitationForPrompt: ({ sessionId }) => ({
+          mode: 'form',
+          sessionId,
+          toolCallId,
+          message: `Allow the open-science-notebook MCP server to run ${tool}?`,
+          requestedSchema: {
+            type: 'object',
+            properties: {
+              persist: { type: 'string', title: 'Approval scope', enum: ['once'] }
+            },
+            required: ['persist']
+          },
+          _meta: { codex_approval_kind: 'mcp_tool_call' }
+        })
+      })
+      const permissionRequests: AcpPermissionRequest[] = []
+      const runtime = new AcpRuntime({
+        appVersion: '0.1.0',
+        defaultCwd: '/workspace',
+        spawnAgent: () => asAgentProcess(process),
+        framework: codexFramework,
+        notebook: {
+          projectName: 'default-project',
+          mcpEntryPath: '/app/out/main/index.js',
+          getRpcConnection: async () => ({ endpoint: 'http://127.0.0.1:4567', token: 'nb' })
+        },
+        callbacks: {
+          onPermissionRequest: (request) => {
+            permissionRequests.push(request)
+            const allowOnce = request.options.find((option) => option.kind === 'allow_once')
+            if (!allowOnce) throw new Error('Missing allow_once permission option')
+            void runtime.respondToPermission({
+              requestId: request.requestId,
+              optionId: allowOnce.optionId
+            })
+          }
+        }
+      })
+
+      const session = await runtime.createSession({ cwd: '/workspace', permissionProfile: 'ask' })
+      await runtime.sendPrompt({ sessionId: session.sessionId, text: `run a large ${tool} input` })
+
+      expect(permissionRequests).toHaveLength(1)
+      expect(permissionRequests[0]).toMatchObject({ toolCallId, providerToolName: tool })
+      expect(permissionRequests[0]?.rawInput).toEqual(expectedPermissionInput)
+      expect(
+        runtime.getSnapshot().events.find((event) => event.toolCallId === toolCallId)?.rawInput
+      ).toBeUndefined()
+      expect(fakeAgent.elicitationResponses).toEqual([{ action: 'accept' }])
+    },
+    30_000
+  )
+
+  it('cancels a Codex MCP elicitation when its permission flow is cancelled', async () => {
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['codex-cancelled-approval-session'], {
+      modes: createModes(['read-only', 'agent', 'agent-full-access'], 'read-only'),
+      codexMcpToolCallBeforeElicitation: {
+        toolCallId: 'call-cancelled-repl',
+        server: 'open-science-notebook',
+        tool: 'repl_execute',
+        arguments: { code: '1 + 1' }
+      },
+      elicitationForPrompt: ({ sessionId }) => ({
+        mode: 'form',
+        sessionId,
+        toolCallId: 'call-cancelled-repl',
+        message: 'Allow the open-science-notebook MCP server to run repl_execute?',
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            persist: { type: 'string', title: 'Approval scope', enum: ['once'] }
+          },
+          required: ['persist']
+        },
+        _meta: { codex_approval_kind: 'mcp_tool_call' }
+      })
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: codexFramework,
+      notebook: {
+        projectName: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        getRpcConnection: async () => ({ endpoint: 'http://127.0.0.1:4567', token: 'nb' })
+      },
+      callbacks: {
+        onPermissionRequest: (request) => {
+          void runtime.respondToPermission({ requestId: request.requestId, cancelled: true })
+        }
+      }
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace', permissionProfile: 'ask' })
+    await runtime.sendPrompt({ sessionId: session.sessionId, text: 'cancel this approval' })
+
+    expect(fakeAgent.elicitationResponses).toEqual([{ action: 'cancel' }])
+  })
+
+  it('cancels a repeated Codex MCP approval after its correlation is consumed', async () => {
     const process = new FakeAgentProcess()
     const fakeAgent = startFakeAgent(process, ['codex-choice-replay-session'], {
       modes: createModes(['read-only', 'agent', 'agent-full-access'], 'read-only'),
@@ -3214,7 +3346,7 @@ describe('ACP runtime session management', () => {
     await runtime.sendPrompt({ sessionId: session.sessionId, text: 'replay approval' })
 
     expect(publishedApprovalCount).toBe(0)
-    expect(fakeAgent.elicitationResponses).toEqual([{ action: 'accept' }, { action: 'decline' }])
+    expect(fakeAgent.elicitationResponses).toEqual([{ action: 'accept' }, { action: 'cancel' }])
   })
 
   it('acknowledges an app-owned MCP choice and silently continues after the user answers', async () => {
@@ -3335,6 +3467,109 @@ describe('ACP runtime session management', () => {
     expect(fakeAgent.prompts[0].text).toContain('Python')
     expect(fakeAgent.prompts[0].text).toContain('Which output should I produce?')
     expect(fakeAgent.prompts[0].text).toContain('Report')
+  })
+
+  it('aggregates usage across repeated app-owned choices for the originating user turn', async () => {
+    const process = new FakeAgentProcess()
+    const usageForText = (text: string): NonNullable<PromptResponse['usage']> =>
+      text === 'begin the workflow'
+        ? {
+            totalTokens: 17,
+            inputTokens: 10,
+            cachedReadTokens: 2,
+            cachedWriteTokens: 1,
+            outputTokens: 4
+          }
+        : text.includes('Answer: Minimal')
+          ? {
+              totalTokens: 31,
+              inputTokens: 20,
+              cachedReadTokens: 4,
+              cachedWriteTokens: 1,
+              outputTokens: 6
+            }
+          : {
+              totalTokens: 45,
+              inputTokens: 30,
+              cachedReadTokens: 5,
+              cachedWriteTokens: 2,
+              outputTokens: 8
+            }
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process)
+    })
+    const fakeAgent = startFakeAgent(process, ['repeated-user-choice-session'], {
+      onPrompt: async ({ sessionId, text }) => {
+        if (text === 'begin the workflow') {
+          await runtime.requestUserInput({
+            sessionId,
+            questions: [
+              {
+                question: 'Which implementation should I use?',
+                options: [{ label: 'Minimal' }, { label: 'Expanded' }]
+              }
+            ]
+          })
+        } else if (text.includes('Answer: Minimal')) {
+          await runtime.requestUserInput({
+            sessionId,
+            questions: [
+              {
+                question: 'Which output should I produce?',
+                options: [{ label: 'Report' }, { label: 'Notebook' }]
+              }
+            ]
+          })
+        }
+        return { stopReason: 'end_turn', usage: usageForText(text) }
+      },
+      claudeTurnCountForPrompt: (text) =>
+        text === 'begin the workflow' ? 1 : text.includes('Answer: Minimal') ? 2 : 3
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    const promptMessageId = 'originating-user-message'
+    await runtime.sendPrompt({
+      sessionId: session.sessionId,
+      text: 'begin the workflow',
+      provenanceContext: { promptMessageId }
+    })
+
+    const firstChoice = runtime.getSnapshot().pendingElicitations?.[0]
+    expect(firstChoice).toBeDefined()
+    runtime.respondToElicitation({
+      requestId: firstChoice!.requestId,
+      action: 'accept',
+      answers: [{ fieldId: 'question_0', value: 'Minimal' }]
+    })
+    await vi.waitFor(() => expect(fakeAgent.prompts).toHaveLength(2))
+    await vi.waitFor(() => expect(runtime.getSnapshot().pendingElicitations).toHaveLength(1))
+
+    const secondChoice = runtime.getSnapshot().pendingElicitations?.[0]
+    runtime.respondToElicitation({
+      requestId: secondChoice!.requestId,
+      action: 'accept',
+      answers: [{ fieldId: 'question_0', value: 'Report' }]
+    })
+    await vi.waitFor(() => expect(fakeAgent.prompts).toHaveLength(3))
+    await vi.waitFor(() =>
+      expect(runtime.getSnapshot().promptInFlightSessionIds).not.toContain(session.sessionId)
+    )
+
+    const stops = runtime
+      .getSnapshot()
+      .events.filter((event) => event.kind === 'stop' && event.promptMessageId === promptMessageId)
+    expect(stops).toHaveLength(3)
+    expect(stops.at(-1)?.turnUsage).toEqual({
+      inputTokens: 60,
+      cacheTokens: 15,
+      cachedReadTokens: 11,
+      cachedWriteTokens: 4,
+      outputTokens: 18,
+      turnCount: 6
+    })
   })
 
   it('publishes one multi-question choice and continues only after every answer', async () => {
