@@ -9,7 +9,11 @@ import type {
   PendingElicitationRequest
 } from './elicitation'
 
-export { MAX_ELICITATION_MESSAGE_CHARS, resolveAgentUserChoiceQuestions } from './elicitation'
+export {
+  isDurableAgentUserChoiceRequest,
+  MAX_ELICITATION_MESSAGE_CHARS,
+  resolveAgentUserChoiceQuestions
+} from './elicitation'
 export type {
   AgentUserChoiceQuestion,
   ElicitationAnswer,
@@ -108,6 +112,11 @@ export type AcpRuntimeEventKind =
   | 'error'
   | 'stop'
   | 'raw'
+
+// Durable renderer marker for compaction lifecycle rows stored through the existing tool-activity
+// projection. The runtime event remains `kind: 'compaction'`; this value only identifies its transcript
+// activity after persistence and replay.
+export const ACP_CONTEXT_COMPACTION_ACTIVITY_TOOL_NAME = 'ContextCompaction'
 
 export type AcpRuntimeEventLevel = 'info' | 'warning' | 'error'
 

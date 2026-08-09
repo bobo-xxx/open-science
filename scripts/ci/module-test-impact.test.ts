@@ -35,6 +35,21 @@ describe('module test impact commands', () => {
     expect(() => createModuleTestPlan('unknown_module')).toThrow('Unknown module: unknown_module')
   })
 
+  it('builds the Compute service contract and fallback plan', () => {
+    const plan = createModuleTestPlan('compute_service')
+
+    expect(plan.testFiles).toEqual(
+      expect.arrayContaining([
+        'src/main/compute/compute-service.test.ts',
+        'src/main/compute/ssh-runner.test.ts',
+        'src/main/compute/ipc.test.ts',
+        'src/main/notebook/local-rpc-server.mcpcall.test.ts'
+      ])
+    )
+    expect(plan.capabilityOverlays).toEqual(['windows_sensitive'])
+    expect(plan.fallbackCapabilities).toEqual(['main_runtime'])
+  })
+
   it('expands changed owners through consumer modules and graph candidates', () => {
     const plan = createAffectedTestPlan(
       [{ path: 'src/main/artifacts/repository.ts', status: 'modified' }],
@@ -46,6 +61,40 @@ describe('module test impact commands', () => {
     expect(plan.testFiles).toContain('src/main/reviewer/ipc.test.ts')
     expect(plan.reasonChains).toContain('artifact_storage -> artifact_provenance')
   })
+
+  it.each(['src/main/reviewer/reviewer-session-driver.ts', 'src/shared/reviewer.ts'])(
+    'expands Reviewer changes through downstream consumers for %s',
+    (path) => {
+      const plan = createAffectedTestPlan([{ path, status: 'modified' }], {
+        status: 'current',
+        testFiles: []
+      })
+
+      expect([...plan.modules].sort()).toEqual([
+        'artifact_provenance',
+        'reviewer_orchestrator',
+        'session_persistence',
+        'workspace_page',
+        'workspace_runtime'
+      ])
+      expect(plan.reasonChains).toEqual(
+        expect.arrayContaining([
+          'reviewer_orchestrator -> workspace_runtime',
+          'reviewer_orchestrator -> workspace_page',
+          'reviewer_orchestrator -> artifact_provenance',
+          'reviewer_orchestrator -> artifact_provenance -> session_persistence'
+        ])
+      )
+      expect(plan.testFiles).toEqual(
+        expect.arrayContaining([
+          'src/main/artifacts/provenance-repository.architecture.test.ts',
+          'src/main/session-persistence/coordinator.architecture.test.ts',
+          'src/renderer/src/lib/acp/useWorkspaceAgentRuntime.architecture.test.ts',
+          'src/renderer/src/pages/workspace/workspace-page.architecture.test.ts'
+        ])
+      )
+    }
+  )
 
   it('fails closed for unknown and destructive changes', () => {
     expect(

@@ -65,6 +65,7 @@ type WorkspaceSidebarProps = {
 const sessionStatusDotClassName: Record<SessionStatus, string> = {
   idle: 'border border-text-100 bg-transparent',
   running: 'bg-session-running ring-2 ring-session-running/20',
+  'waiting-for-user': 'bg-session-waiting ring-2 ring-session-waiting/25',
   'waiting-permission': 'bg-session-waiting ring-2 ring-session-waiting/25',
   'waiting-plan-approval': 'bg-session-waiting ring-2 ring-session-waiting/25',
   error: 'bg-destructive'
@@ -73,6 +74,7 @@ const sessionStatusDotClassName: Record<SessionStatus, string> = {
 const sessionStatusLabel: Record<SessionStatus, string> = {
   idle: 'Idle',
   running: 'Running',
+  'waiting-for-user': 'Waiting for your answer',
   'waiting-permission': 'Waiting for permission',
   'waiting-plan-approval': 'Waiting for plan approval',
   error: 'Error'
@@ -233,6 +235,7 @@ const WorkspaceSidebar = ({
                   const isExportDisabled =
                     session.messages.length === 0 ||
                     session.status === 'running' ||
+                    session.status === 'waiting-for-user' ||
                     session.status === 'waiting-permission'
 
                   return (
@@ -414,7 +417,7 @@ const WorkspaceSidebar = ({
           <div className="relative flex shrink-0 items-center gap-1 p-2">
             <div
               aria-hidden="true"
-              className="pointer-events-none absolute inset-x-0 -top-6 h-6 bg-gradient-to-t from-rail-card-bg to-rail-card-bg/0"
+              className="pointer-events-none absolute inset-x-0 -top-12 h-12 bg-gradient-to-t from-rail-card-bg to-rail-card-bg/0"
             />
             <NotificationBell
               side="top"
