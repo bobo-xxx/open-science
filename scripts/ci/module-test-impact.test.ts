@@ -40,6 +40,7 @@ describe('module test impact commands', () => {
 
     expect(plan.testFiles).toEqual(
       expect.arrayContaining([
+        'src/main/compute/compute-job-lifecycle.test.ts',
         'src/main/compute/compute-service.test.ts',
         'src/main/compute/ssh-runner.test.ts',
         'src/main/compute/ipc.test.ts',
@@ -48,6 +49,47 @@ describe('module test impact commands', () => {
     )
     expect(plan.capabilityOverlays).toEqual(['windows_sensitive'])
     expect(plan.fallbackCapabilities).toEqual(['main_runtime'])
+
+    const affected = createAffectedTestPlan(
+      [{ path: 'src/main/compute/compute-job-lifecycle.ts', status: 'added' }],
+      { status: 'current', testFiles: [] }
+    )
+    expect(affected.modules).toEqual(['compute_service'])
+    expect(affected.testFiles).toEqual(
+      expect.arrayContaining([
+        'src/main/compute/compute-job-lifecycle.test.ts',
+        'src/main/compute/concurrency-integration.test.ts'
+      ])
+    )
+  })
+
+  it.each([
+    'src/main/compute/compute-job-lifecycle.ts',
+    'src/main/compute/job-repository.ts',
+    'src/main/compute/concurrency-manager.ts',
+    'src/main/compute/job-dispatcher.ts',
+    'src/main/compute/job-poller.ts'
+  ])('routes Compute lifecycle changes through its complete certification set for %s', (path) => {
+    const affected = createAffectedTestPlan([{ path, status: 'modified' }], {
+      status: 'current',
+      testFiles: []
+    })
+
+    expect(affected.mode).toBe('selective')
+    expect(affected.modules).toEqual(['compute_service'])
+    expect(affected.testFiles).toEqual(
+      expect.arrayContaining([
+        'src/main/compute/compute-service.architecture.test.ts',
+        'src/main/compute/compute-job-lifecycle.test.ts',
+        'src/main/compute/concurrency-manager.test.ts',
+        'src/main/compute/job-dispatcher.test.ts',
+        'src/main/compute/job-poller.test.ts',
+        'src/main/compute/compute-jobs.integration.test.ts',
+        'src/main/compute/ipc.test.ts',
+        'src/main/compute/application-commands.test.ts',
+        'src/main/notebook/local-rpc-server.test.ts'
+      ])
+    )
   })
 
   it('expands User Skill repository changes through Settings and cross-surface consumers', () => {

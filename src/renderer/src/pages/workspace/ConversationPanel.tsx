@@ -22,7 +22,9 @@ import {
   AlertTriangle,
   ArrowUp,
   BookOpen,
+  ChartNoAxesCombined,
   ChevronDown,
+  CircleHelp,
   FileText,
   Flag,
   GitBranch,
@@ -65,6 +67,7 @@ import { docToSkillIds, type ComposerDoc } from './composer/composer-doc'
 import { ComposerAgentControlsMenu } from './ComposerAgentControlsMenu'
 import { NotificationBell } from '@/components/NotificationBell'
 import { ComposerContextUsage } from './ComposerContextUsage'
+import { ContextWindowDialog } from './ContextWindowDialog'
 import { ComposerModelPicker } from './ComposerModelPicker'
 import { PermissionApprovalControls } from './PermissionApprovalControls'
 import { normalizeRunFailureError } from './error-report'
@@ -120,14 +123,27 @@ const attachmentRemoveButtonClassName = cn(
   'flex size-6 shrink-0 items-center justify-center rounded-md text-text-300 hover:bg-bg-300 hover:text-text-000 disabled:cursor-not-allowed disabled:opacity-50',
   composerInteractiveTransitionClassName
 )
+const attachmentLimitsText = `Any file type · ${formatUploadSizeLimit(MAX_UPLOAD_FILE_BYTES)} per file. Large files are linked, not embedded.`
 
 const ResizableElicitationComposer = ({ children }: React.PropsWithChildren): React.JSX.Element => (
   <ResizableBottomPanel
     ariaLabel="Resize question panel"
     testId="elicitation-composer"
     scrollTestId="elicitation-composer-scroll"
+    constrainGrowthToOverflow
     minimumContentSelector='[data-elicitation-option-row="true"]'
     minimumContentIndex={1}
+  >
+    {children}
+  </ResizableBottomPanel>
+)
+
+const ResizablePermissionComposer = ({ children }: React.PropsWithChildren): React.JSX.Element => (
+  <ResizableBottomPanel
+    ariaLabel="Resize permission panel"
+    testId="permission-composer"
+    scrollTestId="permission-composer-scroll"
+    constrainGrowthToOverflow
   >
     {children}
   </ResizableBottomPanel>
@@ -319,6 +335,7 @@ const ConversationPanel = ({
   const isResuming = activeSession?.id === resumingSessionId
   // Opens the reviewable, consent-gated error report dialog for a failed run.
   const [isReportOpen, setIsReportOpen] = useState(false)
+  const [isContextWindowOpen, setIsContextWindowOpen] = useState(false)
   const [reportDialogEpoch, setReportDialogEpoch] = useState(0)
   const [composerFocusRequest, setComposerFocusRequest] = useState<number>()
 
@@ -406,6 +423,7 @@ const ConversationPanel = ({
             state: 'pending'
           }
         : undefined
+  const hasPendingPermission = pendingPermissions.length > 0
 
   // Re-attaches the interrupted session; on success the banner unmounts, so guard the state update.
   const handleResume = async (): Promise<void> => {
@@ -573,7 +591,7 @@ const ConversationPanel = ({
             data-testid="composer-surface-fade"
             className={cn(
               'pointer-events-none absolute inset-x-0 bg-gradient-to-t from-bg-10 to-bg-10/0',
-              pendingElicitation ? '-top-18 h-18' : '-top-12 h-12'
+              hasPendingPermission || pendingElicitation ? '-top-18 h-18' : '-top-12 h-12'
             )}
           />
 
@@ -627,26 +645,10 @@ const ConversationPanel = ({
                   </div>
                 ) : null}
 
-                {/* Permission controls are already filtered to the visible session by the page. */}
-                {!sideChat ? (
-                  <PermissionApprovalControls
-                    requests={pendingPermissions}
-                    onRespond={onRespondToPermission}
-                    notebookLookup={
-                      activeSession
-                        ? {
-                            sessionId: activeSession.id,
-                            workspaceCwd: activeSession.cwd ?? '',
-                            projectName: activeSession.projectId
-                          }
-                        : undefined
-                    }
-                  />
-                ) : null}
-
                 {/* Switching between a compact job bar and Notebook chrome remounts this layer so a
                     Notebook that becomes available after jobs still receives its entrance animation. */}
                 {!sideChat &&
+                (!pendingElicitation || hasPendingPermission) &&
                 (notebookReference ||
                   hasAnyJobs ||
                   (activeBranchPlan ? isPlanProgressVisible(activeBranchPlan) : false)) ? (
@@ -707,7 +709,7 @@ const ConversationPanel = ({
                     data-testid="composer-card-backdrop"
                     className={cn(
                       'relative -mb-8 rounded-2xl bg-bg-200 pb-8',
-                      (sideChat || pendingElicitation) && 'hidden'
+                      (sideChat || hasPendingPermission || pendingElicitation) && 'hidden'
                     )}
                   />
 
@@ -794,6 +796,23 @@ const ConversationPanel = ({
                         />
                       }
                     />
+                  ) : hasPendingPermission ? (
+                    <ResizablePermissionComposer key={pendingPermissions[0]?.requestId}>
+                      <PermissionApprovalControls
+                        requests={pendingPermissions}
+                        onRespond={onRespondToPermission}
+                        embedded
+                        notebookLookup={
+                          activeSession
+                            ? {
+                                sessionId: activeSession.id,
+                                workspaceCwd: activeSession.cwd ?? '',
+                                projectName: activeSession.projectId
+                              }
+                            : undefined
+                        }
+                      />
+                    </ResizablePermissionComposer>
                   ) : pendingElicitation ? (
                     <ResizableElicitationComposer>
                       <WorkspaceElicitationCard
@@ -826,10 +845,13 @@ const ConversationPanel = ({
                   {/* Composer stays mounted to preserve its draft, but a pending blocking interaction
                       owns the lane and makes the ordinary controls unreachable. */}
                   <form
-                    hidden={Boolean(sideChat || pendingElicitation || pendingPlan)}
+                    hidden={Boolean(
+                      sideChat || hasPendingPermission || pendingElicitation || pendingPlan
+                    )}
                     className={cn(
                       'relative z-10 flex flex-col gap-2 rounded-2xl border border-border-200 bg-bg-000 px-3 py-2',
-                      (sideChat || pendingElicitation || pendingPlan) && 'hidden'
+                      (sideChat || hasPendingPermission || pendingElicitation || pendingPlan) &&
+                        'hidden'
                     )}
                     onSubmit={(event) => event.preventDefault()}
                     {...dropZoneProps}
@@ -971,7 +993,7 @@ const ConversationPanel = ({
                       </div>
 
                       <div className="@container/composer flex items-center gap-1">
-                        {/* The + button opens a dropdown for Attach files and Request review actions. */}
+                        {/* The + button opens a dropdown for attachments and session actions. */}
                         <DropdownMenu>
                           <TooltipProvider delayDuration={200}>
                             <Tooltip>
@@ -980,13 +1002,14 @@ const ConversationPanel = ({
                                   <button
                                     type="button"
                                     disabled={
-                                      isUploadingAttachments || (!canEditDraft && !activeBranchPlan)
+                                      isUploadingAttachments ||
+                                      (!canEditDraft && !activeBranchPlan && !activeSession)
                                     }
                                     className={composerIconButtonClassName}
                                     aria-label={
                                       activeBranchPlan
-                                        ? 'Add attachment, view plan, or request review'
-                                        : 'Add attachment or request review'
+                                        ? 'Add attachment, view context window, view plan, or request review'
+                                        : 'Add attachment, view context window, or request review'
                                     }
                                     data-testid="composer-plus-trigger"
                                   >
@@ -996,26 +1019,50 @@ const ConversationPanel = ({
                               </TooltipTrigger>
                               <TooltipContent side="top">
                                 {activeBranchPlan
-                                  ? 'Add attachment, view plan, or request review'
-                                  : 'Add attachment or request review'}
+                                  ? 'Add attachment, view context window, view plan, or request review'
+                                  : 'Add attachment, view context window, or request review'}
                               </TooltipContent>
                             </Tooltip>
                           </TooltipProvider>
-                          <DropdownMenuContent side="top" align="start" className="w-64">
-                            <DropdownMenuItem
-                              data-testid="menu-attach-files"
-                              disabled={!canEditDraft || isUploadingAttachments}
-                              onSelect={() => fileInputRef.current?.click()}
-                            >
-                              <FileText className="mr-2 size-4 text-text-300" aria-hidden="true" />
-                              Attach files
-                            </DropdownMenuItem>
+                          <DropdownMenuContent side="top" align="start" className="w-56">
+                            <TooltipProvider delayDuration={200}>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <DropdownMenuItem
+                                    data-testid="menu-attach-files"
+                                    disabled={!canEditDraft || isUploadingAttachments}
+                                    onSelect={() => fileInputRef.current?.click()}
+                                  >
+                                    <FileText
+                                      className="mr-2 size-4 text-text-300"
+                                      aria-hidden="true"
+                                    />
+                                    <span className="flex-1">Attach files</span>
+                                    <CircleHelp
+                                      className="size-3.5 text-text-300"
+                                      aria-hidden="true"
+                                    />
+                                  </DropdownMenuItem>
+                                </TooltipTrigger>
+                                <TooltipContent
+                                  side="right"
+                                  className="max-w-[280px] px-3 py-2 leading-5 whitespace-normal"
+                                  data-testid="attachment-limits"
+                                >
+                                  {attachmentLimitsText}
+                                </TooltipContent>
+                              </Tooltip>
+                            </TooltipProvider>
                             <div
-                              className="px-2 py-1.5 text-[11px] leading-4 text-text-300"
-                              data-testid="attachment-limits"
+                              className={cn(
+                                'px-2 py-1.5 text-[11px] leading-4 text-text-300',
+                                canEditDraft && !isUploadingAttachments
+                                  ? 'hidden [@media(pointer:coarse)]:block'
+                                  : 'block'
+                              )}
+                              data-testid="attachment-limits-touch"
                             >
-                              Any file type · {formatUploadSizeLimit(MAX_UPLOAD_FILE_BYTES)} per
-                              file. Large files are linked, not embedded.
+                              {attachmentLimitsText}
                             </div>
                             <DropdownMenuSeparator />
                             {activeSession && activeBranchPlan ? (
@@ -1056,6 +1103,20 @@ const ConversationPanel = ({
                             >
                               <ScanEye className="mr-2 size-4 text-text-300" aria-hidden="true" />
                               Request review
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              data-testid="menu-context-window"
+                              disabled={!activeSession}
+                              onSelect={() => {
+                                if (activeSession) setIsContextWindowOpen(true)
+                              }}
+                            >
+                              <ChartNoAxesCombined
+                                className="mr-2 size-4 text-text-300"
+                                aria-hidden="true"
+                              />
+                              Context window
                             </DropdownMenuItem>
                           </DropdownMenuContent>
                         </DropdownMenu>
@@ -1336,6 +1397,11 @@ const ConversationPanel = ({
             model: activeSession?.agentModel
           }}
           onClose={() => setIsReportOpen(false)}
+        />
+        <ContextWindowDialog
+          open={isContextWindowOpen}
+          session={activeSession}
+          onOpenChange={setIsContextWindowOpen}
         />
       </section>
     </ResizablePanel>

@@ -439,7 +439,9 @@ Workspace-only tokens without a shadcn counterpart, plus shadow tokens. For shar
 - Workspace sidebar outer slot: `z-10 flex h-full w-[220px] min-w-0 shrink-0 flex-col`.
 - Workspace rail card: `m-2 mr-0 flex min-h-0 flex-1 flex-col rounded-lg bg-rail-card-bg shadow-card`.
 - Workspace brand title uses `text-text-000`; beta and section labels use `text-text-100`.
+- `Cmd+B` on macOS and `Ctrl+B` on Windows/Linux toggle the Workspace sidebar. At mobile widths, the same shortcut toggles the navigation drawer.
 - Sessions nav uses `aria-label="Sessions"` and a scroll body `min-h-0 flex-1 overflow-y-auto py-1`.
+- Holding `Cmd` on macOS or `Ctrl` on Windows/Linux reveals numbered shortcut pills beside the first nine Sessions in their current visual order. `Cmd+1`–`Cmd+9` or `Ctrl+1`–`Ctrl+9` opens the matching Session; modal dialogs and modified Alt/Shift chords retain priority.
 - Session row wrapper owns hover/active visuals only: `group mx-1.5 rounded-md px-2.5 py-1.5 text-sm text-text-000 hover:bg-bg-300 select-none`; active adds `bg-bg-300`.
 - Session title button is the row click target: `flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left`.
 - Session status dots are decorative and `aria-hidden`; provide adjacent `sr-only` text such as `Session status: Running`.
@@ -514,6 +516,19 @@ Workspace-only tokens without a shadcn counterpart, plus shadow tokens. For shar
 - Icon buttons: `Button variant="ghost" size="icon"`, `size-8`.
 - Workspace composer shell: `px-4 pb-2`; center content in `mx-auto w-full max-w-4xl`, then use `px-1 md:px-3` so the composer text track aligns with the message content after the form's own `px-3`.
 - Workspace composer form: `relative z-10 flex flex-col gap-2 rounded-2xl bg-bg-000 px-3 py-2 shadow-card-opaque`.
+- Blocking interactions own the composer lane in this order: an already-open Side Chat, Permission
+  approval, Ask-User elicitation, Plan approval, then the ordinary composer. Closing Side Chat reveals
+  any still-pending Permission approval instead of interrupting the Side Chat in progress.
+- Permission approval uses the shared bottom resize handle and replaces the ordinary composer while
+  pending. Its embedded content uses the panel's single border rather than nesting another card. The
+  panel can grow upward only by the amount of currently hidden scroll overflow, never beyond
+  `min(70dvh, 44rem)`; content that already fits cannot be stretched into empty space. At the maximum
+  height, remaining content scrolls inside the panel while the title banner and Allow/Deny action bar
+  stay pinned to the panel top and bottom. Pressing the resize hit area changes only the visible
+  handle, not the full hit-area background.
+- Ask-User elicitation uses the same content-bounded bottom resize behavior. While it owns the
+  composer lane, hide the Notebook, jobs, and Plan status chrome above it so the resize handle is the
+  panel's single top affordance. Restore that status chrome after the elicitation leaves the lane.
 - Textarea: `min-h-[36px] max-h-[200px] py-1.5 text-[15px] leading-relaxed text-text-000 placeholder:text-text-100`.
 - Toolbar action buttons are `h-8 w-8`; send uses `bg-primary text-primary-foreground hover:bg-primary/80`, cancel uses `bg-bg-200 text-text-000 hover:bg-bg-300`.
 - Read-only state: apply `opacity-50` to the input content and action area as a whole, but do not shrink the layout.

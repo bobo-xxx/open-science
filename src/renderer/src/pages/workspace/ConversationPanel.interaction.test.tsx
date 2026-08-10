@@ -344,7 +344,7 @@ describe('ConversationPanel composer intake', () => {
     window.api = previousApi
   })
 
-  it('hides the ordinary composer while structured input is pending', () => {
+  it('shows structured input in a content-bounded lane without notebook chrome', () => {
     const fields = [
       {
         id: 'question_0',
@@ -389,8 +389,18 @@ describe('ConversationPanel composer intake', () => {
       updatedAt: 1
     }
 
+    mockAllJobs = [{ job_id: 'job-1', status: 'done', created_at: 1 }]
     renderPanel({
       activeSession,
+      notebookReference: {
+        sessionId: activeSession.id,
+        projectName: activeSession.projectId,
+        workspaceCwd: '/workspace',
+        notebookSessionRoot: '/notebook',
+        dataRoot: '/data',
+        runtimeRoot: '/runtime',
+        runJsonPath: '/notebook/run.json'
+      },
       pendingElicitations: [
         {
           requestId: 'elicitation-1',
@@ -422,6 +432,8 @@ describe('ConversationPanel composer intake', () => {
     expect(scrollSurface.classList.contains('border-border-200')).toBe(true)
     expect(scrollSurface.classList.contains('shadow-sm')).toBe(true)
     expect(scrollSurface.classList.contains('shadow-card-opaque')).toBe(false)
+    expect(container.querySelector('[aria-label="Open notebook"]')).toBeNull()
+    expect(container.querySelector('[data-testid="remote-job-badge"]')).toBeNull()
 
     const optionRows = container.querySelectorAll<HTMLElement>(
       '[data-elicitation-option-row="true"]'
@@ -449,11 +461,24 @@ describe('ConversationPanel composer intake', () => {
     act(() => {
       resizeHandle.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'ArrowUp' }))
     })
+    expect((elicitationComposer as HTMLElement).style.height).toBe('288px')
+
+    Object.defineProperties(scrollSurface, {
+      clientHeight: { configurable: true, value: 256 },
+      scrollHeight: { configurable: true, value: 400 }
+    })
+    act(() => {
+      resizeHandle.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'ArrowUp' }))
+    })
     expect((elicitationComposer as HTMLElement).style.height).toBe('320px')
 
     const originalInnerHeight = window.innerHeight
     Object.defineProperty(window, 'innerHeight', { configurable: true, value: 568 })
     ;(elicitationComposer as HTMLElement).getBoundingClientRect = () => ({ height: 300 }) as DOMRect
+    Object.defineProperties(scrollSurface, {
+      clientHeight: { configurable: true, value: 250 },
+      scrollHeight: { configurable: true, value: 500 }
+    })
     act(() => {
       resizeHandle.dispatchEvent(
         new MouseEvent('pointerdown', { bubbles: true, button: 0, clientY: 100 })
@@ -501,6 +526,86 @@ describe('ConversationPanel composer intake', () => {
 
     expect(container.querySelector('[data-testid="elicitation-composer"]')).toBeNull()
     expect(container.querySelector('[role="textbox"]')?.closest('form')?.hidden).toBe(false)
+  })
+
+  it('puts permission approval ahead of Ask-User in a content-bounded composer lane', () => {
+    renderPanel({
+      pendingPermissions: [{ requestId: 'permission-1' } as never],
+      pendingElicitations: [
+        {
+          requestId: 'elicitation-after-permission',
+          sessionId: 'session-existing',
+          toolCallId: 'tool-ask-after-permission',
+          message: 'Which scope should the agent use?',
+          fields: [
+            {
+              id: 'question_0',
+              label: 'Scope',
+              kind: 'single-select',
+              options: [{ value: 'focused', label: 'Focused' }]
+            }
+          ]
+        }
+      ]
+    })
+
+    const permissionComposer = container.querySelector(
+      '[data-testid="permission-composer"]'
+    ) as HTMLDivElement
+    const scrollSurface = container.querySelector(
+      '[data-testid="permission-composer-scroll"]'
+    ) as HTMLDivElement
+    const resizeHandle = container.querySelector(
+      '[aria-label="Resize permission panel"]'
+    ) as HTMLButtonElement
+
+    expect(permissionComposer).not.toBeNull()
+    expect(scrollSurface.classList.contains('overflow-y-auto')).toBe(true)
+    expect(resizeHandle).not.toBeNull()
+    expect(resizeHandle.classList.contains('active:bg-bg-200')).toBe(false)
+    expect(container.querySelector('[data-testid="permission-approval-controls"]')).not.toBeNull()
+    expect(container.querySelector('[data-testid="elicitation-composer"]')).toBeNull()
+    expect(getComposerForm().hidden).toBe(true)
+    expect(
+      container
+        .querySelector('[data-testid="composer-surface-fade"]')
+        ?.classList.contains('-top-18')
+    ).toBe(true)
+
+    permissionComposer.getBoundingClientRect = () => ({ height: 320 }) as DOMRect
+    Object.defineProperties(scrollSurface, {
+      clientHeight: { configurable: true, value: 280 },
+      scrollHeight: { configurable: true, value: 280 }
+    })
+
+    act(() => {
+      resizeHandle.dispatchEvent(
+        new MouseEvent('pointerdown', { bubbles: true, button: 0, clientY: 100 })
+      )
+      resizeHandle.dispatchEvent(new MouseEvent('pointermove', { bubbles: true, clientY: 0 }))
+      resizeHandle.dispatchEvent(new MouseEvent('pointerup', { bubbles: true, clientY: 0 }))
+    })
+    expect(permissionComposer.style.height).toBe('320px')
+
+    Object.defineProperty(scrollSurface, 'scrollHeight', { configurable: true, value: 620 })
+    const originalInnerHeight = window.innerHeight
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 1000 })
+    act(() => {
+      resizeHandle.dispatchEvent(
+        new MouseEvent('pointerdown', { bubbles: true, button: 0, clientY: 300 })
+      )
+      resizeHandle.dispatchEvent(new MouseEvent('pointermove', { bubbles: true, clientY: -300 }))
+      resizeHandle.dispatchEvent(new MouseEvent('pointerup', { bubbles: true, clientY: -300 }))
+    })
+    expect(permissionComposer.style.height).toBe('660px')
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: originalInnerHeight })
+
+    renderPanel({ pendingPermissions: [{ requestId: 'permission-2' } as never] })
+    const nextPermissionComposer = container.querySelector(
+      '[data-testid="permission-composer"]'
+    ) as HTMLDivElement
+    expect(nextPermissionComposer).not.toBe(permissionComposer)
+    expect(nextPermissionComposer.style.height).toBe('')
   })
 
   it('serializes a pending question ahead of Plan approval in the shared blocking lane', () => {
@@ -655,12 +760,27 @@ describe('ConversationPanel composer intake', () => {
     })
   })
 
-  it('shows file type and per-file size behavior before selection', () => {
+  it('keeps attachment limits discoverable in the tooltip and touch fallback', () => {
     renderPanel()
 
-    expect(container.querySelector('[data-testid="attachment-limits"]')?.textContent).toContain(
-      'Any file type · 10 GB per file. Large files are linked, not embedded.'
+    const guidance = 'Any file type · 10 GB per file. Large files are linked, not embedded.'
+    expect(container.querySelector('[data-testid="menu-attach-files"]')?.textContent).toBe(
+      'Attach files'
     )
+    expect(
+      [...container.querySelectorAll('[data-testid="tooltip-content"]')].some(
+        (node) => node.textContent === guidance
+      )
+    ).toBe(true)
+
+    const fallback = container.querySelector('[data-testid="attachment-limits-touch"]')
+    expect(fallback?.textContent).toBe(guidance)
+    expect(fallback?.className).toContain('hidden')
+    expect(fallback?.className).toContain('[@media(pointer:coarse)]:block')
+
+    renderPanel({ canEditDraft: false })
+    expect(fallback?.className).toContain('block')
+    expect(fallback?.className).not.toContain('hidden')
   })
 
   it('keeps a pending Plan read-only after the Agent interaction ends without a decision', () => {
@@ -1396,14 +1516,20 @@ describe('ConversationPanel interrupted Session recovery', () => {
 })
 
 describe('ConversationPanel + menu', () => {
-  it('renders both Attach files and Request review items', () => {
+  it('renders Context window as the separated final menu item', () => {
     renderPanel()
 
     const attachItem = container.querySelector('[data-testid="menu-attach-files"]')
+    const contextWindowItem = container.querySelector('[data-testid="menu-context-window"]')
     const reviewItem = container.querySelector('[data-testid="menu-request-review"]')
 
     expect(attachItem).not.toBeNull()
+    expect(contextWindowItem).not.toBeNull()
     expect(reviewItem).not.toBeNull()
+    expect(reviewItem?.compareDocumentPosition(contextWindowItem as Node)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING
+    )
+    expect(contextWindowItem?.previousElementSibling?.tagName).toBe('HR')
   })
 
   it('describes the composer add icon with a tooltip', () => {
@@ -1411,7 +1537,7 @@ describe('ConversationPanel + menu', () => {
 
     expect(
       [...container.querySelectorAll('[data-testid="tooltip-content"]')].some(
-        (node) => node.textContent === 'Add attachment or request review'
+        (node) => node.textContent === 'Add attachment, view context window, or request review'
       )
     ).toBe(true)
   })
