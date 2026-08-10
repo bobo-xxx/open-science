@@ -35,6 +35,7 @@ import {
 } from './side-chat-owner'
 import {
   SessionPersistenceDeletionOwner,
+  type ComputeJobDeletionParticipant,
   type ProjectSessionDeletionResult
 } from './deletion-owner'
 import {
@@ -141,7 +142,8 @@ class SessionPersistenceCoordinator {
     uploads?: SessionUploadPersistence,
     artifactStorage?: ArtifactStorageReconciler,
     permissionGrants?: SessionPermissionGrantReconciliation,
-    private readonly log: Logger = createLogger('session-persistence')
+    private readonly log: Logger = createLogger('session-persistence'),
+    private readonly computeJobs?: ComputeJobDeletionParticipant
   ) {
     const assertMutable = (
       projectId: string,
@@ -175,6 +177,7 @@ class SessionPersistenceCoordinator {
       stateOwner: this.stateOwner,
       provenance,
       uploads,
+      computeJobs,
       assertArchiveMutable: (projectId, sessionId) => {
         if (this.deletedProjects.has(projectId)) {
           throw new Error('Cannot archive a Session whose project has been deleted.')
@@ -206,14 +209,11 @@ class SessionPersistenceCoordinator {
     )
   }
 
-  loadSessionForPermissionReplay(
-    projectId: string,
-    sessionId: string
-  ): Promise<PersistedChatSession> {
+  loadSessionForContinuation(projectId: string, sessionId: string): Promise<PersistedChatSession> {
     return this.enqueue(async () => {
       const loaded = await this.repository.loadSessionWithDiagnostics(projectId, sessionId)
       if (loaded.status !== 'found') {
-        throw new Error(`Cannot build permission replay for a ${loaded.status} Session.`)
+        throw new Error(`Cannot prepare a durable continuation for a ${loaded.status} Session.`)
       }
       return structuredClone(loaded.session)
     })
@@ -533,6 +533,7 @@ class SessionPersistenceCoordinator {
           const state = await this.deletionOwner.getProjectSessionDeletionState(projectId)
           if (state === 'live' || state === 'absent') {
             this.deletedProjects.delete(projectId)
+            await this.computeJobs?.abortProjectJobDeletion?.(projectId)
           }
         } catch {
           // Unknown durable state is treated as committed: retain the in-memory tombstone and intent.
@@ -617,7 +618,12 @@ class SessionPersistenceCoordinator {
       try {
         await this.deletionOwner.deleteSession(projectId, sessionId)
       } catch (error) {
-        this.deletedSessions.delete(key)
+        try {
+          const authority = await this.repository.loadSessionWithDiagnostics(projectId, sessionId)
+          if (authority.status === 'found') this.deletedSessions.delete(key)
+        } catch {
+          // Authority cannot be proven live, so retain the tombstone fail-closed.
+        }
         throw error
       }
     })
@@ -659,6 +665,7 @@ const sessionKey = (projectId: string, sessionId: string): string => `${projectI
 
 export { SessionPersistenceCoordinator, SessionRuntimeContextRevisionConflictError }
 export type {
+  ComputeJobDeletionParticipant,
   PatchSessionRuntimeContextCommand,
   ProjectSessionDeletionResult,
   SessionDeletionHandlers,

@@ -8,6 +8,7 @@ import {
   ARTIFACT_OWNERSHIP_PERSISTENCE_RACE,
   type ArtifactFile
 } from '../../../../shared/artifacts'
+import type { ActivePlanProjection } from '../../../../shared/session-plan/contract'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
@@ -71,6 +72,26 @@ const createArtifactFile = (overrides: Partial<ArtifactFile> = {}): ArtifactFile
   ...overrides
 })
 
+const pendingPlanProjection: ActivePlanProjection = {
+  artifactId: 'plan-1',
+  artifactVersionId: 'plan-version-1',
+  artifactChecksum: 'a'.repeat(64),
+  revision: 1,
+  approval: 'pending',
+  lifecycle: 'awaiting_approval',
+  requiresExplicitContinuation: false,
+  document: {
+    schema_version: 1,
+    task_summary: 'Review the generated plan',
+    phases: [],
+    desired_outputs: [],
+    feasibility: { confidence: 'high', rationale: 'Ready for review.' }
+  },
+  stepStatuses: {},
+  stepStates: {},
+  counts: { phases: 0, delegations: 0, steps: 0, completed: 0, inProgress: 0 }
+}
+
 describe('workspace runtime events', () => {
   // Rebuild the visible session before each adapter assertion.
   beforeEach(() => {
@@ -112,6 +133,21 @@ describe('workspace runtime events', () => {
       streamId: 'assistant-message-1',
       eventIds: ['event-1', 'event-2'],
       status: 'streaming'
+    })
+  })
+
+  it('keeps a pending Plan actionable after the runtime reports a timeout stop', async () => {
+    await applyWorkspaceRuntimeEvent(
+      createEvent({ id: 'plan-ready', kind: 'plan', planProjection: pendingPlanProjection })
+    )
+    await applyWorkspaceRuntimeEvent(
+      createEvent({ id: 'plan-timeout', kind: 'stop', text: 'end_turn' })
+    )
+
+    expect(useSessionStore.getState().sessions[0]).toMatchObject({
+      status: 'waiting-plan-approval',
+      activeRun: undefined,
+      activePlanProjection: { approval: 'pending', lifecycle: 'awaiting_approval' }
     })
   })
 
@@ -915,7 +951,7 @@ describe('workspace runtime events', () => {
     expect(useSessionStore.getState().sessions[0].status).toBe('running')
   })
 
-  it('mirrors restored permission rearm and clear events into the local authority projection', async () => {
+  it('mirrors only request-correlated restored permission lifecycle events', async () => {
     const request = createPermissionRequest()
     useSessionStore.setState((state) => ({
       sessions: state.sessions.map((session) => ({
@@ -937,9 +973,48 @@ describe('workspace runtime events', () => {
 
     await applyWorkspaceRuntimeEvent(
       createEvent({
-        id: 'permission-rearmed',
+        id: 'permission-rearmed-uncorrelated',
         kind: 'permission',
         title: ACP_RESTORED_PERMISSION_REARMED_EVENT_TITLE
+      })
+    )
+    expect(useSessionStore.getState().sessions[0]).toMatchObject({
+      status: 'idle',
+      runtimeContext: { permission: { state: 'continuing' } }
+    })
+
+    await applyWorkspaceRuntimeEvent(
+      createEvent({
+        id: 'permission-rearmed-mismatch',
+        kind: 'permission',
+        title: ACP_RESTORED_PERMISSION_REARMED_EVENT_TITLE,
+        permissionRequestId: 'permission-other'
+      })
+    )
+    expect(useSessionStore.getState().sessions[0]).toMatchObject({
+      status: 'idle',
+      runtimeContext: { permission: { state: 'continuing' } }
+    })
+
+    await applyWorkspaceRuntimeEvent(
+      createEvent({
+        id: 'permission-rearmed',
+        kind: 'permission',
+        title: ACP_RESTORED_PERMISSION_REARMED_EVENT_TITLE,
+        permissionRequestId: request.requestId
+      })
+    )
+    expect(useSessionStore.getState().sessions[0]).toMatchObject({
+      status: 'waiting-permission',
+      runtimeContext: { permission: { state: 'pending' } }
+    })
+
+    await applyWorkspaceRuntimeEvent(
+      createEvent({
+        id: 'permission-settled-mismatch',
+        kind: 'permission',
+        title: ACP_RESTORED_PERMISSION_SETTLED_EVENT_TITLE,
+        permissionRequestId: 'permission-other'
       })
     )
     expect(useSessionStore.getState().sessions[0]).toMatchObject({
@@ -951,7 +1026,8 @@ describe('workspace runtime events', () => {
       createEvent({
         id: 'permission-settled',
         kind: 'permission',
-        title: ACP_RESTORED_PERMISSION_SETTLED_EVENT_TITLE
+        title: ACP_RESTORED_PERMISSION_SETTLED_EVENT_TITLE,
+        permissionRequestId: request.requestId
       })
     )
     expect(useSessionStore.getState().sessions[0].runtimeContext?.permission).toBeUndefined()

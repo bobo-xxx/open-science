@@ -2,7 +2,7 @@
   "name": "open-science",
   "productName": "Open Science",
   "desktopName": "open-science.desktop",
-  "version": "0.12.1",
+  "version": "0.13.0",
   "description": "Open Science — an open-source, model-agnostic AI workbench for scientific discovery.",
   "main": "./out/main/index.js",
   "author": "aipoch",
@@ -53,6 +53,7 @@
   "dependencies": {
     "@agentclientprotocol/claude-agent-acp": "^0.60.0",
     "@agentclientprotocol/sdk": "^1.2.1",
+    "@aipoch/safe-file-publisher-native": "file:packages/safe-file-publisher-native",
     "@anthropic-ai/tokenizer": "^0.0.4",
     "@bokuweb/zstd-wasm": "^0.0.27",
     "@electron-toolkit/preload": "^3.0.2",
