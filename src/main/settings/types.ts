@@ -8,7 +8,8 @@ import type {
   ProjectFilesFilterPreference,
   ProviderType,
   ProviderValidationFailure,
-  ReasoningEffort
+  ReasoningEffort,
+  SubagentModelConfiguration
 } from '../../shared/settings'
 import { SETTINGS_FILE_VERSION } from '../../shared/settings'
 import type { OfficialVendorId } from '../../shared/provider-registry'
@@ -98,9 +99,10 @@ export type StoredCustomMcpOAuthState = {
 // the main process when constructing the MCP transport.
 export type StoredCustomMcpServer = {
   id: string
-  // Added after custom Connectors shipped. Older records derive it from immutable `name` on read.
-  slug?: string
+  // Immutable public invocation name used by host.mcp, Specialists, policy, and generated Skills.
   name: string
+  // Presentation-only label. It may enter context but never participates in identity resolution.
+  displayName: string
   transport: 'stdio' | 'streamable_http' | 'sse'
   command?: string
   args?: string[]
@@ -151,6 +153,8 @@ export type StoredSettings = {
   agentFrameworkId?: AgentFrameworkId
   // Reasoning-effort preference. Absent (or 'default') means the agent keeps its own default.
   reasoningEffort?: ReasoningEffort
+  // Global direct-Subagent model routing. Absence in older documents means dynamic inheritance.
+  subagentModel?: SubagentModelConfiguration
   // Desktop-notification preference for finished/failed agent tasks. Absent means enabled.
   notificationsEnabled?: boolean
   // Conversation-driven Skill package import. Absent means enabled.

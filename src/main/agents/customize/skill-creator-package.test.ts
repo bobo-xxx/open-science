@@ -52,11 +52,13 @@ describe('skill-creator bundled package', () => {
     const skill = await readFile(join(skillRoot, 'SKILL.md'), 'utf8')
     expect(skill).toContain('JavaScript control-plane REPL')
     expect(skill).toContain('host.skills.validate(')
+    expect(skill).toContain('host.agents.attachSkill(')
     expect(skill).toContain('references/schemas.md')
     expect(skill).toContain('agents/grader.md')
     expect(skill).toContain('eval-viewer/generate-review.js')
     expect(skill).not.toMatch(/python -m|\.py\b/)
     expect(skill).not.toMatch(/await host\.skills\.\w+\([^)]*=/)
+    expect(skill).not.toContain('host.agents.attach_skill(')
 
     const triggerReview = await readFile(join(skillRoot, 'assets', 'eval_review.html'), 'utf8')
     expect(triggerReview).toContain('schema_version: 1')
@@ -104,7 +106,16 @@ describe('skill-creator bundled package', () => {
         '---\nname: data-helper\ndescription: Analyze data.\ncompatibility: node\n---\nBody.\n',
         'data-helper'
       )
-    ).toEqual({ valid: false, error: 'Frontmatter must contain exactly name and description.' })
+    ).toEqual({
+      valid: false,
+      error: 'Frontmatter may only contain name, displayName, and description.'
+    })
+    expect(
+      validateSkillDocument(
+        '---\nname: data-helper\ndisplayName: Data Helper\ndescription: Analyze data.\n---\nBody.\n',
+        'data-helper'
+      )
+    ).toMatchObject({ valid: true, name: 'data-helper', displayName: 'Data Helper' })
   })
 
   it('gates evaluation behind the app-owned host.skills.evals capability', async () => {

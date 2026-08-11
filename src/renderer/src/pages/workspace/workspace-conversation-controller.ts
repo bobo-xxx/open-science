@@ -1,9 +1,6 @@
 import { useLayoutEffect, useRef, useState } from 'react'
 
-import {
-  DEFAULT_PERMISSION_PROFILE,
-  type PermissionProfileId
-} from '../../../../shared/permission-profiles'
+import type { PermissionProfileId } from '../../../../shared/permission-profiles'
 import type { ChatSession } from '@/stores/session-store'
 import type { WorkspaceAgentRuntime } from '@/lib/acp/useWorkspaceAgentRuntime'
 
@@ -15,13 +12,18 @@ import {
   type ComposerDoc
 } from './composer/composer-doc'
 import { selectActiveBranchPlan } from './session-plan/active-branch-plan'
+import { respondToSessionPlan } from './session-plan/respond-to-session-plan'
 import type { WorkspaceComposerController } from './workspace-composer-controller'
 import type { WorkspaceSessionController } from './workspace-session-controller'
 import { hasMainConversation } from './use-side-chat-controller'
 
 type WorkspaceConversationRuntime = Pick<
   WorkspaceAgentRuntime,
-  'sendMessage' | 'resendEditedMessage' | 'cancelRun' | 'resumeInterruptedSession'
+  | 'sendMessage'
+  | 'resendEditedMessage'
+  | 'cancelRun'
+  | 'resumeInterruptedSession'
+  | 'ensureSessionReady'
 >
 
 type DraftSubmitIntent = {
@@ -65,6 +67,7 @@ type WorkspaceConversationControllerOptions = {
   isReviewing: boolean
   promptInFlightSessionIds: string[]
   sendPreparationInFlightSessionIds: string[]
+  hasBlockingRootPermissionRequest: boolean
   newConversationAutoReviewEnabled: boolean
   newConversationEnabledComputeHosts: string[]
   composer: ConversationComposer
@@ -94,7 +97,7 @@ type WorkspaceConversationController = {
     revise: (messageId: string, doc: ComposerDoc) => void
     sideChat: { start: () => void }
     resume: () => Promise<void>
-    cancel: () => void
+    cancel: () => Promise<void>
     delete: () => void
   }
 }
@@ -120,7 +123,7 @@ const canSubmit = (options: WorkspaceConversationControllerOptions): boolean => 
     (!docIsEmpty(composer.view.doc) || composer.view.attachments.length > 0) &&
     activeSession?.status !== 'running' &&
     activeSession?.status !== 'waiting-for-user' &&
-    activeSession?.status !== 'waiting-permission' &&
+    (activeSession?.status !== 'waiting-permission' || !options.hasBlockingRootPermissionRequest) &&
     !hasRuntimeInteraction(options) &&
     !activeSession?.fixLoopActive &&
     !activeSession?.conversationGraphSyncBlocked &&
@@ -272,33 +275,11 @@ const useWorkspaceConversationController = (
       if (sideChatOpen || !session || session.activeRun || plan?.approval !== 'pending') {
         throw new Error('The pending Plan is no longer available for a response.')
       }
-      const pendingAction =
-        'feedback' in response
-          ? ('review' as const)
-          : response.decision === 'approved'
-            ? ('approve' as const)
-            : ('reject' as const)
-      const text =
-        'feedback' in response
-          ? response.feedback
-          : response.decision === 'approved'
-            ? 'Approve the current Plan and continue.'
-            : 'Dismiss the current Plan.'
-      const result = await runtime.sendMessage({
-        sessionId: session.id,
-        text,
-        planContinuation: {
-          artifactVersionId: plan.artifactVersionId,
-          revision: plan.revision,
-          pendingAction
-        },
-        attachments: [],
-        cwd: session.cwd,
-        projectId: session.projectId,
-        projectName: session.projectId,
-        permissionProfile: session.permissionProfile ?? DEFAULT_PERMISSION_PROFILE
-      })
-      if (!result) throw new Error('Unable to respond to the Plan.')
+      await runtime.ensureSessionReady(session.id)
+      await respondToSessionPlan(
+        { projectId: session.projectId, sessionId: session.id, projection: plan },
+        response
+      )
     }
 
     return {
@@ -334,17 +315,17 @@ const useWorkspaceConversationController = (
         if (!current.isPersistenceReady || !current.activeSession || current.sideChatOpen) return
         await current.runtime.resumeInterruptedSession(current.activeSession.id)
       },
-      cancel: (): void => {
+      cancel: async (): Promise<void> => {
         const current = optionsRef.current
         if (current.sideChatOpen) return
         const session = current.activeSession
         if (!session) return
-        if (session.fixLoopActive) {
-          void current
-            .abortFixLoop({ projectId: session.projectId, appSessionId: session.id })
-            .catch((error: unknown) => console.warn('Failed to abort fix loop:', error))
-        }
-        void current.runtime.cancelRun(session.id)
+        const fixLoopCancellation = session.fixLoopActive
+          ? current
+              .abortFixLoop({ projectId: session.projectId, appSessionId: session.id })
+              .catch((error: unknown) => console.warn('Failed to abort fix loop:', error))
+          : Promise.resolve()
+        await Promise.all([fixLoopCancellation, current.runtime.cancelRun(session.id)])
       },
       delete: (): void => optionsRef.current.session.actions.confirmDelete()
     }

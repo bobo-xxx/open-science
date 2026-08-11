@@ -573,7 +573,7 @@ describe('AcpPromptTurnWorkflow', () => {
       stopReason: 'cancelled'
     })
 
-    expect(harness.artifacts.open).toHaveBeenCalledWith('s1', {
+    expect(harness.artifacts.open).toHaveBeenCalledWith('s1', expect.any(String), {
       promptMessageId: 'message-1'
     })
     expect(harness.preparation).not.toHaveBeenCalled()
@@ -689,5 +689,22 @@ describe('AcpPromptTurnWorkflow', () => {
     await handles.afterInteractionRelease()
     expect(harness.planLifecycle.beforeRelease).toHaveBeenCalledWith('s1', interaction)
     expect(harness.planLifecycle.afterRelease).toHaveBeenCalledWith('s1')
+  })
+
+  it('passes rejected Plan continuation as protected guidance', async () => {
+    const rejected = {
+      ...planProjection(),
+      approval: 'rejected' as const,
+      lifecycle: 'rejected' as const
+    }
+    const harness = createHarness({ admitPlan: () => ({ protectedRejected: rejected }) })
+
+    await harness.workflow.run(request(), { kind: 'app-continuation' })
+
+    expect(harness.preparation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        protectedContext: expect.stringContaining('approval=rejected')
+      })
+    )
   })
 })

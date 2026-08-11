@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 
 import { resolveActiveConversationMessages } from '../../shared/conversation-graph'
+import type { PersistedConversationGraph } from '../../shared/conversation-graph'
 import type { ProjectFilesChangedEvent, ProjectFileSource } from '../../shared/project-files'
 import {
   materializeSessionConversationGraph,
@@ -37,6 +38,12 @@ type AppendUserMessageToInteractionCommand = Readonly<{
   interactionId: string
   content: string
   beforePersist?: (session: PersistedChatSession) => void
+  runtimeContextPatch?: Readonly<{
+    expectedRevision: number
+    patch:
+      SessionRuntimeContextPatch | ((message: PersistedChatMessage) => SessionRuntimeContextPatch)
+    sessionStatus?: PersistedSessionStatus
+  }>
 }>
 
 type SessionStateRepository = {
@@ -162,6 +169,55 @@ const mergeMainOwnedRelayMessages = (
   if (authoritativeRelays.length === 0) return [...submitted]
   const relayIds = new Set(authoritativeRelays.map((message) => message.id))
   return [...submitted.filter((message) => !relayIds.has(message.id)), ...authoritativeRelays]
+}
+
+const delegatedSubtreeFrameIds = (graph: PersistedConversationGraph): Set<string> => {
+  const result = new Set(
+    graph.frames.filter((frame) => frame.kind === 'delegate').map(({ id }) => id)
+  )
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const frame of graph.frames) {
+      if (frame.parentFrameId && result.has(frame.parentFrameId) && !result.has(frame.id)) {
+        result.add(frame.id)
+        changed = true
+      }
+    }
+  }
+  return result
+}
+
+const mergeMainOwnedDelegateSubtree = (
+  rendererGraph: PersistedConversationGraph,
+  authoritativeGraph: PersistedConversationGraph
+): PersistedConversationGraph => {
+  const rendererOwnedIds = delegatedSubtreeFrameIds(rendererGraph)
+  const authoritativeIds = delegatedSubtreeFrameIds(authoritativeGraph)
+  const mergeScoped = <Value extends { agentFrameId: string }>(
+    rendererValues: readonly Value[],
+    authoritativeValues: readonly Value[]
+  ): Value[] => [
+    ...rendererValues.filter((value) => !rendererOwnedIds.has(value.agentFrameId)),
+    ...authoritativeValues.filter((value) => authoritativeIds.has(value.agentFrameId))
+  ]
+  return {
+    ...rendererGraph,
+    activeFrameId:
+      rendererOwnedIds.has(rendererGraph.activeFrameId) &&
+      !authoritativeGraph.frames.some((frame) => frame.id === rendererGraph.activeFrameId)
+        ? rendererGraph.rootFrameId
+        : rendererGraph.activeFrameId,
+    frames: [
+      ...rendererGraph.frames.filter((frame) => !rendererOwnedIds.has(frame.id)),
+      ...authoritativeGraph.frames.filter((frame) => authoritativeIds.has(frame.id))
+    ],
+    branches: mergeScoped(rendererGraph.branches, authoritativeGraph.branches),
+    messages: mergeScoped(rendererGraph.messages, authoritativeGraph.messages),
+    activities: mergeScoped(rendererGraph.activities, authoritativeGraph.activities),
+    activityGroups: mergeScoped(rendererGraph.activityGroups, authoritativeGraph.activityGroups),
+    runtimeSegments: mergeScoped(rendererGraph.runtimeSegments, authoritativeGraph.runtimeSegments)
+  }
 }
 
 type FinalizedArtifactBindingValidation =
@@ -304,7 +360,11 @@ class SessionPersistenceStateOwner {
     if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
       throw new Error('Session runtime context expected revision must be a non-negative integer.')
     }
-    if (Object.keys(patch).some((owner) => owner !== 'plan' && owner !== 'permission')) {
+    if (
+      Object.keys(patch).some(
+        (owner) => owner !== 'plan' && owner !== 'permission' && owner !== 'delegatedWork'
+      )
+    ) {
       throw new Error('Session runtime context patch contains an unknown authority owner.')
     }
 
@@ -341,6 +401,21 @@ class SessionPersistenceStateOwner {
     if (!content) throw new Error('User Message content must be non-empty.')
     this.options.assertMutable(projectId, sessionId, 'mutate')
     const session = await this.loadRuntimeContextSession(projectId, sessionId, 'patch')
+    const current = session.runtimeContext ?? emptySessionRuntimeContext()
+    const runtimeContextPatch = command.runtimeContextPatch
+    if (
+      runtimeContextPatch &&
+      (!Number.isSafeInteger(runtimeContextPatch.expectedRevision) ||
+        runtimeContextPatch.expectedRevision < 0)
+    ) {
+      throw new Error('Session runtime context expected revision must be a non-negative integer.')
+    }
+    if (runtimeContextPatch && current.revision !== runtimeContextPatch.expectedRevision) {
+      throw new SessionRuntimeContextRevisionConflictError(
+        runtimeContextPatch.expectedRevision,
+        current.revision
+      )
+    }
     command.beforePersist?.(session)
     const timestamp = Math.max(session.updatedAt + 1, Date.now())
     const message: PersistedChatMessage = {
@@ -353,9 +428,30 @@ class SessionPersistenceStateOwner {
       createdAt: timestamp,
       updatedAt: timestamp
     }
+    const patch =
+      typeof runtimeContextPatch?.patch === 'function'
+        ? runtimeContextPatch.patch(message)
+        : runtimeContextPatch?.patch
+    if (patch && Object.keys(patch).some((owner) => owner !== 'plan' && owner !== 'permission')) {
+      throw new Error('Session runtime context patch contains an unknown authority owner.')
+    }
+    const runtimeContext = (() => {
+      if (!patch) return session.runtimeContext
+      const candidate: Record<string, unknown> = { ...current }
+      for (const [owner, value] of Object.entries(patch)) {
+        if (value === undefined) delete candidate[owner]
+        else candidate[owner] = value
+      }
+      candidate.revision = current.revision + 1
+      const sanitized = sanitizeSessionRuntimeContext(candidate)
+      if (!sanitized) throw new Error('Session runtime context patch is not JSON-safe.')
+      return sanitized
+    })()
     const durable = materializeSessionConversationGraph({
       ...session,
+      ...(runtimeContextPatch?.sessionStatus ? { status: runtimeContextPatch.sessionStatus } : {}),
       messages: [...session.messages, message],
+      ...(runtimeContext ? { runtimeContext } : {}),
       updatedAt: timestamp
     })
     await this.options.repository.saveSession(durable)
@@ -405,7 +501,19 @@ class SessionPersistenceStateOwner {
           : rendererOwnedSession.updatedAt
     }
 
-    const materializedSession = materializeSessionConversationGraph(mergedSession)
+    let materializedSession = materializeSessionConversationGraph(mergedSession)
+    if (authority) {
+      const authoritativeGraph = materializeSessionConversationGraph(authority).conversationGraph
+      if (materializedSession.conversationGraph && authoritativeGraph) {
+        materializedSession = {
+          ...materializedSession,
+          conversationGraph: mergeMainOwnedDelegateSubtree(
+            materializedSession.conversationGraph,
+            authoritativeGraph
+          )
+        }
+      }
+    }
     let durableSession = this.options.uploads
       ? await this.options.uploads.upgradeLegacySessionUploads(materializedSession, {
           mode: 'live-save'

@@ -9,6 +9,13 @@ import { randomUUID } from 'node:crypto'
 import { createServer, type Server } from 'node:http'
 import { framePythonRequest, parseLoopResponse, type KernelLoopResponse } from './kernel-protocol'
 import { listenForLocalRpc } from '../local-rpc-transport'
+import { hostSdkHelp } from '../host-sdk/help'
+import { NotebookLocalRpcServer } from './local-rpc-server'
+import { AgentsService } from '../agents/agents-service'
+import { createProfileService } from '../specialist/service'
+import { createDeterministicDelegateExecution } from '../delegation/deterministic-execution'
+import { createInMemoryDelegatedWorkRecords } from '../delegation/durable-delegated-work'
+import { createTestDurableDelegatedWork as createDurableDelegatedWork } from '../delegation/durable-delegated-work-test-fixture'
 
 // Run with: RUN_KERNEL=1 npx vitest run src/main/notebook/repl-loop.integration.test.ts
 // Node is always available in vitest, so the only gate is RUN_KERNEL. The child is spawned exactly
@@ -50,6 +57,746 @@ const startLoop = (
 }
 
 describe('repl_loop local RPC transport', () => {
+  it('exposes only the camelCase public method names', async () => {
+    const { child, send } = startLoop({})
+    try {
+      const result = await send(
+        "const c = host.compute.create('ssh:x'); " +
+          'return JSON.stringify({' +
+          "artifactPath: 'artifactPath' in host, artifact_path: 'artifact_path' in host, " +
+          "listSkills: 'listSkills' in host.agents, list_skills: 'list_skills' in host.agents, " +
+          "listConnectors: 'listConnectors' in host.agents, list_connectors: 'list_connectors' in host.agents, " +
+          "attachSkill: 'attachSkill' in host.agents, attach_skill: 'attach_skill' in host.agents, " +
+          "detachSkill: 'detachSkill' in host.agents, detach_skill: 'detach_skill' in host.agents, " +
+          "attachConnector: 'attachConnector' in host.agents, attach_connector: 'attach_connector' in host.agents, " +
+          "detachConnector: 'detachConnector' in host.agents, detach_connector: 'detach_connector' in host.agents, " +
+          "listCompute: 'listCompute' in host.compute, list_compute: 'list_compute' in host.compute, " +
+          "callCommand: 'callCommand' in c, call_command: 'call_command' in c, " +
+          "submitJob: 'submitJob' in c, submit_job: 'submit_job' in c, " +
+          "attachJob: 'attachJob' in c, attach_job: 'attach_job' in c, " +
+          "setConcurrencyLimit: 'setConcurrencyLimit' in c, set_concurrency_limit: 'set_concurrency_limit' in c" +
+          '})'
+      )
+      expect(result.error).toBeNull()
+      expect(JSON.parse(result.result ?? '{}')).toEqual({
+        artifactPath: true,
+        artifact_path: false,
+        listSkills: true,
+        list_skills: false,
+        listConnectors: true,
+        list_connectors: false,
+        attachSkill: true,
+        attach_skill: false,
+        detachSkill: true,
+        detach_skill: false,
+        attachConnector: true,
+        attach_connector: false,
+        detachConnector: true,
+        detach_connector: false,
+        listCompute: true,
+        list_compute: false,
+        callCommand: true,
+        call_command: false,
+        submitJob: true,
+        submit_job: false,
+        attachJob: true,
+        attach_job: false,
+        setConcurrencyLimit: true,
+        set_concurrency_limit: false
+      })
+    } finally {
+      child.kill()
+    }
+  })
+
+  it('echoes a trailing expression when the call spans multiple lines', async () => {
+    const { child, send } = startLoop({})
+
+    try {
+      const oneLine = await send("await Promise.resolve({ kind: 'ok' })")
+      const multiLine = await send(['await Promise.resolve(', "  { kind: 'ok' }", ')'].join('\n'))
+
+      expect(oneLine.error).toBeNull()
+      expect(multiLine.error).toBeNull()
+      expect(JSON.parse(oneLine.result ?? '{}')).toEqual({ kind: 'ok' })
+      expect(JSON.parse(multiLine.result ?? '{}')).toEqual({ kind: 'ok' })
+    } finally {
+      child.kill()
+    }
+  })
+
+  it('publishes send_frame_message without the legacy send_message alias', async () => {
+    const { child, send } = startLoop({})
+
+    try {
+      const result = await send(
+        'return { current: typeof host.send_frame_message, legacy: typeof host.send_message }'
+      )
+      expect(result.error).toBeNull()
+      expect(JSON.parse(result.result ?? '{}')).toEqual({
+        current: 'function',
+        legacy: 'undefined'
+      })
+    } finally {
+      child.kill()
+    }
+  })
+
+  it('exposes host.help as a thin Host SDK help RPC adapter', async () => {
+    let received: { method?: string; params?: Record<string, unknown> } = {}
+    const server = createServer((request, response) => {
+      let body = ''
+      request.on('data', (chunk) => (body += chunk))
+      request.on('end', () => {
+        received = JSON.parse(body)
+        response.writeHead(200, { 'content-type': 'application/json' }).end(
+          JSON.stringify({
+            result: {
+              kind: 'operation',
+              id: 'host.delegate',
+              availability: { status: 'available' }
+            }
+          })
+        )
+      })
+    })
+    const connection = await listenForLocalRpc(server, {
+      name: 'repl-loop-host-sdk-help-test',
+      transport: 'pipe'
+    })
+    const { child, send } = startLoop({
+      OPEN_SCIENCE_MCP_RPC_ENDPOINT: connection.endpoint,
+      OPEN_SCIENCE_MCP_RPC_SOCKET_PATH: connection.socketPath,
+      OPEN_SCIENCE_MCP_RPC_TOKEN: 'test-token'
+    })
+
+    try {
+      const result = await send("return await host.help('delegate')")
+      expect(result.error).toBeNull()
+      expect(JSON.parse(result.result ?? '{}')).toEqual({
+        kind: 'operation',
+        id: 'host.delegate',
+        availability: { status: 'available' }
+      })
+      expect(received).toEqual({ method: 'hostSdkHelp', params: { query: 'delegate' } })
+    } finally {
+      child.kill()
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      )
+    }
+  }, 60_000)
+
+  it('projects delegation name and Attempt agent name across help, delegate, children, and collect', async () => {
+    const received: Array<{ method?: string; params?: Record<string, unknown> }> = []
+    const server = createServer((request, response) => {
+      let body = ''
+      request.on('data', (chunk) => (body += chunk))
+      request.on('end', () => {
+        const call = JSON.parse(body) as {
+          method?: string
+          params?: Record<string, unknown>
+        }
+        received.push(call)
+        let result: unknown
+        if (call.method === 'hostSdkHelp') {
+          result = hostSdkHelp.query(call.params?.query, {
+            callerRole: 'main',
+            capabilities: {
+              delegate: true,
+              children: true,
+              collect: true,
+              stop_child: true,
+              send_frame_message: true,
+              message_receipt: true,
+              resolve_message: true,
+              submit_output: true
+            }
+          })
+        } else if (call.params?.op === 'children') {
+          result = [
+            {
+              frameId: 'child-1',
+              attemptId: 'attempt-1',
+              title: 'Source trace',
+              name: 'Source trace',
+              agentName: 'Evidence Analyst',
+              status: 'completed'
+            }
+          ]
+        } else if (call.params?.op === 'collect') {
+          result = [
+            {
+              frameId: 'child-1',
+              attemptId: 'attempt-1',
+              name: 'Source trace',
+              agentName: 'Evidence Analyst',
+              status: 'completed',
+              response: 'Durable answer',
+              artifactsCreated: []
+            }
+          ]
+        } else {
+          result = {
+            kind: 'results',
+            children: [
+              {
+                frameId: 'child-1',
+                attemptId: 'attempt-1',
+                name: 'Source trace',
+                agentName: 'Evidence Analyst',
+                status: 'completed',
+                response: 'Durable answer',
+                artifactsCreated: []
+              }
+            ]
+          }
+        }
+        response
+          .writeHead(200, { 'content-type': 'application/json' })
+          .end(JSON.stringify({ result }))
+      })
+    })
+    const connection = await listenForLocalRpc(server, {
+      name: 'repl-loop-delegate-profile-projection-test',
+      transport: 'pipe'
+    })
+    const { child, send } = startLoop({
+      OPEN_SCIENCE_MCP_RPC_ENDPOINT: connection.endpoint,
+      OPEN_SCIENCE_MCP_RPC_SOCKET_PATH: connection.socketPath,
+      OPEN_SCIENCE_MCP_RPC_TOKEN: 'test-token'
+    })
+
+    try {
+      const output = await send(
+        "const help = await host.help('delegate'); const delegated = await host.delegate({ task: 'Trace sources', name: 'Source trace', profile: 'EVIDENCE_ANALYST' }); const children = await host.children(); const collected = await host.collect(['child-1']); return { profile_description: help.request.fields.find(({ name }) => name === 'profile').description, constraints: help.constraints, delegated, children, collected }"
+      )
+      expect(output.error).toBeNull()
+      expect(JSON.parse(output.result ?? '{}')).toEqual({
+        profile_description: 'Specialist id/name; omit to inherit the parent.',
+        constraints: expect.arrayContaining([
+          'Use host.agents.list() for profiles; omission inherits.'
+        ]),
+        delegated: {
+          kind: 'results',
+          children: [
+            {
+              frame_id: 'child-1',
+              attempt_id: 'attempt-1',
+              name: 'Source trace',
+              agent_name: 'Evidence Analyst',
+              status: 'completed',
+              response: 'Durable answer',
+              artifacts_created: []
+            }
+          ]
+        },
+        children: [
+          {
+            frame_id: 'child-1',
+            attempt_id: 'attempt-1',
+            title: 'Source trace',
+            name: 'Source trace',
+            agent_name: 'Evidence Analyst',
+            status: 'completed'
+          }
+        ],
+        collected: [
+          {
+            frame_id: 'child-1',
+            attempt_id: 'attempt-1',
+            name: 'Source trace',
+            agent_name: 'Evidence Analyst',
+            status: 'completed',
+            response: 'Durable answer',
+            artifacts_created: []
+          }
+        ]
+      })
+      expect(received.map(({ method, params }) => [method, params?.op])).toEqual([
+        ['hostSdkHelp', undefined],
+        ['delegatedWorkCall', undefined],
+        ['delegatedWorkCall', 'children'],
+        ['delegatedWorkCall', 'collect']
+      ])
+    } finally {
+      child.kill()
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      )
+    }
+  }, 60_000)
+
+  it('discovers a public Specialist and delegates by its stable id and exact name through the authenticated REPL', async () => {
+    const profileStorage = await mkdtemp(join(tmpdir(), 'repl-delegate-profile-roundtrip-'))
+    const profiles = createProfileService(profileStorage)
+    const selected = await profiles.create({
+      name: 'EVIDENCE_ANALYST',
+      displayName: 'Evidence Analyst'
+    })
+    const execution = createDeterministicDelegateExecution()
+    const session = { projectId: 'project-1', sessionId: 'session-1' }
+    const records = createInMemoryDelegatedWorkRecords({
+      session,
+      rootFrameId: 'root-frame-1',
+      originMessageId: 'origin-message-1'
+    })
+    const work = createDurableDelegatedWork({
+      execution,
+      records,
+      resolveSpecialist: (profileId) => profiles.resolveRunnableById(profileId),
+      resolveSpecialistReference: (reference) => profiles.resolveRunnableByReference(reference)
+    })
+    const agents = new AgentsService({
+      profileService: profiles,
+      catalog: {
+        listSkillCatalog: async () => [],
+        getConnectors: async () => undefined
+      }
+    })
+    const server = new NotebookLocalRpcServer({ execute: async () => ({}) } as never, {
+      transport: 'pipe',
+      agentsService: agents,
+      delegatedWorkService: work
+    })
+    const connection = await server.issueControlConnection(
+      session.sessionId,
+      session.projectId,
+      'root-frame-1',
+      { role: 'main' }
+    )
+    const endInvocation = connection.beginControlInvocation({
+      turnId: 'turn-1',
+      controlInvocationGeneration: 1,
+      toolInvocationId: 'tool-call-1',
+      originatingUserMessageId: 'origin-message-1'
+    })
+    const { child, send } = startLoop({
+      OPEN_SCIENCE_MCP_RPC_ENDPOINT: connection.endpoint,
+      OPEN_SCIENCE_MCP_RPC_SOCKET_PATH: connection.socketPath,
+      OPEN_SCIENCE_MCP_RPC_TOKEN: connection.token,
+      OPEN_SCIENCE_NOTEBOOK_SESSION_ID: session.sessionId
+    })
+
+    try {
+      const workflow =
+        "const specialists = await host.agents.list(); const selected = specialists[0]; const byId = await host.delegate({ name: 'Stable id lookup', task: 'By stable id', profile: selected.id }, { wait: false }); const byName = await host.delegate({ name: 'Exact name lookup', task: 'By exact name', profile: selected.name }, { wait: false }); const main = await host.delegate({ name: 'Default Main lookup', task: 'Default Main' }, { wait: false }); return JSON.stringify({ selected: { id: selected.id, name: selected.name }, byId, byName, main })"
+      const response = await send(workflow)
+      expect(response.error).toBeNull()
+      const result = JSON.parse(response.result ?? '{}')
+      expect(result.selected).toEqual({ id: selected.id, name: selected.name })
+      expect(result.byId.children[0]).toMatchObject({
+        agent_name: 'Evidence Analyst',
+        status: 'running'
+      })
+      expect(result.byName.children[0]).toMatchObject({
+        agent_name: 'Evidence Analyst',
+        status: 'running'
+      })
+      expect(result.main.children[0]).toMatchObject({
+        agent_name: 'Main Agent',
+        status: 'running'
+      })
+
+      await expect.poll(() => execution.controls()).toHaveLength(3)
+      expect(execution.controls().map(({ input }) => input.profile)).toEqual([
+        selected.id,
+        selected.id,
+        undefined
+      ])
+      expect(
+        (await records.snapshot()).records.map(({ attempts }) => attempts[0].resolvedAgent)
+      ).toEqual([
+        {
+          kind: 'specialist',
+          profileId: selected.id,
+          revision: selected.revision,
+          displayName: selected.displayName
+        },
+        {
+          kind: 'specialist',
+          profileId: selected.id,
+          revision: selected.revision,
+          displayName: selected.displayName
+        },
+        { kind: 'main' }
+      ])
+
+      const replay = await send(workflow)
+      expect(replay.error).toBeNull()
+      expect(JSON.parse(replay.result ?? '{}')).toEqual(result)
+      expect(execution.controls()).toHaveLength(3)
+      expect(execution.reservationCounts()).toEqual([1, 1, 1])
+      expect((await records.snapshot()).records).toHaveLength(3)
+    } finally {
+      for (const control of execution.controls()) {
+        control.accept()
+        control.cancel()
+      }
+      child.kill()
+      endInvocation()
+      connection.release()
+      await server.close()
+      await rm(profileStorage, { recursive: true, force: true })
+    }
+  }, 60_000)
+
+  it('exposes host.children and host.collect with snake-case durable projections', async () => {
+    const received: Array<{ method?: string; params?: Record<string, unknown> }> = []
+    const server = createServer((request, response) => {
+      let body = ''
+      request.on('data', (chunk) => (body += chunk))
+      request.on('end', () => {
+        const call = JSON.parse(body)
+        received.push(call)
+        const result =
+          call.params.op === undefined
+            ? {
+                kind: 'receipts',
+                children: [
+                  {
+                    frameId: 'child-1',
+                    attemptId: 'attempt-1',
+                    name: 'Source trace',
+                    agentName: 'Main Agent',
+                    status: 'running'
+                  }
+                ]
+              }
+            : call.params.op === 'children'
+              ? [
+                  {
+                    frameId: 'child-1',
+                    attemptId: 'attempt-1',
+                    title: 'Source trace',
+                    status: 'running'
+                  }
+                ]
+              : [
+                  {
+                    frameId: 'child-1',
+                    attemptId: 'attempt-1',
+                    status: 'completed',
+                    terminalMessageId: 'message-1',
+                    response: 'Durable answer',
+                    artifactsCreated: []
+                  },
+                  {
+                    frameId: 'child-2',
+                    attemptId: 'attempt-2',
+                    name: 'Long analysis',
+                    agentName: 'Main Agent',
+                    status: 'running'
+                  }
+                ]
+        response
+          .writeHead(200, { 'content-type': 'application/json' })
+          .end(JSON.stringify({ result }))
+      })
+    })
+    const connection = await listenForLocalRpc(server, {
+      name: 'repl-loop-delegated-work-test',
+      transport: 'pipe'
+    })
+    const { child, send } = startLoop({
+      OPEN_SCIENCE_MCP_RPC_ENDPOINT: connection.endpoint,
+      OPEN_SCIENCE_MCP_RPC_SOCKET_PATH: connection.socketPath,
+      OPEN_SCIENCE_MCP_RPC_TOKEN: 'test-token',
+      OPEN_SCIENCE_NOTEBOOK_SESSION_ID: 'session-1'
+    })
+
+    try {
+      const firstCell = await send(
+        "globalThis.pendingDelegation = await host.delegate({ task: 'Trace sources', name: 'Source trace' }, { wait: false }); return { delegated: globalThis.pendingDelegation, children: await host.children() }"
+      )
+      expect(firstCell.error).toBeNull()
+      expect(JSON.parse(firstCell.result ?? '{}')).toEqual({
+        delegated: {
+          kind: 'receipts',
+          children: [
+            {
+              frame_id: 'child-1',
+              attempt_id: 'attempt-1',
+              name: 'Source trace',
+              agent_name: 'Main Agent',
+              status: 'running'
+            }
+          ]
+        },
+        children: [
+          {
+            frame_id: 'child-1',
+            attempt_id: 'attempt-1',
+            title: 'Source trace',
+            status: 'running'
+          }
+        ]
+      })
+      const secondCell = await send(
+        'return { results: await host.collect(globalThis.pendingDelegation.children.map(({ frame_id, attempt_id }) => ({ frame_id, attempt_id })), { timeout_seconds: 0 }) }'
+      )
+      expect(secondCell.error).toBeNull()
+      expect(JSON.parse(secondCell.result ?? '{}')).toEqual({
+        results: [
+          {
+            frame_id: 'child-1',
+            attempt_id: 'attempt-1',
+            status: 'completed',
+            terminal_message_id: 'message-1',
+            response: 'Durable answer',
+            artifacts_created: []
+          },
+          {
+            frame_id: 'child-2',
+            attempt_id: 'attempt-2',
+            name: 'Long analysis',
+            agent_name: 'Main Agent',
+            status: 'running'
+          }
+        ]
+      })
+      expect(received).toEqual([
+        {
+          method: 'delegatedWorkCall',
+          params: {
+            request: { task: 'Trace sources', name: 'Source trace' },
+            options: { wait: false },
+            delegation_call_id: '1'
+          }
+        },
+        { method: 'delegatedWorkCall', params: { op: 'children' } },
+        {
+          method: 'delegatedWorkCall',
+          params: {
+            op: 'collect',
+            selectors: [{ frame_id: 'child-1', attempt_id: 'attempt-1' }],
+            options: { timeout_seconds: 0 }
+          }
+        }
+      ])
+    } finally {
+      child.kill()
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      )
+    }
+  }, 60_000)
+
+  it('routes host.submit_output through its dedicated child capability method', async () => {
+    let received: { method?: string; params?: Record<string, unknown> } = {}
+    const server = createServer((request, response) => {
+      let body = ''
+      request.on('data', (chunk) => (body += chunk))
+      request.on('end', () => {
+        received = JSON.parse(body)
+        response
+          .writeHead(200, { 'content-type': 'application/json' })
+          .end(JSON.stringify({ result: { accepted: true } }))
+      })
+    })
+    const connection = await listenForLocalRpc(server, {
+      name: 'repl-loop-submit-output-test',
+      transport: 'pipe'
+    })
+    const { child, send } = startLoop({
+      OPEN_SCIENCE_MCP_RPC_ENDPOINT: connection.endpoint,
+      OPEN_SCIENCE_MCP_RPC_SOCKET_PATH: connection.socketPath,
+      OPEN_SCIENCE_MCP_RPC_TOKEN: 'child-token'
+    })
+    try {
+      const result = await send('return await host.submit_output({ answer: 42 })')
+      expect(result.error).toBeNull()
+      expect(JSON.parse(result.result ?? '{}')).toEqual({ accepted: true })
+      expect(received).toEqual({
+        method: 'delegatedOutputCall',
+        params: { value: { answer: 42 } }
+      })
+    } finally {
+      child.kill()
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      )
+    }
+  }, 60_000)
+
+  it('routes host.send_frame_message kind through delegated work and projects a continuation receipt', async () => {
+    let received: { method?: string; params?: Record<string, unknown> } = {}
+    const server = createServer((request, response) => {
+      let body = ''
+      request.on('data', (chunk) => (body += chunk))
+      request.on('end', () => {
+        received = JSON.parse(body)
+        response.writeHead(200, { 'content-type': 'application/json' }).end(
+          JSON.stringify({
+            result: {
+              direction: 'to_child',
+              disposition: 'continued',
+              status: 'queued',
+              continuation_attempt_id: 'attempt-2'
+            }
+          })
+        )
+      })
+    })
+    const connection = await listenForLocalRpc(server, {
+      name: 'repl-loop-delegated-work-test',
+      transport: 'pipe'
+    })
+    const { child, send } = startLoop({
+      OPEN_SCIENCE_MCP_RPC_ENDPOINT: connection.endpoint,
+      OPEN_SCIENCE_MCP_RPC_SOCKET_PATH: connection.socketPath,
+      OPEN_SCIENCE_MCP_RPC_TOKEN: 'test-token',
+      OPEN_SCIENCE_NOTEBOOK_SESSION_ID: 'session-1'
+    })
+
+    try {
+      const result = await send(
+        "return JSON.stringify(await host.send_frame_message('child-frame', 'Check a counterexample', { kind: 'question' }))"
+      )
+      expect(result.error).toBeNull()
+      expect(JSON.parse(result.result as string)).toEqual({
+        direction: 'to_child',
+        disposition: 'continued',
+        status: 'queued',
+        continuation_attempt_id: 'attempt-2'
+      })
+      expect(received).toEqual({
+        method: 'delegatedWorkCall',
+        params: {
+          op: 'send_message',
+          target: 'child-frame',
+          message: 'Check a counterexample',
+          options: { kind: 'question' }
+        }
+      })
+    } finally {
+      child.kill()
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      )
+    }
+  }, 60_000)
+
+  it('keeps the two-argument host.send_frame_message call compatible', async () => {
+    let received: { method?: string; params?: Record<string, unknown> } = {}
+    const server = createServer((request, response) => {
+      let body = ''
+      request.on('data', (chunk) => (body += chunk))
+      request.on('end', () => {
+        received = JSON.parse(body)
+        response.writeHead(200, { 'content-type': 'application/json' }).end(
+          JSON.stringify({
+            result: {
+              direction: 'to_child',
+              disposition: 'continued',
+              status: 'queued',
+              continuation_attempt_id: 'attempt-2'
+            }
+          })
+        )
+      })
+    })
+    const connection = await listenForLocalRpc(server, {
+      name: 'repl-loop-delegated-work-test',
+      transport: 'pipe'
+    })
+    const { child, send } = startLoop({
+      OPEN_SCIENCE_MCP_RPC_ENDPOINT: connection.endpoint,
+      OPEN_SCIENCE_MCP_RPC_SOCKET_PATH: connection.socketPath,
+      OPEN_SCIENCE_MCP_RPC_TOKEN: 'test-token',
+      OPEN_SCIENCE_NOTEBOOK_SESSION_ID: 'session-1'
+    })
+
+    try {
+      const result = await send(
+        "return JSON.stringify(await host.send_frame_message('child-frame', 'Check a counterexample'))"
+      )
+      expect(result.error).toBeNull()
+      expect(JSON.parse(result.result as string)).toEqual({
+        direction: 'to_child',
+        disposition: 'continued',
+        status: 'queued',
+        continuation_attempt_id: 'attempt-2'
+      })
+      expect(received).toEqual({
+        method: 'delegatedWorkCall',
+        params: {
+          op: 'send_message',
+          target: 'child-frame',
+          message: 'Check a counterexample'
+        }
+      })
+      expect(received.params).not.toHaveProperty('kind')
+    } finally {
+      child.kill()
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      )
+    }
+  }, 60_000)
+
+  it('projects a Delegate-to-parent queued send_frame_message receipt without a child', async () => {
+    let received: { method?: string; params?: Record<string, unknown> } = {}
+    const server = createServer((request, response) => {
+      let body = ''
+      request.on('data', (chunk) => (body += chunk))
+      request.on('end', () => {
+        received = JSON.parse(body)
+        response.writeHead(200, { 'content-type': 'application/json' }).end(
+          JSON.stringify({
+            result: {
+              direction: 'to_parent',
+              disposition: 'message',
+              status: 'queued',
+              message_id: 'message-1',
+              target_frame_id: 'parent-frame',
+              source_attempt_id: 'attempt-1'
+            }
+          })
+        )
+      })
+    })
+    const connection = await listenForLocalRpc(server, {
+      name: 'repl-loop-delegated-work-test',
+      transport: 'pipe'
+    })
+    const { child, send } = startLoop({
+      OPEN_SCIENCE_MCP_RPC_ENDPOINT: connection.endpoint,
+      OPEN_SCIENCE_MCP_RPC_SOCKET_PATH: connection.socketPath,
+      OPEN_SCIENCE_MCP_RPC_TOKEN: 'test-token',
+      OPEN_SCIENCE_NOTEBOOK_SESSION_ID: 'session-1'
+    })
+
+    try {
+      const result = await send(
+        "return JSON.stringify(await host.send_frame_message('parent', 'Which cohort?', { kind: 'question' }))"
+      )
+      expect(result.error).toBeNull()
+      expect(JSON.parse(result.result as string)).toEqual({
+        direction: 'to_parent',
+        disposition: 'message',
+        status: 'queued',
+        message_id: 'message-1',
+        target_frame_id: 'parent-frame',
+        source_attempt_id: 'attempt-1'
+      })
+      expect(received).toEqual({
+        method: 'delegatedWorkCall',
+        params: {
+          op: 'send_message',
+          target: 'parent',
+          message: 'Which cohort?',
+          options: { kind: 'question' }
+        }
+      })
+    } finally {
+      child.kill()
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      )
+    }
+  }, 60_000)
+
   it('routes host.mcp through the issued local socket', async () => {
     let received: { method?: string; params?: { server?: string } } = {}
     let authorization: string | undefined
@@ -375,8 +1122,8 @@ describe('repl_loop local RPC transport', () => {
 
     try {
       const projection = await send(
-        "const first = await host.lineage.graph('artifact-v1', { max_depth: 0 }); " +
-          "const second = await host.lineage.graph('artifact-v1', { max_depth: 0 }); " +
+        "const first = await host.lineage.graph('artifact-v1', { direction: 'down', maxDepth: 0, maxNodes: 5 }); " +
+          "const second = await host.lineage.graph('artifact-v1', { direction: 'down', maxDepth: 0, maxNodes: 5 }); " +
           "const core = await host.lineage.get('artifact-v1'); " +
           'return JSON.stringify({ firstFrozen: Object.isFrozen(first), ' +
           'nodesFrozen: Object.isFrozen(first.nodes), nodeFrozen: Object.isFrozen(first.nodes[0]), ' +
@@ -386,7 +1133,8 @@ describe('repl_loop local RPC transport', () => {
           'packagesFrozen: Object.isFrozen(core.environment.packages), ' +
           'packageFrozen: Object.isFrozen(core.environment.packages[0]), ' +
           'opLogFrozen: Object.isFrozen(core.environment.op_log), ' +
-          'attemptFrozen: Object.isFrozen(core.environment.op_log[0].attempts[0]) })'
+          'attemptFrozen: Object.isFrozen(core.environment.op_log[0].attempts[0]), ' +
+          'returnFields: [first.root_version_id, first.nodes[0].version_id, core.version_id] })'
       )
       expect(projection.error).toBeNull()
       expect(JSON.parse(projection.result ?? '{}')).toEqual({
@@ -401,16 +1149,25 @@ describe('repl_loop local RPC transport', () => {
         packagesFrozen: true,
         packageFrozen: true,
         opLogFrozen: true,
-        attemptFrozen: true
+        attemptFrozen: true,
+        returnFields: ['artifact-v1', 'artifact-v1', 'artifact-v1']
       })
       expect(requests).toEqual([
         {
           method: 'lineageCall',
-          params: { op: 'graph', version_id: 'artifact-v1', options: { max_depth: 0 } }
+          params: {
+            op: 'graph',
+            version_id: 'artifact-v1',
+            options: { direction: 'down', max_depth: 0, max_nodes: 5 }
+          }
         },
         {
           method: 'lineageCall',
-          params: { op: 'graph', version_id: 'artifact-v1', options: { max_depth: 0 } }
+          params: {
+            op: 'graph',
+            version_id: 'artifact-v1',
+            options: { direction: 'down', max_depth: 0, max_nodes: 5 }
+          }
         },
         { method: 'lineageCall', params: { op: 'get', version_id: 'artifact-v1' } }
       ])
@@ -419,7 +1176,19 @@ describe('repl_loop local RPC transport', () => {
         "try { await host.lineage.get('artifact-v1', {}); return 'no error' } " +
           "catch (error) { return error.name + ': ' + error.message }"
       )
-      expect(extraArgument.result).toBe('TypeError: host.lineage.get accepts one version_id')
+      expect(extraArgument.result).toBe('TypeError: host.lineage.get accepts one versionId')
+      expect(requests).toHaveLength(3)
+
+      const oldOptions = await send(
+        "const errors = []; for (const [key, value] of [['max_depth', 0], ['max_nodes', 5]]) { " +
+          "try { await host.lineage.graph('artifact-v1', { [key]: value }) } " +
+          "catch (error) { errors.push(error.name + ': ' + error.message) } } " +
+          'return JSON.stringify(errors)'
+      )
+      expect(JSON.parse(oldOptions.result ?? '[]')).toEqual([
+        'TypeError: host.lineage.graph options unknown option: max_depth',
+        'TypeError: host.lineage.graph options unknown option: max_nodes'
+      ])
       expect(requests).toHaveLength(3)
 
       const invalidProjection = await send(
@@ -548,7 +1317,7 @@ describe('repl_loop local RPC transport', () => {
       })
 
       const batch = await send(
-        "const value = await host.llm(['a', { prompt: 'b' }], { max_concurrency: 2 }); " +
+        "const value = await host.llm(['a', { prompt: 'b' }], { maxConcurrency: 2 }); " +
           'return JSON.stringify({ value, frozen: Object.isFrozen(value), itemFrozen: value.every(Object.isFrozen) })'
       )
       expect(batch.error).toBeNull()
@@ -569,7 +1338,7 @@ describe('repl_loop local RPC transport', () => {
       ])
 
       const invalidOptions = await send(
-        "try { await host.llm('single', { max_concurrency: 2 }); return 'no error' } " +
+        "try { await host.llm('single', { maxConcurrency: 2 }); return 'no error' } " +
           "catch (error) { return error.name + ': ' + error.message }"
       )
       expect(invalidOptions.result).toBe(
@@ -587,11 +1356,20 @@ describe('repl_loop local RPC transport', () => {
       expect(requests).toHaveLength(2)
 
       const invalidBatchOptions = await send(
-        "try { await host.llm(['x'], { max_concurrency: 2, extra: undefined }); return 'no error' } " +
+        "try { await host.llm(['x'], { maxConcurrency: 2, extra: undefined }); return 'no error' } " +
           "catch (error) { return error.name + ': ' + error.message }"
       )
       expect(invalidBatchOptions.result).toBe(
-        'TypeError: host.llm batch options only accept max_concurrency.'
+        'TypeError: host.llm batch options unknown option: extra'
+      )
+      expect(requests).toHaveLength(2)
+
+      const oldBatchOption = await send(
+        "try { await host.llm(['x'], { max_concurrency: 2 }); return 'no error' } " +
+          "catch (error) { return error.name + ': ' + error.message }"
+      )
+      expect(oldBatchOption.result).toBe(
+        'TypeError: host.llm batch options unknown option: max_concurrency'
       )
       expect(requests).toHaveLength(2)
 
@@ -625,12 +1403,12 @@ describe('repl_loop local RPC transport', () => {
       })
 
       const throwingOptionsAccessor = await send(
-        "const options = {}; Object.defineProperty(options, 'max_concurrency', { get() { throw new Error('raw getter detail') } }); " +
+        "const options = {}; Object.defineProperty(options, 'maxConcurrency', { get() { throw new TypeError('unknown option: raw getter detail') } }); " +
           "try { await host.llm(['x'], options); return 'no error' } " +
           "catch (error) { return error.name + ': ' + error.message }"
       )
       expect(throwingOptionsAccessor.result).toBe(
-        'TypeError: host.llm batch options only accept max_concurrency.'
+        'TypeError: host.llm batch options only accept maxConcurrency.'
       )
       expect(requests).toHaveLength(4)
 
@@ -653,7 +1431,7 @@ describe('repl_loop local RPC transport', () => {
     }
   }, 60_000)
 
-  it('validates and freezes host.artifacts results and resolves host.artifact_path', async () => {
+  it('validates and freezes host.artifacts results and resolves host.artifactPath', async () => {
     const requests: Array<{ method?: string; params?: Record<string, unknown> }> = []
     const managedPath = join(tmpdir(), 'managed', 'report.pdf')
     const server = createServer((request, response) => {
@@ -714,26 +1492,58 @@ describe('repl_loop local RPC transport', () => {
 
     try {
       const projection = await send(
-        "const page = await host.artifacts({ search: 'report', limit: 2 }); " +
-          'const localPath = await host.artifact_path(page.artifacts[1].latest_version_id); ' +
+        "const page = await host.artifacts({ search: 'report', sessionId: 'session-a', contentType: 'text/csv', limit: 2 }); " +
+          "await host.artifacts({ versionId: 'artifact-version-1' }); " +
+          'const localPath = await host.artifactPath(page.artifacts[1].latest_version_id); ' +
           'return JSON.stringify({ page, localPath, pageFrozen: Object.isFrozen(page), ' +
           'artifactsFrozen: Object.isFrozen(page.artifacts), itemFrozen: Object.isFrozen(page.artifacts[0]) })'
       )
       expect(projection.error).toBeNull()
-      expect(JSON.parse(projection.result ?? '{}')).toMatchObject({
-        page: { count: 2, project_id: 'project-a', truncated: false },
+      const projected = JSON.parse(projection.result ?? '{}')
+      expect(projected).toMatchObject({
+        page: {
+          count: 2,
+          project_id: 'project-a',
+          truncated: false
+        },
         localPath: managedPath,
         pageFrozen: true,
         artifactsFrozen: true,
         itemFrozen: true
       })
+      expect(projected.page.artifacts[0].latest_version_id).toBe('artifact-version-1')
       expect(requests).toEqual([
         {
           method: 'artifactsCall',
-          params: { op: 'list', options: { search: 'report', limit: 2 } }
+          params: {
+            op: 'list',
+            options: {
+              search: 'report',
+              session_id: 'session-a',
+              content_type: 'text/csv',
+              limit: 2
+            }
+          }
+        },
+        {
+          method: 'artifactsCall',
+          params: { op: 'list', options: { version_id: 'artifact-version-1' } }
         },
         { method: 'artifactsCall', params: { op: 'path', version_id: 'upload-version-1' } }
       ])
+
+      const oldOptions = await send(
+        "const errors = []; for (const [key, value] of [['version_id', 'artifact-version-1'], ['session_id', 'session-a'], ['content_type', 'text/csv']]) { " +
+          'try { await host.artifacts({ [key]: value }) } ' +
+          "catch (error) { errors.push(error.name + ': ' + error.message) } } " +
+          'return JSON.stringify(errors)'
+      )
+      expect(JSON.parse(oldOptions.result ?? '[]')).toEqual([
+        'TypeError: host.artifacts options unknown option: version_id',
+        'TypeError: host.artifacts options unknown option: session_id',
+        'TypeError: host.artifacts options unknown option: content_type'
+      ])
+      expect(requests).toHaveLength(3)
     } finally {
       child.kill()
       await new Promise<void>((resolve, reject) =>
@@ -841,8 +1651,8 @@ describe('repl_loop local RPC transport', () => {
 
     try {
       const projection = await send(
-        "const page = await host.frames.list({ search: 'research' }); " +
-          "const detail = await host.frames.get('frame-1', { branch_id: 'branch-1' }); " +
+        "const page = await host.frames.list({ search: 'research', sessionId: 'session-a', rootsOnly: false }); " +
+          "const detail = await host.frames.get('frame-1', { sessionId: 'session-a', branchId: 'branch-1' }); " +
           'return JSON.stringify({ page, detail, pageFrozen: Object.isFrozen(page), ' +
           'framesFrozen: Object.isFrozen(page.frames), frameFrozen: Object.isFrozen(page.frames[0]), ' +
           'detailFrozen: Object.isFrozen(detail), transcriptFrozen: Object.isFrozen(detail.transcript), ' +
@@ -878,13 +1688,37 @@ describe('repl_loop local RPC transport', () => {
       expect(requests).toEqual([
         {
           method: 'framesCall',
-          params: { op: 'list', options: { search: 'research' } }
+          params: {
+            op: 'list',
+            options: { search: 'research', session_id: 'session-a', roots_only: false }
+          }
         },
         {
           method: 'framesCall',
-          params: { op: 'get', frame_id: 'frame-1', options: { branch_id: 'branch-1' } }
+          params: {
+            op: 'get',
+            frame_id: 'frame-1',
+            options: { session_id: 'session-a', branch_id: 'branch-1' }
+          }
         }
       ])
+
+      const oldOptions = await send(
+        'const errors = []; for (const call of [' +
+          "() => host.frames.list({ session_id: 'session-a' }), " +
+          '() => host.frames.list({ roots_only: false }), ' +
+          "() => host.frames.get('frame-1', { session_id: 'session-a' }), " +
+          "() => host.frames.get('frame-1', { branch_id: 'branch-1' })]) { " +
+          "try { await call() } catch (error) { errors.push(error.name + ': ' + error.message) } } " +
+          'return JSON.stringify(errors)'
+      )
+      expect(JSON.parse(oldOptions.result ?? '[]')).toEqual([
+        'TypeError: host.frames.list options unknown option: session_id',
+        'TypeError: host.frames.list options unknown option: roots_only',
+        'TypeError: host.frames.get options unknown option: session_id',
+        'TypeError: host.frames.get options unknown option: branch_id'
+      ])
+      expect(requests).toHaveLength(2)
 
       const invalid = await send(
         "try { await host.frames.list(); return 'no error' } " +
@@ -1331,7 +2165,7 @@ gate('repl_loop.js host.compute', () => {
     }
   }, 60_000)
 
-  it('create().call_command() posts op=call_command with defaults and returns the ExecResult', async () => {
+  it('create().callCommand() posts op=call_command with defaults and returns the ExecResult', async () => {
     next = {
       status: 200,
       body: { result: { exit_code: 0, stdout: 'hi', stderr: '', truncated: false } }
@@ -1342,7 +2176,7 @@ gate('repl_loop.js host.compute', () => {
     })
     try {
       const r = await send(
-        "const c = host.compute.create('ssh:biowulf'); const res = await c.call_command('echo hi', 'probe'); return res.stdout"
+        "const c = host.compute.create('ssh:biowulf'); const res = await c.callCommand('echo hi', 'probe'); return res.stdout"
       )
       expect(r.error).toBeNull()
       expect(r.result).toContain('hi')
@@ -1350,7 +2184,7 @@ gate('repl_loop.js host.compute', () => {
       expect(received.params?.provider_id).toBe('ssh:biowulf')
       expect(received.params?.cmd).toBe('echo hi')
       expect(received.params?.intent).toBe('probe')
-      // login_shell defaults to true; timeout_seconds omitted -> the service applies its own default.
+      // Public loginShell defaults to true; omitted timeoutSeconds stays omitted on the wire.
       expect(received.params?.login_shell).toBe(true)
       expect(received.params?.timeout_seconds).toBeUndefined()
     } finally {
@@ -1377,7 +2211,7 @@ gate('repl_loop.js host.compute', () => {
     try {
       const r = await send(
         "const c = host.compute.create('ssh:x');\n" +
-          'try { await c.call_command("id", "probe") }\n' +
+          'try { await c.callCommand("id", "probe") }\n' +
           'catch (e) { return JSON.stringify({ code: e.error_code, retry: e.retry_after_user_action, msg: e.message }) }'
       )
       expect(r.error).toBeNull()
@@ -1390,7 +2224,7 @@ gate('repl_loop.js host.compute', () => {
     }
   }, 60_000)
 
-  it('details() posts op=details with mode/text/old_text and returns the result', async () => {
+  it('details() maps public oldText to wire old_text and returns the result', async () => {
     next = { status: 200, body: { result: { doc: 'the doc', isSkeleton: false } } }
     const { child, send } = startLoop({
       OPEN_SCIENCE_MCP_RPC_ENDPOINT: endpoint,
@@ -1407,10 +2241,10 @@ gate('repl_loop.js host.compute', () => {
       expect(received.params?.provider_id).toBe('ssh:biowulf')
       expect(received.params?.mode).toBe('read')
 
-      // replace: text + old_text are forwarded (snake_case matches the RPC contract).
+      // Public oldText maps immediately to the unchanged snake_case RPC field.
       next = { status: 200, body: { result: { ok: true } } }
       const replace = await send(
-        "await host.compute.details('ssh:biowulf', { mode: 'replace', text: 'new', old_text: 'old' }); return 'done'"
+        "await host.compute.details('ssh:biowulf', { mode: 'replace', text: 'new', oldText: 'old' }); return 'done'"
       )
       expect(replace.error).toBeNull()
       expect(received.params?.mode).toBe('replace')
@@ -1421,7 +2255,7 @@ gate('repl_loop.js host.compute', () => {
     }
   }, 60_000)
 
-  it('threads session/project identity from the spawn env into the call_command payload', async () => {
+  it('threads session/project identity from the spawn env into the callCommand payload', async () => {
     next = {
       status: 200,
       body: { result: { exit_code: 0, stdout: '', stderr: '', truncated: false } }
@@ -1434,7 +2268,7 @@ gate('repl_loop.js host.compute', () => {
     })
     try {
       const r = await send(
-        "await host.compute.create('ssh:biowulf').call_command('id', 'probe'); return 'ok'"
+        "await host.compute.create('ssh:biowulf').callCommand('id', 'probe'); return 'ok'"
       )
       expect(r.error).toBeNull()
       expect(received.params?.session_id).toBe('session-42')
@@ -1462,7 +2296,7 @@ gate('repl_loop.js host.compute', () => {
     }
   }, 60_000)
 
-  it('create().set_concurrency_limit(k) posts op=set_concurrency_limit with session_id and limit', async () => {
+  it('create().setConcurrencyLimit(k) posts op=set_concurrency_limit with session_id and limit', async () => {
     next = { status: 200, body: { result: null } }
     const { child, send } = startLoop({
       OPEN_SCIENCE_MCP_RPC_ENDPOINT: endpoint,
@@ -1471,7 +2305,7 @@ gate('repl_loop.js host.compute', () => {
     })
     try {
       const r = await send(
-        "const c = host.compute.create('ssh:biowulf'); await c.set_concurrency_limit(5); return 'ok'"
+        "const c = host.compute.create('ssh:biowulf'); await c.setConcurrencyLimit(5); return 'ok'"
       )
       expect(r.error).toBeNull()
       expect(r.result).toContain('ok')
@@ -1483,7 +2317,7 @@ gate('repl_loop.js host.compute', () => {
     }
   }, 60_000)
 
-  it('create().set_concurrency_limit() validates that k is a positive integer', async () => {
+  it('create().setConcurrencyLimit() validates that k is a positive integer', async () => {
     const { child, send } = startLoop({
       OPEN_SCIENCE_MCP_RPC_ENDPOINT: endpoint,
       OPEN_SCIENCE_MCP_RPC_TOKEN: 'tok',
@@ -1492,19 +2326,19 @@ gate('repl_loop.js host.compute', () => {
     try {
       // Negative number should throw
       const r1 = await send(
-        "const c = host.compute.create('ssh:biowulf'); try { await c.set_concurrency_limit(-1); return 'bad' } catch (e) { return e.message }"
+        "const c = host.compute.create('ssh:biowulf'); try { await c.setConcurrencyLimit(-1); return 'bad' } catch (e) { return e.message }"
       )
       expect(r1.result).toContain('positive integer')
 
       // Zero should throw
       const r2 = await send(
-        "const c2 = host.compute.create('ssh:biowulf'); try { await c2.set_concurrency_limit(0); return 'bad' } catch (e) { return e.message }"
+        "const c2 = host.compute.create('ssh:biowulf'); try { await c2.setConcurrencyLimit(0); return 'bad' } catch (e) { return e.message }"
       )
       expect(r2.result).toContain('positive integer')
 
       // Float should throw
       const r3 = await send(
-        "const c3 = host.compute.create('ssh:biowulf'); try { await c3.set_concurrency_limit(2.5); return 'bad' } catch (e) { return e.message }"
+        "const c3 = host.compute.create('ssh:biowulf'); try { await c3.setConcurrencyLimit(2.5); return 'bad' } catch (e) { return e.message }"
       )
       expect(r3.result).toContain('positive integer')
     } finally {

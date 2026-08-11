@@ -13,6 +13,7 @@ import {
 } from 'react'
 
 import {
+  type AcpAgentRuntimeUpdate,
   type AcpContextUsage,
   type AcpPermissionGrant,
   type AcpPermissionRequest,
@@ -38,6 +39,7 @@ import {
   markRunningSessionsDisconnectedOnDrop,
   processVisibleWorkspaceRuntimeEvents,
   processWorkspaceRuntimeEvents,
+  refreshDelegatedWorkSessions,
   subscribeWorkspacePermissionLifecycle,
   syncWorkspaceContextUsage,
   syncWorkspaceElicitationState,
@@ -53,38 +55,22 @@ import {
   type SendWorkspaceMessageResult
 } from './workspace-runtime-command-owner'
 import { createWorkspaceRuntimeSessionLifecycleOwner } from './workspace-runtime-session-lifecycle-owner'
-import { createPermissionResponseAttemptOwner } from './workspace-permission-response-attempt-owner'
+import { useSubagentRuntimePresentation } from './workspace-subagent-runtime-presentation'
+import {
+  createPermissionResponseAttemptOwner,
+  pendingWorkspacePermissions
+} from './workspace-permission-response-attempt-owner'
 
 type SendPreparationStateChange = (sessionId: string, inFlight: boolean) => void
 type WorkspacePermissionProfileRuntime = Pick<
   ReturnType<typeof useAcpRuntime>,
   'state' | 'setPermissionProfile'
 >
+type SubagentRuntimeListener = (update: AcpAgentRuntimeUpdate) => void
 
 const EMPTY_AGENT_PROMPT_IN_FLIGHT_SESSION_IDS: string[] = []
 const getErrorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : String(error)
-
-const pendingWorkspacePermissions = (
-  sessions: ChatSession[],
-  liveRequests: AcpPermissionRequest[]
-): AcpPermissionRequest[] => {
-  const liveRequestIds = new Set(liveRequests.map((request) => request.requestId))
-  const restoredRequests: AcpPermissionRequest[] = []
-  for (const session of sessions) {
-    const permission = session.runtimeContext?.permission
-    const request = permission?.request
-    if (
-      (session.status === 'waiting-permission' || session.status === 'error') &&
-      permission?.state === 'pending' &&
-      request?.sessionId === session.id &&
-      !liveRequestIds.has(request.requestId)
-    ) {
-      restoredRequests.push(request)
-    }
-  }
-  return restoredRequests.length > 0 ? [...liveRequests, ...restoredRequests] : liveRequests
-}
 
 const setWorkspacePermissionProfile = async (
   runtime: WorkspacePermissionProfileRuntime,
@@ -109,10 +95,13 @@ type WorkspaceAgentRuntime = {
   permissionProfiles: Record<string, SessionPermissionProfileState>
   permissionGrants: Record<string, AcpPermissionGrant[]>
   contextUsageBySession: Record<string, AcpContextUsage>
+  delegatedWorkUnavailableBySession: Record<string, string>
   promptInFlightSessionIds: string[]
   sendPreparationInFlightSessionIds: string[]
   nativeContextCompactionSessionIds: string[]
+  subscribeToSubagentRuntimeUpdates: (listener: SubagentRuntimeListener) => () => void
   compactContext: (sessionId: string) => Promise<boolean>
+  ensureSessionReady: (sessionId: string) => Promise<void>
   sendMessage: (
     input: SendWorkspaceMessageIntent
   ) => Promise<SendWorkspaceMessageResult | undefined>
@@ -130,9 +119,18 @@ type WorkspaceAgentRuntime = {
 }
 
 const WorkspaceAgentRuntimeContext = createContext<WorkspaceAgentRuntime | null>(null)
+const RuntimeProvider = WorkspaceAgentRuntimeContext.Provider
 
 const useOwnedWorkspaceAgentRuntime = (): WorkspaceAgentRuntime => {
   const runtime = useAcpRuntime()
+  const subagentRuntimeUpdateListeners = useRef(new Set<SubagentRuntimeListener>())
+  const subscribeToSubagentRuntimeUpdates = useCallback(
+    (listener: SubagentRuntimeListener): (() => void) => {
+      subagentRuntimeUpdateListeners.current.add(listener)
+      return () => subagentRuntimeUpdateListeners.current.delete(listener)
+    },
+    []
+  )
   const restoredPermissionProjectionKey = useSessionStore((state) =>
     JSON.stringify(
       state.sessions.map((session) => {
@@ -147,7 +145,6 @@ const useOwnedWorkspaceAgentRuntime = (): WorkspaceAgentRuntime => {
     )
   )
   const restoredPermissionSessions = useMemo(() => {
-    // The primitive projection key intentionally controls when this store snapshot is refreshed.
     void restoredPermissionProjectionKey
     return useSessionStore.getState().sessions
   }, [restoredPermissionProjectionKey])
@@ -243,7 +240,14 @@ const useOwnedWorkspaceAgentRuntime = (): WorkspaceAgentRuntime => {
     [durablePermissionSessionIdsKey]
   )
 
-  // Recover overflow before the event projection can surface its raw error or clear the neutral lock.
+  useEffect(() => {
+    const subscribe = window.api?.acp?.onAgentRuntimeUpdate
+    if (!subscribe) return
+    return subscribe((update) => {
+      for (const listener of subagentRuntimeUpdateListeners.current) listener(update)
+    })
+  }, [])
+
   useEffect(() => {
     lifecycleOwner.processRuntimeEvents(runtime, runtime.state.events, {
       supportsImageInput,
@@ -284,6 +288,19 @@ const useOwnedWorkspaceAgentRuntime = (): WorkspaceAgentRuntime => {
   useEffect(() => {
     syncWorkspaceContextUsage(runtime.state.sessionIds, runtime.state.contextUsageBySession)
   }, [runtime.state.sessionIds, runtime.state.contextUsageBySession])
+
+  const delegatedWorkSessionKey = runtime.state.sessionIds.join('\u0000')
+  useEffect(() => {
+    if (runtime.state.delegatedWorkRevision === undefined) return
+    let cancelled = false
+    void refreshDelegatedWorkSessions(
+      delegatedWorkSessionKey.split('\u0000').filter(Boolean),
+      () => cancelled
+    ).catch(() => undefined)
+    return () => {
+      cancelled = true
+    }
+  }, [delegatedWorkSessionKey, runtime.state.delegatedWorkRevision])
 
   useEffect(() => {
     const previousStatus = previousStatusRef.current
@@ -364,6 +381,10 @@ const useOwnedWorkspaceAgentRuntime = (): WorkspaceAgentRuntime => {
     (sessionId: string): Promise<boolean> => lifecycleOwner.compact(runtime, sessionId),
     [lifecycleOwner, runtime]
   )
+  const ensureSessionReady = useCallback(
+    (sessionId: string): Promise<void> => lifecycleOwner.ensureReady(runtime, sessionId),
+    [lifecycleOwner, runtime]
+  )
   const resumeInterruptedSession = useCallback(
     (sessionId: string): Promise<void> =>
       lifecycleOwner.resume(runtime, sessionId, drainRuntimeEvents, {
@@ -432,9 +453,8 @@ const useOwnedWorkspaceAgentRuntime = (): WorkspaceAgentRuntime => {
                     }
                   : undefined
               )
-              // markResumed clears generic interrupted state to idle. Re-arm this main-owned wait
-              // until the restored decision is accepted so a retryable response failure cannot make
-              // the card disappear from the renderer projection.
+              // Keep the main-owned wait until the restored decision succeeds so a retryable
+              // response failure cannot hide the permission card after markResumed clears it.
               useSessionStore.getState().setPermissionPending(session.id)
               session = useSessionStore
                 .getState()
@@ -512,10 +532,13 @@ const useOwnedWorkspaceAgentRuntime = (): WorkspaceAgentRuntime => {
     permissionProfiles: runtime.state.permissionProfiles,
     permissionGrants: runtime.state.permissionGrants,
     contextUsageBySession: runtime.state.contextUsageBySession,
+    delegatedWorkUnavailableBySession: runtime.state.delegatedWorkUnavailableBySession ?? {},
     promptInFlightSessionIds: runtime.state.promptInFlightSessionIds,
     sendPreparationInFlightSessionIds,
     nativeContextCompactionSessionIds: runtime.state.nativeContextCompactionSessionIds ?? [],
+    subscribeToSubagentRuntimeUpdates,
     compactContext,
+    ensureSessionReady,
     sendMessage,
     resendEditedMessage,
     cancelRun,
@@ -528,11 +551,7 @@ const useOwnedWorkspaceAgentRuntime = (): WorkspaceAgentRuntime => {
 }
 
 const WorkspaceAgentRuntimeProvider = ({ children }: PropsWithChildren): ReactElement =>
-  createElement(
-    WorkspaceAgentRuntimeContext.Provider,
-    { value: useOwnedWorkspaceAgentRuntime() },
-    children
-  )
+  createElement(RuntimeProvider, { value: useOwnedWorkspaceAgentRuntime() }, children)
 
 const useWorkspaceAgentRuntime = (): WorkspaceAgentRuntime => {
   const runtime = useContext(WorkspaceAgentRuntimeContext)
@@ -540,6 +559,14 @@ const useWorkspaceAgentRuntime = (): WorkspaceAgentRuntime => {
     throw new Error('useWorkspaceAgentRuntime must be used within WorkspaceAgentRuntimeProvider.')
   }
   return runtime
+}
+
+const useWorkspaceSubagentRuntimeSession = (
+  session: ChatSession,
+  detail: Parameters<typeof useSubagentRuntimePresentation>[2]
+): ChatSession => {
+  const runtime = useWorkspaceAgentRuntime()
+  return useSubagentRuntimePresentation(runtime.subscribeToSubagentRuntimeUpdates, session, detail)
 }
 
 export {
@@ -553,6 +580,7 @@ export {
   pendingWorkspacePermissions,
   syncWorkspaceContextUsage,
   syncWorkspaceInteractionState,
+  useWorkspaceSubagentRuntimeSession,
   useWorkspaceAgentRuntime
 }
 export type { WorkspaceAgentRuntime }

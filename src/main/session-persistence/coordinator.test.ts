@@ -366,6 +366,51 @@ describe('SessionPersistenceCoordinator', () => {
     expect(durable.status).toBe('waiting-plan-approval')
   })
 
+  it('atomically persists Plan feedback and its neutral review marker in one Session save', async () => {
+    let durable = createSession({
+      status: 'waiting-plan-approval',
+      runtimeContext: { version: 1, revision: 2, plan: createRuntimePlan() }
+    })
+    const repository = createSessionRepository({
+      loadSessionWithDiagnostics: vi.fn(async () => ({
+        status: 'found' as const,
+        session: durable
+      })),
+      saveSession: vi.fn(async (session) => {
+        durable = structuredClone(session)
+      })
+    })
+    const coordinator = new SessionPersistenceCoordinator(repository, createFileIndex())
+
+    const message = await coordinator.appendUserMessageToInteraction({
+      projectId: 'project-1',
+      sessionId: 'session-1',
+      interactionId: 'interaction-1',
+      content: 'Split the analysis by cohort.',
+      runtimeContextPatch: {
+        expectedRevision: 2,
+        patch: (persistedMessage) => ({
+          plan: {
+            ...createRuntimePlan(),
+            reviewFeedbackMessageId: persistedMessage.id
+          }
+        })
+      }
+    })
+
+    expect(repository.saveSession).toHaveBeenCalledTimes(1)
+    expect(durable.messages).toContainEqual(message)
+    expect(durable.runtimeContext).toEqual({
+      version: 1,
+      revision: 3,
+      plan: {
+        ...createRuntimePlan(),
+        reviewFeedbackMessageId: message.id
+      }
+    })
+    expect(durable.status).toBe('waiting-plan-approval')
+  })
+
   it('persists Side chat projection and relays without overwriting concurrent authority', async () => {
     let durable = createSession({
       runtimeContext: { version: 1, revision: 2, plan: createRuntimePlan() }
@@ -2017,6 +2062,7 @@ describe('SessionPersistenceCoordinator', () => {
       'operation phase',
       'operation phase',
       'operation phase',
+      'operation phase',
       'operation completed'
     ])
     expect(
@@ -2025,6 +2071,7 @@ describe('SessionPersistenceCoordinator', () => {
         .filter(Boolean)
     ).toEqual([
       'load-authority',
+      'recover-delegation',
       'reconcile-unread-sessions',
       'reconcile-derived-state',
       'reconcile-derived-state'
@@ -2082,6 +2129,72 @@ describe('SessionPersistenceCoordinator', () => {
     )
     expect(JSON.stringify(log.error.mock.calls)).not.toContain('Session authority unavailable')
     expect(JSON.stringify(log.error.mock.calls)).not.toContain('/private/sessions')
+  })
+
+  it('keeps healthy Sessions readable when one delegated recovery is structurally invalid', async () => {
+    const damaged = materializeSessionConversationGraph(
+      createSession({
+        id: 'damaged-session',
+        runtimeContext: {
+          version: 1,
+          revision: 1,
+          delegatedWork: {
+            records: [
+              {
+                agentFrameId: 'missing-child-frame',
+                attempts: [
+                  {
+                    id: 'attempt-1',
+                    status: 'running',
+                    resolvedAgent: { kind: 'main' },
+                    runtimeSegmentIds: [],
+                    startedAt: 1
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      })
+    )
+    const healthy = createSession({ id: 'healthy-session', title: 'Healthy Session' })
+    const repository = createSessionRepository({
+      loadAllWithDiagnostics: vi.fn().mockResolvedValue({
+        result: { sessions: [damaged, healthy], manifest: { version: 1 as const } },
+        isComplete: true
+      })
+    })
+    const fileIndex = createFileIndex()
+    const log = createTestLogger()
+    const coordinator = new SessionPersistenceCoordinator(
+      repository,
+      fileIndex,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      log
+    )
+
+    const loaded = await coordinator.loadAll()
+
+    expect(loaded.sessions.map(({ id }) => id)).toEqual(['damaged-session', 'healthy-session'])
+    expect(loaded.diagnostics).toMatchObject({
+      isComplete: false,
+      failure: 'startup-reconciliation-failed'
+    })
+    expect(fileIndex.reconcileActiveSessions).not.toHaveBeenCalled()
+    expect(fileIndex.syncSession).not.toHaveBeenCalled()
+    expect(log.error).toHaveBeenCalledWith(
+      'operation failed',
+      expect.objectContaining({
+        operation: 'delegation-recovery',
+        phase: 'recover-session',
+        status: 'degraded',
+        retryable: true
+      })
+    )
   })
 
   it('keeps hydration available and records unread Session reconciliation degradation', async () => {

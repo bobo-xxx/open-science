@@ -20,7 +20,6 @@ import type { PackageMirror } from '../../shared/mirror'
 import type { NotebookLanguage } from '../../shared/notebook'
 import type { RuntimeEnablement, RuntimeSelection } from '../../shared/notebook-runtime'
 import type { CloseActionPreference } from '../../shared/window-controls'
-import { customConnectorSlug } from '../../shared/custom-connector'
 import {
   type StoredComputeGrant,
   type StoredConnectors,
@@ -32,6 +31,7 @@ import {
 import { sanitizePackageMirror } from './record-codec'
 import { sanitizeSettings } from './document-codec'
 import { SettingsDocumentStore } from './document-store'
+import { buildSubagentModelMutation } from './subagent-model-settings'
 
 // Stable semantic mutation facade. The injected document store owns arbitration and atomic IO; all
 // secret handling remains above this layer in crypto.ts and service.ts.
@@ -239,35 +239,34 @@ class SettingsRepository {
     })
   }
 
-  // Records the detected claude executable metadata for later spawns.
   async setClaudeInfo(claude: ClaudeInfo): Promise<StoredSettings> {
     return this.mutate((settings) => ({ ...settings, claude }))
   }
 
-  // Sets (or clears back to public hosts when empty) the package-mirror configuration.
   async setPackageMirror(mirror: PackageMirror): Promise<StoredSettings> {
     const sanitized = sanitizePackageMirror(mirror)
 
     return this.mutate((settings) => ({ ...settings, packageMirror: sanitized }))
   }
 
-  // Persists the selected agent backend; applied on the next reconnect.
   async setAgentFramework(id: AgentFrameworkId): Promise<StoredSettings> {
     return this.mutate((settings) => ({ ...settings, agentFrameworkId: id }))
   }
 
-  // Persists the reasoning-effort preference; applied to sessions created after the next reconnect.
   async setReasoningEffort(effort: ReasoningEffort): Promise<StoredSettings> {
     return this.mutate((settings) => ({ ...settings, reasoningEffort: effort }))
   }
 
-  // Persists the desktop-notification preference; read fresh at notification time so it applies
-  // immediately, without a restart.
+  async setSubagentModel(
+    ...args: Parameters<typeof buildSubagentModelMutation>
+  ): Promise<StoredSettings> {
+    return this.mutate(buildSubagentModelMutation(...args))
+  }
+
   async setNotificationsEnabled(enabled: boolean): Promise<StoredSettings> {
     return this.mutate((settings) => ({ ...settings, notificationsEnabled: enabled }))
   }
 
-  // Persists whether subsequent conversations receive the Skill import MCP and its instructions.
   async setConversationSkillImportEnabled(enabled: boolean): Promise<StoredSettings> {
     return this.mutate((settings) => ({ ...settings, conversationSkillImportEnabled: enabled }))
   }
@@ -552,14 +551,14 @@ class SettingsRepository {
     })
   }
 
-  // Removes a custom MCP server by id and every policy alias owned by its local id/public identity.
+  // Removes a custom MCP server by id and policy entries owned by its public name.
   async removeCustomServer(id: string): Promise<StoredSettings> {
     return this.mutateConnectors((connectors) => {
       const removed = (connectors.customMcpServers ?? []).find((s) => s.id === id)
       connectors.customMcpServers = (connectors.customMcpServers ?? []).filter((s) => s.id !== id)
       if (!removed) return
 
-      const aliases = new Set([removed.id, customConnectorSlug(removed), removed.name])
+      const aliases = new Set([removed.name])
       connectors.autoAllowIds = connectors.autoAllowIds.filter((entry) => !aliases.has(entry))
       const withoutToolAliases = (entries: string[] | undefined): string[] | undefined => {
         const kept = (entries ?? []).filter(

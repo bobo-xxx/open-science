@@ -257,7 +257,8 @@ describe('SettingsService: custom MCP OAuth', () => {
   it('delegates authentication and returns the refreshed connector snapshot', async () => {
     const service = createService()
     const added = await service.addCustomServer({
-      name: 'OAuth MCP',
+      name: 'oauth-mcp',
+      displayName: 'OAuth MCP',
       transport: 'streamable_http',
       url: 'https://mcp.example.test',
       oauth: { scopes: ['openid'] }
@@ -1567,7 +1568,7 @@ describe('SettingsService: validation', () => {
         name: 'G',
         baseUrl: 'https://g/v1',
         model: 'm',
-        apiEndpoints: ['openai'],
+        apiEndpoints: ['anthropic'],
         key: 'k'
       })
     ).providers[0]
@@ -3611,7 +3612,8 @@ describe('SettingsService: skills', () => {
     expect(skills).toEqual([
       expect.objectContaining({
         id: 'demo',
-        name: 'Demo',
+        name: 'demo',
+        displayName: 'Demo',
         description: 'A demo skill.',
         enabled: true
       })
@@ -3640,7 +3642,7 @@ describe('SettingsService: skills', () => {
     const service = await createSkillService()
 
     let skills = await service.createSkill({
-      name: 'My Skill',
+      name: 'my-skill',
       description: 'Mine.',
       body: '# Mine',
       metadata: { author: 'Ada', license: 'MIT', category: 'research' }
@@ -3656,7 +3658,6 @@ describe('SettingsService: skills', () => {
 
     skills = await service.updateSkill({
       id: 'personal-my-skill',
-      name: 'My Skill',
       description: 'Edited.',
       body: '# Edited',
       metadata: detail.metadata
@@ -3672,7 +3673,7 @@ describe('SettingsService: skills', () => {
 
   it('runs the shared live-reference guard before direct Skill deletion', async () => {
     const service = await createSkillService()
-    await service.createSkill({ name: 'My Skill', description: 'Mine.', body: '# Mine' })
+    await service.createSkill({ name: 'my-skill', description: 'Mine.', body: '# Mine' })
     const guard = vi.fn().mockRejectedValue(
       Object.assign(new Error('Skill is referenced by specialist-1.'), {
         code: 'protected-skill'
@@ -3689,7 +3690,7 @@ describe('SettingsService: skills', () => {
 
   it('checks live Specialist references atomically with direct Skill deletion', async () => {
     const service = await createSkillService()
-    await service.createSkill({ name: 'My Skill', description: 'Mine.', body: '# Mine' })
+    await service.createSkill({ name: 'my-skill', description: 'Mine.', body: '# Mine' })
     const packageSkills = new UserSkillSpecialistPackageAdapter(storageRoot)
     await packageSkills.beginMutation('tx-delete-race', 'research-synth', [])
 
@@ -3713,15 +3714,14 @@ describe('SettingsService: skills', () => {
     await expect(service.getSkillDetail('personal-my-skill')).resolves.toBeDefined()
   })
 
-  it('creates with a custom slug and reconciles references reported by the detail view', async () => {
+  it('uses the immutable name and reconciles references reported by the detail view', async () => {
     const service = await createSkillService()
     const b64 = (text: string): string => Buffer.from(text).toString('base64')
 
     await service.createSkill({
-      name: 'Ref Skill',
+      name: 'ref-skill-id',
       description: 'd',
       body: '# body',
-      slug: 'ref-skill-id',
       references: [
         { path: 'keep.py', dataBase64: b64('keep') },
         { path: 'drop.py', dataBase64: b64('drop') }
@@ -3734,7 +3734,6 @@ describe('SettingsService: skills', () => {
     // Editing keeps one file, drops one, and adds one.
     await service.updateSkill({
       id: 'personal-ref-skill-id',
-      name: 'Ref Skill',
       description: 'd',
       body: '# body',
       references: [{ path: 'keep.py' }, { path: 'new.py', dataBase64: b64('new') }]
@@ -4079,7 +4078,7 @@ describe('SettingsService: skills', () => {
   it('reports disabled picks and resolves agent-readable skill nudge names', async () => {
     const service = await createSkillService()
 
-    await service.createSkill({ name: 'My Skill', description: 'Mine.', body: '# Mine' })
+    await service.createSkill({ name: 'my-skill', description: 'Mine.', body: '# Mine' })
     await service.setSkillEnabled({ id: 'demo', enabled: false })
 
     // Only the disabled pick (demo) needs a respawn; the enabled personal skill does not.
@@ -4089,7 +4088,7 @@ describe('SettingsService: skills', () => {
     // Featured ids are the agent-facing frontmatter names, but user-skill ids carry an app prefix.
     expect(await service.skillNudgeNamesForIds(['demo', 'personal-my-skill', 'nope'])).toEqual([
       'demo',
-      'My Skill'
+      'my-skill'
     ])
   })
 
@@ -4553,6 +4552,21 @@ describe('checkEnvironment', () => {
 })
 
 describe('SettingsService: managed-runtime flags', () => {
+  it('advertises delegated work only for certified frameworks', async () => {
+    const snapshot = await createService().getSettingsView()
+
+    expect(
+      snapshot.agentFrameworks.map(({ id, supportsDelegatedWork }) => ({
+        id,
+        supportsDelegatedWork
+      }))
+    ).toEqual([
+      { id: 'claude-code', supportsDelegatedWork: true },
+      { id: 'opencode', supportsDelegatedWork: true },
+      { id: 'codex', supportsDelegatedWork: true }
+    ])
+  })
+
   it('reports claudeManaged when the resolved path is the app-managed install, opencode as non-managed', async () => {
     await repository.setClaudeInfo({
       resolvedPath: join(managedClaudeDir(storageRoot), 'claude'),
@@ -5027,6 +5041,199 @@ describe('SettingsService: reasoning effort', () => {
     backend.responsesBridgeLease?.setReasoningEffort?.(undefined)
     await post()
     expect(upstreamRequest).not.toHaveProperty('reasoning_effort')
+  })
+})
+
+describe('SettingsService: Subagent model', () => {
+  it('captures inherited identity from the originating live Session backend', async () => {
+    const service = createService()
+    const created = await service.upsertProvider({
+      type: 'custom',
+      name: 'Session provider',
+      apiEndpoints: ['anthropic'],
+      baseUrl: 'https://session.example/v1',
+      model: 'subagent-model',
+      key: 'secret'
+    })
+    const provider = created.providers.find((candidate) => candidate.name === 'Session provider')!
+    await service.setSubagentModel({ mode: 'inherit' })
+
+    await expect(
+      service.resolveSubagentExecutionModel('claude-code', {
+        backendId: `claude-code:${provider.id}`,
+        modelRoute: 'claude-anthropic',
+        model: 'subagent-model',
+        reasoningEffort: 'xhigh'
+      })
+    ).resolves.toEqual({
+      frameworkId: 'claude-code',
+      providerId: provider.id,
+      backendId: `claude-code:${provider.id}`,
+      modelRoute: 'claude-anthropic',
+      model: 'subagent-model',
+      reasoningEffort: 'xhigh'
+    })
+  })
+
+  it('atomically validates and saves a fixed compound provider/model target', async () => {
+    const service = createService()
+    const created = await service.upsertProvider({
+      type: 'custom',
+      name: 'Subagent gateway',
+      apiEndpoints: ['anthropic'],
+      baseUrl: 'https://subagent.example/v1',
+      model: 'subagent-model',
+      key: 'secret'
+    })
+    const provider = created.providers.find((candidate) => candidate.name === 'Subagent gateway')!
+
+    const snapshot = await service.setSubagentModel({
+      mode: 'fixed',
+      providerId: provider.id,
+      model: 'subagent-model',
+      reasoningEffort: 'high'
+    })
+
+    expect(snapshot.subagentModel).toEqual({
+      mode: 'fixed',
+      providerId: provider.id,
+      model: 'subagent-model',
+      reasoningEffort: 'high'
+    })
+  })
+
+  it('keeps an admitted fixed backend available in memory after its provider is deleted', async () => {
+    const service = createService()
+    const created = await service.upsertProvider({
+      type: 'custom',
+      name: 'Ephemeral admitted gateway',
+      apiEndpoints: ['anthropic'],
+      baseUrl: 'https://subagent.example/v1',
+      model: 'subagent-model',
+      key: 'secret'
+    })
+    const provider = created.providers.find(
+      (candidate) => candidate.name === 'Ephemeral admitted gateway'
+    )!
+    await service.setSubagentModel({
+      mode: 'fixed',
+      providerId: provider.id,
+      model: 'subagent-model',
+      reasoningEffort: 'high'
+    })
+
+    const admission = await service.admitSubagentExecutionModel('claude-code', {})
+    await service.deleteProvider(provider.id)
+    const claim = admission.backendLease!.claim()
+
+    expect(admission.snapshot).toMatchObject({
+      providerId: provider.id,
+      model: 'subagent-model'
+    })
+    expect(claim.backend).toMatchObject({
+      framework: { id: 'claude-code' },
+      env: { ANTHROPIC_AUTH_TOKEN: 'secret' }
+    })
+    await expect(service.resolveAdmittedSubagentBackend(admission.snapshot)).rejects.toThrow()
+    await admission.backendLease!.release()
+    await claim.release()
+  })
+
+  it('restores a deleted fixed provider by ID without rewriting the Subagent configuration', async () => {
+    const service = createService()
+    const draft = {
+      type: 'custom' as const,
+      name: 'Restorable Subagent gateway',
+      apiEndpoints: ['anthropic' as const],
+      baseUrl: 'https://subagent.example/v1',
+      model: 'subagent-model',
+      key: 'secret'
+    }
+    const provider = (await service.upsertProvider(draft)).providers.find(
+      (candidate) => candidate.name === draft.name
+    )!
+    const fixed = {
+      mode: 'fixed' as const,
+      providerId: provider.id,
+      model: 'subagent-model',
+      reasoningEffort: 'high' as const
+    }
+    await service.setSubagentModel(fixed)
+
+    await service.deleteProvider(provider.id)
+    expect((await service.getSettingsView()).subagentModel).toEqual(fixed)
+    const restored = await service.upsertProvider({ ...draft, id: provider.id })
+
+    expect(restored.providers).toContainEqual(expect.objectContaining({ id: provider.id }))
+    expect(restored.subagentModel).toEqual(fixed)
+    await expect(service.resolveSubagentExecutionModel('claude-code', {})).resolves.toMatchObject({
+      providerId: provider.id,
+      model: 'subagent-model'
+    })
+  })
+
+  it('rejects a stale unavailable fixed target and retains the committed configuration', async () => {
+    const service = createService()
+    await service.setSubagentModel({ mode: 'inherit' })
+
+    await expect(
+      service.setSubagentModel({
+        mode: 'fixed',
+        providerId: 'removed',
+        model: 'removed-model',
+        reasoningEffort: 'default'
+      })
+    ).rejects.toThrow('no longer available')
+    expect((await service.getSettingsView()).subagentModel).toEqual({ mode: 'inherit' })
+  })
+
+  it('rejects a fixed provider whose latest validation failed before resolving a backend', async () => {
+    const service = createService()
+    const created = await service.upsertProvider({
+      type: 'custom',
+      name: 'Failing Subagent gateway',
+      apiEndpoints: ['anthropic'],
+      baseUrl: 'https://subagent.example/v1',
+      model: 'subagent-model',
+      key: 'secret'
+    })
+    const provider = created.providers[0]
+    await service.setSubagentModel({
+      mode: 'fixed',
+      providerId: provider.id,
+      model: 'subagent-model',
+      reasoningEffort: 'high'
+    })
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ status: 401 }))
+    await service.validateProvider({ providerId: provider.id })
+
+    await expect(service.resolveSubagentExecutionModel('claude-code', {})).rejects.toThrow(
+      'validation failed'
+    )
+  })
+
+  it('normalizes an unsupported fixed model effort to Default in the atomic commit', async () => {
+    const service = createService()
+    const created = await service.upsertProvider({
+      type: 'custom',
+      name: 'No-effort gateway',
+      apiEndpoints: ['anthropic'],
+      baseUrl: 'https://subagent.example/v1',
+      model: 'no-effort-model',
+      key: 'secret',
+      reasoningEffortPreset: 'unsupported'
+    })
+
+    await expect(
+      service.setSubagentModel({
+        mode: 'fixed',
+        providerId: created.providers[0].id,
+        model: 'no-effort-model',
+        reasoningEffort: 'high'
+      })
+    ).resolves.toMatchObject({
+      subagentModel: { reasoningEffort: 'default' }
+    })
   })
 })
 

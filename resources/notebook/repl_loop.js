@@ -43,6 +43,7 @@ delete process.env.OPEN_SCIENCE_NOTEBOOK_PROJECT_NAME
 // running. It is never exposed to sandbox code; host.agents forwards it as server context so an
 // approved switch can capture only this invocation's outer completion.
 let ACTIVE_CONTROL_INVOCATION_ID
+let DELEGATE_CALL_SEQUENCE = 0
 
 // Private references to the RPC clients, captured before user code runs. host.mcp MUST use these, not
 // the global `fetch`: a vm sandbox is not a security boundary, so sandbox code can reach the outer
@@ -1081,21 +1082,39 @@ const normalizedHostLlmRequest = (value) => {
   }
 }
 
+const remappedHostObject = (value, label, keyMap) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError(`${label} must be an object.`)
+  }
+  const keys = Reflect.ownKeys(value)
+  const unknown = keys.find(
+    (key) => typeof key !== 'string' || !Object.prototype.hasOwnProperty.call(keyMap, key)
+  )
+  if (unknown !== undefined) throw new TypeError(`${label} unknown option: ${String(unknown)}`)
+  return Object.fromEntries(keys.map((key) => [keyMap[key], value[key]]))
+}
+
 const normalizedHostLlmOptions = (value) => {
   if (value === undefined) return undefined
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError('host.llm batch options only accept maxConcurrency.')
+  }
+  let keys
+  try {
+    keys = Reflect.ownKeys(value)
+  } catch {
+    throw new TypeError('host.llm batch options only accept maxConcurrency.')
+  }
+  const unknown = keys.find((key) => key !== 'maxConcurrency')
+  if (unknown !== undefined) {
+    throw new TypeError(`host.llm batch options unknown option: ${String(unknown)}`)
+  }
+  if (keys.length === 0) return {}
   let concurrency
   try {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {
-      throw new TypeError('host.llm batch options only accept max_concurrency.')
-    }
-    const keys = Reflect.ownKeys(value)
-    if (keys.some((key) => key !== 'max_concurrency')) {
-      throw new TypeError('host.llm batch options only accept max_concurrency.')
-    }
-    if (keys.length === 0) return {}
-    concurrency = value.max_concurrency
+    concurrency = value.maxConcurrency
   } catch {
-    throw new TypeError('host.llm batch options only accept max_concurrency.')
+    throw new TypeError('host.llm batch options only accept maxConcurrency.')
   }
   if (
     typeof concurrency !== 'number' ||
@@ -1103,7 +1122,7 @@ const normalizedHostLlmOptions = (value) => {
     concurrency < 1 ||
     concurrency > 4
   ) {
-    throw new TypeError('host.llm max_concurrency must be an integer from 1 through 4.')
+    throw new TypeError('host.llm maxConcurrency must be an integer from 1 through 4.')
   }
   return { max_concurrency: concurrency }
 }
@@ -1161,7 +1180,7 @@ async function hostLlm(request, options = undefined) {
 async function artifactsRpc(op, params) {
   if (!RPC_ENDPOINT)
     throw new Error(
-      `host.${op === 'list' ? 'artifacts' : 'artifact_path'} is unavailable: RPC endpoint not set`
+      `host.${op === 'list' ? 'artifacts' : 'artifactPath'} is unavailable: RPC endpoint not set`
     )
   const res = await capturedRpcFetch(RPC_ENDPOINT, {
     method: 'POST',
@@ -1171,7 +1190,7 @@ async function artifactsRpc(op, params) {
   const body = await res.json().catch(() => ({}))
   if (!res.ok || body.error) {
     throw new Error(
-      `host.${op === 'list' ? 'artifacts' : 'artifact_path'}: ${body.error || 'HTTP ' + res.status}`
+      `host.${op === 'list' ? 'artifacts' : 'artifactPath'}: ${body.error || 'HTTP ' + res.status}`
     )
   }
   return body.result
@@ -1188,6 +1207,18 @@ const HOST_ARTIFACT_REQUIRED_KEYS = [
   'latest_version_created_at'
 ]
 const HOST_ARTIFACT_OPTIONAL_KEYS = ['content_type', 'checksum']
+const HOST_ARTIFACT_INPUT_KEYS = {
+  versionId: 'version_id',
+  sessionId: 'session_id',
+  filename: 'filename',
+  exact: 'exact',
+  search: 'search',
+  contentType: 'content_type',
+  after: 'after',
+  before: 'before',
+  cursor: 'cursor',
+  limit: 'limit'
+}
 
 const validatedHostArtifact = (value) => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -1225,7 +1256,9 @@ const validatedHostArtifact = (value) => {
 
 async function hostArtifacts(options = {}) {
   if (arguments.length > 1) throw new TypeError('host.artifacts accepts at most one options object')
-  const result = await artifactsRpc('list', { options })
+  const result = await artifactsRpc('list', {
+    options: remappedHostObject(options, 'host.artifacts options', HOST_ARTIFACT_INPUT_KEYS)
+  })
   if (
     !result ||
     typeof result !== 'object' ||
@@ -1254,10 +1287,10 @@ async function hostArtifacts(options = {}) {
 }
 
 async function hostArtifactPath(versionId) {
-  if (arguments.length !== 1) throw new TypeError('host.artifact_path accepts one version_id')
+  if (arguments.length !== 1) throw new TypeError('host.artifactPath accepts one versionId')
   const result = await artifactsRpc('path', { version_id: versionId })
   if (typeof result !== 'string' || !path.isAbsolute(result)) {
-    throw new Error('host.artifact_path returned an invalid path')
+    throw new Error('host.artifactPath returned an invalid path')
   }
   return result
 }
@@ -2147,13 +2180,22 @@ const validatedHostLineageVersion = (value) => {
 
 async function hostLineageGraph(versionId, options = {}) {
   if (arguments.length < 1 || arguments.length > 2) {
-    throw new TypeError('host.lineage.graph accepts version_id and at most one options object')
+    throw new TypeError('host.lineage.graph accepts versionId and at most one options object')
   }
-  return validatedHostLineageGraph(await lineageRpc('graph', { version_id: versionId, options }))
+  return validatedHostLineageGraph(
+    await lineageRpc('graph', {
+      version_id: versionId,
+      options: remappedHostObject(options, 'host.lineage.graph options', {
+        direction: 'direction',
+        maxDepth: 'max_depth',
+        maxNodes: 'max_nodes'
+      })
+    })
+  )
 }
 
 async function hostLineageGet(versionId) {
-  if (arguments.length !== 1) throw new TypeError('host.lineage.get accepts one version_id')
+  if (arguments.length !== 1) throw new TypeError('host.lineage.get accepts one versionId')
   return validatedHostLineageVersion(await lineageRpc('get', { version_id: versionId }))
 }
 
@@ -2162,7 +2204,19 @@ const hostLineage = Object.freeze({ graph: hostLineageGraph, get: hostLineageGet
 async function hostFramesList(options = {}) {
   if (arguments.length > 1)
     throw new TypeError('host.frames.list accepts at most one options object')
-  const result = await framesRpc('list', { options })
+  const result = await framesRpc('list', {
+    options: remappedHostObject(options, 'host.frames.list options', {
+      sessionId: 'session_id',
+      rootsOnly: 'roots_only',
+      kind: 'kind',
+      archived: 'archived',
+      search: 'search',
+      after: 'after',
+      before: 'before',
+      limit: 'limit',
+      cursor: 'cursor'
+    })
+  })
   const required = ['project_id', 'frames', 'total_count']
   const optional = ['next_cursor']
   if (
@@ -2185,9 +2239,17 @@ async function hostFramesList(options = {}) {
 
 async function hostFramesGet(frameId, options = {}) {
   if (arguments.length < 1 || arguments.length > 2) {
-    throw new TypeError('host.frames.get accepts frame_id and at most one options object')
+    throw new TypeError('host.frames.get accepts frameId and at most one options object')
   }
-  const result = await framesRpc('get', { frame_id: frameId, options })
+  const result = await framesRpc('get', {
+    frame_id: frameId,
+    options: remappedHostObject(options, 'host.frames.get options', {
+      sessionId: 'session_id',
+      branchId: 'branch_id',
+      before: 'before',
+      limit: 'limit'
+    })
+  })
   const keys = ['project_id', 'session', 'frame', 'branch', 'transcript', 'runtime_segments']
   if (
     !exactObject(result, keys) ||
@@ -2232,8 +2294,8 @@ async function computeRpc(params) {
   return body.result
 }
 
-// host.agents: control-plane Specialist management SDK (issue 02). Read-only in this slice
-// (list/get/list_skills/list_connectors); mutation/switch land in later issues. Routed over the SAME
+// host.agents: control-plane Specialist management SDK. Reads, ordinary mutations, and privileged
+// delete/switch operations are routed over the SAME
 // app-local RPC endpoint as host.mcp/host.compute but as its own `agentsCall` method — never through
 // host.mcp(). Uses the captured RPC endpoint/token + client for the same token-isolation reasons. The
 // trusted calling session identity is the COMPUTE_SESSION_ID captured at spawn time
@@ -2261,17 +2323,220 @@ async function agentsRpc(op, params = {}, sessionId = COMPUTE_SESSION_ID) {
     // (auth, unknown method) are not method-scoped, so prefix them with the op the caller invoked so
     // the agent always sees a host.agents.* namespaced, secret-free message.
     const serverMessage = body.error || 'host.agents HTTP ' + res.status
-    const prefixed = /^host\.agents\./.test(serverMessage)
-      ? serverMessage
-      : `host.agents.${op}: ${serverMessage}`
-    throw new Error(prefixed)
+    const publicMethod =
+      {
+        list_skills: 'listSkills',
+        list_connectors: 'listConnectors',
+        attach_skill: 'attachSkill',
+        detach_skill: 'detachSkill',
+        attach_connector: 'attachConnector',
+        detach_connector: 'detachConnector'
+      }[op] || op
+    const detail = String(serverMessage).replace(/^host\.agents\.[^:]+:\s*/, '')
+    throw new Error(`host.agents.${publicMethod}: ${detail}`)
   }
   return body.result
 }
 
-// host.agents namespace. Methods and filter/write fields are snake_case; returned records are
-// camelCase. list_skills/list_connectors accept an optional stable id or unique public name.
-// create/update/attach_*/detach_* are the ordinary-mutation surface (issue 03); they return a real
+async function delegateRpc(request, options = {}) {
+  if (!RPC_ENDPOINT) throw new Error('host.delegate is unavailable: control RPC endpoint not set')
+  const delegationCallId = String(++DELEGATE_CALL_SEQUENCE)
+  const res = await capturedRpcFetch(RPC_ENDPOINT, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer ' + (RPC_TOKEN || '') },
+    body: JSON.stringify({
+      method: 'delegatedWorkCall',
+      params: { request, options, delegation_call_id: delegationCallId }
+    })
+  })
+  const body = await res.json().catch(() => ({}))
+  if (!res.ok || body.error) {
+    throw new Error(`host.delegate: ${body.error || 'HTTP ' + res.status}`)
+  }
+  const outcome = body.result || {}
+  return {
+    kind: outcome.kind,
+    children: (outcome.children || []).map((child) => ({
+      frame_id: child.frameId,
+      attempt_id: child.attemptId,
+      ...(child.name !== undefined ? { name: child.name } : {}),
+      ...(child.agentName !== undefined ? { agent_name: child.agentName } : {}),
+      status: child.status,
+      ...(child.terminalMessageId ? { terminal_message_id: child.terminalMessageId } : {}),
+      ...(child.response !== undefined ? { response: child.response } : {}),
+      ...(child.status !== 'running' ? { artifacts_created: child.artifactsCreated || [] } : {}),
+      ...(child.cancellationReason ? { cancellation_reason: child.cancellationReason } : {}),
+      ...(child.error ? { error: child.error } : {}),
+      ...(child.structuredOutputUnsatisfied !== undefined
+        ? { structured_output_unsatisfied: child.structuredOutputUnsatisfied }
+        : {}),
+      ...(child.structuredOutput !== undefined ? { structured_output: child.structuredOutput } : {})
+    }))
+  }
+}
+
+async function hostHelp(query = undefined) {
+  if (!RPC_ENDPOINT) throw new Error('host.help is unavailable: control RPC endpoint not set')
+  const res = await capturedRpcFetch(RPC_ENDPOINT, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer ' + (RPC_TOKEN || '') },
+    body: JSON.stringify({
+      method: 'hostSdkHelp',
+      params: { ...(query !== undefined ? { query } : {}) }
+    })
+  })
+  const body = await res.json().catch(() => ({}))
+  if (!res.ok || body.error) {
+    throw new Error(`host.help: ${body.error || 'HTTP ' + res.status}`)
+  }
+  return body.result
+}
+
+async function hostDelegate(request, options = {}) {
+  return delegateRpc(request, options)
+}
+
+async function hostStopChild(frameIds) {
+  if (!RPC_ENDPOINT) throw new Error('host.stop_child is unavailable: control RPC endpoint not set')
+  const res = await capturedRpcFetch(RPC_ENDPOINT, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer ' + (RPC_TOKEN || '') },
+    body: JSON.stringify({
+      method: 'delegatedWorkCall',
+      params: { operation: 'stop_children', frame_ids: frameIds }
+    })
+  })
+  const body = await res.json().catch(() => ({}))
+  if (!res.ok || body.error) {
+    throw new Error(`host.stop_child: ${body.error || 'HTTP ' + res.status}`)
+  }
+  return (body.result || []).map((child) => ({
+    frame_id: child.frameId,
+    status: child.status
+  }))
+}
+
+async function delegatedObservationRpc(op, selectors = undefined, options = undefined) {
+  if (!RPC_ENDPOINT) throw new Error(`host.${op} is unavailable: control RPC endpoint not set`)
+  const res = await capturedRpcFetch(RPC_ENDPOINT, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer ' + (RPC_TOKEN || '') },
+    body: JSON.stringify({
+      method: 'delegatedWorkCall',
+      params: {
+        op,
+        ...(selectors !== undefined
+          ? op === 'collect'
+            ? { selectors }
+            : { frame_ids: selectors }
+          : {}),
+        ...(options !== undefined ? { options } : {})
+      }
+    })
+  })
+  const body = await res.json().catch(() => ({}))
+  if (!res.ok || body.error) {
+    throw new Error(`host.${op}: ${body.error || 'HTTP ' + res.status}`)
+  }
+  return (body.result || []).map((child) => ({
+    frame_id: child.frameId,
+    attempt_id: child.attemptId,
+    ...(child.title !== undefined ? { title: child.title } : {}),
+    ...(child.name !== undefined ? { name: child.name } : {}),
+    ...(child.agentName !== undefined ? { agent_name: child.agentName } : {}),
+    status: child.status,
+    ...(child.terminalMessageId ? { terminal_message_id: child.terminalMessageId } : {}),
+    ...(child.response !== undefined ? { response: child.response } : {}),
+    ...(op === 'collect' && child.status !== 'running'
+      ? { artifacts_created: child.artifactsCreated || [] }
+      : {}),
+    ...(child.cancellationReason ? { cancellation_reason: child.cancellationReason } : {}),
+    ...(child.error ? { error: child.error } : {}),
+    ...(child.structuredOutputUnsatisfied !== undefined
+      ? { structured_output_unsatisfied: child.structuredOutputUnsatisfied }
+      : {}),
+    ...(child.structuredOutput !== undefined ? { structured_output: child.structuredOutput } : {})
+  }))
+}
+
+async function hostSubmitOutput(value) {
+  if (!RPC_ENDPOINT)
+    throw new Error('host.submit_output is unavailable: control RPC endpoint not set')
+  const res = await capturedRpcFetch(RPC_ENDPOINT, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer ' + (RPC_TOKEN || '') },
+    body: JSON.stringify({ method: 'delegatedOutputCall', params: { value } })
+  })
+  const body = await res.json().catch(() => ({}))
+  if (!res.ok || body.error) {
+    const detail =
+      body.error && typeof body.error === 'object'
+        ? JSON.stringify(body.error)
+        : body.error || 'HTTP ' + res.status
+    throw new Error(`host.submit_output: ${detail}`)
+  }
+  return body.result
+}
+
+async function hostChildren(frameIds = undefined) {
+  return delegatedObservationRpc('children', frameIds)
+}
+
+async function hostCollect(selectors, options = undefined) {
+  return delegatedObservationRpc('collect', selectors, options)
+}
+
+async function hostSendFrameMessage(target, message, options = undefined) {
+  if (!RPC_ENDPOINT) {
+    throw new Error('host.send_frame_message is unavailable: control RPC endpoint not set')
+  }
+  const res = await capturedRpcFetch(RPC_ENDPOINT, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer ' + (RPC_TOKEN || '') },
+    body: JSON.stringify({
+      method: 'delegatedWorkCall',
+      params: {
+        op: 'send_message',
+        target,
+        message,
+        ...(options !== undefined ? { options } : {})
+      }
+    })
+  })
+  const body = await res.json().catch(() => ({}))
+  if (!res.ok || body.error) {
+    throw new Error(`host.send_frame_message: ${body.error || 'HTTP ' + res.status}`)
+  }
+  return body.result
+}
+
+async function hostMessageReceipt(selector, options = undefined) {
+  return delegatedMessageRpc('message_receipt', { selector, options })
+}
+
+async function hostResolveMessage(messageId, options) {
+  return delegatedMessageRpc('resolve_message', {
+    message_id: messageId,
+    action: options && options.action
+  })
+}
+
+async function delegatedMessageRpc(op, params) {
+  if (!RPC_ENDPOINT) throw new Error(`host.${op} is unavailable: control RPC endpoint not set`)
+  const res = await capturedRpcFetch(RPC_ENDPOINT, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer ' + (RPC_TOKEN || '') },
+    body: JSON.stringify({ method: 'delegatedWorkCall', params: { op, ...params } })
+  })
+  const body = await res.json().catch(() => ({}))
+  if (!res.ok || body.error) throw new Error(`host.${op}: ${body.error || 'HTTP ' + res.status}`)
+  return body.result
+}
+
+// host.agents namespace. JavaScript methods, inputs, and returned records use camelCase. The private
+// RPC operation names remain transport details.
+// create/update/attachSkill/detachSkill/attachConnector/detachConnector are the ordinary-mutation
+// surface (issue 03); they return a real
 // post-write camelCase Profile read-back and never echo requested input. switch/delete are the
 // privileged surface (issue 04/05): authorized this milestone by the /customize Skill's chat-text
 // confirmation + the pass-through SDK approval gateway (design.md §7/§14), not the standard card.
@@ -2282,30 +2547,56 @@ const hostAgents = {
   async get(name) {
     return agentsRpc('get', { name })
   },
-  async list_skills(nameOrId = undefined) {
+  async listSkills(nameOrId = undefined) {
     return agentsRpc('list_skills', nameOrId !== undefined ? { name_or_id: nameOrId } : {})
   },
-  async list_connectors(nameOrId = undefined) {
+  async listConnectors(nameOrId = undefined) {
     return agentsRpc('list_connectors', nameOrId !== undefined ? { name_or_id: nameOrId } : {})
   },
   async create(input) {
-    return agentsRpc('create', input || {})
+    return agentsRpc(
+      'create',
+      remappedHostObject(input || {}, 'host.agents.create input', {
+        name: 'name',
+        displayName: 'display_name',
+        description: 'description',
+        systemPrompt: 'system_prompt',
+        iconKey: 'icon_key',
+        colorKey: 'color_key',
+        enabled: 'enabled',
+        unrestricted: 'unrestricted',
+        skillNames: 'skill_names',
+        connectorNames: 'connector_names'
+      })
+    )
   },
   async update(name, patch) {
-    // Nest the patch so a rename (patch.name) never collides with the lookup name on the wire —
-    // design.md §4 / customize-skill.md: update(name, patch) where patch may carry a new `name`.
-    return agentsRpc('update', { name, patch: patch || {} })
+    return agentsRpc('update', {
+      name,
+      patch: remappedHostObject(patch || {}, 'host.agents.update patch', {
+        displayName: 'display_name',
+        revision: 'revision',
+        description: 'description',
+        systemPrompt: 'system_prompt',
+        iconKey: 'icon_key',
+        colorKey: 'color_key',
+        enabled: 'enabled',
+        unrestricted: 'unrestricted',
+        skillNames: 'skill_names',
+        connectorNames: 'connector_names'
+      })
+    })
   },
-  async attach_skill(name, skillRef, options) {
+  async attachSkill(name, skillRef, options) {
     return agentsRpc('attach_skill', { name, skill_ref: skillRef, ...(options || {}) })
   },
-  async detach_skill(name, skillRef, options) {
+  async detachSkill(name, skillRef, options) {
     return agentsRpc('detach_skill', { name, skill_ref: skillRef, ...(options || {}) })
   },
-  async attach_connector(name, connectorRef, options) {
+  async attachConnector(name, connectorRef, options) {
     return agentsRpc('attach_connector', { name, connector_ref: connectorRef, ...(options || {}) })
   },
-  async detach_connector(name, connectorRef, options) {
+  async detachConnector(name, connectorRef, options) {
     return agentsRpc('detach_connector', { name, connector_ref: connectorRef, ...(options || {}) })
   },
   // Privileged: switch binds only the trusted calling session (server-captured). After approval the
@@ -2356,12 +2647,12 @@ const hostSkills = {
   async validate(name) {
     return skillsRpc('validate', { name })
   },
-  async edit(name, path, content, old_string = undefined) {
+  async edit(name, path, content, oldString = undefined) {
     return skillsRpc('edit', {
       name,
       path,
       content,
-      ...(old_string !== undefined ? { old_string } : {})
+      ...(oldString !== undefined ? { old_string: oldString } : {})
     })
   },
   async publish(name, overwrite = false) {
@@ -2391,8 +2682,8 @@ function computeError(raw) {
   return new Error(String(raw))
 }
 
-// host.compute namespace mirroring the spec's Python API surface (kept snake_case on purpose — a JS
-// camelCase pass is a deferred one-shot rename once the whole compute feature lands; see roadmap §8).
+// host.compute namespace. Public methods and input keys are camelCase; the adapter immediately maps
+// them to the existing snake_case computeCall RPC contract.
 const hostCompute = {
   // Enumerate registered compute hosts for discovery. No approval, no session context.
   async list() {
@@ -2401,52 +2692,82 @@ const hostCompute = {
 
   // Returns session-enabled compute hosts (≠ list() which returns all registered hosts).
   // Uses COMPUTE_SESSION_ID from spawn env so the registry lookup is always session-scoped.
-  async list_compute() {
+  async listCompute() {
     return computeRpc({ op: 'list_compute', session_id: COMPUTE_SESSION_ID })
   },
-  // Bind a thin handle to one provider (no network call). call_command runs one short remote command;
-  // login_shell defaults to true (runs login profiles, then attempts a readable ~/.bashrc, before the
+  // Bind a thin handle to one provider (no network call). callCommand runs one short remote command;
+  // loginShell defaults to true (runs login profiles, then attempts a readable ~/.bashrc, before the
   // command). A .bashrc can deliberately return early for non-interactive shells. false performs no
   // shell initialization.
-  // timeout_seconds
+  // timeoutSeconds
   // is optional (the service applies its own default when omitted). Session/project context is threaded
   // from the spawn env so the approval broker can remember a grant for this conversation/project.
   //
-  // submit_job: non-blocking job submission — returns {job_id, provider_id, status:'submitted',
+  // submitJob: non-blocking job submission — returns {job_id, provider_id, status:'submitted',
   // remote_workdir} immediately, before any SSH. Background dispatch runs the job detached.
-  // attach_job: returns a handle with .status() to read job state from DB without SSH.
+  // attachJob: returns a handle with .status() to read job state from DB without SSH.
   create(providerId) {
     return {
       provider_id: providerId,
-      async call_command(cmd, intent, options = {}) {
+      async callCommand(cmd, intent, options = {}) {
+        const normalized = remappedHostObject(options, 'host.compute.callCommand options', {
+          loginShell: 'login_shell',
+          timeoutSeconds: 'timeout_seconds'
+        })
         return computeRpc({
           op: 'call_command',
           provider_id: providerId,
           cmd,
           intent,
-          login_shell: options.login_shell !== undefined ? options.login_shell : true,
-          timeout_seconds: options.timeout_seconds,
+          login_shell: normalized.login_shell !== undefined ? normalized.login_shell : true,
+          timeout_seconds: normalized.timeout_seconds,
           session_id: COMPUTE_SESSION_ID,
           project_id: COMPUTE_PROJECT_NAME
         })
       },
 
       // Non-blocking job submission. Returns immediately with job_id + remote_workdir.
-      // options: { environment?, resources?, inputs?, outputs?, timeout_seconds?, harvest? }
+      // options: { environment?, resources?, inputs?, outputs?, timeoutSeconds?, harvest? }
       // Session/project context is always threaded from spawn env for grant-scope memory.
       // workspace_cwd is captured at spawn time so the main process can resolve workspace paths.
-      async submit_job(intent, command, options = {}) {
+      async submitJob(intent, command, options = {}) {
+        const normalized = remappedHostObject(options, 'host.compute.submitJob options', {
+          environment: 'environment',
+          resources: 'resources',
+          inputs: 'inputs',
+          outputs: 'outputs',
+          timeoutSeconds: 'timeout_seconds',
+          harvest: 'harvest'
+        })
+        if (normalized.inputs !== undefined && !Array.isArray(normalized.inputs)) {
+          throw new TypeError('host.compute.submitJob inputs must be an array.')
+        }
+        const inputs = normalized.inputs?.map((input) =>
+          remappedHostObject(input, 'host.compute.submitJob input', {
+            src: 'src',
+            dstFilename: 'dst_filename',
+            remotePath: 'remote_path'
+          })
+        )
+        const harvest =
+          normalized.harvest === undefined
+            ? undefined
+            : remappedHostObject(normalized.harvest, 'host.compute.submitJob harvest', {
+                exclude: 'exclude',
+                maxFileMb: 'max_file_mb',
+                maxTotalMb: 'max_total_mb'
+              })
         return computeRpc({
           op: 'submit_job',
           provider_id: providerId,
           intent,
           command,
-          environment: options.environment,
-          resources: options.resources,
-          inputs: options.inputs,
-          outputs: options.outputs,
-          timeout_seconds: options.timeout_seconds,
-          harvest: options.harvest,
+          environment: normalized.environment,
+          resources: normalized.resources,
+          inputs,
+          outputs: normalized.outputs,
+          timeout_seconds: normalized.timeout_seconds,
+          harvest,
           session_id: COMPUTE_SESSION_ID,
           project_id: COMPUTE_PROJECT_NAME,
           workspace_cwd: process.cwd()
@@ -2456,7 +2777,7 @@ const hostCompute = {
       // Attaches to an existing job by job_id. .status() reads from DB only (no SSH).
       // .result() returns the full JobResult (spec §11.4): scans the local harvest directory,
       // returns workspace-relative file paths, never triggers harvest or SSH (design §9).
-      attach_job(jobId) {
+      attachJob(jobId) {
         return {
           job_id: jobId,
           async status() {
@@ -2471,9 +2792,9 @@ const hostCompute = {
       // Set session-level concurrency limit (Phase 3c). Limits the number of non-terminal jobs
       // that can run simultaneously across all providers in this session. Jobs exceeding the limit
       // enter 'queued' state and auto-dispatch when slots free up.
-      async set_concurrency_limit(k) {
+      async setConcurrencyLimit(k) {
         if (typeof k !== 'number' || k <= 0 || k > 500 || !Number.isInteger(k)) {
-          throw new Error('set_concurrency_limit: k must be a positive integer between 1 and 500')
+          throw new Error('setConcurrencyLimit: k must be a positive integer between 1 and 500')
         }
         return computeRpc({
           op: 'set_concurrency_limit',
@@ -2494,32 +2815,52 @@ const hostCompute = {
     }
   },
   // Read/append/replace the host knowledge doc. mode defaults to 'read'; append needs `text`; replace
-  // needs `text` + `old_text` (old_text must match the current doc exactly, guarding against clobbering
-  // a concurrent edit). Snake_case option keys mirror the RPC contract and the spec's Python surface.
+  // needs `text` + `oldText` (oldText must match the current doc exactly, guarding against clobbering
+  // a concurrent edit).
   async details(providerId, options = {}) {
+    const normalized = remappedHostObject(options, 'host.compute.details options', {
+      mode: 'mode',
+      text: 'text',
+      oldText: 'old_text'
+    })
     return computeRpc({
       op: 'details',
       provider_id: providerId,
-      mode: options.mode || 'read',
-      text: options.text,
-      old_text: options.old_text
+      mode: normalized.mode || 'read',
+      text: normalized.text,
+      old_text: normalized.old_text
     })
   }
 }
 
+// Keep this explicit object in sync with HostSdkHelpRegistry. Its keys are the published Subagent
+// Host SDK surface and are checked by src/main/host-sdk/help.test.ts.
+const subagentHostOperations = Object.freeze({
+  delegate: hostDelegate,
+  children: hostChildren,
+  collect: hostCollect,
+  stop_child: hostStopChild,
+  send_frame_message: hostSendFrameMessage,
+  message_receipt: hostMessageReceipt,
+  resolve_message: hostResolveMessage,
+  submit_output: hostSubmitOutput
+})
+
 // Persistent sandbox: user-declared globals persist across requests (assign to `globalThis`/bare).
 const sandbox = {
   host: {
+    help: hostHelp,
     capabilities: hostCapabilities,
     llm: hostLlm,
     artifacts: hostArtifacts,
-    artifact_path: hostArtifactPath,
+    artifactPath: hostArtifactPath,
     lineage: hostLineage,
     frames: hostFrames,
     mcp: hostMcp,
     compute: hostCompute,
     agents: hostAgents,
-    skills: hostSkills
+    skills: hostSkills,
+    ...subagentHostOperations
   },
   console,
   process,
@@ -2540,27 +2881,35 @@ function wrapForRun(code) {
   const plain = '(async () => {\n' + code + '\n})()'
   const trimmed = code.replace(/[\s;]+$/, '')
   if (!trimmed) return plain
-  // Split at the rightmost top-level statement boundary (newline or ';'); the tail is the candidate
-  // trailing expression. A ';' inside a string/for-header just yields a tail that won't compile below.
-  const split = Math.max(trimmed.lastIndexOf('\n'), trimmed.lastIndexOf(';'))
-  const head = split >= 0 ? trimmed.slice(0, split + 1) : ''
-  const tail = trimmed.slice(split + 1).trim()
-  // Only echo something that can start an expression — never a declaration/control statement.
-  if (
-    !tail ||
-    /^(const|let|var|if|for|while|function|class|switch|try|throw|return|do|else|import|export)\b/.test(
-      tail
-    )
-  ) {
-    return plain
+  // Try candidate statement boundaries from right to left. A newline or semicolon may be nested
+  // inside a multiline call, string, or for-header; compile-checking progressively wider tails finds
+  // the complete final expression without needing a second JavaScript parser in the runtime bundle.
+  const boundaries = []
+  for (let index = trimmed.length - 1; index >= 0; index -= 1) {
+    if (trimmed[index] === '\n' || trimmed[index] === ';') boundaries.push(index)
   }
-  const echo = '(async () => {\n' + head + '\nreturn (\n' + tail + '\n)\n})()'
-  try {
-    new vm.Script(echo, { filename: '<repl>' })
-    return echo
-  } catch {
-    return plain
+  boundaries.push(-1)
+  for (const split of boundaries) {
+    const head = split >= 0 ? trimmed.slice(0, split + 1) : ''
+    const tail = trimmed.slice(split + 1).trim()
+    // Only echo something that can start an expression — never a declaration/control statement.
+    if (
+      !tail ||
+      /^(const|let|var|if|for|while|function|class|switch|try|throw|return|do|else|import|export)\b/.test(
+        tail
+      )
+    ) {
+      continue
+    }
+    const echo = '(async () => {\n' + head + '\nreturn (\n' + tail + '\n)\n})()'
+    try {
+      new vm.Script(echo, { filename: '<repl>' })
+      return echo
+    } catch {
+      // This boundary was inside the final expression; retry with a wider candidate.
+    }
   }
+  return plain
 }
 
 // Runs one request against the persistent context. console is redirected into strings and restored in
@@ -2612,6 +2961,7 @@ rl.on('line', (line) => {
   }
   chain = chain.then(async () => {
     ACTIVE_CONTROL_INVOCATION_ID = request.control_invocation_id
+    DELEGATE_CALL_SEQUENCE = 0
     try {
       const resp = await run(request.code || '')
       resp.req_id = request.req_id

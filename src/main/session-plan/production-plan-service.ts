@@ -9,7 +9,7 @@ import { SessionPlanInteractionOwner } from './session-plan-interaction-owner'
 
 type ProductionPlanServiceDependencies = Readonly<{
   interactions?: SessionPlanInteractionOwner
-  artifactTurns: Pick<ArtifactTurnOwner, 'writeForActiveTurn'>
+  artifactTurns: Pick<ArtifactTurnOwner, 'handleForExecution' | 'write'>
   provenance: Pick<ArtifactProvenanceRepository, 'resolveVersionContent'>
   sessions: Pick<
     SessionPersistenceCoordinator,
@@ -29,8 +29,8 @@ const createProductionPlanService = ({
 }: ProductionPlanServiceDependencies): PlanService =>
   new PlanService({
     interactions,
-    writeArtifactForActiveTurn: (sessionId, input) =>
-      artifactTurns.writeForActiveTurn(sessionId, input),
+    writeArtifactForExecution: (executionId, input) =>
+      artifactTurns.write(artifactTurns.handleForExecution(executionId), input),
     readArtifactVersion: async ({ projectId, sessionId, artifactId, artifactVersionId }) => {
       const resolved = await provenance.resolveVersionContent({
         projectId,
@@ -65,7 +65,28 @@ const createProductionPlanService = ({
         sessionId: input.sessionId,
         interactionId: input.interactionId,
         content: input.content,
-        ...(input.beforePersist ? { beforePersist: input.beforePersist } : {})
+        ...(input.beforePersist ? { beforePersist: input.beforePersist } : {}),
+        ...(input.markPlanReview
+          ? {
+              runtimeContextPatch: {
+                expectedRevision: input.markPlanReview.expectedRevision,
+                patch: (message) => ({
+                  plan: {
+                    ...input.markPlanReview!.plan,
+                    reviewFeedbackMessageId: message.id,
+                    continuation: {
+                      commandId: input.markPlanReview!.commandId,
+                      kind: 'review-feedback' as const,
+                      state: 'queued' as const,
+                      originatingPromptMessageId: message.id,
+                      createdAt: input.markPlanReview!.createdAt
+                    }
+                  }
+                }),
+                sessionStatus: 'waiting-plan-approval' as const
+              }
+            }
+          : {})
       }),
     isRevisionConflict: (error) => error instanceof SessionRuntimeContextRevisionConflictError,
     onApprovalRequested,

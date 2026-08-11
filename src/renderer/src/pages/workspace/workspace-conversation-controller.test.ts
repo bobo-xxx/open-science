@@ -4,6 +4,7 @@ import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { ChatSession } from '@/stores/session-store'
+import { useSessionStore } from '@/stores/session-store'
 
 import type { ComposerDoc } from './composer/composer-doc'
 import {
@@ -52,6 +53,7 @@ const options = (
     isReviewing: false,
     promptInFlightSessionIds: [],
     sendPreparationInFlightSessionIds: [],
+    hasBlockingRootPermissionRequest: false,
     newConversationAutoReviewEnabled: false,
     newConversationEnabledComputeHosts: [],
     composer: {
@@ -90,7 +92,8 @@ const options = (
       sendMessage: vi.fn(() => Promise.resolve({ sessionId: 'session-a', messageId: 'message-a' })),
       resendEditedMessage: vi.fn(() => Promise.resolve(true)),
       cancelRun: vi.fn(() => Promise.resolve()),
-      resumeInterruptedSession: vi.fn(() => Promise.resolve())
+      resumeInterruptedSession: vi.fn(() => Promise.resolve()),
+      ensureSessionReady: vi.fn(() => Promise.resolve())
     },
     sideChatOpen: false,
     setAutoReviewEnabled: vi.fn(),
@@ -138,6 +141,64 @@ afterEach(() => {
 })
 
 describe('workspace conversation controller', () => {
+  it('submits a restored Plan approval through the human-gated Plan command', async () => {
+    const pendingPlan = {
+      artifactId: 'artifact-plan-a',
+      artifactVersionId: 'version-plan-a',
+      artifactChecksum: 'a'.repeat(64),
+      originatingPromptMessageId: 'message-user-a',
+      revision: 3,
+      approval: 'pending',
+      lifecycle: 'awaiting_approval',
+      requiresExplicitContinuation: false,
+      document: {
+        schema_version: 1,
+        task_summary: 'Analyze the dataset',
+        phases: [],
+        desired_outputs: [],
+        feasibility: { confidence: 'high', rationale: 'Inputs are available.' }
+      },
+      stepStatuses: {},
+      stepStates: {},
+      counts: { phases: 0, delegations: 0, steps: 0, completed: 0, inProgress: 0 }
+    } as const
+    const pendingSession = session({
+      status: 'waiting-plan-approval',
+      activePlanProjection: pendingPlan as never
+    })
+    const respondPlan = vi.fn(async () => ({ changed: true }))
+    const getPlanProjection = vi.fn(async () => ({
+      ...pendingPlan,
+      revision: 4,
+      approval: 'approved' as const,
+      lifecycle: 'approved' as const
+    }))
+    Object.defineProperty(window, 'api', {
+      configurable: true,
+      value: { acp: { respondPlan, getPlanProjection } }
+    })
+    useSessionStore.setState({ sessions: [pendingSession] })
+    const input = options({
+      activeSession: pendingSession,
+      getSession: (sessionId) => (sessionId === pendingSession.id ? pendingSession : undefined)
+    })
+    const hook = renderController(input)
+    mounted.push(hook)
+
+    await act(async () => hook.result.current.actions.submit.restoredPlan({ decision: 'approved' }))
+
+    expect(respondPlan).toHaveBeenCalledWith({
+      projectId: 'project-a',
+      sessionId: 'session-a',
+      artifactVersionId: 'version-plan-a',
+      expectedRevision: 3,
+      decision: 'approved'
+    })
+    expect(input.runtime.ensureSessionReady).toHaveBeenCalledWith('session-a')
+    expect(input.runtime.ensureSessionReady).toHaveBeenCalledBefore(respondPlan)
+    expect(input.runtime.sendMessage).not.toHaveBeenCalled()
+  })
+
   it('blocks submit and revision while waiting for a user answer', () => {
     const input = options({ activeSession: session({ status: 'waiting-for-user' }) })
     const hook = renderController(input)
@@ -211,7 +272,7 @@ describe('workspace conversation controller', () => {
     act(() => hook.result.current.actions.submit.draft({ forcedSkillIds: [] }))
     act(() => hook.result.current.actions.revise('message-user-a', textDoc('changed')))
     await act(async () => hook.result.current.actions.resume())
-    act(() => hook.result.current.actions.cancel())
+    await act(async () => hook.result.current.actions.cancel())
 
     expect(hook.result.current.availability).toMatchObject({
       submit: false,
@@ -347,7 +408,7 @@ describe('workspace conversation controller', () => {
     expect(hook.result.current.actions.revise).toBe(revise)
   })
 
-  it('aborts an active Fix Loop before cancelling the runtime run', () => {
+  it('aborts an active Fix Loop before cancelling the runtime run', async () => {
     const order: string[] = []
     const input = options({ activeSession: session({ fixLoopActive: true }) })
     input.abortFixLoop = vi.fn(() => {
@@ -361,7 +422,7 @@ describe('workspace conversation controller', () => {
     const hook = renderController(input)
     mounted.push(hook)
 
-    act(() => hook.result.current.actions.cancel())
+    await act(async () => hook.result.current.actions.cancel())
 
     expect(order).toEqual(['review', 'runtime'])
   })
