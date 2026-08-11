@@ -36,6 +36,7 @@ import { createAcpCreateSessionWorkflow } from './acp/create-session-workflow'
 import { createAcpHandlerWorkflows } from './acp/handler-workflows'
 import { createAcpTaskAgentPort } from './acp/task-agent-port'
 import { ArtifactCodeReconstructionRunner } from './acp/artifact-code-reconstruction-runner'
+import { RestrictedInferenceRunner } from './acp/restricted-inference-runner'
 import { ArchiveCoordinator } from './archive/coordinator'
 import { ArtifactCodeReconstructionService } from './artifacts/code-reconstruction'
 import {
@@ -124,6 +125,7 @@ import { runtimeRoot } from './notebook/runtime-paths'
 import { HostArtifactsService } from './notebook/host-artifacts-service'
 import { HostLineageService } from './notebook/host-lineage-service'
 import { HostFramesService } from './notebook/host-frames-service'
+import { HostLlmService } from './notebook/host-llm-service'
 import type { NotebookEnvironmentManager } from './notebook/runtime-service'
 import { parseArtifactVersionLocator } from '../shared/artifact-provenance'
 import { DEFAULT_ARTIFACT_PROJECT_NAME } from '../shared/artifacts'
@@ -173,6 +175,7 @@ import { type SessionPersistenceBackend } from './session-persistence/ipc'
 import { tryDecryptKey } from './settings/crypto'
 import { SETTINGS_INSTALL_LOG_CHANNEL, registerSettingsIpcHandlers } from './settings/ipc'
 import { registerLocalFsIpcHandlers } from './local-fs/ipc'
+import { GrantedLocalRootsRepository } from './local-fs/granted-roots-repository'
 import { LocalFsService } from './local-fs/service'
 import { getAppClaudeConfigDir } from './settings/provider-env'
 import { SettingsService } from './settings/service'
@@ -453,8 +456,15 @@ const createApplicationModules = async (
     inputAuthority: immutableInputAuthority
   })
   // Shared local-fs service backs both the "This computer" browser IPC and the managed-preview
-  // resolver below, so path validation stays identical across both entry points.
-  const localFsService = new LocalFsService()
+  // resolver below, so path validation stays identical across both entry points. Granted folder
+  // roots persist in the SQLite project DB behind the local-fs:granted-roots:* channels; the
+  // settings service is passed as the legacy store so a pre-existing settings.json
+  // grantedLocalRoots field is imported into the DB once on first use.
+  const grantedRootsRepository = new GrantedLocalRootsRepository(
+    () => getProjectDbClient(resolveStorageRoot()),
+    settingsService
+  )
+  const localFsService = new LocalFsService(grantedRootsRepository)
   // One source-neutral resolver keeps previews and user-requested exports on identical trust checks.
   const resolveManagedFilePath = (
     source: ManagedPreviewSource,
@@ -991,7 +1001,7 @@ const createApplicationModules = async (
   settingsService.setCustomServerRuntimeProjectionProvider({
     materializedSkillNames: () => connectorRuntimeSettings.materializedCustomSkillNames(),
     availability: (id) => connectorRuntimeSettings.customServerAvailability(id),
-    isRefreshing: () => connectorRuntimeSettings.isRefreshing()
+    isRefreshing: (id) => connectorRuntimeSettings.isRefreshing(id)
   })
   settingsService.setCustomServerAuthenticator(
     async (serverId) => {
@@ -1248,6 +1258,17 @@ const createApplicationModules = async (
     },
     onPublishedSkillsChanged: () => void runtimeRef.current?.requestSkillsReload()
   })
+  const hostLlmLog = createLogger('notebook:host-llm')
+  const hostLlmService = new HostLlmService({
+    captureTarget: () => settingsService.captureActiveExplicitAgentBackendTarget(),
+    runner: new RestrictedInferenceRunner({
+      appVersion: app.getVersion(),
+      configRoot,
+      profileNamespace: 'host-llm',
+      resolveTarget: (target, context) =>
+        settingsService.resolveExplicitAgentBackend(target, context)
+    })
+  })
   const notebookRpcServer = await modules.add(
     new NotebookLocalRpcServer(notebookLocalRpc, {
       onSessionReleased: (sessionId) => completionGateCoordinator.releaseSession(sessionId),
@@ -1298,10 +1319,22 @@ const createApplicationModules = async (
       }),
       inputRegistry: notebookInputRegistry,
       agentsService,
-      skillsService: hostSkillsService
+      skillsService: hostSkillsService,
+      hostLlm: hostLlmService
     }),
     createNotebookLocalRpcModule
   )
+  // Reverse module disposal cancels active inference before the RPC server waits for its handlers.
+  await modules.add(hostLlmService, (service) => ({
+    name: 'host-llm-service',
+    capability: service,
+    dispose: () => service.shutdown()
+  }))
+  void hostLlmService
+    .sweepStaleProfiles()
+    .catch((error) =>
+      hostLlmLog.error('stale host.llm profile cleanup failed', diagnosticErrorFields(error))
+    )
   // Register ownership before ACP construction. Reverse disposal therefore drains ACP + Notebook
   // through the coordinator first, then releases the local bridge without creating a second runtime
   // shutdown owner; rollback also closes a server started during partial composition.
@@ -1390,6 +1423,7 @@ const createApplicationModules = async (
       authorizeSkillImportReferencedUploads: (projectId, sessionId, paths) =>
         conversationSkillImporter.authorizeReferencedUploads(projectId, sessionId, paths),
       settingsService,
+      grantedRootsRepository,
       permissionGrantRegistry,
       taskNotifications,
       notificationInbox,
@@ -1707,7 +1741,10 @@ const createApplicationModules = async (
     skills: { requestSkillsReload: () => void runtime.requestSkillsReload() },
     connectors: {
       invalidatePermissionProjection: () => permissionGrantProjection.invalidateProjection(),
-      refreshConnectorSkillDocs: () => connectorRuntimeSettings.refresh(),
+      refreshConnectorSkillDocs: (customServerId) =>
+        customServerId
+          ? connectorRuntimeSettings.refreshCustomServer(customServerId)
+          : connectorRuntimeSettings.refresh(),
       requestSkillsReload: () => void runtime.requestSkillsReload(),
       pruneCustomServerPermissions: (serverId) =>
         permissionGrantRegistry.prune({ kind: 'mcp_server', serverId }).then(() => undefined),
