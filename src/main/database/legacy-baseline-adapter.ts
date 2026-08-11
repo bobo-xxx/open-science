@@ -18,6 +18,7 @@ import {
   findPendingSqliteCheckConstraints,
   type SqliteCheckConstraintMigration
 } from './sqlite-schema-migrations'
+import { DatabaseValidationError } from './database-validation-error'
 import { migrationSqlExecutor } from './migration-sql-executor'
 
 // schema-locality: begin frozen-0001-repairs
@@ -132,6 +133,38 @@ const splitSqlDefinitions = (ddl: string): string[] => {
 const readQuotedIdentifiers = (value: string): string[] =>
   [...value.matchAll(/"((?:[^"]|"")+)"/g)].map((match) => match[1]!.replaceAll('""', '"'))
 
+const hasRedundantOuterParentheses = (value: string): boolean => {
+  if (value[0] !== '(' || value.at(-1) !== ')') return false
+
+  let depth = 0
+  let quote: '"' | "'" | undefined
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index]!
+    if (quote) {
+      if (char !== quote) continue
+      if (value[index + 1] === quote) index += 1
+      else quote = undefined
+      continue
+    }
+    if (char === '"' || char === "'") {
+      quote = char
+      continue
+    }
+    if (char === '(') depth += 1
+    else if (char === ')') depth -= 1
+
+    if (depth === 0 && index < value.length - 1) return false
+    if (depth < 0) return false
+  }
+  return depth === 0 && quote === undefined
+}
+
+const stripRedundantOuterParentheses = (value: string): string => {
+  let normalized = value
+  while (hasRedundantOuterParentheses(normalized)) normalized = normalized.slice(1, -1).trim()
+  return normalized
+}
+
 const normalizeSqlFragment = (value: string | null): string | null => {
   if (value === null) return null
   const literals: string[] = []
@@ -145,10 +178,55 @@ const normalizeSqlFragment = (value: string | null): string | null => {
     .replaceAll(/\s+/g, ' ')
     .replaceAll(/\s*([(),=<>])\s*/g, '$1')
     .toLowerCase()
+  normalized = stripRedundantOuterParentheses(normalized)
   literals.forEach((literal, index) => {
     normalized = normalized.replace(`__open_science_sql_literal_${index}__`, literal)
   })
   return normalized
+}
+
+type KnownEquivalentCheckExpression = {
+  actual: string
+  expected: string
+}
+
+// Pre-ledger runtime DDL sometimes emitted an equivalent boolean expression in a different order.
+// Pair each accepted legacy form with the exact frozen target so a future contract change still fails
+// closed instead of inheriting this compatibility allowance.
+const KNOWN_EQUIVALENT_CHECK_EXPRESSIONS: ReadonlyMap<
+  string,
+  readonly KnownEquivalentCheckExpression[]
+> = new Map([
+  [
+    'ArtifactVersionInput.ArtifactVersionInput_sourceIdentity_check',
+    [
+      {
+        actual: normalizeSqlFragment(`
+          ("sourceKind" = 'artifact-version' AND "sourceArtifactVersionId" IS NOT NULL AND "sourceUploadVersionId" IS NULL AND "inputFileVersionId" = "sourceArtifactVersionId") OR
+          ("sourceKind" = 'upload-version' AND "sourceUploadVersionId" IS NOT NULL AND "sourceArtifactVersionId" IS NULL AND "inputFileVersionId" = "sourceUploadVersionId")
+        `)!,
+        expected: normalizeSqlFragment(`
+          (("sourceKind" = 'artifact-version' AND "sourceArtifactVersionId" IS NOT NULL AND "sourceUploadVersionId" IS NULL AND "inputFileVersionId" = "sourceArtifactVersionId") OR
+          ("sourceKind" = 'upload-version' AND "sourceArtifactVersionId" IS NULL AND "sourceUploadVersionId" IS NOT NULL AND "inputFileVersionId" = "sourceUploadVersionId"))
+        `)!
+      }
+    ]
+  ]
+])
+
+const checkExpressionsMatch = (
+  tableName: string,
+  constraintName: string,
+  actual: string | undefined,
+  expected: string
+): boolean => {
+  if (actual === expected) return true
+  return Boolean(
+    actual &&
+    KNOWN_EQUIVALENT_CHECK_EXPRESSIONS.get(`${tableName}.${constraintName}`)?.some(
+      (equivalent) => equivalent.actual === actual && equivalent.expected === expected
+    )
+  )
 }
 
 const parseTargetTable = (ddl: string): readonly [string, TargetTable] | undefined => {
@@ -350,8 +428,9 @@ const classifyLegacySchema = async (client: PrismaClient): Promise<void> => {
      ORDER BY "type", "name"`
   )
   if (unsupportedObjects.length > 0) {
-    throw new Error(
-      `Legacy database classification blocked: unsupported schema objects ${unsupportedObjects.map(({ type, name }) => `${type} ${name}`).join(', ')}.`
+    throw new DatabaseValidationError(
+      `Legacy database classification blocked by unsupported schema objects.`,
+      { kind: 'unsupported-schema-objects', actual: unsupportedObjects }
     )
   }
 
@@ -367,9 +446,10 @@ const classifyLegacySchema = async (client: PrismaClient): Promise<void> => {
     .map((table) => table.name)
     .filter((tableName) => !CURRENT_TABLE_COLUMNS.has(tableName))
   if (unknownTables.length > 0) {
-    throw new Error(
-      `Legacy database classification blocked: unknown tables ${unknownTables.join(', ')}.`
-    )
+    throw new DatabaseValidationError(`Legacy database classification found unknown tables.`, {
+      kind: 'unknown-tables',
+      actual: unknownTables
+    })
   }
 
   for (const { name: tableName } of tables) {
@@ -386,8 +466,9 @@ const classifyLegacySchema = async (client: PrismaClient): Promise<void> => {
       .map((column) => column.name)
       .filter((columnName) => !allowedColumns.has(columnName))
     if (unknownColumns.length > 0) {
-      throw new Error(
-        `Legacy database classification blocked: ${tableName} contains unknown columns ${unknownColumns.join(', ')}.`
+      throw new DatabaseValidationError(
+        `Legacy database classification found unknown columns in ${tableName}.`,
+        { kind: 'unknown-columns', table: tableName, actual: unknownColumns }
       )
     }
   }
@@ -402,11 +483,27 @@ const classifyLegacySchema = async (client: PrismaClient): Promise<void> => {
     .map((index) => index.name)
     .filter((indexName) => !TARGET_INDEX_NAMES.has(indexName))
   if (unknownIndexes.length > 0) {
-    throw new Error(
-      `Legacy database classification blocked: unknown indexes ${unknownIndexes.join(', ')}.`
-    )
+    throw new DatabaseValidationError(`Legacy database classification found unknown indexes.`, {
+      kind: 'unknown-indexes',
+      actual: unknownIndexes
+    })
   }
 }
+
+const columnDiagnostic = (column: SqliteTableColumn): Record<string, unknown> => ({
+  type: column.type.toUpperCase(),
+  notNull: Boolean(Number(column.notnull)),
+  defaultValue: normalizeSqlFragment(column.dflt_value),
+  primaryKeyOrder: Number(column.pk)
+})
+
+const targetColumnDiagnostic = (column: TargetColumn): Record<string, unknown> => ({
+  type: column.type,
+  notNull: column.notNull,
+  defaultValue: column.defaultValue,
+  primaryKeyOrder: column.primaryKeyOrder,
+  autoIncrement: column.autoIncrement
+})
 
 const prepareRuntimeSchemaBaseline = async (
   client: PrismaClient
@@ -436,17 +533,19 @@ const verifyRuntimeSchemaTarget = async (
   const expectedTables = new Set(target.tableNames)
   const missingTables = target.tableNames.filter((tableName) => !actualTables.has(tableName))
   if (missingTables.length > 0) {
-    throw new Error(
-      `Database baseline verification found missing tables ${missingTables.join(', ')}.`
-    )
+    throw new DatabaseValidationError(`Database baseline verification found missing tables.`, {
+      kind: 'missing-tables',
+      expected: missingTables
+    })
   }
   const unexpectedTables = exact
     ? [...actualTables].filter((tableName) => !expectedTables.has(tableName))
     : []
   if (unexpectedTables.length > 0) {
-    throw new Error(
-      `Database baseline verification found unexpected tables ${unexpectedTables.join(', ')}.`
-    )
+    throw new DatabaseValidationError(`Database baseline verification found unexpected tables.`, {
+      kind: 'unexpected-tables',
+      actual: unexpectedTables
+    })
   }
 
   const foreignKeyKey = (foreignKey: TargetForeignKey): string =>
@@ -469,16 +568,21 @@ const verifyRuntimeSchemaTarget = async (
       (columnName) => !actualColumns.has(columnName)
     )
     if (missingColumns.length > 0) {
-      throw new Error(
-        `Database baseline verification found missing columns ${tableName}.${missingColumns.join(`, ${tableName}.`)}.`
+      throw new DatabaseValidationError(
+        `Database baseline verification found missing columns in ${tableName}.`,
+        { kind: 'missing-columns', table: tableName, expected: missingColumns }
       )
     }
+    const retiredColumns = new Set(RETIRED_LEGACY_COLUMNS[tableName] ?? [])
     const unexpectedColumns = exact
-      ? [...actualColumns.keys()].filter((columnName) => !expectedTable.columns.has(columnName))
+      ? [...actualColumns.keys()].filter(
+          (columnName) => !expectedTable.columns.has(columnName) && !retiredColumns.has(columnName)
+        )
       : []
     if (unexpectedColumns.length > 0) {
-      throw new Error(
-        `Database baseline verification found unexpected columns ${tableName}.${unexpectedColumns.join(`, ${tableName}.`)}.`
+      throw new DatabaseValidationError(
+        `Database baseline verification found unexpected columns in ${tableName}.`,
+        { kind: 'unexpected-columns', table: tableName, actual: unexpectedColumns }
       )
     }
 
@@ -491,8 +595,15 @@ const verifyRuntimeSchemaTarget = async (
         actualDefault !== expected.defaultValue ||
         Number(actual.pk) !== expected.primaryKeyOrder
       ) {
-        throw new Error(
-          `Database baseline verification found an incompatible column definition for ${tableName}.${columnName}.`
+        throw new DatabaseValidationError(
+          `Database baseline verification found an incompatible column definition for ${tableName}.${columnName}.`,
+          {
+            kind: 'column-definition-mismatch',
+            table: tableName,
+            column: columnName,
+            expected: targetColumnDiagnostic(expected),
+            actual: columnDiagnostic(actual)
+          }
         )
       }
     }
@@ -504,40 +615,77 @@ const verifyRuntimeSchemaTarget = async (
     )
     const actualTable = rows[0]?.sql ? parseTargetTable(rows[0].sql)?.[1] : undefined
     if (!actualTable) {
-      throw new Error(
-        `Database baseline verification could not inspect constraints for ${tableName}.`
+      throw new DatabaseValidationError(
+        `Database baseline verification could not inspect constraints for ${tableName}.`,
+        { kind: 'constraint-inspection-failed', table: tableName }
       )
     }
     if (actualTable.unsupportedDefinitions.length > 0) {
-      throw new Error(
-        `Database baseline verification found unsupported constraints for ${tableName}.`
+      throw new DatabaseValidationError(
+        `Database baseline verification found unsupported constraints for ${tableName}.`,
+        {
+          kind: 'unsupported-constraints',
+          table: tableName,
+          actual: { count: actualTable.unsupportedDefinitions.length }
+        }
       )
     }
-    if (
-      [...expectedTable.columns].some(
-        ([columnName, expected]) =>
-          actualTable.columns.get(columnName)?.autoIncrement !== expected.autoIncrement
-      )
-    ) {
-      throw new Error(
-        `Database baseline verification found incompatible AUTOINCREMENT constraints for ${tableName}.`
+    const incompatibleAutoIncrement = [...expectedTable.columns].find(
+      ([columnName, expected]) =>
+        actualTable.columns.get(columnName)?.autoIncrement !== expected.autoIncrement
+    )
+    if (incompatibleAutoIncrement) {
+      const [columnName, expected] = incompatibleAutoIncrement
+      throw new DatabaseValidationError(
+        `Database baseline verification found an incompatible AUTOINCREMENT constraint for ${tableName}.${columnName}.`,
+        {
+          kind: 'autoincrement-mismatch',
+          table: tableName,
+          column: columnName,
+          expected: expected.autoIncrement,
+          actual: actualTable.columns.get(columnName)?.autoIncrement ?? null
+        }
       )
     }
-    if (
-      [...expectedTable.checks.entries()].some(
-        ([name, expression]) => actualTable.checks.get(name) !== expression
-      ) ||
-      actualTable.checks.size !== expectedTable.checks.size
-    ) {
-      throw new Error(
-        `Database baseline verification found incompatible CHECK constraints for ${tableName}.`
+    const incompatibleCheck = [...expectedTable.checks.entries()].find(
+      ([name, expression]) =>
+        !checkExpressionsMatch(tableName, name, actualTable.checks.get(name), expression)
+    )
+    if (incompatibleCheck) {
+      const [constraint, expected] = incompatibleCheck
+      throw new DatabaseValidationError(
+        `Database baseline verification found an incompatible CHECK constraint for ${tableName}.${constraint}.`,
+        {
+          kind: 'check-constraint-mismatch',
+          table: tableName,
+          constraint,
+          expected,
+          actual: actualTable.checks.get(constraint) ?? null
+        }
+      )
+    }
+    if (actualTable.checks.size !== expectedTable.checks.size) {
+      throw new DatabaseValidationError(
+        `Database baseline verification found an incompatible CHECK constraint set for ${tableName}.`,
+        {
+          kind: 'check-constraint-set-mismatch',
+          table: tableName,
+          expected: [...expectedTable.checks.keys()],
+          actual: [...actualTable.checks.keys()]
+        }
       )
     }
     const expectedForeignKeys = expectedTable.foreignKeys.map(foreignKeyKey).sort()
     const parsedForeignKeys = actualTable.foreignKeys.map(foreignKeyKey).sort()
     if (parsedForeignKeys.join('\n') !== expectedForeignKeys.join('\n')) {
-      throw new Error(
-        `Database baseline verification found incompatible foreign-key definitions for ${tableName}.`
+      throw new DatabaseValidationError(
+        `Database baseline verification found incompatible foreign-key definitions for ${tableName}.`,
+        {
+          kind: 'foreign-key-definition-mismatch',
+          table: tableName,
+          expected: expectedForeignKeys,
+          actual: parsedForeignKeys
+        }
       )
     }
 
@@ -560,8 +708,14 @@ const verifyRuntimeSchemaTarget = async (
       )
       .sort()
     if (pragmaForeignKeys.join('\n') !== targetPragmaForeignKeys.join('\n')) {
-      throw new Error(
-        `Database baseline verification found incompatible foreign-key metadata for ${tableName}.`
+      throw new DatabaseValidationError(
+        `Database baseline verification found incompatible foreign-key metadata for ${tableName}.`,
+        {
+          kind: 'foreign-key-metadata-mismatch',
+          table: tableName,
+          expected: targetPragmaForeignKeys,
+          actual: pragmaForeignKeys
+        }
       )
     }
   }
@@ -573,8 +727,15 @@ const verifyRuntimeSchemaTarget = async (
     )
     const actualIndex = indexes.find((index) => index.name === expected.name)
     if (!actualIndex || Number(actualIndex.unique) !== Number(expected.unique)) {
-      throw new Error(
-        `Database baseline verification found an incompatible index definition for ${expected.name}.`
+      throw new DatabaseValidationError(
+        `Database baseline verification found an incompatible index definition for ${expected.name}.`,
+        {
+          kind: 'index-definition-mismatch',
+          table: expected.tableName,
+          constraint: expected.name,
+          expected: { unique: expected.unique, columns: expected.columns },
+          actual: actualIndex ? { unique: Boolean(Number(actualIndex.unique)) } : null
+        }
       )
     }
     const indexColumns = await migrationSqlExecutor.query<SqliteIndexColumnRow[]>(
@@ -585,8 +746,15 @@ const verifyRuntimeSchemaTarget = async (
       .sort((left, right) => Number(left.seqno) - Number(right.seqno))
       .map((column) => column.name)
     if (actualColumnNames.join('\n') !== expected.columns.join('\n')) {
-      throw new Error(
-        `Database baseline verification found an incompatible index definition for ${expected.name}.`
+      throw new DatabaseValidationError(
+        `Database baseline verification found incompatible index columns for ${expected.name}.`,
+        {
+          kind: 'index-column-mismatch',
+          table: expected.tableName,
+          constraint: expected.name,
+          expected: expected.columns,
+          actual: actualColumnNames
+        }
       )
     }
   }
@@ -602,8 +770,12 @@ const verifyRuntimeSchemaTarget = async (
       .map((index) => index.name)
       .filter((indexName) => !expectedIndexes.has(indexName))
     if (unexpectedIndexes.length > 0) {
-      throw new Error(
-        `Database baseline verification found unexpected indexes ${unexpectedIndexes.join(', ')}.`
+      throw new DatabaseValidationError(
+        `Database baseline verification found unexpected indexes.`,
+        {
+          kind: 'unexpected-indexes',
+          actual: unexpectedIndexes
+        }
       )
     }
   }
@@ -613,7 +785,10 @@ const verifyRuntimeSchemaTarget = async (
     'PRAGMA integrity_check'
   )
   if (integrityRows.length !== 1 || integrityRows[0]?.integrity_check !== 'ok') {
-    throw new Error('Database baseline verification failed SQLite integrity_check.')
+    throw new DatabaseValidationError(
+      'Database baseline verification failed SQLite integrity_check.',
+      { kind: 'integrity-check-failed', actual: integrityRows }
+    )
   }
 }
 
