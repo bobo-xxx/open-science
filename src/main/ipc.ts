@@ -122,6 +122,8 @@ import { createProductionMicromambaRunner } from './notebook/windows-micromamba-
 import { createRuntimeSelectionWorkflows } from './notebook/runtime-selection-workflows'
 import { runtimeRoot } from './notebook/runtime-paths'
 import { HostArtifactsService } from './notebook/host-artifacts-service'
+import { HostLineageService } from './notebook/host-lineage-service'
+import { HostFramesService } from './notebook/host-frames-service'
 import type { NotebookEnvironmentManager } from './notebook/runtime-service'
 import { parseArtifactVersionLocator } from '../shared/artifact-provenance'
 import { DEFAULT_ARTIFACT_PROJECT_NAME } from '../shared/artifacts'
@@ -983,11 +985,14 @@ const createApplicationModules = async (
   const connectorRuntimeSettings = new ConnectorRuntimeSettingsProjection({
     readConnectors: () => settingsService.getConnectors(),
     skillsDir: join(getAppClaudeConfigDir(resolveStorageRoot()), 'skills'),
-    mcpClientManager
+    mcpClientManager,
+    notifyStatusChanged: () => broadcastToRenderers('settings:connector-runtime-changed', undefined)
   })
-  settingsService.setMaterializedCustomSkillNamesProvider(() =>
-    connectorRuntimeSettings.materializedCustomSkillNames()
-  )
+  settingsService.setCustomServerRuntimeProjectionProvider({
+    materializedSkillNames: () => connectorRuntimeSettings.materializedCustomSkillNames(),
+    availability: (id) => connectorRuntimeSettings.customServerAvailability(id),
+    isRefreshing: () => connectorRuntimeSettings.isRefreshing()
+  })
   settingsService.setCustomServerAuthenticator(
     async (serverId) => {
       const server = (await settingsService.getConnectors())?.customMcpServers?.find(
@@ -1067,6 +1072,8 @@ const createApplicationModules = async (
         return undefined
       }
     },
+    onCustomServerAvailabilityChanged: (serverId, availability) =>
+      connectorRuntimeSettings.setCustomServerDispatchAvailability(serverId, availability),
     localToolHandlers: { 'molecule/preview_molecule': moleculePreviewHandler }
   })
   // Register compute IPC handlers early so computeService can be wired into the notebook RPC server.
@@ -1182,6 +1189,7 @@ const createApplicationModules = async (
       listSkillCatalog: () => settingsService.listSpecialistSkillCatalog(),
       getConnectors: () => settingsService.getConnectors()
     },
+    customServerAvailability: (id) => connectorRuntimeSettings.customServerAvailability(id),
     sessionBinding: sessionBindingService,
     approvalGateway: specialistApprovalGateway,
     approvalLifecycle: completionHandoffLifecycle,
@@ -1275,6 +1283,18 @@ const createApplicationModules = async (
       hostArtifacts: new HostArtifactsService(projectFilesRepository, {
         artifact: artifactProvenanceRepository,
         upload: uploadRepository
+      }),
+      hostLineage: new HostLineageService({
+        catalog: projectFilesRepository,
+        provenance: artifactProvenanceRepository
+      }),
+      hostFrames: new HostFramesService({
+        readProject: (projectId) =>
+          sessionRepository.loadProjectWithDiagnostics(projectId, { mode: 'read-only' }),
+        readSession: (projectId, sessionId) =>
+          sessionRepository.loadSessionWithDiagnostics(projectId, sessionId, {
+            mode: 'read-only'
+          })
       }),
       inputRegistry: notebookInputRegistry,
       agentsService,
@@ -1693,7 +1713,8 @@ const createApplicationModules = async (
         permissionGrantRegistry.prune({ kind: 'mcp_server', serverId }).then(() => undefined),
       beginCustomServerSecurityChange: (serverId) =>
         connectorService.beginCustomServerSecurityChange(serverId),
-      clearCustomServerFailure: (serverId) => connectorService.clearCustomServerFailure(serverId)
+      clearCustomServerFailure: (serverId) => connectorService.clearCustomServerFailure(serverId),
+      resetCustomServerClient: (serverId) => mcpClientManager.close(serverId)
     },
     appearance: { applyAppIconVariant: onAppIconVariantChanged ?? (() => undefined) }
   })

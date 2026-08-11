@@ -312,5 +312,12 @@ test('keeps representative conversation, project, and recovery states visually s
     .getByRole('alert')
     .filter({ hasText: 'Saved conversation data was damaged' })
   await expect(recoveryAlert).toBeVisible()
+  const completedSessionDismiss = page.getByRole('button', {
+    name: /Mark completed session .* as read/
+  })
+  if (await completedSessionDismiss.isVisible()) {
+    await completedSessionDismiss.click()
+    await expect(completedSessionDismiss).toBeHidden()
+  }
   await expectStableScreenshot(page, 'session-recovery-warning.png')
 })

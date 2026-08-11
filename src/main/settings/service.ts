@@ -83,6 +83,7 @@ import { SettingsPreferencesModule, toSettingsPreferencesSnapshot } from './pref
 import { NotebookRuntimeSettingsModule } from './notebook-runtime-settings'
 import { SkillCatalogModule } from './skill-catalog'
 import { ConnectorSettingsModule, type CustomServerSecurityChangeGuard } from './connector-settings'
+import type { CustomServerRuntimeProjectionProvider } from './connector-settings'
 import { ProviderAccountsModule } from './provider-accounts'
 import { AgentRuntimeManager, type ExecuteClaudeProbe } from './agent-runtime-manager'
 import {
@@ -91,7 +92,6 @@ import {
   type AgentBackendSelection,
   type ExplicitAgentBackendTarget
 } from './backend-resolver'
-import { CONNECTOR_CATALOG } from '../connectors/catalog'
 import { SkillRegistry, type BundledSkill } from '../skills/registry'
 import { UserSkillRepository } from '../skills/user-skill-repository'
 import type { SkillExportArchive } from '../skills/export'
@@ -519,10 +519,9 @@ class SettingsService {
     return this.connectors.provisionedConnectorSkillNames()
   }
 
-  setMaterializedCustomSkillNamesProvider(provider: () => readonly string[]): void {
-    this.connectors.setMaterializedCustomSkillNamesProvider(provider)
+  setCustomServerRuntimeProjectionProvider(provider: CustomServerRuntimeProjectionProvider): void {
+    this.connectors.setCustomServerRuntimeProjectionProvider(provider)
   }
-
   // Returns the subset of forced ids that are currently disabled in settings — i.e. the picks that need
   // a respawn to materialize. Enabled picks are already present and need no reconnect.
   async skillsNeedingForceLoad(forcedIds: string[]): Promise<string[]> {
@@ -546,21 +545,9 @@ class SettingsService {
   async codexSkillCatalog(
     codexHome: string | undefined
   ): Promise<Array<{ name: string; description: string; path: string; source?: 'connector' }>> {
-    return this.skills.codexSkillCatalog(codexHome, (settings) => {
-      return this.connectors.enabledConnectorIds(settings.connectors).flatMap((id) => {
-        const connector = CONNECTOR_CATALOG.find((candidate) => candidate.id === id)
-        return connector
-          ? [
-              {
-                directory: `mcp-${id}`,
-                name: `mcp-${id}`,
-                description: connector.useWhen,
-                source: 'connector' as const
-              }
-            ]
-          : []
-      })
-    })
+    return this.skills.codexSkillCatalog(codexHome, (settings) =>
+      this.connectors.connectorSkillCatalogEntries(settings.connectors)
+    )
   }
 
   // Returns one skill's view plus its SKILL.md body for the detail view (any source).

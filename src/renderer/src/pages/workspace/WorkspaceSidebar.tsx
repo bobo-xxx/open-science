@@ -1,12 +1,14 @@
 import {
   Archive,
   BookOpen,
+  ChevronDown,
   ChevronLeft,
   Download,
   FileText,
   FileType2,
   Files,
   MoreVertical,
+  PanelLeft,
   Pencil,
   Pin,
   PinOff,
@@ -58,6 +60,22 @@ type WorkspaceSidebarProps = {
   onArchiveSession?: (session: ChatSession) => void
   onDeleteSession: (session: ChatSession) => void
   onOpenSettings: () => void
+  onOpenProjectSettings: () => void
+  onNewProject: () => void
+  // Either absent renders the menu item disabled (the page disables it only for an authoritatively
+  // complete empty project or while a download is already running; an unknown or incomplete index
+  // stays clickable so the click path can repair the index).
+  canDownloadProjectArtifacts?: boolean
+  onDownloadProjectArtifacts?: () => void
+  // Desktop only: rendered in the header row right after the project menu. Hidden while the
+  // sidebar is collapsed — the panel layout mounts its floating fallback then, keeping a single
+  // workspace-sidebar-toggle instance mounted at a time.
+  sidebarToggle?: {
+    state: 'open' | 'collapsed'
+    onToggle: () => void
+  }
+  // The layout shares one ref between this header instance and the floating collapsed fallback.
+  sidebarToggleButtonRef?: React.Ref<HTMLButtonElement>
   mobileMode?: boolean
   isMobileOpen?: boolean
   onMobileClose?: () => void
@@ -168,12 +186,12 @@ const getNextSessionSectionRefreshAt = (sessions: ChatSession[], now: number): n
 const sidebarInteractiveTransitionClassName = 'transition-colors duration-200 ease-out'
 
 const sessionRowClassName = cn(
-  'group mx-1.5 select-none rounded-md px-2.5 py-1.5 text-sm text-text-000 hover:bg-bg-300',
+  'group relative mx-1.5 select-none rounded-md px-2.5 py-1.5 text-sm text-text-000 hover:bg-bg-300',
   sidebarInteractiveTransitionClassName
 )
 
 const sessionRowActionClassName =
-  'relative -mr-1 rounded p-0.5 text-text-100 opacity-0 transition-[opacity,color,background-color] duration-200 ease-out hover:!opacity-100 hover:bg-bg-400 hover:text-text-000 focus-visible:opacity-100 group-hover:opacity-100 data-[state=open]:opacity-100'
+  'absolute right-1.5 top-1/2 z-10 -translate-y-1/2 rounded p-0.5 text-text-100 opacity-0 transition-[opacity,color,background-color] duration-200 ease-out hover:!opacity-100 hover:bg-bg-400 hover:text-text-000 focus-visible:opacity-100 group-hover:opacity-100 data-[state=open]:opacity-100'
 
 // Shared icon wrapper inside each menu item row.
 const sessionMenuIconClassName = 'flex size-4 shrink-0 items-center justify-center'
@@ -201,6 +219,12 @@ const WorkspaceSidebarView = ({
   onArchiveSession,
   onDeleteSession,
   onOpenSettings,
+  onOpenProjectSettings,
+  onNewProject,
+  canDownloadProjectArtifacts = false,
+  onDownloadProjectArtifacts,
+  sidebarToggle,
+  sidebarToggleButtonRef,
   mobileMode = false,
   isMobileOpen = false,
   onMobileClose,
@@ -231,26 +255,89 @@ const WorkspaceSidebarView = ({
     >
       <div className="m-2 flex min-h-0 flex-1 flex-col rounded-lg bg-rail-card-bg shadow-card">
         <div className="px-3 pt-3">
-          <div className={cn('flex items-start', mobileMode ? 'gap-2' : 'pr-9')}>
-            <div className="min-w-0 flex-1">
+          <div className="flex items-center">
+            <button
+              type="button"
+              onClick={onGoHome}
+              aria-label="All projects"
+              title="All projects"
+              className={cn(
+                'grid h-7 w-5 shrink-0 cursor-pointer place-items-center rounded-md text-muted-foreground hover:bg-bg-300 hover:text-text-000',
+                sidebarInteractiveTransitionClassName
+              )}
+            >
+              <ChevronLeft className="size-4" strokeWidth={2} aria-hidden="true" />
+            </button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  title={projectName}
+                  className={cn(
+                    'flex min-w-0 flex-1 cursor-pointer items-center gap-1 rounded-lg py-1 pl-1 pr-2 text-left font-serif text-[15px] font-bold tracking-[-0.02em] text-text-000 hover:bg-bg-300 data-[state=open]:bg-bg-300',
+                    sidebarInteractiveTransitionClassName
+                  )}
+                >
+                  <span className="min-w-0 flex-1 truncate">{projectName}</span>
+                  <ChevronDown
+                    className="size-3.5 shrink-0 text-text-100"
+                    strokeWidth={2}
+                    aria-hidden="true"
+                  />
+                </button>
+              </DropdownMenuTrigger>
+              {/* Project action menu: mirrors the session row menu chrome below. */}
+              <DropdownMenuContent
+                aria-label="Project actions"
+                className={cn('min-w-[11rem]', mobileMode && 'z-[80]')}
+                side="bottom"
+                align="start"
+                sideOffset={6}
+              >
+                <DropdownMenuItem className="gap-2" onSelect={() => onOpenProjectSettings()}>
+                  <span className={sessionMenuIconClassName}>
+                    <Settings className="size-4" strokeWidth={2} aria-hidden="true" />
+                  </span>
+                  Project settings
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  className="gap-2"
+                  disabled={!canDownloadProjectArtifacts || !onDownloadProjectArtifacts}
+                  onSelect={() => onDownloadProjectArtifacts?.()}
+                >
+                  <span className={sessionMenuIconClassName}>
+                    <Download className="size-4" strokeWidth={2} aria-hidden="true" />
+                  </span>
+                  Download artifacts…
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem className="gap-2" onSelect={() => onNewProject()}>
+                  <span className={sessionMenuIconClassName}>
+                    <Plus className="size-4" strokeWidth={2} aria-hidden="true" />
+                  </span>
+                  New project
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+            {!mobileMode && sidebarToggle && sidebarToggle.state !== 'collapsed' ? (
               <button
+                ref={sidebarToggleButtonRef}
                 type="button"
-                onClick={onGoHome}
+                data-testid="workspace-sidebar-toggle"
                 className={cn(
-                  'flex w-full items-center gap-1 rounded-md px-1.5 py-1 text-[11px] text-muted-foreground hover:bg-bg-300 hover:text-text-000',
+                  'grid size-7 shrink-0 cursor-pointer place-items-center rounded-lg text-action-panel-toggle hover:bg-bg-300',
                   sidebarInteractiveTransitionClassName
                 )}
+                aria-label="Collapse sidebar panel"
+                aria-expanded={true}
+                aria-controls="left-panel"
+                aria-keyshortcuts={isMac ? 'Meta+B' : 'Control+B'}
+                title="Collapse sidebar panel"
+                onClick={sidebarToggle.onToggle}
               >
-                <ChevronLeft className="size-3.5" strokeWidth={2} aria-hidden="true" />
-                <span>All projects</span>
+                <PanelLeft className="size-4" strokeWidth={2} fill="none" aria-hidden="true" />
               </button>
-              <div
-                className="mt-1.5 truncate px-1.5 font-serif text-[16px] font-bold tracking-[-0.02em] text-text-000"
-                title={projectName}
-              >
-                {projectName}
-              </div>
-            </div>
+            ) : null}
             {mobileMode ? (
               <button
                 type="button"
@@ -349,7 +436,7 @@ const WorkspaceSidebarView = ({
                       className={cn(sessionRowClassName, isActive && 'bg-bg-300 text-text-000')}
                       title={session.title}
                     >
-                      <div className="flex w-full min-w-0 items-center gap-1.5">
+                      <div className="flex w-full min-w-0 items-center">
                         <button
                           type="button"
                           className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left"
@@ -375,22 +462,39 @@ const WorkspaceSidebarView = ({
                           <span className="sr-only">
                             Session status: {sessionStatusLabel[session.status]}
                           </span>
-                          <span className="min-w-0 flex-1 truncate">{session.title}</span>
+                          <span
+                            className={cn(
+                              'min-w-0 flex-1 overflow-hidden whitespace-nowrap',
+                              section.label === 'Active' &&
+                                session.status !== 'idle' &&
+                                'font-semibold'
+                            )}
+                          >
+                            {session.title}
+                          </span>
                           {showSessionShortcuts && shortcutNumber ? (
                             <kbd
                               aria-hidden="true"
-                              className="shrink-0 rounded-full bg-bg-300 px-1.5 py-0.5 font-sans text-[11px] font-medium leading-none tabular-nums text-text-100"
+                              className="relative z-[2] mr-5 shrink-0 rounded-full bg-bg-300 px-1.5 py-0.5 font-sans text-[11px] font-medium leading-none tabular-nums text-text-100"
                             >
                               {isMac ? `⌘${shortcutNumber}` : `Ctrl+${shortcutNumber}`}
                             </kbd>
                           ) : null}
                         </button>
 
+                        <span
+                          aria-hidden="true"
+                          className={cn(
+                            'pointer-events-none absolute inset-y-0 right-0 z-[1] w-12 rounded-r-md bg-gradient-to-r from-transparent via-rail-card-bg to-rail-card-bg group-hover:via-bg-300 group-hover:to-bg-300',
+                            isActive && 'via-bg-300 to-bg-300'
+                          )}
+                        />
+
                         <DropdownMenu>
                           <DropdownMenuTrigger asChild>
                             <button
                               type="button"
-                              className={cn(sessionRowActionClassName, isActive && 'opacity-100')}
+                              className={cn(sessionRowActionClassName, mobileMode && 'opacity-100')}
                               aria-label={`Open actions for ${session.title}`}
                             >
                               <span
@@ -404,7 +508,7 @@ const WorkspaceSidebarView = ({
                           {/* Session action menu: uses shadcn default light-surface tokens. */}
                           <DropdownMenuContent
                             aria-label="Session actions"
-                            className="min-w-[9rem]"
+                            className={cn('min-w-[9rem]', mobileMode && 'z-[80]')}
                             side="right"
                             align="start"
                             sideOffset={6}
@@ -470,7 +574,10 @@ const WorkspaceSidebarView = ({
                                   </span>
                                   <span className="flex-1">Export conversation</span>
                                 </DropdownMenuSubTrigger>
-                                <DropdownMenuSubContent aria-label="Export conversation formats">
+                                <DropdownMenuSubContent
+                                  aria-label="Export conversation formats"
+                                  className={mobileMode ? 'z-[80]' : undefined}
+                                >
                                   <DropdownMenuItem
                                     className="gap-2"
                                     onSelect={() => onExportSession(session, 'markdown')}

@@ -249,6 +249,7 @@ export const RENDERER_CONTRACT_GROUPS = Object.freeze([
   group('platform-file-save', '', [
     ['getRuntimeVersions', null, NATIVE], ['saveBlobFile', 'file:save-blob', MAPPED_NATIVE], ['saveManagedFile', 'file:save-managed', DELEGATED_NATIVE],
     ['saveSessionArtifacts', 'file:save-session-artifacts', MAPPED_ELECTRON],
+    ['saveProjectArtifacts', 'file:save-project-artifacts', MAPPED_ELECTRON],
   ]),
   group('preview', 'preview', [
     ['delete', 'preview:delete'], ['load', 'preview:load'], ['save', 'preview:save'],
@@ -326,7 +327,7 @@ export const RENDERER_CONTRACT_GROUPS = Object.freeze([
     ['loginIsolatedCodex', 'settings:login-isolated-codex', LOCAL], ['loginSharedClaude', 'settings:login-shared-claude', LOCAL],
     ['logoutIsolatedClaude', 'settings:logout-isolated-claude', LOCAL], ['logoutIsolatedCodex', 'settings:logout-isolated-codex', LOCAL],
     ['logoutSharedClaude', 'settings:logout-shared-claude', LOCAL], ['markOnboardingComplete', 'settings:mark-onboarding-complete'],
-    ['onConnectorApprovalRequest', 'connectors:approval-request', EVENT], ['onInstallLog', 'settings:install-log', EVENT],
+    ['onConnectorApprovalRequest', 'connectors:approval-request', EVENT], ['onConnectorRuntimeChanged', 'settings:connector-runtime-changed', EVENT], ['onInstallLog', 'settings:install-log', EVENT],
     ['onSkillImportApprovalRequest', 'skills:conversation-import-request', EVENT],
     ['onSkillImportApprovalSettled', 'skills:conversation-import-settled', EVENT], ['previewAgentHomeSkill', 'settings:preview-agent-home-skill'], ['previewCustomServerTemplateExport', 'settings:preview-custom-server-template-export', ELECTRON],
     ['previewGitHubSkill', 'settings:preview-github-skill'], ['previewSkillZip', 'settings:preview-skill-zip'],
@@ -337,6 +338,7 @@ export const RENDERER_CONTRACT_GROUPS = Object.freeze([
     ['setAppIconVariant', 'settings:set-app-icon-variant', LOCAL], ['setClosePreference', 'settings:set-close-preference', LOCAL],
     ['setDefaultPermissionProfile', 'settings:set-default-permission-profile', LOCAL],
     ['setConnectorAutoAllow', 'settings:set-connector-auto-allow'], ['setConnectorEnabled', 'settings:set-connector-enabled'],
+    ['retryCustomServer', 'settings:retry-custom-server', LOCAL],
     ['setConversationSkillImportEnabled', 'settings:set-conversation-skill-import-enabled'], ['setCustomServerEnabled', 'settings:set-custom-server-enabled'],
     ['setNcbiCredentials', 'settings:set-ncbi-credentials'], ['setNotificationsEnabled', 'settings:set-notifications-enabled', LOCAL],
     ['setPackageMirror', 'settings:set-package-mirror', LOCAL], ['setReasoningEffort', 'settings:set-reasoning-effort'],

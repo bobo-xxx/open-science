@@ -8,7 +8,7 @@
 
 **Open Science is an open-source, local-first, model-agnostic, self-hosted AI research workbench for reproducible scientific discovery.** Built for researchers, it runs on your own computer (macOS, Windows, Linux). Create a project, describe a task in plain language, and let the AI agent read files, run Python and R code, search the web, call scientific data connectors, and return reproducible reports, tables, and figures linked to an inspectable activity history in one workspace.
 
-Open Science currently includes 18 featured research skills and 24 built-in scientific connectors, with its strongest coverage in bioinformatics, computational biology, biomedical research, genomics, structural biology, and computational drug discovery—and an extensible architecture designed to support more scientific disciplines over time.
+Open Science supports computational and data-intensive research across disciplines, including machine learning, statistics, life sciences, chemistry, materials science, physics and environmental science. It supports the research process from literature review and hypothesis development to code execution, data analysis, simulation, visualization, and the production of traceable research outputs.
 
 > 💡 **[Open Science v0.13.0 released](https://github.com/aipoch/open-science/releases/latest)** _(last updated August 10, 2026)_. Highlights include persistent side conversations, a conversational skill creator, project pinning, a unified plan-approval composer, branch-aware context-window run trends, session keyboard shortcuts, and notebook host capability introspection, alongside restored upload bytes, preserved continuation provenance, and hardened compute job transitions. See the [latest release notes](https://github.com/aipoch/open-science/releases/latest) for the full changelog.
 
@@ -33,7 +33,6 @@ Open Science currently includes 18 featured research skills and 24 built-in scie
 - [Frequently Asked Questions](#frequently-asked-questions)
 - [Get Involved](#get-involved)
 - [License](#license)
-- [Star History](#star-history)
 
 ## 🚀 Quick Start
 
@@ -423,13 +422,3 @@ Before opening a public issue, remove API Keys, tokens, private file paths, unpu
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
-
-## Star History
-
-<a href="https://www.star-history.com/?repos=aipoch%2Fopen-science&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=aipoch/open-science&type=date&theme=dark&legend=top-left&sealed_token=SfYmaFKVrSeoWXSFpM9v1yIMgQGuqcSgB3atEXCZ41bGZjk56hO-cJaQrD1sVpdyioihMw-HX-gxMQ3LsNaMPk8hP4sk1CzYoh-AtROEZeFB_5GestwN4xj2dlQSBuqa4nFUWabnN4YTg02U7tipvbF_YkahNnTz5m5W-GEn3xioDebss0lJJL8HrJfl" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=aipoch/open-science&type=date&legend=top-left&sealed_token=SfYmaFKVrSeoWXSFpM9v1yIMgQGuqcSgB3atEXCZ41bGZjk56hO-cJaQrD1sVpdyioihMw-HX-gxMQ3LsNaMPk8hP4sk1CzYoh-AtROEZeFB_5GestwN4xj2dlQSBuqa4nFUWabnN4YTg02U7tipvbF_YkahNnTz5m5W-GEn3xioDebss0lJJL8HrJfl" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=aipoch/open-science&type=date&legend=top-left&sealed_token=SfYmaFKVrSeoWXSFpM9v1yIMgQGuqcSgB3atEXCZ41bGZjk56hO-cJaQrD1sVpdyioihMw-HX-gxMQ3LsNaMPk8hP4sk1CzYoh-AtROEZeFB_5GestwN4xj2dlQSBuqa4nFUWabnN4YTg02U7tipvbF_YkahNnTz5m5W-GEn3xioDebss0lJJL8HrJfl" />
- </picture>
-</a>

@@ -58,6 +58,8 @@ import type {
   SaveBlobFileResult,
   SaveManagedFileRequest,
   SaveManagedFileResult,
+  SaveProjectArtifactsRequest,
+  SaveProjectArtifactsResult,
   SaveSessionArtifactsRequest,
   SaveSessionArtifactsResult
 } from '../shared/file-save'
@@ -341,6 +343,7 @@ export interface OpenScienceAPI {
   saveBlobFile(request: SaveBlobFileRequest): Promise<SaveBlobFileResult>
   saveManagedFile(request: SaveManagedFileRequest): Promise<SaveManagedFileResult>
   saveSessionArtifacts(request: SaveSessionArtifactsRequest): Promise<SaveSessionArtifactsResult>
+  saveProjectArtifacts(request: SaveProjectArtifactsRequest): Promise<SaveProjectArtifactsResult>
   // Host platform (process.platform), e.g. 'win32' | 'darwin' | 'linux'.
   platform: string
   getRuntimeVersions(): {
@@ -503,7 +506,9 @@ export interface OpenScienceAPI {
     updateCustomServer(request: UpdateCustomServerRequest): Promise<ConnectorsSnapshot>
     authenticateCustomServer(request: AuthenticateCustomServerRequest): Promise<ConnectorsSnapshot>
     cancelCustomServerAuthentication(request: AuthenticateCustomServerRequest): Promise<void>
+    retryCustomServer(request: AuthenticateCustomServerRequest): Promise<ConnectorsSnapshot>
     onConnectorApprovalRequest(listener: AcpListener<ConnectorApprovalRequest>): RemoveListener
+    onConnectorRuntimeChanged(listener: AcpListener<undefined>): RemoveListener
     onSkillImportApprovalRequest(
       listener: AcpListener<ConversationSkillImportApprovalRequest>
     ): RemoveListener
