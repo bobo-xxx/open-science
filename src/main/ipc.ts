@@ -28,6 +28,10 @@ import {
 import { registerApplicationCommandElectronAdapter } from './application-command-electron-adapter'
 import type { ApplicationInvocation } from './application-command-router'
 import { createApplicationEventModule, type ApplicationEventSource } from './application-events'
+import {
+  LIFECYCLE_CHANNELS,
+  MAIN_DELEGATED_WORK_LIFECYCLE_CLIENT_ID
+} from '../shared/lifecycle-events'
 
 import { createAcpRuntime } from './acp/runtime-composition'
 import { SideChatRelayOwner } from './acp/side-chat-relay-owner'
@@ -51,6 +55,7 @@ import { ArtifactRunRegistry } from './artifacts/run-registry'
 import { createComputeIpcModule } from './compute/ipc'
 import type { ComputeJobOwnerLiveness } from './compute/job-deletion-owner'
 import { attachEnabledComputeHosts } from './compute/enabled-hosts-registry'
+import { SessionEnabledComputeHostsOwner } from './compute/session-enabled-hosts-owner'
 import { createComputeJobRuntime } from './compute/job-runtime'
 import { waitForInitialConnectorRefresh } from './connector-reload'
 import { ApprovalBroker } from './connectors/approval-broker'
@@ -134,6 +139,7 @@ import { parseArtifactVersionLocator } from '../shared/artifact-provenance'
 import { parseUploadVersionReference } from '../shared/uploads'
 import { DEFAULT_ARTIFACT_PROJECT_NAME } from '../shared/artifacts'
 import type { NotebookLanguage } from '../shared/notebook'
+import { MAIN_ENABLED_COMPUTE_HOSTS_LIFECYCLE_CLIENT_ID } from '../shared/lifecycle-events'
 import { OFFICE_PREVIEW_STATE_CHANNEL } from '../shared/office-preview'
 import { prepareExternalPythonRuntime } from './notebook/venv-overlay'
 import {
@@ -251,7 +257,7 @@ import { registerStorageIpcHandlers } from './storage/ipc'
 import { createStorageCommandOwner } from './storage/command-owner'
 import { withDataRootWrite } from './storage/migration-state'
 import { normalizeLegacyDataPaths } from './storage/normalize-legacy-paths'
-import { detectActiveSessions } from './storage/detect-active'
+import { createDelegatedActivityProjection, detectActiveSessions } from './storage/detect-active'
 import {
   computeDefaultDataRoot,
   initDataRoot,
@@ -262,6 +268,7 @@ import {
 } from './storage-root'
 import { createUpdateCommandOwner, registerUpdateIpcHandlers } from './update/ipc'
 import { createUpdateStrategy } from './update/create-strategy'
+import { createDelegatedSafeInstallGate } from './update/strategy'
 import { startUpdateScheduler } from './update/scheduler'
 import { createDefaultUploadRepository, registerUploadIpcHandlers } from './uploads/ipc'
 import { createUploadCommandOwner } from './uploads/command-owner'
@@ -619,6 +626,14 @@ const createApplicationModules = async (
       return computeJobDeletionRef.current.abortProjectJobDeletion(projectId)
     }
   }
+  // Delegated execution can outlive its root Turn and therefore is absent from the ACP runtime's
+  // active-prompt list. Keep a synchronous projection of durable delegated mutations for the
+  // close/quit and storage-migration safety gates. The selector deliberately ignores active routes:
+  // inactive-branch work still owns processes/files and must block disruptive operations.
+  const delegatedActivity = createDelegatedActivityProjection()
+  const getActiveDelegatedSessions = (): { projectName: string; sessionId: string }[] =>
+    delegatedActivity.getActiveDelegatedSessions()
+
   const sessionPersistenceCoordinator = new SessionPersistenceCoordinator(
     sessionRepository,
     projectFilesRepository,
@@ -631,7 +646,14 @@ const createApplicationModules = async (
         reconcilePermissionGrantOwners(permissionGrantRegistry, { sessions })
     },
     undefined,
-    computeJobDeletionPort
+    computeJobDeletionPort,
+    (session) => {
+      delegatedActivity.recordSession(session)
+      broadcastToRenderers(LIFECYCLE_CHANNELS.sessionUpdated, {
+        session,
+        originClientId: MAIN_DELEGATED_WORK_LIFECYCLE_CLIENT_ID
+      })
+    }
   )
   const sideChatRelay = new SideChatRelayOwner({
     targetState: (parentSessionId) => {
@@ -688,6 +710,7 @@ const createApplicationModules = async (
       runtime: {
         getActivePromptSessions: () => runtimeRef.current?.getActivePromptSessions() ?? []
       },
+      delegated: { getActiveDelegatedSessions },
       notebook: {
         getActiveNotebookSessions: () =>
           notebookActivityRef.current?.getActiveNotebookSessions() ?? []
@@ -713,11 +736,14 @@ const createApplicationModules = async (
   archiveCoordinator.setMarkReadSessions((sessionIds) =>
     notificationInbox.markSessionsRead(sessionIds)
   )
+  const sessionEnabledComputeHostsOwnerRef: { current?: SessionEnabledComputeHostsOwner } = {}
   bindNotificationInboxDeletionRuntime({
     inbox: notificationInbox,
     sessionPersistenceCoordinator,
-    onSessionsDeleted: (sessionIds) =>
-      sideChatOwnerRef.current?.invalidateParents(sessionIds) ?? Promise.resolve()
+    onSessionsDeleted: async (sessionIds) => {
+      await sessionEnabledComputeHostsOwnerRef.current?.clear(sessionIds)
+      await (sideChatOwnerRef.current?.invalidateParents(sessionIds) ?? Promise.resolve())
+    }
   })
   const projectHandlers = createProjectHandlers(projectRepository, projectDeletionCoordinator, {
     updateArchive: (request) => archiveCoordinator.updateProjectArchive(request)
@@ -732,8 +758,22 @@ const createApplicationModules = async (
   // the next message. Shared by persistSessionSpecialist (stash) and saveSession (flush).
   const pendingSpecialistBindings = new PendingSessionSpecialistBindings()
   const sessionPersistenceBackend: SessionPersistenceBackend = {
-    loadAll: () =>
-      loadSessionsAfterProjectRecovery(projectDeletionCoordinator, sessionPersistenceCoordinator),
+    loadAll: async () => {
+      const result = await loadSessionsAfterProjectRecovery(
+        projectDeletionCoordinator,
+        sessionPersistenceCoordinator
+      )
+      if (!sessionEnabledComputeHostsOwnerRef.current) {
+        throw new Error('Session enabled Compute Host ownership is not initialized.')
+      }
+      return {
+        ...result,
+        sessions: await sessionEnabledComputeHostsOwnerRef.current.reconcile(
+          result.sessions,
+          result.diagnostics?.isComplete === true
+        )
+      }
+    },
     loadOne: async ({ projectId, sessionId }) => {
       await projectDeletionCoordinator.recoverPendingDeletions()
       return sessionRepository.loadSession(projectId, sessionId)
@@ -742,7 +782,16 @@ const createApplicationModules = async (
       await projectDeletionCoordinator.recoverPendingDeletions()
       const created =
         (await sessionRepository.loadSession(session.projectId, session.id)) === undefined
-      const durableSession = await sessionPersistenceCoordinator.saveSession(session, options)
+      const durableSession = created
+        ? await (() => {
+            if (!sessionEnabledComputeHostsOwnerRef.current) {
+              throw new Error('Session enabled Compute Host ownership is not initialized.')
+            }
+            return sessionEnabledComputeHostsOwnerRef.current.createSession(session, (candidate) =>
+              sessionPersistenceCoordinator.saveSession(candidate, options)
+            )
+          })()
+        : await sessionPersistenceCoordinator.saveSession(session, options)
       // Flush any approved host.agents.switch binding stashed while this session was not yet durable,
       // so the approved target survives a restart before the next message (the in-memory binding
       // alone does not persist across restart).
@@ -1115,7 +1164,28 @@ const createApplicationModules = async (
     undefined,
     taskNotifications,
     permissionGrantRegistry,
-    settingsRepository
+    settingsRepository,
+    {
+      pruneSessionEnabledHosts: async (providerId, afterPrune) => {
+        if (!sessionEnabledComputeHostsOwnerRef.current) {
+          throw new Error('Session enabled Compute Host ownership is not initialized.')
+        }
+        const sessions = await sessionEnabledComputeHostsOwnerRef.current.pruneProvider(
+          providerId,
+          afterPrune
+        )
+        for (const session of sessions) {
+          try {
+            applicationEvents.publish('session:updated', {
+              session,
+              originClientId: MAIN_ENABLED_COMPUTE_HOSTS_LIFECYCLE_CLIENT_ID
+            })
+          } catch {
+            // The durable repair and cache projection have committed; lifecycle delivery is best effort.
+          }
+        }
+      }
+    }
   )
   surfaceAdapters = beforeAcpAdapters
   const {
@@ -1125,6 +1195,14 @@ const createApplicationModules = async (
     hostRepository,
     enabledComputeHostsRegistry: hostsRegistry
   } = computeIpcModule
+  const sessionEnabledComputeHostsOwner = new SessionEnabledComputeHostsOwner({
+    registry: hostsRegistry,
+    hostExists: async (providerId) => (await hostRepository.get(providerId)) !== null,
+    listHostIds: async () => (await hostRepository.list()).map((host) => host.providerId),
+    sessionAuthority: sessionPersistenceCoordinator,
+    withDataRootWrite
+  })
+  sessionEnabledComputeHostsOwnerRef.current = sessionEnabledComputeHostsOwner
   computeJobDeletionRef.current = jobDeletionOwner
   await projectDeletionCoordinator.restorePendingDeletionBarriers()
   await jobDeletionOwner.restoreOrphanJobDeletionBarriers(isComputeJobOwnerLive)
@@ -1900,7 +1978,10 @@ const createApplicationModules = async (
   // this immutable dependency from construction; the manifest fallback ignores it because it does not
   // quit the running app to install.
   const updateStrategy = createUpdateStrategy(process.platform, {
-    installGate: () => shutdownCoordinator.runForUpdateGate(UPDATE_SHUTDOWN_BUDGET_MS)
+    installGate: createDelegatedSafeInstallGate(
+      () => getActiveDelegatedSessions().length > 0,
+      () => shutdownCoordinator.runForUpdateGate(UPDATE_SHUTDOWN_BUDGET_MS)
+    )
   })
   const updateCommandOwner = createUpdateCommandOwner(updateStrategy)
   let stopUpdateScheduler: (() => void) | undefined
@@ -2294,6 +2375,7 @@ const createApplicationModules = async (
     runtime,
     notebook: notebookService,
     getActivePromptSessions: () => runtime.getActivePromptSessions(),
+    getActiveDelegatedSessions,
     settingsService,
     micromambaRunner
   })
@@ -2303,6 +2385,7 @@ const createApplicationModules = async (
         runtime,
         notebook: notebookService,
         getActivePromptSessions: () => runtime.getActivePromptSessions(),
+        getActiveDelegatedSessions,
         settingsService
       },
       storageCommandOwner
@@ -2469,7 +2552,8 @@ const createApplicationModules = async (
         get: (providerId) => settingsService.getComputeBookmarks(providerId),
         set: (providerId, folders) => settingsService.setComputeBookmarks(providerId, folders)
       },
-      enabledHosts: hostsRegistry
+      enabledHosts: sessionEnabledComputeHostsOwner,
+      events: applicationEvents
     },
     permissionGrants: permissionGrantProjection,
     dataContent: {
@@ -2564,12 +2648,16 @@ const createApplicationModules = async (
     detectActiveSessions: () =>
       detectActiveSessions({
         runtime: { getActivePromptSessions: () => runtime.getQuitBlockingPromptSessions() },
+        delegated: { getActiveDelegatedSessions },
         notebook: notebookService
       }),
     prepareForQuit: () => runtime.prepareForQuit(),
     electronAdapters: {
       beforeCompute: beforeComputeAdapters,
-      compute: computeIpcModule,
+      compute: {
+        handlers: computeIpcModule.handlers,
+        enabledHosts: sessionEnabledComputeHostsOwner
+      },
       beforeAcp: beforeAcpAdapters,
       acp: {
         runtime,
