@@ -2684,9 +2684,14 @@ describe('SettingsService: preflight & spawn config', () => {
     await repository.setAgentFramework('codex')
     const provider = (
       await service.upsertProvider({
-        type: 'official',
-        name: 'DeepSeek',
-        vendorId: 'deepseek',
+        type: 'custom',
+        name: 'Chat Gateway',
+        apiEndpoints: ['openai'],
+        baseUrl: 'https://api.deepseek.com/v1',
+        model: 'deepseek-v4-pro',
+        contextWindow: 1_000_000,
+        reasoningEffortPreset: 'none-high',
+        reasoningEffortTransport: 'deepseek',
         key: 'test-key'
       })
     ).providers[0]
@@ -2695,9 +2700,7 @@ describe('SettingsService: preflight & spawn config', () => {
       ...storedProvider,
       lastValidatedAt: Date.now()
     })
-    // deepseek-v4-pro does not yet support the native Responses API, so it drives the Chat Completions
-    // bridge (the test's whole purpose). deepseek-v4-flash would route to native Responses instead.
-    await service.setActiveProvider(provider.id, 'deepseek-v4-pro')
+    await service.setActiveProvider(provider.id)
     await repository.setReasoningEffort('low')
 
     vi.stubEnv('OPEN_SCIENCE_AGENT_FRAMEWORK', 'codex')
@@ -3247,6 +3250,7 @@ describe('SettingsService: official vendors', () => {
 
   it('refreshes models from the vendor and persists them over the bundled catalog', async () => {
     const service = createService()
+    mockedNet.fetch.mockClear()
     vi.stubGlobal(
       'fetch',
       vi.fn().mockResolvedValue({
@@ -3269,6 +3273,10 @@ describe('SettingsService: official vendors', () => {
 
     const result = await service.refreshProviderModels({ providerId: created.id })
     expect(result).toMatchObject({ ok: true, models: ['deepseek-v5', 'deepseek-v4-pro'] })
+    expect(mockedNet.fetch).toHaveBeenCalledWith(
+      expect.stringMatching(/\/models$/),
+      expect.objectContaining({ method: 'GET', signal: expect.any(AbortSignal) })
+    )
 
     // The fetched list now backs the provider view (and persists).
     const view = (await service.getSettingsView()).providers[0]
@@ -3329,24 +3337,22 @@ describe('SettingsService: official vendors', () => {
     })
   })
 
-  it('probes DeepSeek with the bridge tool-call contract under Codex', async () => {
+  it('probes DeepSeek Pro through the native Responses route under Codex', async () => {
     const service = createService()
     await repository.setAgentFramework('codex')
-    const fetchMock = vi.fn().mockResolvedValue(validBridgeToolCallResponse())
+    const fetchMock = vi.fn().mockResolvedValue(validNativeCompatibilityToolCallResponse())
     vi.stubGlobal('fetch', fetchMock)
 
     const result = await service.validateProvider({
       draft: { type: 'official', vendorId: 'deepseek', key: 'sk-ds' }
     })
 
-    expect(result.ok).toBe(true)
-    // The dual-endpoint vendor reaches Codex through the Chat Completions bridge, so the probe must
-    // prove streaming function calls on the same OpenAI route before validation succeeds.
-    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body))
-    expect(fetchMock.mock.calls[0][0]).toBe('https://api.deepseek.com/v1/chat/completions')
-    expect(body).toMatchObject({
+    expect(result).toMatchObject({ ok: true, category: 'ok' })
+    expect(fetchMock.mock.calls[0][0]).toBe('https://api.deepseek.com/v1/responses')
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toMatchObject({
+      model: 'deepseek-v4-pro',
       stream: true,
-      tools: [{ type: 'function', function: { name: 'open_science_bridge_probe' } }]
+      tools: [{ type: 'function', name: 'open_science__bridge_probe' }]
     })
   })
 

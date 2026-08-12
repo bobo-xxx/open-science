@@ -212,7 +212,7 @@ Target values for dark mode. Apply under `.dark` when dark theme is enabled:
 
 1. Default to shadcn semantic classes for new UI: `bg-background`, `text-foreground`, `bg-card`, `bg-accent`, `text-muted-foreground`, and so on.
 2. Use workspace classes only where this document names a workspace surface (shell, sidebar rows, composer, session menus, markdown blocks, and similar).
-3. Do not add new color token names. Extend styling only through the shadcn and workspace token sets below.
+3. Add color roles only when an existing semantic token cannot preserve the intended meaning and visual value. Register the role in `main.css` and document it here before using it in components.
 
 ### shadcn Semantic Tokens
 
@@ -259,6 +259,31 @@ Workspace-only tokens without a shadcn counterpart, plus shadow tokens. For shar
 | `--shadow-card`                     | `shadow-card`                      | `0 0 0 1px rgb(10 10 10 / 0.06), 0 4px 24px rgb(10 10 10 / 0.04)` | Sidebar rail card and composer dock         |
 | `--shadow-card-opaque`              | `shadow-card-opaque`               | `0 0 0 1px rgb(10 10 10 / 0.08), 0 8px 28px rgb(10 10 10 / 0.1)`  | Composer form                               |
 | `--shadow-menu` / `--shadow-dialog` | `shadow-menu`, `shadow-dialog`     | `0 2px 8px rgb(0 0 0 / 0.08)`, `0 8px 32px rgb(10 10 10 / 12%)`   | Menus and modal dialogs                     |
+
+### Settings Status and Category Tokens
+
+Settings views use named aliases for categorical data and host status. The aliases in `main.css`
+resolve to the established Tailwind palette values, so semantic cleanup does not change the rendered
+colors.
+
+| Semantic role        | Tailwind classes                                                                                                                             | Usage                                          |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
+| Storage categories   | `bg-storage-artifacts`, `bg-storage-delegation`, `bg-storage-runtime`, `bg-storage-uploads`, `bg-storage-notebooks`, `bg-storage-workspaces` | Disk-usage bar segments and legend swatches    |
+| Success surface      | `bg-status-success-surface`, `text-status-success-foreground`                                                                                | Reachable Compute host icon and badge          |
+| Success accent       | `bg-status-success-accent/10`, `text-status-success-accent-foreground`                                                                       | Completed storage migration icon               |
+| Failure surface      | `bg-status-failure-surface`, `text-status-failure-foreground`                                                                                | Failed Compute host icon and badge             |
+| Failure detail       | `border-status-failure-border`, `bg-status-failure-subtle/50`, `text-status-failure-accent`, `text-status-failure-strong`                    | Compute probe failure panel                    |
+| Dark status variants | `dark:*-status-success-dark-*`, `dark:*-status-failure-dark-*`                                                                               | Preserve the existing dark-mode status palette |
+
+Do not use these tokens as general brand accents. Storage colors distinguish categories; status
+colors communicate a successful or failed probe/migration result.
+
+### Named Layer Tokens
+
+| Token                     | Tailwind class    | Value | Usage                                                              |
+| ------------------------- | ----------------- | ----- | ------------------------------------------------------------------ |
+| `--z-index-markdown-menu` | `z-markdown-menu` | `200` | Streamdown Mermaid and table format menus above fullscreen content |
+| -----                     | --------------    | ----- | -----                                                              |
 
 ### Border Opacity
 
@@ -613,9 +638,9 @@ Workspace-only tokens without a shadcn counterpart, plus shadow tokens. For shar
 ### Onboarding
 
 - Root: `h-svh overflow-y-auto bg-bg-10 text-text-000`.
-- Container: `mx-auto min-h-full w-full max-w-[1040px] px-8 py-7`.
+- Container: `mx-auto min-h-full w-full max-w-[1040px] px-4 py-5 sm:px-8 sm:py-7`.
 - Brand: reuse the exact Home treatment, `font-serif text-[26px] font-medium leading-none tracking-[-0.02em] text-text-000`; do not recolor it with `primary`.
-- Main layout: `mt-12 grid grid-cols-[240px_minmax(0,1fr)] gap-10`; the left column is unframed introduction/progress, and the right column is the only visible work card.
+- Main layout: one column with compact spacing below `md`; at `md` and wider use `mt-12 grid grid-cols-[240px_minmax(0,1fr)] gap-10`. The left column is unframed introduction/progress, and the right column is the only visible work card.
 - Work surface: one shadcn `Card`, `min-h-[420px] gap-0 rounded-lg bg-bg-000 py-0 shadow-card ring-1 ring-border-200`; do not nest visual cards inside it.
 - Current step uses `bg-primary text-primary-foreground`; completed and inactive labels remain neutral.
 - Commands use shadcn `Button`; primary commands inherit the shared deep-green `primary` variant.
@@ -660,6 +685,7 @@ Workspace-only tokens without a shadcn counterpart, plus shadow tokens. For shar
 - Preference label/control pairs use `SettingsRow`: a two-column grid with the label and optional description on the left and a stable `12rem` to `20rem` control column on the right. Create and edit forms use one consistent stacked field rhythm instead: a visible `text-sm font-medium` label above a full-width Input, Textarea, or Select, followed by helper or error text. Cards remain for repeated objects, install/status surfaces, paths, errors, and drop zones.
 - Editor fields needed for the primary task stay visible. Optional or uncommon fields live under a borderless **Advanced settings** disclosure with `aria-expanded` / `aria-controls`; it is collapsed by default and opens initially when imported credentials must be entered or existing advanced values would otherwise be hidden. Do not wrap the disclosure in a card.
 - Form textareas use the shared `Textarea`; binary settings use the shared `Switch`.
+- Network > Proxy is a breadcrumb-backed second-level form. It offers System (the historical default), Manual, and Direct modes; Manual uses a labeled proxy URL, optional bypass rules, blur/save validation, and explicit rejection of embedded credentials. System keeps per-request OS/PAC resolution inside Electron while new agent processes inherit only the proxy environment present when Open Science started; Manual supplies a fixed proxy to both stacks, and Direct clears proxy variables. Saving reports inline loading, error, or quiet success and explains that only new requests and processes adopt the change; live agents, notebook kernels, and installers are not restarted.
 - Select fields use `Select`, with a `32px` trigger height.
 - A visible Settings search or filter field owns the platform search shortcut: `Cmd+K` on macOS and `Ctrl+K` on Windows/Linux focus it without selecting or clearing its value. The topmost nested Settings dialog wins over a search behind it; hidden or disabled searches do not intercept the shortcut. Persistent list-toolbars show the shortcut as right-aligned keycaps inside the field, while transient searches such as runtime-package and Specialist capability filters expose the same behavior through `aria-keyshortcuts` without repeating the visual hint.
 
