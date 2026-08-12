@@ -69,7 +69,18 @@ vi.mock('@/components/streamdown/AgentMarkdown', () => ({
   AgentMarkdown: ({ content }: { content: string }) => {
     agentMarkdownRenderMock(content)
     return <div>{content}</div>
-  }
+  },
+  PresentedAgentMarkdown: ({
+    content,
+    isAnimating
+  }: {
+    content: string
+    isAnimating?: boolean
+  }) => (
+    <div data-testid="presented-agent-markdown" data-animating={isAnimating || undefined}>
+      {content}
+    </div>
+  )
 }))
 
 vi.mock('@/components/ui/message-scroller', () => {
@@ -282,7 +293,420 @@ describe('WorkspaceMessageScroller artifact click behavior', () => {
     await act(async () => {
       root.unmount()
     })
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
     container.remove()
+  })
+
+  it('keeps later tools behind the visible assistant prefix', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal(
+      'requestAnimationFrame',
+      (callback: FrameRequestCallback) =>
+        setTimeout(() => callback(performance.now()), 16) as unknown as number
+    )
+    vi.stubGlobal('cancelAnimationFrame', (frameId: number) => clearTimeout(frameId))
+    const { WorkspaceMessageScroller } = await import('./WorkspaceMessageScroller')
+    const prompt = createMessage({ id: 'prompt-stream', sortIndex: 1, createdAt: 100 })
+    const reply = createMessage({
+      id: 'reply-stream',
+      role: 'agent',
+      content: 'Flow',
+      status: 'streaming',
+      streamId: 'stream-1',
+      responseToMessageId: prompt.id,
+      sortIndex: 2,
+      createdAt: 101
+    })
+    const render = async (session: ChatSession): Promise<void> => {
+      await act(async () => {
+        root.render(
+          <WorkspaceMessageScroller activeSession={session} onSendEditedMessage={vi.fn()} />
+        )
+      })
+    }
+
+    root = createRoot(container)
+    await render(
+      createSession({
+        activeRun: { promptMessageId: prompt.id, startedAt: 100 },
+        messages: [prompt]
+      })
+    )
+    await render(
+      createSession({
+        activeRun: { promptMessageId: prompt.id, startedAt: 100 },
+        messages: [prompt, reply]
+      })
+    )
+    expect(container.querySelector('[data-testid="presented-agent-markdown"]')?.textContent).toBe(
+      ''
+    )
+
+    await act(async () => vi.advanceTimersByTimeAsync(512))
+    expect(container.querySelector('[data-testid="presented-agent-markdown"]')?.textContent).toBe(
+      'F'
+    )
+
+    const tool = createActivity({
+      id: 'tool-after-stream',
+      title: 'Tool after buffered text',
+      promptMessageId: prompt.id,
+      sortIndex: 3,
+      createdAt: 102
+    })
+    await render(
+      createSession({
+        activeRun: { promptMessageId: prompt.id, startedAt: 100 },
+        messages: [prompt, reply],
+        activities: [tool]
+      })
+    )
+    expect(
+      container.querySelector('[data-message-id="activity-group-tool-after-stream"]')
+    ).toBeNull()
+
+    await act(async () => vi.advanceTimersByTimeAsync(96))
+    expect(container.textContent).toContain('Flow')
+    expect(
+      container.querySelector('[data-message-id="activity-group-tool-after-stream"]')
+    ).not.toBeNull()
+  })
+
+  it('keeps terminal metadata behind the final visible assistant prefix', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal(
+      'requestAnimationFrame',
+      (callback: FrameRequestCallback) =>
+        setTimeout(() => callback(performance.now()), 16) as unknown as number
+    )
+    vi.stubGlobal('cancelAnimationFrame', (frameId: number) => clearTimeout(frameId))
+    const { WorkspaceMessageScroller } = await import('./WorkspaceMessageScroller')
+    const prompt = createMessage({ id: 'prompt-terminal', sortIndex: 1, createdAt: 100 })
+    const reply = createMessage({
+      id: 'reply-terminal',
+      role: 'agent',
+      content: 'Done',
+      status: 'streaming',
+      streamId: 'stream-terminal',
+      responseToMessageId: prompt.id,
+      sortIndex: 2,
+      createdAt: 101
+    })
+    const render = async (session: ChatSession): Promise<void> => {
+      await act(async () => {
+        root.render(
+          <WorkspaceMessageScroller activeSession={session} onSendEditedMessage={vi.fn()} />
+        )
+      })
+    }
+
+    root = createRoot(container)
+    await render(
+      createSession({
+        activeRun: { promptMessageId: prompt.id, startedAt: 100 },
+        messages: [prompt]
+      })
+    )
+    await render(
+      createSession({
+        activeRun: { promptMessageId: prompt.id, startedAt: 100 },
+        messages: [prompt, reply]
+      })
+    )
+    await render(
+      createSession({
+        status: 'idle',
+        messages: [
+          prompt,
+          {
+            ...reply,
+            status: 'complete',
+            completedAt: 200,
+            updatedAt: 200
+          }
+        ]
+      })
+    )
+    expect(container.textContent).not.toContain('Completed')
+    expect(container.textContent).not.toContain('Done')
+
+    await act(async () => vi.advanceTimersByTimeAsync(96))
+    expect(container.textContent).toContain('Done')
+    expect(container.textContent).toContain('Completed')
+  })
+
+  it('does not replay a buffered assistant message after switching sessions', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal(
+      'requestAnimationFrame',
+      (callback: FrameRequestCallback) =>
+        setTimeout(() => callback(performance.now()), 16) as unknown as number
+    )
+    vi.stubGlobal('cancelAnimationFrame', (frameId: number) => clearTimeout(frameId))
+    const { WorkspaceMessageScroller } = await import('./WorkspaceMessageScroller')
+    const prompt = createMessage({ id: 'prompt-session-a', sortIndex: 1, createdAt: 100 })
+    const reply = createMessage({
+      id: 'reply-session-a',
+      role: 'agent',
+      content: 'Resume without replay after switching sessions',
+      status: 'streaming',
+      streamId: 'stream-session-a',
+      responseToMessageId: prompt.id,
+      sortIndex: 2,
+      createdAt: 101
+    })
+    const sessionA = createSession({
+      id: 'session-a',
+      activeRun: { promptMessageId: prompt.id, startedAt: 100 },
+      messages: [prompt, reply]
+    })
+    const render = async (session: ChatSession): Promise<void> => {
+      await act(async () => {
+        root.render(
+          <WorkspaceMessageScroller activeSession={session} onSendEditedMessage={vi.fn()} />
+        )
+      })
+    }
+
+    root = createRoot(container)
+    await render(
+      createSession({
+        id: sessionA.id,
+        activeRun: sessionA.activeRun,
+        messages: [prompt]
+      })
+    )
+    await render(sessionA)
+    await act(async () => vi.advanceTimersByTimeAsync(512))
+    expect(container.querySelector('[data-testid="presented-agent-markdown"]')?.textContent).toBe(
+      'R'
+    )
+
+    await render(
+      createSession({
+        id: 'session-b',
+        messages: [createMessage({ id: 'prompt-session-b' })]
+      })
+    )
+    await render(sessionA)
+
+    expect(container.querySelector('[data-testid="presented-agent-markdown"]')?.textContent).toBe(
+      reply.content
+    )
+
+    const continuedReply = { ...reply, content: `${reply.content} plus more` }
+    await render({ ...sessionA, messages: [prompt, continuedReply] })
+    expect(container.querySelector('[data-testid="presented-agent-markdown"]')?.textContent).toBe(
+      reply.content
+    )
+    await act(async () => vi.advanceTimersByTimeAsync(512))
+    expect(container.querySelector('[data-testid="presented-agent-markdown"]')?.textContent).toBe(
+      `${reply.content} `
+    )
+  })
+
+  it('does not replay an assistant fragment after the turn advances to a tool', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal(
+      'requestAnimationFrame',
+      (callback: FrameRequestCallback) =>
+        setTimeout(() => callback(performance.now()), 16) as unknown as number
+    )
+    vi.stubGlobal('cancelAnimationFrame', (frameId: number) => clearTimeout(frameId))
+    const { WorkspaceMessageScroller } = await import('./WorkspaceMessageScroller')
+    const prompt = createMessage({ id: 'prompt-before-tool', sortIndex: 1, createdAt: 100 })
+    const reply = createMessage({
+      id: 'reply-before-tool',
+      role: 'agent',
+      content: 'Fixed before tool',
+      status: 'streaming',
+      streamId: 'stream-before-tool',
+      responseToMessageId: prompt.id,
+      sortIndex: 2,
+      createdAt: 101
+    })
+    const tool = createActivity({
+      id: 'tool-after-fixed-fragment',
+      title: 'Tool after fixed fragment',
+      promptMessageId: prompt.id,
+      sortIndex: 3,
+      createdAt: 102
+    })
+
+    root = createRoot(container)
+    await act(async () => {
+      root.render(
+        <WorkspaceMessageScroller
+          activeSession={createSession({
+            activeRun: { promptMessageId: prompt.id, startedAt: 100 },
+            messages: [prompt, reply],
+            activities: [tool]
+          })}
+          onSendEditedMessage={vi.fn()}
+        />
+      )
+    })
+
+    expect(container.querySelector('[data-testid="presented-agent-markdown"]')?.textContent).toBe(
+      reply.content
+    )
+    expect(
+      container.querySelector('[data-message-id="activity-group-tool-after-fixed-fragment"]')
+    ).not.toBeNull()
+  })
+
+  it('paces a new assistant fragment that arrives after a tool', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal(
+      'requestAnimationFrame',
+      (callback: FrameRequestCallback) =>
+        setTimeout(() => callback(performance.now()), 16) as unknown as number
+    )
+    vi.stubGlobal('cancelAnimationFrame', (frameId: number) => clearTimeout(frameId))
+    const { WorkspaceMessageScroller } = await import('./WorkspaceMessageScroller')
+    const prompt = createMessage({ id: 'prompt-around-tool', sortIndex: 1, createdAt: 100 })
+    const beforeTool = createMessage({
+      id: 'reply-before-live-tool',
+      role: 'agent',
+      content: 'Before tool',
+      status: 'streaming',
+      streamId: 'stream-around-tool',
+      responseToMessageId: prompt.id,
+      sortIndex: 2,
+      createdAt: 101
+    })
+    const tool = createActivity({
+      id: 'tool-between-fragments',
+      title: 'Tool between fragments',
+      promptMessageId: prompt.id,
+      sortIndex: 3,
+      createdAt: 102
+    })
+    const afterTool = createMessage({
+      id: 'reply-after-live-tool',
+      role: 'agent',
+      content: 'After tool',
+      status: 'streaming',
+      streamId: 'stream-around-tool',
+      responseToMessageId: prompt.id,
+      sortIndex: 4,
+      createdAt: 103
+    })
+    const render = async (session: ChatSession): Promise<void> => {
+      await act(async () => {
+        root.render(
+          <WorkspaceMessageScroller activeSession={session} onSendEditedMessage={vi.fn()} />
+        )
+      })
+    }
+
+    root = createRoot(container)
+    await render(
+      createSession({
+        activeRun: { promptMessageId: prompt.id, startedAt: 100 },
+        messages: [prompt]
+      })
+    )
+    await render(
+      createSession({
+        activeRun: { promptMessageId: prompt.id, startedAt: 100 },
+        messages: [prompt, beforeTool]
+      })
+    )
+    await act(async () => vi.advanceTimersByTimeAsync(512))
+    await render(
+      createSession({
+        activeRun: { promptMessageId: prompt.id, startedAt: 100 },
+        messages: [prompt, beforeTool, afterTool],
+        activities: [tool]
+      })
+    )
+    expect(
+      container.querySelector('[data-message-id="activity-group-tool-between-fragments"]')
+    ).toBeNull()
+    await act(async () => vi.advanceTimersByTimeAsync(160))
+
+    const assistantSurfaces = container.querySelectorAll('[data-testid="presented-agent-markdown"]')
+    expect(assistantSurfaces).toHaveLength(2)
+    expect(assistantSurfaces[0]?.textContent).toBe(beforeTool.content)
+    expect(assistantSurfaces[1]?.textContent).toBe('')
+    await act(async () => vi.advanceTimersByTimeAsync(512))
+    expect(assistantSurfaces[1]?.textContent).toBe('A')
+  })
+
+  it('does not replay a buffered assistant message after switching active branches', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal(
+      'requestAnimationFrame',
+      (callback: FrameRequestCallback) =>
+        setTimeout(() => callback(performance.now()), 16) as unknown as number
+    )
+    vi.stubGlobal('cancelAnimationFrame', (frameId: number) => clearTimeout(frameId))
+    const { WorkspaceMessageScroller } = await import('./WorkspaceMessageScroller')
+    const promptA = createMessage({ id: 'prompt-branch-a', sortIndex: 1, createdAt: 100 })
+    const replyA = createMessage({
+      id: 'reply-branch-a',
+      role: 'agent',
+      content: 'Resume without replay on the original branch',
+      status: 'streaming',
+      streamId: 'stream-branch-a',
+      responseToMessageId: promptA.id,
+      sortIndex: 2,
+      createdAt: 101
+    })
+    const createGraph = (
+      messages: ChatMessage[]
+    ): ReturnType<typeof createLinearConversationGraph> =>
+      createLinearConversationGraph({
+        sessionId: 'branched-stream-session',
+        messages,
+        frameworkId: 'codex',
+        createdAt: 100,
+        updatedAt: 101
+      })
+    const initialGraphA = createGraph([promptA])
+    const streamingGraphA = createGraph([promptA, replyA])
+    const branchBGraph = structuredClone(streamingGraphA)
+    branchBGraph.branches.push({
+      ...branchBGraph.branches[0],
+      id: 'branch-b',
+      parentBranchId: branchBGraph.branches[0].id,
+      createdAt: 102,
+      updatedAt: 102
+    })
+    branchBGraph.frames[0].activeBranchId = 'branch-b'
+    const sessionFromGraph = (graph: typeof streamingGraphA): ChatSession =>
+      createSession({
+        id: 'branched-stream-session',
+        activeRun: { promptMessageId: promptA.id, startedAt: 100 },
+        conversationGraph: graph,
+        messages: resolveActiveConversationMessages(graph).map((message, index) => ({
+          ...projectConversationMessage(message),
+          sortIndex: index + 1
+        }))
+      })
+    const render = async (session: ChatSession): Promise<void> => {
+      await act(async () => {
+        root.render(
+          <WorkspaceMessageScroller activeSession={session} onSendEditedMessage={vi.fn()} />
+        )
+      })
+    }
+
+    root = createRoot(container)
+    await render(sessionFromGraph(initialGraphA))
+    await render(sessionFromGraph(streamingGraphA))
+    await act(async () => vi.advanceTimersByTimeAsync(512))
+    expect(container.querySelector('[data-testid="presented-agent-markdown"]')?.textContent).toBe(
+      'R'
+    )
+
+    await render(sessionFromGraph(branchBGraph))
+
+    expect(container.querySelector('[data-testid="presented-agent-markdown"]')?.textContent).toBe(
+      replyA.content
+    )
   })
 
   it('opens the exact durable source Frame from an inline upward message', async () => {

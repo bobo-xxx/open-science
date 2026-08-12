@@ -17,6 +17,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -90,6 +91,31 @@ type SessionScopedActivityGroupState = {
 type SessionScopedActivityExpansionState = {
   sessionId: string | undefined
   overrides: ActivityExpansionOverrides
+}
+
+type SessionScopedMessagePresentationState = {
+  scopeId: string | undefined
+  messageIds: Set<string>
+}
+
+type VisibleMessageSnapshot = {
+  scopeId: string | undefined
+  messageIds: Set<string>
+}
+
+const VisibleMessageSnapshotCommit = ({
+  scopeId,
+  messageIdsKey,
+  onCommit
+}: {
+  scopeId: string | undefined
+  messageIdsKey: string
+  onCommit: (scopeId: string | undefined, messageIds: Set<string>) => void
+}): null => {
+  useLayoutEffect(() => {
+    onCommit(scopeId, new Set(JSON.parse(messageIdsKey)))
+  }, [messageIdsKey, onCommit, scopeId])
+  return null
 }
 
 type MessageUploadAttachment = NonNullable<ChatSession['messages'][number]['uploads']>[number]
@@ -250,6 +276,12 @@ const WorkspaceMessageScrollerImpl = ({
 }: WorkspaceMessageScrollerProps): React.JSX.Element => {
   const currentSessionId = activeSession?.id
   const currentProjectId = activeSession?.projectId
+  const activeConversationFrame = activeSession?.conversationGraph?.frames.find(
+    (frame) => frame.id === activeSession.conversationGraph?.activeFrameId
+  )
+  const currentPresentationScopeId = currentSessionId
+    ? JSON.stringify([currentSessionId, activeConversationFrame?.activeBranchId ?? 'legacy'])
+    : undefined
   const artifactVisibility = useWorkspaceArtifactVisibility(activeSession)
   const notebookRunsById = useNotebookRunsById(notebookReference)
   const handoffEvents = useHandoffLifecycleEvents(handoffLifecycleSource, currentSessionId)
@@ -319,6 +351,11 @@ const WorkspaceMessageScrollerImpl = ({
       sessionId: undefined,
       overrides: {}
     }))
+  const [messagePresentationState, setMessagePresentationState] =
+    useState<SessionScopedMessagePresentationState>(() => ({
+      scopeId: undefined,
+      messageIds: new Set()
+    }))
   const collapsedActivityGroups =
     collapsedActivityGroupState.sessionId === currentSessionId
       ? collapsedActivityGroupState.groupIds
@@ -334,6 +371,47 @@ const WorkspaceMessageScrollerImpl = ({
   const conversationItems = useMemo(
     () => groupConversationItems(rawConversationItems, activeSession?.activityGroups),
     [activeSession?.activityGroups, rawConversationItems]
+  )
+  const [visibleMessageSnapshot, setVisibleMessageSnapshot] = useState<VisibleMessageSnapshot>(
+    () => ({ scopeId: undefined, messageIds: new Set() })
+  )
+  const presentationScopeRemainedVisible =
+    visibleMessageSnapshot.scopeId === currentPresentationScopeId
+  const presentingMessageIds =
+    messagePresentationState.scopeId === currentPresentationScopeId
+      ? messagePresentationState.messageIds
+      : new Set<string>()
+  const presentationBarrierIndex = conversationItems.findIndex(
+    (item) => item.type === 'message' && presentingMessageIds.has(item.message.id)
+  )
+  const visibleMessageIds = (
+    presentationBarrierIndex >= 0
+      ? conversationItems.slice(0, presentationBarrierIndex + 1)
+      : conversationItems
+  ).flatMap((item) => (item.type === 'message' ? [item.message.id] : []))
+  const visibleMessageIdsKey = JSON.stringify(visibleMessageIds)
+  const handleVisibleMessageSnapshotCommit = useCallback(
+    (scopeId: string | undefined, messageIds: Set<string>): void => {
+      setVisibleMessageSnapshot({ scopeId, messageIds })
+    },
+    []
+  )
+  const handleMessagePresentationChange = useCallback(
+    (messageId: string, presenting: boolean): void => {
+      setMessagePresentationState((currentState) => {
+        const currentMessageIds =
+          currentState.scopeId === currentPresentationScopeId
+            ? currentState.messageIds
+            : new Set<string>()
+        if (currentMessageIds.has(messageId) === presenting) return currentState
+
+        const nextMessageIds = new Set(currentMessageIds)
+        if (presenting) nextMessageIds.add(messageId)
+        else nextMessageIds.delete(messageId)
+        return { scopeId: currentPresentationScopeId, messageIds: nextMessageIds }
+      })
+    },
+    [currentPresentationScopeId]
   )
   const durablePlanOwnerActivityId = useMemo(
     () => findDurablePlanOwnerActivityId(activeSession, rawConversationItems),
@@ -615,8 +693,17 @@ const WorkspaceMessageScrollerImpl = ({
           <MessageScrollerViewport aria-label="Conversation">
             <MessageScrollerContent className="gap-0 px-4">
               <div className={conversationContentClassName}>
+                <VisibleMessageSnapshotCommit
+                  scopeId={currentPresentationScopeId}
+                  messageIdsKey={visibleMessageIdsKey}
+                  onCommit={handleVisibleMessageSnapshotCommit}
+                />
                 {/* Messages and tool activities share one sorted transcript timeline. */}
                 {conversationItems.map((item, itemIndex) => {
+                  if (presentationBarrierIndex >= 0 && itemIndex > presentationBarrierIndex) {
+                    return null
+                  }
+
                   if (item.type === 'message') {
                     const artifacts = artifactVisibility.artifactsForMessage(item.message)
                     // Jobs pre-assigned to this slot: each job appears in exactly one slot.
@@ -697,9 +784,17 @@ const WorkspaceMessageScrollerImpl = ({
                           : undefined,
                       artifacts
                     }
+                    if (item.message.role === 'agent') {
+                      messageItemProps.onPresentationChange = handleMessagePresentationChange
+                      messageItemProps.presentationSourceOpen =
+                        itemIndex === conversationItems.length - 1
+                      messageItemProps.presentationAnimateOnMount =
+                        presentationScopeRemainedVisible &&
+                        !visibleMessageSnapshot.messageIds.has(item.message.id)
+                    }
 
                     return (
-                      <div key={item.id}>
+                      <div key={JSON.stringify([currentPresentationScopeId, item.id])}>
                         {/* Unbound completed jobs that belong chronologically before this message */}
                         {jobsBeforeMessage.map((job) => (
                           <MessageScrollerItem
@@ -719,7 +814,9 @@ const WorkspaceMessageScrollerImpl = ({
                         ) : (
                           <WorkspaceMessageItem {...messageItemProps} canEditMessage={false} />
                         )}
-                        {currentSessionId && item.message.role === 'agent' ? (
+                        {currentSessionId &&
+                        item.message.role === 'agent' &&
+                        !presentingMessageIds.has(item.message.id) ? (
                           <WorkspaceMessageReview
                             projectId={currentProjectId}
                             sessionId={currentSessionId}
@@ -852,25 +949,29 @@ const WorkspaceMessageScrollerImpl = ({
                 })}
 
                 {/* Render any remaining unbound completed jobs after all conversation items */}
-                {trailingJobs.map((job) => (
-                  <MessageScrollerItem
-                    key={`completed-job-${job.job_id}`}
-                    messageId={`completed-job-${job.job_id}`}
-                    className="min-w-0"
-                  >
-                    <div className="px-4 py-1 md:px-6">
-                      <div className="mx-auto w-full max-w-4xl">
-                        <CompletedJobCard job={job} onOpen={handleOpenJobDetail} />
-                      </div>
-                    </div>
-                  </MessageScrollerItem>
-                ))}
+                {presentationBarrierIndex < 0
+                  ? trailingJobs.map((job) => (
+                      <MessageScrollerItem
+                        key={`completed-job-${job.job_id}`}
+                        messageId={`completed-job-${job.job_id}`}
+                        className="min-w-0"
+                      >
+                        <div className="px-4 py-1 md:px-6">
+                          <div className="mx-auto w-full max-w-4xl">
+                            <CompletedJobCard job={job} onOpen={handleOpenJobDetail} />
+                          </div>
+                        </div>
+                      </MessageScrollerItem>
+                    ))
+                  : null}
 
-                {trailingContent}
+                {presentationBarrierIndex < 0 ? trailingContent : null}
 
-                {isResumingSession && activeSession ? (
+                {presentationBarrierIndex < 0 && isResumingSession && activeSession ? (
                   <WorkspaceAgentLoadingRow sessionId={activeSession.id} phase="resuming" />
-                ) : agentLoadingPhase !== 'hidden' && activeSession ? (
+                ) : presentationBarrierIndex < 0 &&
+                  agentLoadingPhase !== 'hidden' &&
+                  activeSession ? (
                   <WorkspaceAgentLoadingRow
                     sessionId={activeSession.id}
                     phase={agentLoadingPhase}

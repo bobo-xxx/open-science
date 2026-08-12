@@ -448,10 +448,54 @@ beforeEach(() => {
 
 afterEach(() => {
   act(() => root.unmount())
+  vi.useRealTimers()
+  vi.unstubAllGlobals()
   container.remove()
 })
 
 describe('ConversationPanel composer intake', () => {
+  it('focuses the ordinary composer when the draft context changes', () => {
+    renderPanel({ composerFocusKey: 'session-a' })
+    expect(document.activeElement).toBe(getComposerEditor())
+
+    const navigationButton = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Open navigation"]'
+    )!
+    navigationButton.focus()
+    expect(document.activeElement).toBe(navigationButton)
+
+    renderPanel({ composerFocusKey: 'session-b' })
+    expect(document.activeElement).toBe(getComposerEditor())
+  })
+
+  it('does not focus the hidden composer while a blocking interaction owns its lane', () => {
+    renderPanel({ composerFocusKey: 'session-a' })
+    const navigationButton = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Open navigation"]'
+    )!
+    navigationButton.focus()
+
+    renderPanel({
+      composerFocusKey: 'session-blocked',
+      pendingPermissions: [{ requestId: 'permission-focus' } as never]
+    })
+
+    expect(getComposerForm().hidden).toBe(true)
+    expect(document.activeElement).toBe(navigationButton)
+  })
+
+  it('does not refocus the composer when draft editing becomes available', () => {
+    renderPanel({ composerFocusKey: 'session-preparing', canEditDraft: false })
+    const navigationButton = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Open navigation"]'
+    )!
+    navigationButton.focus()
+
+    renderPanel({ composerFocusKey: 'session-preparing', canEditDraft: true })
+
+    expect(document.activeElement).toBe(navigationButton)
+  })
+
   it('keeps the Main composer available while a delegated question is pending', () => {
     renderPanel({
       activeSession: delegatedQuestionSession(),
@@ -1507,7 +1551,20 @@ describe('ConversationPanel composer intake', () => {
       (container.querySelector('[aria-label="Close Side chat"]') as HTMLButtonElement).click()
     )
     expect(onCloseSideChat).toHaveBeenCalledOnce()
+    renderPanel({ onCloseSideChat })
     expect(document.activeElement).toBe(getComposerEditor())
+
+    const navigationButton = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Open navigation"]'
+    )!
+    navigationButton.focus()
+    renderPanel({
+      composerFocusKey: 'session-blocked-after-side-chat',
+      pendingPermissions: [{ requestId: 'permission-after-side-chat' } as never]
+    })
+
+    expect(getComposerForm().hidden).toBe(true)
+    expect(document.activeElement).toBe(navigationButton)
   })
 
   it('keeps the Side chat input fixed and pins streamed output to the bottom', () => {
@@ -1589,6 +1646,171 @@ describe('ConversationPanel composer intake', () => {
     expect(followUp.disabled).toBe(false)
     expect(container.querySelector('[aria-label="Send Side chat follow up"]')).toBeNull()
     expect(container.querySelector('[aria-label="Cancel Side chat response"]')).not.toBeNull()
+  })
+
+  it('paces only the live Side chat turn and keeps its tool behind visible text', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal(
+      'requestAnimationFrame',
+      (callback: FrameRequestCallback) =>
+        setTimeout(() => callback(performance.now()), 16) as unknown as number
+    )
+    vi.stubGlobal('cancelAnimationFrame', (frameId: number) => clearTimeout(frameId))
+    const sideChatProps = {
+      onSendSideChat: vi.fn(async () => true),
+      onSideChatDraftChange: vi.fn(),
+      onCancelSideChat: vi.fn(),
+      onCloseSideChat: vi.fn()
+    }
+    const entries = [
+      { id: 'user-history', kind: 'message' as const, role: 'user' as const, text: 'Old prompt' },
+      {
+        id: 'assistant-history',
+        kind: 'message' as const,
+        role: 'assistant' as const,
+        text: 'Historical answer'
+      },
+      { id: 'user-live', kind: 'message' as const, role: 'user' as const, text: 'New prompt' },
+      {
+        id: 'assistant-live',
+        kind: 'message' as const,
+        role: 'assistant' as const,
+        text: 'Flow'
+      }
+    ]
+
+    renderPanel({
+      ...sideChatProps,
+      sideChat: {
+        generation: 1,
+        parentSessionId: 'session-existing',
+        projectId: 'project-a',
+        sideSessionId: 'side-1',
+        draft: '',
+        running: true,
+        entries: entries.slice(0, -1)
+      }
+    })
+    renderPanel({
+      ...sideChatProps,
+      sideChat: {
+        generation: 1,
+        parentSessionId: 'session-existing',
+        projectId: 'project-a',
+        sideSessionId: 'side-1',
+        draft: '',
+        running: true,
+        entries
+      }
+    })
+
+    expect(container.textContent).toContain('Historical answer')
+    expect(container.textContent).not.toContain('Flow')
+    expect(container.querySelectorAll('.agent-markdown-streaming')).toHaveLength(1)
+
+    await act(async () => vi.advanceTimersByTimeAsync(496))
+    expect(container.textContent).not.toContain('Flow')
+    await act(async () => vi.advanceTimersByTimeAsync(16))
+    expect(container.textContent).toContain('F')
+
+    const nextAssistant = {
+      id: 'assistant-after-tool',
+      kind: 'message' as const,
+      role: 'assistant' as const,
+      text: 'Next'
+    }
+
+    renderPanel({
+      ...sideChatProps,
+      sideChat: {
+        generation: 1,
+        parentSessionId: 'session-existing',
+        projectId: 'project-a',
+        sideSessionId: 'side-1',
+        draft: '',
+        running: true,
+        entries: [
+          ...entries,
+          {
+            id: 'tool-live',
+            kind: 'tool',
+            title: 'Tool after current answer',
+            status: 'in_progress'
+          },
+          nextAssistant
+        ]
+      }
+    })
+    expect(container.textContent).not.toContain('Tool after current answer')
+    expect(container.textContent).not.toContain(nextAssistant.text)
+
+    await act(async () => vi.advanceTimersByTimeAsync(96))
+    expect(container.textContent).toContain('Flow')
+    expect(container.textContent).toContain('Tool after current answer')
+    expect(container.textContent).not.toContain(nextAssistant.text)
+    await act(async () => vi.advanceTimersByTimeAsync(512))
+    expect(container.textContent).toContain('N')
+    expect(container.textContent).not.toContain(nextAssistant.text)
+  })
+
+  it('does not replay a buffered Side chat answer after the panel reopens', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal(
+      'requestAnimationFrame',
+      (callback: FrameRequestCallback) =>
+        setTimeout(() => callback(performance.now()), 16) as unknown as number
+    )
+    vi.stubGlobal('cancelAnimationFrame', (frameId: number) => clearTimeout(frameId))
+    const sideChatProps = {
+      onSendSideChat: vi.fn(async () => true),
+      onSideChatDraftChange: vi.fn(),
+      onCancelSideChat: vi.fn(),
+      onCloseSideChat: vi.fn()
+    }
+    const userEntry = {
+      id: 'user-reopen',
+      kind: 'message' as const,
+      role: 'user' as const,
+      text: 'Keep going'
+    }
+    const assistantEntry = {
+      id: 'assistant-reopen',
+      kind: 'message' as const,
+      role: 'assistant' as const,
+      text: 'Resume without replay'
+    }
+    const sideChat = {
+      generation: 2,
+      parentSessionId: 'session-existing',
+      projectId: 'project-a',
+      sideSessionId: 'side-2',
+      draft: '',
+      running: true,
+      entries: [userEntry, assistantEntry]
+    }
+
+    renderPanel({ ...sideChatProps, sideChat: { ...sideChat, entries: [userEntry] } })
+    renderPanel({ ...sideChatProps, sideChat })
+    await act(async () => vi.advanceTimersByTimeAsync(512))
+    expect(container.textContent).toContain('R')
+    expect(container.textContent).not.toContain(assistantEntry.text)
+
+    renderPanel()
+    renderPanel({ ...sideChatProps, sideChat })
+
+    expect(container.textContent).toContain(assistantEntry.text)
+
+    const continuedAnswer = `${assistantEntry.text}, then continue`
+    renderPanel({
+      ...sideChatProps,
+      sideChat: {
+        ...sideChat,
+        entries: [userEntry, { ...assistantEntry, text: continuedAnswer }]
+      }
+    })
+    expect(container.textContent).not.toContain(continuedAnswer)
+    await act(async () => vi.advanceTimersByTimeAsync(512))
+    expect(container.textContent).toContain(`${assistantEntry.text},`)
   })
 
   it('keeps main approval and ask-user surfaces waiting while Side chat is open', () => {
@@ -2106,7 +2328,7 @@ describe('ConversationPanel + menu', () => {
     const textarea = container.querySelector('textarea') as HTMLTextAreaElement
     await act(async () => {
       const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set
-      setter?.call(textarea, '批准执行')
+      setter?.call(textarea, 'Approved for execution')
       textarea.dispatchEvent(new Event('input', { bubbles: true }))
       textarea
         .closest('form')
@@ -2116,7 +2338,7 @@ describe('ConversationPanel + menu', () => {
 
     expect(respondToSessionPlanMock).toHaveBeenCalledWith(
       expect.objectContaining({ sessionId: 'session-plan-text-approval' }),
-      { feedback: '批准执行' }
+      { feedback: 'Approved for execution' }
     )
   })
 
