@@ -246,6 +246,31 @@ describe('ConnectorsPanel (groups)', () => {
     expect(addConnector?.getAttribute('data-variant')).toBe('outline')
   })
 
+  it('orders the group filter before search and keeps the narrow toolbar contained', () => {
+    act(() => {
+      root.render(<ConnectorsPanel onNavigate={vi.fn()} />)
+    })
+
+    const toolbar = document.body.querySelector<HTMLElement>('[data-testid="connectors-toolbar"]')
+    const search = document.body.querySelector<HTMLInputElement>('[aria-label="Search connectors"]')
+    const filter = document.body.querySelector<HTMLElement>(
+      '[aria-label="Filter connectors by group"]'
+    )
+    const addConnector = Array.from(
+      document.body.querySelectorAll<HTMLButtonElement>('button')
+    ).find((button) => button.textContent?.includes('Add connector'))
+
+    expect(toolbar?.className).toContain('grid-cols-[9rem_minmax(0,1fr)]')
+    expect(toolbar?.className).toContain('sm:grid-cols-[9rem_minmax(0,1fr)_auto]')
+    expect(filter?.compareDocumentPosition(search!)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+    expect(search?.compareDocumentPosition(addConnector!)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+    expect(search?.parentElement?.className).toContain('min-w-0')
+    expect(search?.parentElement?.className).toContain('sm:col-start-2')
+    expect(filter?.className).toContain('w-full')
+    expect(addConnector?.className).toContain('col-span-2')
+    expect(addConnector?.className).toContain('w-full')
+  })
+
   it('toggles a featured connector and navigates to its detail on row click', () => {
     const onNavigate = vi.fn()
     act(() => {
