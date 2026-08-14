@@ -42,6 +42,7 @@ type FakeSettingsService = Record<
   | 'uninstallCodex'
   | 'setAgentFramework'
   | 'setReasoningEffort'
+  | 'setReviewerModel'
   | 'setSubagentModel'
   | 'resolveActiveReasoningEffort'
   | 'resolveActiveModelChangeTarget'
@@ -70,6 +71,7 @@ type FakeSettingsService = Record<
   | 'getSkillDetail'
   | 'buildSkillExport'
   | 'setSkillEnabled'
+  | 'setSkillsEnabled'
   | 'createSkill'
   | 'updateSkill'
   | 'deleteSkill'
@@ -119,6 +121,9 @@ const createFakeService = (): FakeSettingsService => ({
   setReasoningEffort: vi
     .fn()
     .mockResolvedValue({ claude: {}, providers: [], reasoningEffort: 'high' }),
+  setReviewerModel: vi
+    .fn()
+    .mockResolvedValue({ claude: {}, providers: [], reviewerModel: { mode: 'inherit' } }),
   setSubagentModel: vi
     .fn()
     .mockResolvedValue({ claude: {}, providers: [], subagentModel: { mode: 'inherit' } }),
@@ -177,6 +182,7 @@ const createFakeService = (): FakeSettingsService => ({
     archiveBytes: new Uint8Array([1, 2, 3])
   }),
   setSkillEnabled: vi.fn().mockResolvedValue([]),
+  setSkillsEnabled: vi.fn().mockResolvedValue([]),
   createSkill: vi.fn().mockResolvedValue([]),
   updateSkill: vi.fn().mockResolvedValue([]),
   deleteSkill: vi.fn().mockResolvedValue([]),
@@ -777,7 +783,13 @@ describe('settings IPC handlers', () => {
 
     await invoke('settings:set-skill-enabled', { id: 'demo', enabled: false })
     expect(service.setSkillEnabled).toHaveBeenCalledWith({ id: 'demo', enabled: false })
-    expect(onSkillsChanged).toHaveBeenCalledTimes(1)
+
+    await invoke('settings:set-skills-enabled', { ids: ['imported-demo'], enabled: false })
+    expect(service.setSkillsEnabled).toHaveBeenCalledWith({
+      ids: ['imported-demo'],
+      enabled: false
+    })
+    expect(onSkillsChanged).toHaveBeenCalledTimes(2)
   })
 
   it('builds and saves an eligible Skill export through the desktop adapter', async () => {
@@ -1109,6 +1121,30 @@ describe('settings IPC handlers', () => {
       })
     ).rejects.toThrow('Invalid Subagent model configuration.')
     expect(service.setSubagentModel).toHaveBeenCalledOnce()
+  })
+
+  it('validates and forwards one complete Reviewer model mutation', async () => {
+    handlers.clear()
+    const service = createFakeService()
+    const configuration = {
+      mode: 'fixed' as const,
+      providerId: 'provider-a',
+      model: 'reviewer-model',
+      reasoningEffort: 'high' as const
+    }
+    const snapshot = { claude: {}, providers: [], reviewerModel: configuration }
+    service.setReviewerModel.mockResolvedValue(snapshot)
+    registerTestSettingsIpcHandlers({ service: asService(service) })
+
+    await expect(invoke('settings:set-reviewer-model', { configuration })).resolves.toBe(snapshot)
+    expect(service.setReviewerModel).toHaveBeenCalledWith(configuration)
+
+    await expect(
+      invoke('settings:set-reviewer-model', {
+        configuration: { ...configuration, model: '' }
+      })
+    ).rejects.toThrow('Invalid Reviewer model configuration.')
+    expect(service.setReviewerModel).toHaveBeenCalledOnce()
   })
 
   it('persists the notifications preference on set-notifications-enabled', async () => {

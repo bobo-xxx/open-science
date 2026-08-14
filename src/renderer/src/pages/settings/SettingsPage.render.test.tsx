@@ -380,7 +380,7 @@ describe('SettingsPage layout', () => {
       'button'
     )
 
-    // The Model panel splits Active model, Reasoning effort, and Subagent model (their own
+    // The Model panel splits Active model, Reasoning effort, Subagent model, and Reviewer model (their own
     // sections) from provider management; the agent framework moved to the Agent sub-panel.
     expect(document.body.textContent).toContain('Active model')
     expect(document.body.textContent).toContain('Reasoning effort')
@@ -388,13 +388,16 @@ describe('SettingsPage layout', () => {
     expect(document.body.textContent).toContain('may approximate unsupported levels')
     expect(document.body.textContent).toContain('Providers')
     expect(document.body.textContent).not.toContain('Agent framework')
-    expect(document.body.querySelectorAll('[data-slot="settings-section"]')).toHaveLength(4)
+    expect(document.body.querySelectorAll('[data-slot="settings-section"]')).toHaveLength(5)
     expect(
       Array.from(document.body.querySelectorAll('[data-slot="settings-section"]')).map((section) =>
         section.getAttribute('aria-label')
       )
-    ).toEqual(['Active model', 'Reasoning effort', 'Subagent model', 'Providers'])
+    ).toEqual(['Active model', 'Reasoning effort', 'Subagent model', 'Reviewer model', 'Providers'])
     expect(document.body.textContent).toContain('Model used by subagents when Delegation is on.')
+    expect(document.body.textContent).toContain(
+      'Model used for manual, automatic, and re-run Reviews.'
+    )
     // The add action lives with the list as a dashed ghost row, not a section-header button.
     const addRow = Array.from(document.body.querySelectorAll<HTMLButtonElement>('button')).find(
       (button) => button.textContent?.trim() === 'Add provider'
@@ -1993,6 +1996,31 @@ describe('SettingsPage layout', () => {
       crumb?.click()
     })
     expect(document.body.querySelector('[aria-label="Back to skills"]')).toBeNull()
+  })
+
+  it('opens bulk Skill management as a breadcrumb sub-page without Featured Skills', async () => {
+    await act(async () => {
+      root.render(<SettingsPage open onClose={vi.fn()} />)
+    })
+
+    await act(async () => navButton('Skills')?.click())
+    await act(async () => {
+      await Promise.resolve()
+    })
+    const manage = Array.from(document.body.querySelectorAll<HTMLButtonElement>('button')).find(
+      (button) => button.textContent?.trim() === 'Manage'
+    )
+    await act(async () => manage?.click())
+
+    const crumb = document.body.querySelector<HTMLButtonElement>('[aria-label="Back to skills"]')
+    expect(crumb).not.toBeNull()
+    expect(document.body.textContent).toContain('Manage skills')
+    expect(document.body.textContent).toContain('Featured Skills are not changed.')
+    expect(document.body.textContent).not.toContain('Alpha')
+
+    await act(async () => crumb?.click())
+    expect(document.body.querySelector('[aria-label="Back to skills"]')).toBeNull()
+    expect(document.body.textContent).toContain('Alpha')
   })
 
   it('opens directly on a skill detail when the store has a pending skill', async () => {

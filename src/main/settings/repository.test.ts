@@ -122,6 +122,32 @@ describe('settings repository', () => {
     })
   })
 
+  it('defaults and atomically persists the Reviewer model policy', async () => {
+    expect(sanitizeSettings({ providers: [] }).reviewerModel).toEqual({ mode: 'inherit' })
+
+    const repository = new SettingsRepository(await createStorageRoot())
+    await repository.setReviewerModel({
+      mode: 'fixed',
+      providerId: 'provider-a',
+      model: 'reviewer-model',
+      reasoningEffort: 'high'
+    })
+
+    await expect(repository.getSettings()).resolves.toMatchObject({
+      reviewerModel: {
+        mode: 'fixed',
+        providerId: 'provider-a',
+        model: 'reviewer-model',
+        reasoningEffort: 'high'
+      }
+    })
+
+    await repository.setReviewerModel({ mode: 'inherit' })
+    await expect(repository.getSettings()).resolves.toMatchObject({
+      reviewerModel: { mode: 'inherit' }
+    })
+  })
+
   it('keeps only an existing Claude subscription provider as the preferred mode', () => {
     const providers = [
       {
@@ -1095,6 +1121,16 @@ describe('settings repository: v2 official providers & activeModel migration', (
 
     // Re-enabling removes the id (and drops the field when the set becomes empty).
     await repository.setSkillEnabled('citation-formatter', true)
+    expect((await repository.getSettings()).disabledSkillIds).toBeUndefined()
+  })
+
+  it('persists a Skill enablement batch in the existing disabledSkillIds field', async () => {
+    const repository = new SettingsRepository(await createStorageRoot())
+
+    await repository.setSkillsEnabled(['imported-a', 'personal-b', 'imported-a'], false)
+    expect((await repository.getSettings()).disabledSkillIds).toEqual(['imported-a', 'personal-b'])
+
+    await repository.setSkillsEnabled(['imported-a', 'personal-b'], true)
     expect((await repository.getSettings()).disabledSkillIds).toBeUndefined()
   })
 

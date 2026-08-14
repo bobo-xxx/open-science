@@ -137,6 +137,7 @@ import { HostArtifactsService } from './notebook/host-artifacts-service'
 import { HostLineageService } from './notebook/host-lineage-service'
 import { HostFramesService } from './notebook/host-frames-service'
 import { HostLlmService } from './notebook/host-llm-service'
+import { HostViewImageService } from './notebook/host-view-image-service'
 import type { NotebookEnvironmentManager } from './notebook/runtime-service'
 import { parseArtifactVersionLocator } from '../shared/artifact-provenance'
 import { parseUploadVersionReference } from '../shared/uploads'
@@ -156,6 +157,7 @@ import {
   registerReviewerIpcHandlers,
   type ReviewerCommandOwner
 } from './reviewer/ipc'
+import { ReviewerModelRuntimeOwner } from './reviewer/model-runtime-owner'
 import {
   createDefaultReviewRepository,
   createDefaultSessionRepository,
@@ -1605,6 +1607,26 @@ const createApplicationModules = async (
         settingsService.resolveExplicitAgentBackend(target, context)
     })
   })
+  const hostViewImageService = new HostViewImageService({
+    catalog: projectFilesRepository,
+    resolvers: {
+      artifact: artifactProvenanceRepository,
+      upload: uploadRepository
+    },
+    captureBackend: (sessionId) => {
+      const backend = runtimeRef.current?.captureSessionBackend(sessionId)
+      return backend
+        ? {
+            frameworkId: backend.framework.id,
+            backendId: backend.backendId,
+            modelRoute: backend.modelRoute,
+            model: backend.context.model ?? backend.session.model,
+            supportsImageInput: backend.context.supportsImageInput,
+            generationToken: backend
+          }
+        : undefined
+    }
+  })
   const notebookRpcServer = await modules.add(
     new NotebookLocalRpcServer(notebookLocalRpc, {
       onSessionReleased: (sessionId) => completionGateCoordinator.releaseSession(sessionId),
@@ -1657,7 +1679,8 @@ const createApplicationModules = async (
       agentsService,
       delegatedWorkService: delegatedWork.host,
       skillsService: hostSkillsService,
-      hostLlm: hostLlmService
+      hostLlm: hostLlmService,
+      hostViewImage: hostViewImageService
     }),
     createNotebookLocalRpcModule
   )
@@ -1679,13 +1702,15 @@ const createApplicationModules = async (
   // The RPC server needs the runtime service to dispatch to, and the runtime service needs the RPC
   // server's (lazily-started) connection for host.mcp() env injection — wire the second half here to
   // avoid a construction cycle.
-  notebookService.setMcpRpcConnectionResolver(({ sessionId, projectId, agentFrameId, attemptId }) =>
-    notebookRpcServer.issueControlConnection(
-      sessionId,
-      projectId,
-      agentFrameId,
-      attemptId ? { role: 'delegate', attemptId } : { role: 'main' }
-    )
+  notebookService.setMcpRpcConnectionResolver(
+    ({ sessionId, projectId, agentFrameId, attemptId, workspaceCwd }) =>
+      notebookRpcServer.issueControlConnection(
+        sessionId,
+        projectId,
+        agentFrameId,
+        attemptId ? { role: 'delegate', attemptId } : { role: 'main' },
+        workspaceCwd
+      )
   )
   // The renderer's approval card responds here; the broker resolves the held connector call.
   declareElectronAdapter('connector-approvals', () => {
@@ -2027,8 +2052,25 @@ const createApplicationModules = async (
   permissionGrantRegistry.subscribe(() => runtime.notifyPermissionGrantsChanged())
   // Single shared teardown owner for both the before-quit handler (index.ts) and the pre-update-install
   // gate. Update handling is deliberately constructed below, after this dependency is complete.
+  let reviewerModelRuntimeShutdown:
+    Pick<ReviewerModelRuntimeOwner, 'shutdown' | 'shutdownForUpdateGate'> | undefined
   const shutdownCoordinator = new BackendShutdownCoordinator({
-    runtime,
+    runtime: {
+      shutdownForQuit: async () => {
+        const [main, reviewer] = await Promise.all([
+          runtime.shutdownForQuit(),
+          reviewerModelRuntimeShutdown?.shutdown() ?? Promise.resolve({ reaped: true })
+        ])
+        return { reaped: main.reaped && reviewer.reaped }
+      },
+      shutdownForUpdateGate: async () => {
+        const [main, reviewer] = await Promise.all([
+          runtime.shutdownForUpdateGate(),
+          reviewerModelRuntimeShutdown?.shutdownForUpdateGate() ?? Promise.resolve({ reaped: true })
+        ])
+        return { reaped: main.reaped && reviewer.reaped }
+      }
+    },
     notebook: notebookService,
     log: createLogger('shutdown')
   })
@@ -2543,8 +2585,35 @@ const createApplicationModules = async (
   // and 'reviewer:get-for-session' so the renderer's fire-and-forget reviewer calls resolve to
   // real handlers instead of no-ops. Passing the already-constructed AcpRuntime so the reviewer
   // can spawn sessions under the same agent connection.
+  const reviewerModelRuntime = await modules.add(
+    {
+      appVersion: app.getVersion(),
+      captureModel: () => settingsService.admitReviewerExecutionModel(),
+      resolveTarget: (target, context) =>
+        settingsService.resolveExplicitAgentBackend(target, context)
+    },
+    (options) => {
+      const owner = new ReviewerModelRuntimeOwner(options)
+      reviewerModelRuntimeShutdown = owner
+      return {
+        name: 'reviewer-model-runtime',
+        capability: owner,
+        disposeTimeoutMs: QUIT_SHUTDOWN_BUDGET_MS,
+        dispose: async () => {
+          try {
+            if (!(await owner.shutdown()).reaped) {
+              throw new BackendShutdownOutcomeError('degraded')
+            }
+          } finally {
+            if (reviewerModelRuntimeShutdown === owner) reviewerModelRuntimeShutdown = undefined
+          }
+        }
+      }
+    }
+  )
   const reviewerOptions = {
     acpRuntime: runtime,
+    modelRuntime: reviewerModelRuntime,
     mcpEntryPath: mainEntryPath,
     artifactProvenanceRepository,
     withSessionMutation: <Result>(

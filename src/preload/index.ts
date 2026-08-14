@@ -31,6 +31,7 @@ import type {
   SetCustomServerEnabledRequest,
   SetNcbiCredentialsRequest,
   SetSkillEnabledRequest,
+  SetSkillsEnabledRequest,
   SetToolPermissionRequest,
   UpdateCustomServerRequest,
   UpdateSkillRequest
@@ -219,6 +220,8 @@ const api: OpenScienceAPI = {
       electronRendererContracts.invoke('settings.setAgentFramework', request),
     setReasoningEffort: (request) =>
       electronRendererContracts.invoke('settings.setReasoningEffort', request),
+    setReviewerModel: (request) =>
+      electronRendererContracts.invoke('settings.setReviewerModel', request),
     setSubagentModel: (request) =>
       electronRendererContracts.invoke('settings.setSubagentModel', request),
     onChanged: (listener) => electronRendererContracts.subscribe('settings.onChanged', listener),
@@ -272,6 +275,8 @@ const api: OpenScienceAPI = {
       electronRendererContracts.invoke('settings.exportSkill', request),
     setSkillEnabled: (request: SetSkillEnabledRequest) =>
       electronRendererContracts.invoke('settings.setSkillEnabled', request),
+    setSkillsEnabled: (request: SetSkillsEnabledRequest) =>
+      electronRendererContracts.invoke('settings.setSkillsEnabled', request),
     createSkill: (request: CreateSkillRequest) =>
       electronRendererContracts.invoke('settings.createSkill', request),
     updateSkill: (request: UpdateSkillRequest) =>

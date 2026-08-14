@@ -227,8 +227,10 @@ import type {
   SetDefaultPermissionProfileRequest,
   SetAppIconVariantRequest,
   SetReasoningEffortRequest,
+  SetReviewerModelRequest,
   SetSubagentModelRequest,
   SetSkillEnabledRequest,
+  SetSkillsEnabledRequest,
   SettingsSnapshot,
   AppIconPreview,
   SkillDetailView,
@@ -457,6 +459,7 @@ export interface OpenScienceAPI {
     setActiveProvider(request: SetActiveProviderRequest): Promise<SettingsSnapshot>
     setAgentFramework(request: SetAgentFrameworkRequest): Promise<SettingsSnapshot>
     setReasoningEffort(request: SetReasoningEffortRequest): Promise<SettingsSnapshot>
+    setReviewerModel(request: SetReviewerModelRequest): Promise<SettingsSnapshot>
     setSubagentModel(request: SetSubagentModelRequest): Promise<SettingsSnapshot>
     onChanged(listener: (snapshot: SettingsSnapshot) => void): () => void
     setNotificationsEnabled(request: SetNotificationsEnabledRequest): Promise<SettingsSnapshot>
@@ -496,6 +499,7 @@ export interface OpenScienceAPI {
     getSkillDetail(id: string): Promise<SkillDetailView>
     exportSkill(request: ExportSkillRequest): Promise<ExportSkillResult>
     setSkillEnabled(request: SetSkillEnabledRequest): Promise<SkillView[]>
+    setSkillsEnabled(request: SetSkillsEnabledRequest): Promise<SkillView[]>
     createSkill(request: CreateSkillRequest): Promise<SkillView[]>
     updateSkill(request: UpdateSkillRequest): Promise<SkillView[]>
     deleteSkill(request: DeleteSkillRequest): Promise<SkillView[]>

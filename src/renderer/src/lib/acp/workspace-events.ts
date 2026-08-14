@@ -34,7 +34,12 @@ import {
   type ChatSession,
   type ToolActivity
 } from '../../stores/session-store'
-import { useSettingsStore } from '../../stores/settings-store'
+import {
+  recordAcpChunkEventReceived,
+  recordAgentMessageChunkCommit,
+  recordTextEventApplied,
+  recordToolEventApplied
+} from '../streaming-metrics'
 import { saveSessionInOrder } from '../session-persistence/session-persistence'
 import {
   createRuntimeStreamId,
@@ -42,8 +47,21 @@ import {
   getAcpRuntimeEventText,
   isAssistantRuntimeChatMessageEvent,
   isBufferableAssistantTextEvent,
-  isRuntimeChatMessageEvent
+  isRuntimeChatMessageEvent,
+  type RuntimeChatMessageEvent
 } from './chat-events'
+
+// One seam for per-chunk metrics so the single and batch apply paths cannot drift apart.
+const recordAppliedTextChunk = (
+  event: RuntimeChatMessageEvent,
+  content: string | undefined
+): void => {
+  recordAcpChunkEventReceived()
+  recordTextEventApplied(
+    createRuntimeStreamId(event),
+    typeof content === 'string' ? content.length : 0
+  )
+}
 
 // Sessions whose next triggerAutoReview call should be skipped exactly once.
 // Used to suppress the re-review that would otherwise be triggered by the [Auditor] correction turn:
@@ -391,8 +409,7 @@ const assembleReviewRunRequest = (sessionId: string): ReviewRunRequest | undefin
     sessionId,
     turnMessageId: lastAgentMessage.id,
     projectId: session.projectId ?? '',
-    mainSessionId: sessionId,
-    model: useSettingsStore.getState().activeModel
+    mainSessionId: sessionId
   }
 }
 
@@ -570,6 +587,8 @@ const applyWorkspaceRuntimeEvent = async (
     }
 
     store.completeActivityGroup(event.sessionId, event.promptMessageId)
+    recordAgentMessageChunkCommit(1)
+    recordAppliedTextChunk(event, content)
     store.appendAgentMessageChunk({
       sessionId: event.sessionId,
       streamId: createRuntimeStreamId(event),
@@ -583,6 +602,9 @@ const applyWorkspaceRuntimeEvent = async (
 
   // Tool calls become visible activity rows, including web-search query/result payloads.
   if (event.kind === 'tool' && event.sessionId && event.toolCallId) {
+    if (!isActivityGroupControlEvent(event)) {
+      recordToolEventApplied(event.toolCallId, event.title)
+    }
     if (isActivityGroupControlEvent(event)) {
       const title = getActivityGroupTitleFromToolEvent(event)
       if (title) {
@@ -914,8 +936,10 @@ const applyWorkspaceRuntimeEventBatch = async (events: AcpRuntimeEvent[]): Promi
       promptMessageId: event.promptMessageId,
       content
     })
+    recordAppliedTextChunk(event, content)
   }
 
+  recordAgentMessageChunkCommit(inputs.length)
   store.appendAgentMessageChunks(inputs)
   return true
 }

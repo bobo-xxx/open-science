@@ -36,7 +36,7 @@ import {
 import { sanitizePackageMirror } from './record-codec'
 import { sanitizeSettings } from './document-codec'
 import { SettingsDocumentStore } from './document-store'
-import { buildSubagentModelMutation } from './subagent-model-settings'
+import { buildReviewerModelMutation, buildSubagentModelMutation } from './subagent-model-settings'
 
 // Stable semantic mutation facade. The injected document store owns arbitration and atomic IO; all
 // secret handling remains above this layer in crypto.ts and service.ts.
@@ -283,6 +283,12 @@ class SettingsRepository {
     return this.mutate(buildSubagentModelMutation(...args))
   }
 
+  async setReviewerModel(
+    ...args: Parameters<typeof buildReviewerModelMutation>
+  ): Promise<StoredSettings> {
+    return this.mutate(buildReviewerModelMutation(...args))
+  }
+
   async setNotificationsEnabled(enabled: boolean): Promise<StoredSettings> {
     return this.mutate((settings) => ({ ...settings, notificationsEnabled: enabled }))
   }
@@ -481,19 +487,18 @@ class SettingsRepository {
     })
   }
 
-  // Adds or removes a skill id from the disabled set (default-on model), returning the new document.
   async setSkillEnabled(id: string, enabled: boolean): Promise<StoredSettings> {
+    return this.setSkillsEnabled([id], enabled)
+  }
+
+  async setSkillsEnabled(ids: string[], enabled: boolean): Promise<StoredSettings> {
     return this.mutate((settings) => {
-      const current = new Set(settings.disabledSkillIds ?? [])
-
-      if (enabled) current.delete(id)
-      else current.add(id)
-
-      const disabledSkillIds = [...current]
-
-      return disabledSkillIds.length > 0
-        ? { ...settings, disabledSkillIds }
-        : { ...settings, disabledSkillIds: undefined }
+      const disabled = new Set(settings.disabledSkillIds ?? [])
+      for (const id of ids) {
+        if (enabled) disabled.delete(id)
+        else disabled.add(id)
+      }
+      return { ...settings, disabledSkillIds: disabled.size ? [...disabled] : undefined }
     })
   }
 
