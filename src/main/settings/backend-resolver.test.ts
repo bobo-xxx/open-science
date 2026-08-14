@@ -1,8 +1,11 @@
+import { join } from 'node:path'
+
 import { describe, expect, it, vi } from 'vitest'
 
 import { SETTINGS_FILE_VERSION } from '../../shared/settings'
 import type { AgentConfigFile, AgentFrameworkId } from '../agent-framework'
 import { opencodeTransportProviderId } from '../agent-framework/opencode'
+import { SKILL_IMPORT_SYSTEM_PROMPT_APPEND } from '../skills/mcp-server'
 import type { ResolvedProvider } from './provider-env'
 import type { ProviderRuntimeTarget, RuntimeProviderModelSelection } from './provider-accounts'
 import type { StoredProvider, StoredSettings } from './types'
@@ -554,7 +557,12 @@ describe('AgentBackendResolver configured and explicit targets', () => {
       { systemPromptAppends: ['Stable Open Science app guidance.'] }
     )
 
-    expect(backend.systemPromptAppends).toBeUndefined()
+    expect(backend.systemPromptAppends?.join('\n')).toContain(
+      join('/storage', 'skills', 'personal')
+    )
+    expect(backend.systemPromptAppends?.join('\n')).not.toContain(
+      'Stable Open Science app guidance.'
+    )
     await backend.anthropicBridgeLease?.release()
   })
 
@@ -1206,34 +1214,98 @@ describe('AgentBackendResolver bridge predicates', () => {
         provider: { apiEndpoints: ['openai'] as const }
       }
     }
-  ])('advertises exact enabled Connector Skill names to $name', async (testCase) => {
-    const harness = makeHarness({
-      connectorIds: ['pubmed', 'literature'],
-      connectorSkillNames: ['mcp-pubmed', 'mcp-literature', 'mcp-custom-chemistry'],
-      targetOverride: () => testCase.target
-    })
+  ])('provides the fixed Personal and Imported Skill paths to $name', async (testCase) => {
+    const harness = makeHarness({ targetOverride: () => testCase.target })
 
-    const backend = await harness.resolver.resolveExplicitTarget({
-      frameworkId: testCase.frameworkId,
-      providerId: 'provider-a',
-      model: { kind: 'provider-default' },
-      reasoningEffort: 'high'
-    })
+    const backend = await harness.resolver.resolveExplicitTarget(
+      {
+        frameworkId: testCase.frameworkId,
+        providerId: 'provider-a',
+        model: { kind: 'provider-default' },
+        reasoningEffort: 'high'
+      },
+      { systemPromptAppends: [SKILL_IMPORT_SYSTEM_PROMPT_APPEND] }
+    )
     const instructions =
       testCase.frameworkId === 'claude-code'
-        ? backend.systemPromptAppends?.join('\n\n')
+        ? [SKILL_IMPORT_SYSTEM_PROMPT_APPEND, ...(backend.systemPromptAppends ?? [])].join('\n\n')
         : backend.persistentSystemPrompt
 
-    expect(instructions).toContain(
-      'Globally Enabled Connector Skills: `mcp-pubmed`, `mcp-literature`, `mcp-custom-chemistry`.'
-    )
-    expect(instructions).toContain('Allowed Specialist Skills for this session')
-    expect(instructions).not.toContain('host.mcp("custom-chemistry"')
-    expect(instructions).not.toContain('`mcp-openalex`')
+    expect(instructions).toContain(join('/storage', 'skills', 'personal'))
+    expect(instructions).toContain(join('/storage', 'skills', 'imported'))
+    expect(instructions).toContain('<name>/SKILL.md')
+    expect(instructions).toContain('discovered automatically')
+    expect(instructions).toContain('do not download, unpack, or copy an external Skill there')
+    expect(instructions).toContain('request_skill_import')
+    expect(instructions).toContain('when it is available')
+    expect(instructions).toContain('Never unpack or copy a Skill into a Skill directory yourself')
+    expect(instructions).not.toContain('Do not use names beginning with')
+    expect(instructions).not.toContain('copy over bundled Skill names or ids')
+    expect(instructions).not.toContain('reuse another user Skill id')
     await backend.anthropicBridgeLease?.release()
     await backend.responsesBridgeLease?.release()
     await backend.providerTransportLease?.release()
   })
+
+  it.each([
+    { name: 'Claude Code', frameworkId: 'claude-code' as const, target: {} },
+    { name: 'OpenCode', frameworkId: 'opencode' as const, target: {} },
+    {
+      name: 'Codex Responses',
+      frameworkId: 'codex' as const,
+      target: { provider: { apiEndpoints: ['responses'] as const } }
+    },
+    {
+      name: 'Codex bridge',
+      frameworkId: 'codex' as const,
+      target: {
+        needsChatResponsesBridge: true,
+        provider: { apiEndpoints: ['openai'] as const }
+      }
+    }
+  ])(
+    'rematerializes exact enabled Connector Skill names for each $name generation',
+    async (testCase) => {
+      const harness = makeHarness({
+        connectorIds: ['pubmed', 'literature'],
+        connectorSkillNames: ['mcp-pubmed', 'mcp-literature', 'mcp-custom-chemistry'],
+        targetOverride: () => testCase.target
+      })
+      const target = {
+        frameworkId: testCase.frameworkId,
+        providerId: 'provider-a',
+        model: { kind: 'provider-default' as const },
+        reasoningEffort: 'high' as const
+      }
+
+      const previousBackend = await harness.resolver.resolveExplicitTarget(target)
+      await previousBackend.anthropicBridgeLease?.release()
+      await previousBackend.responsesBridgeLease?.release()
+      await previousBackend.providerTransportLease?.release()
+
+      const backend = await harness.resolver.resolveExplicitTarget(target)
+      const instructions =
+        testCase.frameworkId === 'claude-code'
+          ? backend.systemPromptAppends?.join('\n\n')
+          : backend.persistentSystemPrompt
+
+      expect(instructions).toContain(
+        'Globally Enabled Connector Skills: `mcp-pubmed`, `mcp-literature`, `mcp-custom-chemistry`.'
+      )
+      expect(instructions).toContain('Allowed Specialist Skills for this session')
+      expect(instructions).not.toContain('host.mcp("custom-chemistry"')
+      expect(instructions).not.toContain('`mcp-openalex`')
+      expect(harness.runtime.provisionClaudeRuntimeConfig).toHaveBeenCalledTimes(
+        testCase.frameworkId === 'claude-code' ? 2 : 0
+      )
+      expect(harness.runtime.materializeAgentSkills).toHaveBeenCalledTimes(
+        testCase.frameworkId === 'claude-code' ? 0 : 2
+      )
+      await backend.anthropicBridgeLease?.release()
+      await backend.responsesBridgeLease?.release()
+      await backend.providerTransportLease?.release()
+    }
+  )
 
   it.each([
     { name: 'OpenCode', frameworkId: 'opencode' as const, target: {} },

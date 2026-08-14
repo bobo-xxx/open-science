@@ -172,7 +172,7 @@ export const RENDERER_CONTRACT_GROUPS = Object.freeze([
     ['compactSession', 'acp:compact-session'], ['connect', 'acp:connect', WEB, DEFAULT_EMPTY, DEFAULT_EMPTY_ABSENT_ONLY], ['createSession', 'acp:create-session', WEB, DEFAULT_EMPTY, DEFAULT_EMPTY_ABSENT_ONLY],
     ['continueInterruptedTurn', 'acp:continue-interrupted-turn'], ['deleteSession', 'acp:delete-session'], ['disconnect', 'acp:disconnect'], ['getState', 'acp:get-state'], ['getPlanProjection', 'acp:get-plan-projection'],
     ['resetSessionContext', 'acp:reset-session-context'], ['respondToPermission', 'acp:respond-permission'], ['resumeSession', 'acp:resume-session'],
-    ['respondPlan', 'acp:respond-plan'], ['respondToElicitation', 'acp:respond-elicitation'], ['revokePermissionGrant', 'acp:revoke-permission-grant'], ['sendPrompt', 'acp:send-prompt'], ['setPermissionProfile', 'acp:set-permission-profile'],
+    ['respondPlan', 'acp:respond-plan'], ['respondToElicitation', 'acp:respond-elicitation'], ['revokePermissionGrant', 'acp:revoke-permission-grant'], ['saveAsSkill', 'acp:save-as-skill'], ['sendPrompt', 'acp:send-prompt'], ['setPermissionProfile', 'acp:set-permission-profile'],
   ]),
   group('artifacts', 'artifacts', [
     ['finalizeRunArtifacts', 'artifacts:finalize-run'], ['generateCodeReconstruction', 'artifacts:generate-code-reconstruction'], ['getCodeReconstruction', 'artifacts:get-code-reconstruction'],
@@ -212,7 +212,7 @@ export const RENDERER_CONTRACT_GROUPS = Object.freeze([
   ]),
   group('local-fs', 'localFs', [
     ['getRoots', 'local-fs:get-roots', LOCAL], ['grantRoot', 'local-fs:grant-root', LOCAL], ['listDir', 'local-fs:list-dir', LOCAL],
-    ['listGrantedRoots', 'local-fs:granted-roots:list', LOCAL], ['openPath', 'local-fs:open-path', LOCAL], ['readPreview', 'local-fs:read-preview', LOCAL],
+    ['listDrives', 'local-fs:list-drives', LOCAL], ['listGrantedRoots', 'local-fs:granted-roots:list', LOCAL], ['openPath', 'local-fs:open-path', LOCAL], ['readPreview', 'local-fs:read-preview', LOCAL],
     ['removeGrantedRoot', 'local-fs:granted-roots:remove', LOCAL], ['reveal', 'local-fs:reveal', LOCAL], ['setGrantedRootAccess', 'local-fs:granted-roots:set-access', LOCAL],
   ]),
   group('logs', 'logs', [

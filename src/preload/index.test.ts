@@ -254,6 +254,7 @@ describe('preload bridge — public surface inventory', () => {
       'acp.respondToPermission',
       'acp.resumeSession',
       'acp.revokePermissionGrant',
+      'acp.saveAsSkill',
       'acp.sendPrompt',
       'acp.setPermissionProfile',
       'artifacts.finalizeRunArtifacts',
@@ -310,6 +311,7 @@ describe('preload bridge — public surface inventory', () => {
       'localFs.getRoots',
       'localFs.grantRoot',
       'localFs.listDir',
+      'localFs.listDrives',
       'localFs.listGrantedRoots',
       'localFs.openPath',
       'localFs.readPreview',
@@ -608,7 +610,7 @@ describe('preload bridge — runtime renderer contract catalog', () => {
   it('routes every owned method through its cataloged Electron channel', async () => {
     const requestContracts = runtimeContracts.filter(({ kind }) => kind === 'method')
 
-    expect(runtimeContracts).toHaveLength(195)
+    expect(runtimeContracts).toHaveLength(196)
 
     for (const contract of requestContracts) {
       invokeMock.mockClear()
@@ -674,7 +676,7 @@ describe('preload bridge — runtime renderer contract catalog', () => {
 })
 
 describe('preload bridge — core renderer contract catalog', () => {
-  it('pins the exact 23-group, 156-callable T1d complement', () => {
+  it('pins the exact 23-group, 157-callable T1d complement', () => {
     expect(coreContractGroups.map(({ capability }) => capability)).toEqual([
       'artifacts',
       'cli',
@@ -701,7 +703,7 @@ describe('preload bridge — core renderer contract catalog', () => {
       'uploads',
       'window'
     ])
-    expect(coreContracts).toHaveLength(157)
+    expect(coreContracts).toHaveLength(158)
     expect({
       requests: coreContracts.filter(
         ({ dispatchPolicy }) => dispatchPolicy.electron === 'electron-ipc-request'
@@ -713,16 +715,16 @@ describe('preload bridge — core renderer contract catalog', () => {
       surfaceNative: coreContracts.filter(
         ({ dispatchPolicy }) => dispatchPolicy.electron === 'surface-native'
       ).length
-    }).toEqual({ requests: 117, events: 29, sends: 10, surfaceNative: 1 })
+    }).toEqual({ requests: 118, events: 29, sends: 10, surfaceNative: 1 })
   })
 
-  it('routes all 117 request methods through their cataloged Electron channels', async () => {
+  it('routes all 118 request methods through their cataloged Electron channels', async () => {
     const requestContracts = coreContracts.filter(
       ({ dispatchPolicy }) => dispatchPolicy.electron === 'electron-ipc-request'
     )
     const localFile = { name: 'catalog.csv' } as File
 
-    expect(requestContracts).toHaveLength(117)
+    expect(requestContracts).toHaveLength(118)
 
     for (const contract of requestContracts) {
       invokeMock.mockClear()

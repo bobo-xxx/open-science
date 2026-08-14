@@ -127,6 +127,7 @@ const api: OpenScienceAPI = {
     resetSessionContext: (request) =>
       electronRendererContracts.invoke('acp.resetSessionContext', request),
     sendPrompt: (request) => electronRendererContracts.invoke('acp.sendPrompt', request),
+    saveAsSkill: (request) => electronRendererContracts.invoke('acp.saveAsSkill', request),
     compactSession: (request) => electronRendererContracts.invoke('acp.compactSession', request),
     cancel: (request) => electronRendererContracts.invoke('acp.cancel', request),
     deleteSession: (request) => electronRendererContracts.invoke('acp.deleteSession', request),
@@ -623,6 +624,7 @@ const api: OpenScienceAPI = {
     listDir: (path) => electronRendererContracts.invoke('localFs.listDir', path),
     readPreview: (request) => electronRendererContracts.invoke('localFs.readPreview', request),
     getRoots: () => electronRendererContracts.invoke('localFs.getRoots'),
+    listDrives: () => electronRendererContracts.invoke('localFs.listDrives'),
     reveal: (path) => electronRendererContracts.invoke('localFs.reveal', path),
     openPath: (path) => electronRendererContracts.invoke('localFs.openPath', path),
     listGrantedRoots: () => electronRendererContracts.invoke('localFs.listGrantedRoots'),
