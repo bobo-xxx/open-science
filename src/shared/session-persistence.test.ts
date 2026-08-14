@@ -7,8 +7,10 @@ import {
   createSessionFile,
   ConversationGraphMaterializationError,
   materializeSessionConversationGraph,
+  isReviewerCorrectionAttribution,
   sanitizeActivityGroup,
   normalizeSessionFile,
+  sanitizeMessageAttribution,
   sanitizeMessageImages,
   sanitizeSessionRuntimeContext,
   sanitizeToolActivity,
@@ -168,6 +170,44 @@ describe('conversation graph materialization diagnostics', () => {
   })
 })
 
+describe('session branch source persistence', () => {
+  it('restores a complete source snapshot without inferring one for historical sessions', () => {
+    const historical = createSessionWithActivity(undefined)
+    const restored = normalizeSessionFile({
+      ...historical,
+      activities: undefined,
+      branchSource: {
+        sessionId: 'source-session',
+        agentFrameId: 'source-frame',
+        messageBranchId: 'source-branch',
+        headMessageId: 'source-head'
+      }
+    })
+
+    expect(restored?.branchSource).toEqual({
+      sessionId: 'source-session',
+      agentFrameId: 'source-frame',
+      messageBranchId: 'source-branch',
+      headMessageId: 'source-head'
+    })
+    expect(normalizeSessionFile(historical)?.branchSource).toBeUndefined()
+  })
+
+  it('discards malformed or empty source snapshots', () => {
+    const base = { ...createSessionWithActivity(undefined), activities: undefined }
+
+    expect(
+      normalizeSessionFile({ ...base, branchSource: { sessionId: '' } })?.branchSource
+    ).toBeUndefined()
+    expect(
+      normalizeSessionFile({
+        ...base,
+        branchSource: { sessionId: 'source-session', messageBranchId: 42 }
+      })?.branchSource
+    ).toBeUndefined()
+  })
+})
+
 describe('branch Plan history persistence', () => {
   it('restores only branch-bound projections and recomputes their display state', () => {
     const valid = createHistoricalPlan()
@@ -229,6 +269,102 @@ describe('branch Plan history persistence', () => {
       'version-4',
       'version-5'
     ])
+  })
+})
+
+describe('message attribution persistence', () => {
+  it('recognizes only the closed Reviewer Correction attribution variant', () => {
+    expect(
+      isReviewerCorrectionAttribution({
+        kind: 'application',
+        feature: 'reviewer',
+        purpose: 'correction',
+        causeReviewId: 'review-1'
+      })
+    ).toBe(true)
+    expect(
+      isReviewerCorrectionAttribution({
+        kind: 'application',
+        feature: 'reviewer',
+        purpose: 'correction',
+        causeReviewId: 'review-1',
+        rendererClaim: true
+      })
+    ).toBe(false)
+    expect(isReviewerCorrectionAttribution(undefined)).toBe(false)
+  })
+
+  it('preserves a Reviewer Correction attribution through Session JSON and Conversation Graph projection', () => {
+    const session = normalizeSessionFile({
+      ...createSessionWithActivity(undefined),
+      messages: [
+        {
+          id: 'correction-1',
+          role: 'user',
+          content: '[Auditor] Correct the unsupported claim.',
+          status: 'complete',
+          eventIds: ['event-1'],
+          attribution: {
+            kind: 'application',
+            feature: 'reviewer',
+            purpose: 'correction',
+            causeReviewId: 'review-1'
+          },
+          createdAt: 2,
+          updatedAt: 2
+        }
+      ]
+    })
+
+    expect(session?.messages[0]?.attribution).toEqual({
+      kind: 'application',
+      feature: 'reviewer',
+      purpose: 'correction',
+      causeReviewId: 'review-1'
+    })
+    expect(
+      session &&
+        materializeSessionConversationGraph(session).conversationGraph?.messages[0]?.attribution
+    ).toEqual({
+      kind: 'application',
+      feature: 'reviewer',
+      purpose: 'correction',
+      causeReviewId: 'review-1'
+    })
+  })
+
+  it('drops malformed or extended attribution without dropping the Message', () => {
+    expect(
+      sanitizeMessageAttribution({
+        kind: 'application',
+        feature: 'reviewer',
+        purpose: 'correction',
+        causeReviewId: 'review-1',
+        rendererClaim: true
+      })
+    ).toBeUndefined()
+    const session = normalizeSessionFile({
+      ...createSessionWithActivity(undefined),
+      messages: [
+        {
+          id: 'legacy-message',
+          role: 'user',
+          content: '[Auditor] remains visible as human text',
+          status: 'complete',
+          eventIds: [],
+          attribution: { kind: 'unknown', feature: 'reviewer' },
+          createdAt: 2,
+          updatedAt: 2
+        }
+      ]
+    })
+
+    expect(session?.messages[0]).toMatchObject({
+      id: 'legacy-message',
+      role: 'user',
+      content: '[Auditor] remains visible as human text'
+    })
+    expect(session?.messages[0]).not.toHaveProperty('attribution')
   })
 })
 

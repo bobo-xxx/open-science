@@ -23,6 +23,21 @@ const callCapabilities = async (
   }
 }
 
+const callHostSdkHelp = async (
+  connection: RpcConnection,
+  query: string
+): Promise<{ response: Response; payload: Record<string, unknown> }> => {
+  const response = await fetch(connection.endpoint, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${connection.token}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ method: 'hostSdkHelp', params: { query } })
+  })
+  return {
+    response,
+    payload: (await response.json()) as Record<string, unknown>
+  }
+}
+
 let server: NotebookLocalRpcServer | undefined
 
 afterEach(async () => {
@@ -66,7 +81,15 @@ describe('capabilitiesCall RPC', () => {
         lineage: true,
         frames: true,
         llm: true,
-        viewImage: false
+        viewImage: false,
+        delegate: false,
+        children: false,
+        collect: false,
+        stopChild: false,
+        sendFrameMessage: false,
+        messageReceipt: false,
+        resolveMessage: false,
+        submitOutput: false
       }
     })
   })
@@ -97,6 +120,32 @@ describe('capabilitiesCall RPC', () => {
         }
       }
     })
+  })
+
+  it('does not advertise delegated work without the trusted origin required by its route', async () => {
+    server = new NotebookLocalRpcServer({ execute: async () => ({}) } as never, {
+      transport: 'tcp',
+      delegatedWorkService: {
+        delegate: async () => ({}) as never,
+        sendMessage: async () => ({}) as never
+      }
+    })
+    const connection = await server.issueControlConnection(
+      'trusted-session',
+      'trusted-project',
+      'root-frame-trusted-session'
+    )
+    const endInvocation = connection.beginControlInvocation({
+      turnId: 'turn-1',
+      controlInvocationGeneration: 1,
+      toolInvocationId: 'tool-1'
+    })
+
+    await expect(callCapabilities(connection)).resolves.toMatchObject({
+      payload: { result: { delegate: false, sendFrameMessage: false } }
+    })
+
+    endInvocation()
   })
 
   it('does not advertise Host Frames to an ordinary non-control Session token', async () => {
@@ -145,6 +194,130 @@ describe('capabilitiesCall RPC', () => {
     await expect(callCapabilities(connection)).resolves.toMatchObject({
       payload: { result: { llm: false } }
     })
+  })
+
+  it('does not advertise host.viewImage without a trusted Session workspace', async () => {
+    server = new NotebookLocalRpcServer({ execute: async () => ({}) } as never, {
+      transport: 'tcp',
+      hostViewImage: {
+        isAvailable: async () => true,
+        stage: async () => ({}) as never,
+        complete: async () => [],
+        discard: () => {},
+        discardSession: () => {},
+        shutdown: () => {}
+      }
+    })
+    const connection = await server.issueControlConnection(
+      'trusted-session',
+      'trusted-project',
+      'root-frame-trusted-session'
+    )
+    const endInvocation = connection.beginControlInvocation({
+      turnId: 'turn-1',
+      controlInvocationGeneration: 1,
+      toolInvocationId: 'tool-1'
+    })
+
+    await expect(callCapabilities(connection)).resolves.toMatchObject({
+      payload: { result: { viewImage: false } }
+    })
+
+    endInvocation()
+  })
+
+  it('reports host.viewImage unavailable from host.help without a trusted Session workspace', async () => {
+    server = new NotebookLocalRpcServer({ execute: async () => ({}) } as never, {
+      transport: 'tcp',
+      hostViewImage: {
+        isAvailable: async () => true,
+        stage: async () => ({}) as never,
+        complete: async () => [],
+        discard: () => {},
+        discardSession: () => {},
+        shutdown: () => {}
+      }
+    })
+    const connection = await server.issueControlConnection(
+      'trusted-session',
+      'trusted-project',
+      'root-frame-trusted-session'
+    )
+    const endInvocation = connection.beginControlInvocation({
+      turnId: 'turn-1',
+      controlInvocationGeneration: 1,
+      toolInvocationId: 'tool-1'
+    })
+
+    await expect(callHostSdkHelp(connection, 'viewImage')).resolves.toMatchObject({
+      payload: { result: { availability: { status: 'unavailable' } } }
+    })
+
+    endInvocation()
+  })
+
+  it('advertises host.viewImage with an active invocation and trusted Session workspace', async () => {
+    server = new NotebookLocalRpcServer({ execute: async () => ({}) } as never, {
+      transport: 'tcp',
+      hostViewImage: {
+        isAvailable: async () => true,
+        stage: async () => ({}) as never,
+        complete: async () => [],
+        discard: () => {},
+        discardSession: () => {},
+        shutdown: () => {}
+      }
+    })
+    const connection = await server.issueControlConnection(
+      'trusted-session',
+      'trusted-project',
+      'root-frame-trusted-session',
+      { role: 'main' },
+      '/trusted-workspace'
+    )
+    const endInvocation = connection.beginControlInvocation({
+      turnId: 'turn-1',
+      controlInvocationGeneration: 1,
+      toolInvocationId: 'tool-1'
+    })
+
+    await expect(callCapabilities(connection)).resolves.toMatchObject({
+      payload: { result: { viewImage: true } }
+    })
+
+    endInvocation()
+  })
+
+  it('does not advertise host.viewImage when its certified visual route is unavailable', async () => {
+    server = new NotebookLocalRpcServer({ execute: async () => ({}) } as never, {
+      transport: 'tcp',
+      hostViewImage: {
+        isAvailable: async () => false,
+        stage: async () => ({}) as never,
+        complete: async () => [],
+        discard: () => {},
+        discardSession: () => {},
+        shutdown: () => {}
+      }
+    })
+    const connection = await server.issueControlConnection(
+      'trusted-session',
+      'trusted-project',
+      'root-frame-trusted-session',
+      { role: 'main' },
+      '/trusted-workspace'
+    )
+    const endInvocation = connection.beginControlInvocation({
+      turnId: 'turn-1',
+      controlInvocationGeneration: 1,
+      toolInvocationId: 'tool-1'
+    })
+
+    await expect(callCapabilities(connection)).resolves.toMatchObject({
+      payload: { result: { viewImage: false } }
+    })
+
+    endInvocation()
   })
 
   it('rejects bootstrap, invalid, and released tokens instead of returning an all-false bitmap', async () => {
