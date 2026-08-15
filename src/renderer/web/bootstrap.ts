@@ -3,13 +3,21 @@ import {
   isApplicationCommandErrorCode
 } from '../../shared/application-command-contract'
 import {
+  WEB_EVENT_STREAM_PROTOCOL_VERSION,
   WEB_RPC_PROTOCOL_VERSION,
   webRpcBootstrapSchema,
-  webRpcEventSchema,
+  webRpcEventMessageSchema,
   webRpcResponseSchema
 } from '../../shared/web-rpc-contract'
+import {
+  WEB_EVENT_CONNECTION_STATE_EVENT,
+  WEB_EVENT_CONSUMERS_READY_EVENT,
+  WEB_EVENTS_OPEN_EVENT,
+  WEB_EVENT_SURFACE_ATTRIBUTE,
+  type WebEventConnectionPhase
+} from '../../shared/web-event-connection'
 import { installWebRendererContracts } from './api-installer'
-import { initI18n } from '@/i18n'
+import { i18next, initI18n } from '@/i18n'
 import { applyHtmlLang, resolveInitialLocale } from '@/lib/locale-preference'
 import { applyTheme, resolveInitialTheme } from '@/lib/theme'
 import openScienceLogoSvg from '../../main/remote-access/openscience-logo.svg?raw'
@@ -23,10 +31,13 @@ applyTheme(resolveInitialTheme())
 // person reading the page — the backend host's OS locale may be something else entirely.
 const initialLocale = resolveInitialLocale()
 initI18n(initialLocale)
+const t = i18next.t.bind(i18next)
 applyHtmlLang(initialLocale)
+document.documentElement.setAttribute(WEB_EVENT_SURFACE_ATTRIBUTE, 'true')
 
-const REMOTE_ACCESS_OFF_MESSAGE =
+const REMOTE_ACCESS_OFF_MESSAGE = t(
   'Remote access is off on the home computer. Re-enable a remote access mode in Open Science, then try again.'
+)
 
 class RemoteAccessOffError extends Error {}
 
@@ -47,6 +58,8 @@ const setConnectionMessage = (message: string): void => {
   const element = connectionMessage()
   if (element) element.textContent = message
 }
+
+setConnectionMessage(t('Connecting to remote computer…'))
 
 const connectionLogo = document.getElementById('open-science-connection-logo')
 if (connectionLogo) {
@@ -81,7 +94,12 @@ const fetchBootstrap = async (): Promise<unknown> => {
   let lastError: unknown
   for (let attempt = 1; attempt <= BOOTSTRAP_ATTEMPTS; attempt += 1) {
     if (attempt > 1) {
-      setConnectionMessage(`Reconnecting to remote computer… (${attempt}/${BOOTSTRAP_ATTEMPTS})`)
+      setConnectionMessage(
+        t('Reconnecting to remote computer… ({{attempt}}/{{maxAttempts}})', {
+          attempt,
+          maxAttempts: BOOTSTRAP_ATTEMPTS
+        })
+      )
       await wait(Math.min(500 * 2 ** (attempt - 2), 5_000))
     }
     const controller = new AbortController()
@@ -122,11 +140,11 @@ const showConnectionFailure = (error: unknown): void => {
     message.textContent =
       error instanceof RemoteAccessOffError
         ? detail
-        : `This computer did not finish responding. ${detail}`
+        : t('This computer did not finish responding. {{detail}}', { detail })
   }
   const retry = document.createElement('button')
   retry.type = 'button'
-  retry.textContent = 'Try again'
+  retry.textContent = t('Try again')
   retry.style.cssText =
     'margin-top:18px;border:1px solid #737373;border-radius:8px;background:var(--connection-background);color:var(--connection-foreground);padding:9px 14px;font:inherit;cursor:pointer'
   retry.addEventListener('click', () => window.location.reload())
@@ -202,22 +220,91 @@ const rewritePreviewUrls = (value: unknown): unknown => {
   return value
 }
 
+type EventCursor = {
+  streamId: string
+  latestSequence: number
+}
+
+let eventCursor: EventCursor
 let eventReconnectAttempt = 0
+let eventRecoveryRequired = false
+
+const publishEventConnectionPhase = (phase: WebEventConnectionPhase): void => {
+  window.dispatchEvent(
+    new CustomEvent(WEB_EVENT_CONNECTION_STATE_EVENT, {
+      detail: { phase }
+    })
+  )
+}
+
+const requireEventReload = (socket: WebSocket): void => {
+  if (eventRecoveryRequired) return
+  eventRecoveryRequired = true
+  publishEventConnectionPhase('reload-required')
+  socket.close(1000, 'Event stream resynchronization required')
+}
 
 const connectEvents = (): void => {
+  if (eventRecoveryRequired) return
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const socket = new WebSocket(
-    `${protocol}//${location.host}/events?client=${encodeURIComponent(clientId)}`
-  )
+  const url = new URL(`${protocol}//${location.host}/events`)
+  url.searchParams.set('client', clientId)
+  url.searchParams.set('eventProtocol', String(WEB_EVENT_STREAM_PROTOCOL_VERSION))
+  url.searchParams.set('stream', eventCursor.streamId)
+  url.searchParams.set('after', String(eventCursor.latestSequence))
+  const socket = new WebSocket(url.toString())
+
   socket.addEventListener('open', () => {
-    eventReconnectAttempt = 0
-    window.dispatchEvent(new Event('open-science:web-events-open'))
+    publishEventConnectionPhase('replaying')
   })
   socket.addEventListener('message', (event) => {
-    const message = webRpcEventSchema.parse(JSON.parse(String(event.data), reviveBinary))
-    for (const listener of listeners.get(message.channel) ?? []) listener(message.payload)
+    let decoded: unknown
+    try {
+      decoded = JSON.parse(String(event.data), reviveBinary)
+    } catch {
+      requireEventReload(socket)
+      return
+    }
+    const parsed = webRpcEventMessageSchema.safeParse(decoded)
+    if (!parsed.success) {
+      requireEventReload(socket)
+      return
+    }
+    const message = parsed.data
+    if (message.kind === 'resync-required') {
+      requireEventReload(socket)
+      return
+    }
+    if (message.streamId !== eventCursor.streamId) {
+      requireEventReload(socket)
+      return
+    }
+    if (message.kind === 'event') {
+      if (message.sequence !== eventCursor.latestSequence + 1) {
+        requireEventReload(socket)
+        return
+      }
+      try {
+        for (const listener of listeners.get(message.channel) ?? []) listener(message.payload)
+      } catch (error) {
+        console.error('Failed to apply a Web event frame.', error)
+        requireEventReload(socket)
+        return
+      }
+      eventCursor.latestSequence = message.sequence
+      return
+    }
+    if (message.latestSequence !== eventCursor.latestSequence) {
+      requireEventReload(socket)
+      return
+    }
+    eventReconnectAttempt = 0
+    publishEventConnectionPhase('live')
+    window.dispatchEvent(new Event(WEB_EVENTS_OPEN_EVENT))
   })
   socket.addEventListener('close', () => {
+    if (eventRecoveryRequired) return
+    publishEventConnectionPhase('reconnecting')
     const delay = Math.min(1_000 * 2 ** eventReconnectAttempt, 10_000)
     eventReconnectAttempt += 1
     window.setTimeout(connectEvents, delay)
@@ -243,7 +330,7 @@ const downloadBlob = (blob: Blob, name: string): void => {
   window.setTimeout(() => URL.revokeObjectURL(url), 0)
 }
 
-const installWebApi = async (): Promise<void> => {
+const installWebApi = async (): Promise<EventCursor> => {
   const parsedBootstrap = webRpcBootstrapSchema.safeParse(await fetchBootstrap())
   if (!parsedBootstrap.success) {
     throw new Error(
@@ -291,12 +378,24 @@ const installWebApi = async (): Promise<void> => {
   })
 
   ;(window as unknown as { api: unknown }).api = api
-  connectEvents()
+  return {
+    streamId: bootstrap.eventStream.streamId,
+    latestSequence: bootstrap.eventStream.latestSequence
+  }
 }
 
+const eventConsumersReady = new Promise<void>((resolve) => {
+  window.addEventListener(WEB_EVENT_CONSUMERS_READY_EVENT, () => resolve(), {
+    once: true
+  })
+})
+
 try {
-  await installWebApi()
+  eventCursor = await installWebApi()
   await import('../src/main')
+  await eventConsumersReady
+  publishEventConnectionPhase('connecting')
+  connectEvents()
 } catch (error) {
   showConnectionFailure(error)
 }
