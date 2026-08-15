@@ -10,6 +10,7 @@ import type {
   NotebookExecutionResult,
   NotebookExecutorLifecycleCallbacks
 } from './runtime-service'
+import type { NotebookSessionExecutor } from './session-aggregate'
 import {
   NotebookRuntimeService,
   resolveDefaultExecutorOptions,
@@ -35,7 +36,12 @@ import type {
   InstallResult as InstallResultForTest
 } from './package-manager'
 import type { EnvironmentInfo } from '../../shared/notebook-env'
-import type { NotebookEnvironmentManifest, NotebookEnvironmentStatus } from '../../shared/notebook'
+import {
+  NOTEBOOK_STATE_HISTORY_FRAME_ID_LIMIT_BYTES,
+  NOTEBOOK_STATE_TARGET_RUN_LIMIT,
+  type NotebookEnvironmentManifest,
+  type NotebookEnvironmentStatus
+} from '../../shared/notebook'
 import type { DiscoveredInterpreter, RuntimeEnablement } from '../../shared/notebook-runtime'
 import {
   CompletionGateCoordinator,
@@ -57,6 +63,7 @@ import {
   writeRReadyMarker
 } from './runtime-paths'
 import type { NotebookShellProcess } from './shell-process'
+import { NOTEBOOK_CODE_LIMIT_BYTES } from './content-limits'
 
 let storageRoot: string | undefined
 
@@ -246,6 +253,375 @@ describe('notebook runtime service', () => {
     )
   })
 
+  it('shuts down every idle root and Frame lane owned by one Project', async () => {
+    const root = await createStorageRoot()
+    const shutdowns = [vi.fn(), vi.fn(), vi.fn()]
+    let executorIndex = 0
+    const service = new NotebookRuntimeService({
+      configRoot: root,
+      dataRoot: root,
+      projectName: 'default-project',
+      repository: new NotebookRunRepository(root),
+      environmentStateTracker: verifiedPackageMutationTracker(),
+      executorFactory: () => {
+        const shutdown = shutdowns[executorIndex++]
+        return {
+          execute: async (request) => ({
+            status: 'completed' as const,
+            stdout: '',
+            stderr: '',
+            traceback: '',
+            cwdAfter: request.cwd,
+            outputs: []
+          }),
+          shutdown: async () => {
+            shutdown()
+            return { reaped: true }
+          }
+        }
+      }
+    })
+    const rootContext = {
+      rootFrameId: 'root-frame-session-1',
+      agentFrameId: 'root-frame-session-1',
+      messageBranchId: 'branch-root',
+      runtimeSegmentId: 'runtime-root',
+      promptMessageId: 'message-root'
+    }
+    const childContext = {
+      ...rootContext,
+      agentFrameId: 'child-frame-1',
+      messageBranchId: 'branch-child',
+      runtimeSegmentId: 'runtime-child',
+      promptMessageId: 'message-child'
+    }
+    await service.execute({
+      projectName: 'project-1',
+      sessionId: 'session-1',
+      workspaceCwd: '/workspace',
+      code: 'root_value = 1',
+      provenanceContext: rootContext
+    })
+    await service.execute({
+      projectName: 'project-1',
+      sessionId: 'session-1',
+      workspaceCwd: '/workspace',
+      code: 'child_value = 2',
+      provenanceContext: childContext
+    })
+    await service.execute({
+      projectName: 'project-2',
+      sessionId: 'session-2',
+      workspaceCwd: '/workspace',
+      code: 'other_value = 3'
+    })
+
+    await service.shutdownProject('project-1')
+
+    expect(shutdowns[0]).toHaveBeenCalledOnce()
+    expect(shutdowns[1]).toHaveBeenCalledOnce()
+    expect(shutdowns[2]).not.toHaveBeenCalled()
+  })
+
+  it('blocks new Project lanes and drains a pending lane creation before deletion snapshots', async () => {
+    const root = await createStorageRoot()
+    const repository = new NotebookRunRepository(root)
+    const load = repository.loadOrCreate.bind(repository)
+    const loading = createDeferred<void>()
+    vi.spyOn(repository, 'loadOrCreate').mockImplementation(async (request) => {
+      await loading.promise
+      return load(request)
+    })
+    const service = new NotebookRuntimeService({
+      configRoot: root,
+      dataRoot: root,
+      projectName: 'default-project',
+      repository,
+      environmentStateTracker: verifiedPackageMutationTracker()
+    })
+    const request = {
+      projectName: 'project-1',
+      sessionId: 'session-pending',
+      workspaceCwd: '/workspace'
+    }
+
+    const pending = service.state(request)
+    await vi.waitFor(() => expect(repository.loadOrCreate).toHaveBeenCalledOnce())
+    const deleting = service.shutdownProject('project-1')
+    loading.resolve(undefined)
+
+    await expect(pending).rejects.toThrow('Project is being deleted.')
+    await expect(deleting).resolves.toBeUndefined()
+    await expect(service.state(request)).rejects.toThrow('Project is being deleted.')
+
+    service.releaseProjectDeletion('project-1')
+    await expect(service.state(request)).resolves.toMatchObject({ sessionId: 'session-pending' })
+    await service.shutdown(request)
+  })
+
+  it('drains an admitted restart before shutting down the Project lane', async () => {
+    const root = await createStorageRoot()
+    const restartGate = createDeferred<void>()
+    const events: string[] = []
+    const service = new NotebookRuntimeService({
+      configRoot: root,
+      dataRoot: root,
+      projectName: 'default-project',
+      repository: new NotebookRunRepository(root),
+      environmentStateTracker: verifiedPackageMutationTracker(),
+      executorFactory: () => ({
+        execute: async (request): Promise<NotebookExecutionResult> => ({
+          status: 'completed',
+          stdout: '',
+          stderr: '',
+          traceback: '',
+          cwdAfter: request.cwd,
+          outputs: []
+        }),
+        shutdown: async () => {
+          events.push('shutdown')
+          return { reaped: true }
+        },
+        restart: async () => {
+          events.push('restart-started')
+          await restartGate.promise
+          events.push('restart-finished')
+        }
+      })
+    })
+    const request = {
+      projectName: 'project-1',
+      sessionId: 'session-restarting',
+      workspaceCwd: root
+    }
+    await service.execute({ ...request, code: '1' })
+
+    const restarting = service.restart(request)
+    await vi.waitFor(() => expect(events).toContain('restart-started'))
+    const deleting = service.shutdownProject('project-1')
+    await Promise.resolve()
+
+    expect(events).not.toContain('shutdown')
+    await expect(service.state(request)).rejects.toThrow('Project is being deleted.')
+
+    restartGate.resolve(undefined)
+    await restarting
+    await deleting
+
+    expect(events).toEqual(['restart-started', 'restart-finished', 'shutdown'])
+  })
+
+  it('cancels an admitted execution before shutting down the Project lane', async () => {
+    const root = await createStorageRoot()
+    let executionSignal: AbortSignal | undefined
+    const execute = vi.fn(
+      (request: NotebookExecutionRequest) =>
+        new Promise<NotebookExecutionResult>((resolve) => {
+          executionSignal = request.signal
+          request.signal?.addEventListener(
+            'abort',
+            () =>
+              resolve({
+                status: 'cancelled',
+                stdout: '',
+                stderr: 'cancelled',
+                traceback: '',
+                cwdAfter: request.cwd,
+                outputs: []
+              }),
+            { once: true }
+          )
+        })
+    )
+    const shutdown = vi.fn(async () => ({ reaped: true }))
+    const service = new NotebookRuntimeService({
+      configRoot: root,
+      dataRoot: root,
+      projectName: 'default-project',
+      repository: new NotebookRunRepository(root),
+      environmentStateTracker: verifiedPackageMutationTracker(),
+      executorFactory: () => ({ execute, shutdown })
+    })
+    const request = {
+      projectName: 'project-1',
+      sessionId: 'session-executing',
+      workspaceCwd: root
+    }
+    const begin = await service.beginCodeCell(request)
+    await service.appendCodeCell({
+      ...request,
+      cellId: begin.cellId,
+      writeId: begin.writeId,
+      delta: '1'
+    })
+    await service.finishCodeCell({
+      ...request,
+      cellId: begin.cellId,
+      writeId: begin.writeId
+    })
+
+    const running = service.runCell({ ...request, cellId: begin.cellId })
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce())
+    const deleting = service.shutdownProject('project-1')
+    await vi.waitFor(() => expect(executionSignal?.aborted).toBe(true))
+
+    await expect(running).resolves.toMatchObject({ status: 'cancelled' })
+    await deleting
+
+    expect(shutdown).toHaveBeenCalledOnce()
+  })
+
+  it('cancels admitted control and shell executions before Project shutdown completes', async () => {
+    const root = await createStorageRoot()
+    let controlSignal: AbortSignal | undefined
+    let shellSignal: AbortSignal | undefined
+    const service = new NotebookRuntimeService({
+      configRoot: root,
+      dataRoot: root,
+      projectName: 'default-project',
+      repository: new NotebookRunRepository(root),
+      environmentStateTracker: verifiedPackageMutationTracker(),
+      executorFactory: () => ({
+        execute: (request) =>
+          new Promise<NotebookExecutionResult>((resolve) => {
+            controlSignal = request.signal
+            request.signal?.addEventListener(
+              'abort',
+              () =>
+                resolve({
+                  status: 'cancelled',
+                  stdout: '',
+                  stderr: 'cancelled',
+                  traceback: '',
+                  cwdAfter: request.cwd,
+                  outputs: []
+                }),
+              { once: true }
+            )
+          }),
+        shutdown: async () => ({ reaped: true })
+      }),
+      shellProcess: {
+        execute: (request) =>
+          new Promise((resolve) => {
+            shellSignal = request.signal
+            request.signal?.addEventListener(
+              'abort',
+              () =>
+                resolve({
+                  stdout: '',
+                  stderr: 'Shell command was cancelled.',
+                  exitCode: null,
+                  cancelled: true
+                }),
+              { once: true }
+            )
+          })
+      }
+    })
+    const scope = { projectName: 'project-1', workspaceCwd: root }
+
+    const control = service.executeControl({ ...scope, sessionId: 'control-session', code: '1' })
+    const shell = service.executeShell({
+      ...scope,
+      sessionId: 'shell-session',
+      command: 'long-running-command'
+    })
+    await vi.waitFor(() => {
+      expect(controlSignal).toBeInstanceOf(AbortSignal)
+      expect(shellSignal).toBeInstanceOf(AbortSignal)
+    })
+
+    const deleting = service.shutdownProject('project-1')
+    await vi.waitFor(() => {
+      expect(controlSignal?.aborted).toBe(true)
+      expect(shellSignal?.aborted).toBe(true)
+    })
+
+    await expect(control).resolves.toMatchObject({ status: 'cancelled' })
+    await expect(shell).resolves.toEqual({
+      stdout: '',
+      stderr: 'Shell command was cancelled.',
+      exitCode: null
+    })
+    await expect(deleting).resolves.toBeUndefined()
+  })
+
+  it('drains an admitted Project-scoped package install before shutdown completes', async () => {
+    const root = await createStorageRoot()
+    const installGate = createDeferred<InstallResultForTest>()
+    const installPackagesImpl = vi.fn(() => installGate.promise)
+    const service = new NotebookRuntimeService({
+      configRoot: root,
+      dataRoot: root,
+      projectName: 'default-project',
+      repository: new NotebookRunRepository(root),
+      environmentStateTracker: verifiedPackageMutationTracker(),
+      installPackagesImpl
+    })
+
+    const installing = service.managePackages({
+      projectId: 'project-1',
+      language: 'python',
+      packages: ['numpy']
+    })
+    await vi.waitFor(() => expect(installPackagesImpl).toHaveBeenCalledOnce())
+
+    let shutdownCompleted = false
+    const deleting = service.shutdownProject('project-1').then(() => {
+      shutdownCompleted = true
+    })
+    await Promise.resolve()
+
+    expect(shutdownCompleted).toBe(false)
+
+    installGate.resolve({
+      ok: true,
+      needsRestart: false,
+      log: 'installed',
+      method: 'pip'
+    })
+    await installing
+    await deleting
+
+    expect(shutdownCompleted).toBe(true)
+  })
+
+  it('rejects new Project-scoped installs during deletion without blocking global installs', async () => {
+    const root = await createStorageRoot()
+    const installPackagesImpl = vi.fn().mockResolvedValue({
+      ok: true,
+      needsRestart: false,
+      log: 'installed',
+      method: 'pip'
+    })
+    const service = new NotebookRuntimeService({
+      configRoot: root,
+      dataRoot: root,
+      projectName: 'default-project',
+      repository: new NotebookRunRepository(root),
+      environmentStateTracker: verifiedPackageMutationTracker(),
+      installPackagesImpl
+    })
+
+    service.beginProjectDeletion('project-1')
+    await expect(
+      service.managePackages({
+        projectId: 'project-1',
+        language: 'python',
+        packages: ['numpy']
+      })
+    ).rejects.toThrow('Project is being deleted.')
+    expect(installPackagesImpl).not.toHaveBeenCalled()
+
+    await expect(
+      service.managePackages({ language: 'python', packages: ['numpy'] })
+    ).resolves.toMatchObject({ ok: true })
+    expect(installPackagesImpl).toHaveBeenCalledOnce()
+
+    service.releaseProjectDeletion('project-1')
+  })
+
   it('peeks only actionable in-memory handoff state without creating or reloading a Session', async () => {
     const root = await createStorageRoot()
     const { service } = lifecycleCallbackHarness(root)
@@ -270,6 +646,57 @@ describe('notebook runtime service', () => {
     expect(JSON.stringify(handoff)).not.toContain('runtimeRoot')
 
     await service.shutdownSession('session-1')
+    expect(service.peekHandoffContext('session-1')).toBeUndefined()
+  })
+
+  it('rejects oversized streamed code and releases the write lock', async () => {
+    const root = await createStorageRoot()
+    const { service } = lifecycleCallbackHarness(root)
+    const begin = await service.beginCodeCell({
+      sessionId: 'session-1',
+      workspaceCwd: root
+    })
+
+    await expect(
+      service.appendCodeCell({
+        sessionId: 'session-1',
+        workspaceCwd: root,
+        cellId: begin.cellId,
+        writeId: begin.writeId,
+        delta: 'x'.repeat(NOTEBOOK_CODE_LIMIT_BYTES + 1)
+      })
+    ).rejects.toThrow(/exceeds/u)
+
+    const state = await service.state({ sessionId: 'session-1', workspaceCwd: root })
+    expect(state.activeWrite).toBeUndefined()
+    expect(state.cells[0]).toMatchObject({ id: begin.cellId, code: '', status: 'idle' })
+  })
+
+  it('rejects an oversized targeted history request before creating a session', async () => {
+    const root = await createStorageRoot()
+    const { service } = lifecycleCallbackHarness(root)
+    const runIds = Array.from(
+      { length: NOTEBOOK_STATE_TARGET_RUN_LIMIT + 1 },
+      (_, index) => `run-${index}`
+    )
+
+    await expect(
+      service.state({ sessionId: 'session-1', workspaceCwd: root, runIds })
+    ).rejects.toThrow(/at most 20 targeted run IDs/u)
+    expect(service.peekHandoffContext('session-1')).toBeUndefined()
+  })
+
+  it('rejects an oversized history summary Frame ID before creating a session', async () => {
+    const root = await createStorageRoot()
+    const { service } = lifecycleCallbackHarness(root)
+
+    await expect(
+      service.state({
+        sessionId: 'session-1',
+        workspaceCwd: root,
+        historySummaryFrameId: 'x'.repeat(NOTEBOOK_STATE_HISTORY_FRAME_ID_LIMIT_BYTES + 1)
+      })
+    ).rejects.toThrow(/history summary Frame ID must not exceed 1024 UTF-8 bytes/u)
     expect(service.peekHandoffContext('session-1')).toBeUndefined()
   })
 
@@ -547,8 +974,10 @@ describe('notebook runtime service', () => {
     )
     const execution = await executionStarted.promise
 
-    expect(execution.signal).toBe(cancellation.signal)
+    expect(execution.signal).toBeInstanceOf(AbortSignal)
+    expect(execution.signal?.aborted).toBe(false)
     cancellation.abort()
+    expect(execution.signal?.aborted).toBe(true)
 
     await expect(run).resolves.toMatchObject({ status: 'cancelled' })
     await expect(
@@ -1164,7 +1593,8 @@ describe('notebook runtime service', () => {
             stderr: '',
             traceback: '',
             cwdAfter: request.cwd,
-            outputs: [{ type: 'stream', name: 'stdout', text: 'from-repl\n' }]
+            outputs: [{ type: 'stream', name: 'stdout', text: 'from-repl\n' }],
+            truncated: true
           }
         },
         shutdown: async () => ({ reaped: true })
@@ -1201,6 +1631,7 @@ describe('notebook runtime service', () => {
     expect(result).toMatchObject({
       status: 'completed',
       stdout: 'from-repl\n',
+      truncated: true,
       outputs: [{ type: 'stream', name: 'stdout', text: 'from-repl\n' }]
     })
 
@@ -1980,7 +2411,8 @@ describe('notebook runtime service', () => {
       const execute = vi.fn<NotebookShellProcess['execute']>().mockResolvedValue({
         stdout: 'partial output',
         stderr: 'command failed',
-        exitCode: 9
+        exitCode: 9,
+        truncated: true
       })
       const service = new NotebookRuntimeService({
         configRoot: root,
@@ -2002,12 +2434,14 @@ describe('notebook runtime service', () => {
         cwd: join(root, 'notebooks', 'default-project', 'session-1', 'data'),
         handoffDir: join(root, 'notebooks', 'default-project', 'session-1', 'handoff'),
         runtimeRoot: getRuntimeRoot(root),
-        timeoutMs: 321
+        timeoutMs: 321,
+        signal: expect.any(AbortSignal)
       })
       expect(result).toEqual({
         stdout: 'partial output',
         stderr: 'command failed',
-        exitCode: 9
+        exitCode: 9,
+        truncated: true
       })
       const state = await service.state({ sessionId: 'session-1', workspaceCwd: root })
       expect(state.runs[0]).toMatchObject({
@@ -2976,6 +3410,44 @@ describe('notebook runtime service', () => {
     expect(settled.kernelStatus).toBe('idle')
   })
 
+  it('does not create a live environment entry when restarting before any kernel spawned', async () => {
+    const root = await createStorageRoot()
+    let releaseRestart: (() => void) | undefined
+    const service = new NotebookRuntimeService({
+      configRoot: root,
+      dataRoot: root,
+      projectName: 'default-project',
+      repository: new NotebookRunRepository(root),
+      executorFactory: () => ({
+        execute: async (request): Promise<NotebookExecutionResult> => ({
+          status: 'completed',
+          stdout: '',
+          stderr: '',
+          traceback: '',
+          cwdAfter: request.cwd,
+          outputs: []
+        }),
+        shutdown: async () => ({ reaped: true }),
+        restart: () =>
+          new Promise<void>((resolve) => {
+            releaseRestart = resolve
+          })
+      })
+    })
+
+    const restarting = service.restart({ sessionId: 'session-1', workspaceCwd: root })
+    await vi.waitFor(() => expect(releaseRestart).toBeDefined())
+
+    const midFlight = await service.state({ sessionId: 'session-1', workspaceCwd: root })
+    expect(midFlight.kernelStatus).toBe('restarting')
+    expect(midFlight.environments).toEqual([])
+
+    releaseRestart?.()
+    const settled = await restarting
+    expect(settled.kernelStatus).toBe('idle')
+    expect(settled.environments).toEqual([])
+  })
+
   it('keeps the executor callback current across an in-place restart', async () => {
     const root = await createStorageRoot()
     const { service, lifecycles, changedSessions } = lifecycleCallbackHarness(root, {
@@ -3116,7 +3588,10 @@ describe('notebook runtime service', () => {
         restartRecommended: false
       }
     ])
-    expect(await readFile(restarted.runJsonPath, 'utf8')).toBe(runJsonBefore)
+    expect(JSON.parse(await readFile(restarted.runJsonPath, 'utf8')).kernel).toMatchObject({
+      lastKnownStatus: 'terminated',
+      terminatedKernelInstances: [{ kind: 'python', environment: 'analysis' }]
+    })
     expect(changedSessions).toHaveLength(changedCountBefore + 1)
   })
 
@@ -3194,12 +3669,12 @@ describe('notebook runtime service', () => {
     const persistenceGate = new Promise<void>((resolve) => {
       releasePersistence = resolve
     })
-    const updateKernelStatus = repository.updateKernelStatus.bind(repository)
+    const markKernelTerminated = repository.markKernelTerminated.bind(repository)
     const updateSpy = vi
-      .spyOn(repository, 'updateKernelStatus')
+      .spyOn(repository, 'markKernelTerminated')
       .mockImplementation(async (request) => {
         await persistenceGate
-        return updateKernelStatus(request)
+        return markKernelTerminated(request)
       })
     const changedCountBefore = changedSessions.length
 
@@ -3260,14 +3735,70 @@ describe('notebook runtime service', () => {
     expect(afterRespawn.kernelStatus).toBe('idle')
   })
 
-  it('clears a stale terminated status once a control-plane run completes on the respawned kernel', async () => {
+  it('persists idle after recovering a terminated kernel in a recreated runtime service', async () => {
     const root = await createStorageRoot()
     let lifecycle!: NotebookExecutorLifecycleCallbacks
-    const service = new NotebookRuntimeService({
+    const executorFactory = (
+      _sessionId: string,
+      callbacks: NotebookExecutorLifecycleCallbacks
+    ): NotebookSessionExecutor => {
+      lifecycle = callbacks
+      return {
+        execute: async (request: NotebookExecutionRequest): Promise<NotebookExecutionResult> => ({
+          status: 'completed',
+          stdout: '',
+          stderr: '',
+          traceback: '',
+          cwdAfter: request.cwd,
+          outputs: []
+        }),
+        shutdown: async () => ({ reaped: true })
+      }
+    }
+
+    const firstService = new NotebookRuntimeService({
       configRoot: root,
       dataRoot: root,
       projectName: 'default-project',
       repository: new NotebookRunRepository(root),
+      executorFactory
+    })
+    await firstService.execute({ sessionId: 'session-1', workspaceCwd: root, code: '1' })
+    await lifecycle.onIdleShutdown('python', DEFAULT_PY_ENV)
+
+    const recoveredService = new NotebookRuntimeService({
+      configRoot: root,
+      dataRoot: root,
+      projectName: 'default-project',
+      repository: new NotebookRunRepository(root),
+      executorFactory
+    })
+    await recoveredService.execute({ sessionId: 'session-1', workspaceCwd: root, code: '2' })
+
+    const reloadedService = new NotebookRuntimeService({
+      configRoot: root,
+      dataRoot: root,
+      projectName: 'default-project',
+      repository: new NotebookRunRepository(root),
+      executorFactory
+    })
+    const reloadedState = await reloadedService.state({
+      sessionId: 'session-1',
+      workspaceCwd: root
+    })
+    expect(reloadedState.kernelStatus).toBe('idle')
+  })
+
+  it('does not clear a terminated data-kernel status after an unrelated control run', async () => {
+    const root = await createStorageRoot()
+    let lifecycle!: NotebookExecutorLifecycleCallbacks
+    const repository = new NotebookRunRepository(root)
+    const statusWrite = vi.spyOn(repository, 'updateKernelStatus')
+    const service = new NotebookRuntimeService({
+      configRoot: root,
+      dataRoot: root,
+      projectName: 'default-project',
+      repository,
       executorFactory: (_sessionId, callbacks) => {
         lifecycle = callbacks
         return {
@@ -3291,11 +3822,196 @@ describe('notebook runtime service', () => {
 
     const afterShutdown = await service.state({ sessionId: 'session-1', workspaceCwd: root })
     expect(afterShutdown.kernelStatus).toBe('terminated')
+    statusWrite.mockClear()
 
     await service.executeControl({ sessionId: 'session-1', workspaceCwd: root, code: '2' })
 
-    const afterRespawn = await service.state({ sessionId: 'session-1', workspaceCwd: root })
-    expect(afterRespawn.kernelStatus).toBe('idle')
+    expect(statusWrite).not.toHaveBeenCalled()
+  })
+
+  it('does not durably recover a terminated data kernel through an unrelated control run after relaunch', async () => {
+    const root = await createStorageRoot()
+    let lifecycle!: NotebookExecutorLifecycleCallbacks
+    const executorFactory = (
+      _sessionId: string,
+      callbacks: NotebookExecutorLifecycleCallbacks
+    ): NotebookSessionExecutor => {
+      lifecycle = callbacks
+      return {
+        execute: async (request: NotebookExecutionRequest): Promise<NotebookExecutionResult> => ({
+          status: 'completed',
+          stdout: '',
+          stderr: '',
+          traceback: '',
+          cwdAfter: request.cwd,
+          outputs: []
+        }),
+        shutdown: async () => ({ reaped: true })
+      }
+    }
+
+    const firstService = new NotebookRuntimeService({
+      configRoot: root,
+      dataRoot: root,
+      projectName: 'default-project',
+      repository: new NotebookRunRepository(root),
+      executorFactory
+    })
+    await firstService.execute({
+      sessionId: 'session-1',
+      workspaceCwd: root,
+      code: '1'
+    })
+    const runJsonPath = (await firstService.state({ sessionId: 'session-1', workspaceCwd: root }))
+      .runJsonPath
+    await lifecycle.onIdleShutdown('python', DEFAULT_PY_ENV)
+
+    const recoveredService = new NotebookRuntimeService({
+      configRoot: root,
+      dataRoot: root,
+      projectName: 'default-project',
+      repository: new NotebookRunRepository(root),
+      executorFactory
+    })
+    await recoveredService.executeControl({
+      sessionId: 'session-1',
+      workspaceCwd: root,
+      code: '2'
+    })
+
+    const persisted = JSON.parse(await readFile(runJsonPath, 'utf8'))
+    expect(persisted.kernel).toMatchObject({
+      lastKnownStatus: 'terminated',
+      terminatedKernelInstances: [{ kind: 'python', environment: DEFAULT_PY_ENV }]
+    })
+    const reloadedService = new NotebookRuntimeService({
+      configRoot: root,
+      dataRoot: root,
+      projectName: 'default-project',
+      repository: new NotebookRunRepository(root),
+      executorFactory
+    })
+    expect(
+      (await reloadedService.state({ sessionId: 'session-1', workspaceCwd: root })).kernelStatus
+    ).toBe('terminated')
+  })
+
+  it('persists idle after recovering a terminated repl in a recreated runtime service', async () => {
+    const root = await createStorageRoot()
+    let lifecycle!: NotebookExecutorLifecycleCallbacks
+    const executorFactory = (
+      _sessionId: string,
+      callbacks: NotebookExecutorLifecycleCallbacks
+    ): NotebookSessionExecutor => {
+      lifecycle = callbacks
+      return {
+        execute: async (request: NotebookExecutionRequest): Promise<NotebookExecutionResult> => ({
+          status: 'completed',
+          stdout: '',
+          stderr: '',
+          traceback: '',
+          cwdAfter: request.cwd,
+          outputs: []
+        }),
+        shutdown: async () => ({ reaped: true })
+      }
+    }
+
+    const firstService = new NotebookRuntimeService({
+      configRoot: root,
+      dataRoot: root,
+      projectName: 'default-project',
+      repository: new NotebookRunRepository(root),
+      executorFactory
+    })
+    await firstService.executeControl({ sessionId: 'session-1', workspaceCwd: root, code: '1' })
+    await lifecycle.onIdleShutdown('repl', undefined)
+
+    const recoveredService = new NotebookRuntimeService({
+      configRoot: root,
+      dataRoot: root,
+      projectName: 'default-project',
+      repository: new NotebookRunRepository(root),
+      executorFactory
+    })
+    await recoveredService.executeControl({
+      sessionId: 'session-1',
+      workspaceCwd: root,
+      code: '2'
+    })
+
+    const reloadedService = new NotebookRuntimeService({
+      configRoot: root,
+      dataRoot: root,
+      projectName: 'default-project',
+      repository: new NotebookRunRepository(root),
+      executorFactory
+    })
+    const reloadedState = await reloadedService.state({
+      sessionId: 'session-1',
+      workspaceCwd: root
+    })
+    expect(reloadedState.kernelStatus).toBe('idle')
+  })
+
+  it('keeps a legacy coarse terminated status until an explicit restart', async () => {
+    const root = await createStorageRoot()
+    const repository = new NotebookRunRepository(root)
+    const executorFactory = (): NotebookSessionExecutor => ({
+      execute: async (request: NotebookExecutionRequest): Promise<NotebookExecutionResult> => ({
+        status: 'completed',
+        stdout: '',
+        stderr: '',
+        traceback: '',
+        cwdAfter: request.cwd,
+        outputs: []
+      }),
+      shutdown: async () => ({ reaped: true })
+    })
+    const firstService = new NotebookRuntimeService({
+      configRoot: root,
+      dataRoot: root,
+      projectName: 'default-project',
+      repository,
+      executorFactory
+    })
+    await firstService.execute({
+      sessionId: 'session-1',
+      workspaceCwd: root,
+      code: '1'
+    })
+    const runJsonPath = (await firstService.state({ sessionId: 'session-1', workspaceCwd: root }))
+      .runJsonPath
+    await repository.updateKernelStatus({
+      projectName: 'default-project',
+      sessionId: 'session-1',
+      lane: createRootNotebookLane('default-project', 'session-1', 'root-frame-session-1'),
+      status: 'terminated'
+    })
+
+    const recoveredService = new NotebookRuntimeService({
+      configRoot: root,
+      dataRoot: root,
+      projectName: 'default-project',
+      repository: new NotebookRunRepository(root),
+      executorFactory
+    })
+    await recoveredService.executeControl({
+      sessionId: 'session-1',
+      workspaceCwd: root,
+      code: '2'
+    })
+    expect(JSON.parse(await readFile(runJsonPath, 'utf8')).kernel).toMatchObject({
+      lastKnownStatus: 'terminated'
+    })
+    expect(
+      JSON.parse(await readFile(runJsonPath, 'utf8')).kernel.terminatedKernelInstances
+    ).toBeUndefined()
+
+    await recoveredService.restart({ sessionId: 'session-1', workspaceCwd: root })
+    expect(JSON.parse(await readFile(runJsonPath, 'utf8')).kernel).toMatchObject({
+      lastKnownStatus: 'idle'
+    })
   })
 
   describe('lifecycle & concurrency (G2/G3/G4/G5)', () => {
@@ -3303,13 +4019,14 @@ describe('notebook runtime service', () => {
     // observe how many runs are concurrently in flight and in what order.
     const holdingService = (
       root: string,
-      onStart: (request: NotebookExecutionRequest, release: () => void) => void
+      onStart: (request: NotebookExecutionRequest, release: () => void) => void,
+      repository = new NotebookRunRepository(root)
     ): NotebookRuntimeService =>
       new NotebookRuntimeService({
         configRoot: root,
         dataRoot: root,
         projectName: 'default-project',
-        repository: new NotebookRunRepository(root),
+        repository,
         environmentStateTracker: {
           prepareRun: vi.fn().mockResolvedValue({
             fingerprint: 'stable',
@@ -3355,6 +4072,30 @@ describe('notebook runtime service', () => {
       await run
       const settled = await service.state({ sessionId: 'session-1', workspaceCwd: root })
       expect(settled.kernelStatus).toBe('idle')
+    })
+
+    it('keeps ordinary running/idle status in memory without rewriting run.json', async () => {
+      const root = await createStorageRoot()
+      const repository = new NotebookRunRepository(root)
+      const statusWrite = vi.spyOn(repository, 'updateKernelStatus')
+      let release: (() => void) | undefined
+      const service = holdingService(
+        root,
+        (_request, resolve) => {
+          release = resolve
+        },
+        repository
+      )
+
+      const run = service.execute({ sessionId: 'session-1', workspaceCwd: root, code: '1' })
+      await vi.waitFor(() => expect(release).toBeDefined())
+      expect(
+        (await service.state({ sessionId: 'session-1', workspaceCwd: root })).kernelStatus
+      ).toBe('running')
+      release?.()
+      await run
+
+      expect(statusWrite).not.toHaveBeenCalled()
     })
 
     it('keeps the kernel idle when the runtime mutation policy rejects before execution', async () => {
@@ -5539,6 +6280,7 @@ describe('v4 runtime bindings & agent tools', () => {
       enablement?: RuntimeEnablement
       executions?: NotebookExecutionRequest[]
       terminations?: string[]
+      terminate?: (kind: 'python' | 'r' | 'repl', env: string) => Promise<void>
       platform?: NodeJS.Platform
       repository?: NotebookRunRepository
       discoverRuntimes?: (language: 'python' | 'r') => Promise<DiscoveredInterpreter[]>
@@ -5587,9 +6329,11 @@ describe('v4 runtime bindings & agent tools', () => {
           }
         },
         shutdown: async () => ({ reaped: true }),
-        terminate: async (kind, env) => {
-          options.terminations?.push(`${kind}:${env}`)
-        }
+        terminate:
+          options.terminate ??
+          (async (kind, env) => {
+            options.terminations?.push(`${kind}:${env}`)
+          })
       })
     })
 
@@ -5775,6 +6519,63 @@ describe('v4 runtime bindings & agent tools', () => {
     // Subsequent runs use the newly-bound interpreter.
     await service.execute({ sessionId: 's', workspaceCwd: root, code: '2', language: 'python' })
     expect(executions.at(-1)?.resolvedInterpreter?.command).toBe(userPyB.interpreterPath)
+  })
+
+  it('clears exact persisted terminations when intentionally switching or revoking a runtime', async () => {
+    const root = await createStorageRoot()
+    const repository = new NotebookRunRepository(root)
+    const seedTerminatedDefault = async (sessionId: string): Promise<void> => {
+      const lane = createRootNotebookLane('default-project', sessionId, `root-frame-${sessionId}`)
+      await repository.loadOrCreate({
+        projectName: 'default-project',
+        sessionId,
+        workspaceCwd: root,
+        lane
+      })
+      await repository.markKernelTerminated({
+        projectName: 'default-project',
+        sessionId,
+        lane,
+        kernelInstance: { kind: 'python', environment: DEFAULT_PY_ENV }
+      })
+    }
+    await seedTerminatedDefault('switch-session')
+    await seedTerminatedDefault('revoke-session')
+
+    const service = bindingService(root, {
+      repository,
+      enablement: {
+        enabled: { [userPyA.envId]: true, [userPyB.envId]: true },
+        installAuthorized: {}
+      }
+    })
+
+    await service.bindRuntime({
+      sessionId: 'switch-session',
+      workspaceCwd: root,
+      language: 'python',
+      runtimeId: userPyA.envId
+    })
+    await service.switchRuntime({
+      sessionId: 'switch-session',
+      workspaceCwd: root,
+      language: 'python',
+      runtimeId: userPyB.envId
+    })
+
+    await service.bindRuntime({
+      sessionId: 'revoke-session',
+      workspaceCwd: root,
+      language: 'python',
+      runtimeId: userPyA.envId
+    })
+    await service.revokeRuntime('python', userPyA.envId, { force: true })
+
+    for (const sessionId of ['switch-session', 'revoke-session']) {
+      const persisted = await repository.findExisting('default-project', sessionId)
+      expect(persisted?.kernel).toMatchObject({ lastKnownStatus: 'idle' })
+      expect(persisted?.kernel.terminatedKernelInstances).toBeUndefined()
+    }
   })
 
   it('preserves a switched and revoked binding across a replacement session generation', async () => {
@@ -7690,6 +8491,51 @@ describe('v4 runtime bindings & agent tools', () => {
     // after the in-flight run drains (here already finished), not left to idle-timeout.
     await vi.waitFor(() => expect(terminations).toContain('python:default-python'))
     await service.shutdownAll()
+  })
+
+  it('waits for a deferred runtime-revocation drain before removing the Project lane', async () => {
+    const root = await createStorageRoot()
+    const terminationStarted = createDeferred<void>()
+    const terminationGate = createDeferred<void>()
+    const events: string[] = []
+    const service = bindingService(root, {
+      enablement: { enabled: { [userPyA.envId]: true }, installAuthorized: {} },
+      terminate: async () => {
+        events.push('revocation-started')
+        terminationStarted.resolve(undefined)
+        await terminationGate.promise
+        events.push('revocation-finished')
+      }
+    })
+    const request = {
+      projectName: 'project-1',
+      sessionId: 's',
+      workspaceCwd: root
+    }
+    await service.bindRuntime({
+      ...request,
+      language: 'python',
+      runtimeId: userPyA.envId
+    })
+    await service.execute({ ...request, code: '1', language: 'python' })
+
+    await service.revokeRuntime('python', userPyA.envId)
+    await terminationStarted.promise
+
+    let deletionCompleted = false
+    const deleting = service.shutdownProject('project-1').then(() => {
+      deletionCompleted = true
+      events.push('project-deleted')
+    })
+    await Promise.resolve()
+
+    expect(deletionCompleted).toBe(false)
+    expect(events).toEqual(['revocation-started'])
+
+    terminationGate.resolve(undefined)
+    await deleting
+
+    expect(events).toEqual(['revocation-started', 'revocation-finished', 'project-deleted'])
   })
 
   it('shares one aggregate initialization across concurrent public session reads', async () => {

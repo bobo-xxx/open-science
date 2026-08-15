@@ -57,6 +57,7 @@ import { WorkspacePlanActivityRecord } from './WorkspacePlanActivityRecord'
 import { parseGeneratePlanDocument } from './generate-plan-activity-projection'
 import { WorkspaceAgentLoadingRow } from './WorkspaceAgentLoadingRow'
 import { WorkspaceMessageItem } from './WorkspaceMessageItem'
+import { WorkspaceRunMarks } from './WorkspaceRunMarks'
 import type { ArtifactMentionPart } from './WorkspaceMessageItem'
 import { useWorkspaceArtifactVisibility, type MessageArtifact } from './WorkspaceArtifactVisibility'
 import { useWorkspaceMessageEditState } from './workspace-message-edit-state-context'
@@ -81,6 +82,7 @@ import type { NotebookSessionReference } from '../../../../shared/notebook'
 import { useNotebookRunsById } from './use-notebook-runs-by-id'
 import { WorkspaceElicitationCard } from './WorkspaceElicitationCard'
 import { WorkspaceSubagentMessageRow } from './WorkspaceSubagentMessageRow'
+import { getNotebookRunIdFromActivity } from './workspace-tool-activity-details'
 
 type WorkspaceMessageScrollerProps = {
   activeSession: ChatSession | undefined
@@ -113,6 +115,8 @@ type SessionScopedActivityExpansionState = {
   sessionId: string | undefined
   overrides: ActivityExpansionOverrides
 }
+
+const EMPTY_ACTIVITY_EXPANSION_OVERRIDES: ActivityExpansionOverrides = {}
 
 type SessionScopedMessagePresentationState = {
   scopeId: string | undefined
@@ -345,11 +349,18 @@ const WorkspaceMessageScrollerImpl = ({
     !activeSession.compacting
   )
   const messageScrollerViewportRef = useRef<HTMLDivElement | null>(null)
+  const [messageScrollerViewport, setMessageScrollerViewport] = useState<HTMLDivElement | null>(
+    null
+  )
   const messageScrollerContentRef = useRef<HTMLDivElement | null>(null)
   const scrollToFirstMessageButtonRef = useRef<HTMLButtonElement | null>(null)
   const previousMessageScrollerScrollTopRef = useRef(0)
   const scrollToFirstMessageHideTimeoutRef = useRef<number | undefined>(undefined)
   const [scrollThresholdAllowsFirstMessage, setScrollThresholdAllowsFirstMessage] = useState(false)
+  const handleMessageScrollerViewportRef = useCallback((node: HTMLDivElement | null): void => {
+    messageScrollerViewportRef.current = node
+    setMessageScrollerViewport(node)
+  }, [])
   const activeConversationFrame = activeSession?.conversationGraph?.frames.find(
     (frame) => frame.id === activeSession.conversationGraph?.activeFrameId
   )
@@ -357,7 +368,6 @@ const WorkspaceMessageScrollerImpl = ({
     ? JSON.stringify([currentSessionId, activeConversationFrame?.activeBranchId ?? 'legacy'])
     : undefined
   const artifactVisibility = useWorkspaceArtifactVisibility(activeSession)
-  const notebookRunsById = useNotebookRunsById(notebookReference)
   const handoffEvents = useHandoffLifecycleEvents(handoffLifecycleSource, currentSessionId)
   // The whole-window find bar is an Electron overlay owned by main; the Workspace only needs to tell
   // main it is mounted and searchable so Cmd/Ctrl+F is intercepted (and re-arm UNREADY on unmount).
@@ -437,7 +447,7 @@ const WorkspaceMessageScrollerImpl = ({
   const activityExpansionOverrides =
     activityExpansionOverrideState.sessionId === currentSessionId
       ? activityExpansionOverrideState.overrides
-      : {}
+      : EMPTY_ACTIVITY_EXPANSION_OVERRIDES
   const rawConversationItems = useMemo(
     () => createConversationItems(activeSession, handoffEvents),
     [activeSession, handoffEvents]
@@ -446,6 +456,33 @@ const WorkspaceMessageScrollerImpl = ({
     () => groupConversationItems(rawConversationItems, activeSession?.activityGroups),
     [activeSession?.activityGroups, rawConversationItems]
   )
+  const notebookRunIdByActivityId = useMemo(
+    () =>
+      new Map(
+        conversationItems.flatMap((item) => {
+          const activities =
+            item.type === 'activity-group'
+              ? item.activities
+              : item.type === 'activity'
+                ? [item.activity]
+                : []
+          return activities.flatMap((activity) => {
+            const runId = getNotebookRunIdFromActivity(activity)
+            return runId ? [[activity.id, runId] as const] : []
+          })
+        })
+      ),
+    [conversationItems]
+  )
+  const requestedNotebookRunIds = useMemo(
+    () =>
+      Object.entries(activityExpansionOverrides).flatMap(([activityId, expanded]) => {
+        const runId = expanded ? notebookRunIdByActivityId.get(activityId) : undefined
+        return runId ? [runId] : []
+      }),
+    [activityExpansionOverrides, notebookRunIdByActivityId]
+  )
+  const notebookRunsById = useNotebookRunsById(notebookReference, requestedNotebookRunIds)
   const [visibleMessageSnapshot, setVisibleMessageSnapshot] = useState<VisibleMessageSnapshot>(
     () => ({ scopeId: undefined, messageIds: new Set() })
   )
@@ -940,12 +977,16 @@ const WorkspaceMessageScrollerImpl = ({
         scrollPreviousItemPeek={64}
       >
         <MessageScroller className="relative min-h-0 flex-1 bg-bg-10">
+          <WorkspaceRunMarks
+            items={presentedConversationItems}
+            viewport={messageScrollerViewport}
+          />
           <div
             aria-hidden="true"
             className="pointer-events-none absolute inset-x-0 top-0 z-10 h-6 bg-gradient-to-b from-bg-10 to-bg-10/0"
           />
           <MessageScrollerViewport
-            ref={messageScrollerViewportRef}
+            ref={handleMessageScrollerViewportRef}
             aria-label={t('Conversation')}
             onScroll={handleMessageScrollerScroll}
           >

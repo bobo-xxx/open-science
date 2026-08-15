@@ -141,6 +141,7 @@ describe('home dialogs shared chrome', () => {
       "Shown in the project list for your reference — not included in the agent's prompt."
     )
     const elements = collectElements(tree)
+    const nameField = elements.find((element) => element.props.id === 'project-form-name')
     const descriptionField = elements.find((element) => element.type === 'textarea')
     const agentContextField = elements.find(
       (element) => element.props.id === 'project-form-agent-context'
@@ -169,6 +170,8 @@ describe('home dialogs shared chrome', () => {
       agentContextField
     ].forEach((field) => expectDialogFormFieldClassName(field?.props.className))
     expect(descriptionField?.props['aria-describedby']).toBe('project-form-description-help')
+    expect(nameField?.props.maxLength).toBe(200)
+    expect(descriptionField?.props.maxLength).toBe(1000)
     expect(descriptionField?.props.placeholder).toBe('Describe what this project is about…')
     expect(agentContextField?.props['aria-describedby']).toBe('project-form-agent-context-help')
     expect(cancelButton?.props.variant).toBe('ghost')
@@ -248,6 +251,7 @@ describe('home dialogs shared chrome', () => {
     expect(text).toContain(
       'Generated artifacts and uploaded files stored by Open Science will also be deleted.'
     )
+    expect(text).toContain('Deleting this project will stop its running tasks and notebooks.')
     expect(text).toContain("Files in the project's working folder are not deleted.")
     expect(text).not.toContain('Generated artifacts remain on disk')
   })

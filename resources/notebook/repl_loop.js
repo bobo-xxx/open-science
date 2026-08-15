@@ -17,6 +17,52 @@ const { fileURLToPath } = require('node:url')
 // Protocol output line. console is captured into strings during a run (see run()), so writing the
 // JSON here via process.stdout.write cannot be corrupted by user console output.
 const emit = (obj) => process.stdout.write(JSON.stringify(obj) + '\n')
+const OUTPUT_LIMIT_BYTES =
+  Number(process.env.OPEN_SCIENCE_NOTEBOOK_TEXT_LIMIT_BYTES) || 2 * 1024 * 1024
+const DIAGNOSTIC_LIMIT_BYTES = Math.min(16 * 1024, Math.max(0, OUTPUT_LIMIT_BYTES))
+
+const takeOutput = (budget, value) => {
+  value = String(value)
+  if (budget.remaining <= 0) {
+    if (value) budget.truncated = true
+    return ''
+  }
+  const candidate = value.length > budget.remaining ? value.slice(0, budget.remaining) : value
+  const encoded = Buffer.from(candidate, 'utf8')
+  if (encoded.byteLength <= budget.remaining) {
+    budget.remaining -= encoded.byteLength
+    if (candidate.length < value.length) budget.truncated = true
+    return encoded.toString('utf8')
+  }
+  let end = Math.min(budget.remaining, encoded.byteLength)
+  while (end > 0 && end < encoded.byteLength && (encoded[end] & 0xc0) === 0x80) end -= 1
+  const prefix = encoded.subarray(0, end).toString('utf8')
+  budget.remaining -= Buffer.byteLength(prefix, 'utf8')
+  budget.truncated = true
+  return prefix
+}
+
+const takeOutputTail = (budget, value) => {
+  value = String(value)
+  if (budget.remaining <= 0) {
+    if (value) budget.truncated = true
+    return ''
+  }
+  const candidate =
+    value.length > budget.remaining ? value.slice(value.length - budget.remaining) : value
+  const encoded = Buffer.from(candidate, 'utf8')
+  if (encoded.byteLength <= budget.remaining) {
+    budget.remaining -= encoded.byteLength
+    if (candidate.length < value.length) budget.truncated = true
+    return encoded.toString('utf8')
+  }
+  let start = encoded.byteLength - budget.remaining
+  while (start < encoded.byteLength && (encoded[start] & 0xc0) === 0x80) start += 1
+  const suffix = encoded.subarray(start).toString('utf8')
+  budget.remaining -= Buffer.byteLength(suffix, 'utf8')
+  budget.truncated = true
+  return suffix
+}
 
 // Capture the connector RPC credentials privately, then delete them from process.env BEFORE the
 // sandbox is built. The sandbox exposes `process` (for cwd() etc.), so leaving the token in
@@ -1352,17 +1398,21 @@ async function hostViewImage(source, options = undefined) {
 const HOST_ARTIFACT_REQUIRED_KEYS = [
   'id',
   'filename',
-  'size_bytes',
-  'latest_version_id',
-  'session_id',
-  'root_frame_id',
-  'is_user_upload',
-  'latest_version_created_at'
+  'contentType',
+  'sizeBytes',
+  'latestVersionId',
+  'checksum',
+  'projectId',
+  'sessionId',
+  'rootFrameId',
+  'agentFrameId',
+  'isUserUpload',
+  'createdAt',
+  'latestVersionCreatedAt'
 ]
-const HOST_ARTIFACT_OPTIONAL_KEYS = ['content_type', 'checksum']
 const HOST_ARTIFACT_INPUT_KEYS = {
   versionId: 'version_id',
-  sessionId: 'session_id',
+  frameId: 'frame_id',
   filename: 'filename',
   exact: 'exact',
   search: 'search',
@@ -1373,37 +1423,34 @@ const HOST_ARTIFACT_INPUT_KEYS = {
   limit: 'limit'
 }
 
-const validatedHostArtifact = (value) => {
+const nullableHostArtifactString = (value) => value === null || typeof value === 'string'
+
+const validatedHostArtifact = (value, projectId) => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('host.artifacts returned an invalid Artifact')
   }
   const keys = Object.keys(value)
   if (
     HOST_ARTIFACT_REQUIRED_KEYS.some((key) => !keys.includes(key)) ||
-    keys.some(
-      (key) =>
-        !HOST_ARTIFACT_REQUIRED_KEYS.includes(key) && !HOST_ARTIFACT_OPTIONAL_KEYS.includes(key)
-    ) ||
     typeof value.id !== 'string' ||
     typeof value.filename !== 'string' ||
-    typeof value.size_bytes !== 'number' ||
-    !Number.isSafeInteger(value.size_bytes) ||
-    typeof value.latest_version_id !== 'string' ||
-    typeof value.session_id !== 'string' ||
-    (value.root_frame_id !== null && typeof value.root_frame_id !== 'string') ||
-    typeof value.is_user_upload !== 'boolean' ||
-    typeof value.latest_version_created_at !== 'string' ||
-    (value.content_type !== undefined && typeof value.content_type !== 'string') ||
-    (value.checksum !== undefined && typeof value.checksum !== 'string')
+    !nullableHostArtifactString(value.contentType) ||
+    !Number.isSafeInteger(value.sizeBytes) ||
+    value.sizeBytes < 0 ||
+    typeof value.latestVersionId !== 'string' ||
+    !nullableHostArtifactString(value.checksum) ||
+    value.projectId !== projectId ||
+    typeof value.sessionId !== 'string' ||
+    !nullableHostArtifactString(value.rootFrameId) ||
+    !nullableHostArtifactString(value.agentFrameId) ||
+    typeof value.isUserUpload !== 'boolean' ||
+    typeof value.createdAt !== 'string' ||
+    typeof value.latestVersionCreatedAt !== 'string'
   ) {
     throw new Error('host.artifacts returned an invalid Artifact')
   }
   return Object.freeze(
-    Object.fromEntries(
-      [...HOST_ARTIFACT_REQUIRED_KEYS, ...HOST_ARTIFACT_OPTIONAL_KEYS]
-        .filter((key) => value[key] !== undefined)
-        .map((key) => [key, value[key]])
-    )
+    Object.fromEntries(HOST_ARTIFACT_REQUIRED_KEYS.map((key) => [key, value[key]]))
   )
 }
 
@@ -1417,24 +1464,24 @@ async function hostArtifacts(options = {}) {
     typeof result !== 'object' ||
     Array.isArray(result) ||
     !Number.isSafeInteger(result.count) ||
-    typeof result.project_id !== 'string' ||
+    result.count < 0 ||
+    typeof result.projectId !== 'string' ||
     typeof result.truncated !== 'boolean' ||
-    (result.next_cursor !== undefined && typeof result.next_cursor !== 'string') ||
+    (result.nextCursor !== undefined && typeof result.nextCursor !== 'string') ||
     !Array.isArray(result.artifacts) ||
-    result.count !== result.artifacts.length ||
-    result.truncated !== (result.next_cursor !== undefined) ||
-    Object.keys(result).some(
-      (key) => !['count', 'project_id', 'truncated', 'next_cursor', 'artifacts'].includes(key)
-    )
+    result.count < result.artifacts.length ||
+    result.truncated !== (result.nextCursor !== undefined)
   ) {
     throw new Error('host.artifacts returned an invalid result')
   }
-  const artifacts = Object.freeze(result.artifacts.map(validatedHostArtifact))
+  const artifacts = Object.freeze(
+    result.artifacts.map((artifact) => validatedHostArtifact(artifact, result.projectId))
+  )
   return Object.freeze({
     count: result.count,
-    project_id: result.project_id,
+    projectId: result.projectId,
     truncated: result.truncated,
-    ...(result.next_cursor !== undefined ? { next_cursor: result.next_cursor } : {}),
+    ...(result.nextCursor !== undefined ? { nextCursor: result.nextCursor } : {}),
     artifacts
   })
 }
@@ -3186,13 +3233,18 @@ function wrapForRun(code) {
 async function run(code) {
   let out = '',
     err = ''
+  const outputBudget = {
+    remaining: OUTPUT_LIMIT_BYTES - DIAGNOSTIC_LIMIT_BYTES,
+    truncated: false
+  }
+  const diagnosticBudget = { remaining: DIAGNOSTIC_LIMIT_BYTES, truncated: false }
   const origLog = console.log,
     origErr = console.error
   console.log = (...a) => {
-    out += a.map(String).join(' ') + '\n'
+    out += takeOutput(outputBudget, a.map(String).join(' ') + '\n')
   }
   console.error = (...a) => {
-    err += a.map(String).join(' ') + '\n'
+    err += takeOutput(outputBudget, a.map(String).join(' ') + '\n')
   }
   let error = null,
     result = null
@@ -3201,18 +3253,29 @@ async function run(code) {
     if (value !== undefined) {
       // Non-serializable (e.g. circular) echoes fall back to a string so a run never fails on output.
       try {
-        result = typeof value === 'string' ? value : JSON.stringify(value)
+        const serialized = typeof value === 'string' ? value : JSON.stringify(value)
+        // JSON.stringify returns undefined (without throwing) for functions and Symbols. Keep the
+        // protocol's null result instead of fabricating the literal string "undefined".
+        if (serialized !== undefined) result = takeOutput(outputBudget, serialized)
       } catch {
-        result = String(value)
+        result = takeOutput(outputBudget, String(value))
       }
     }
   } catch (e) {
-    error = e && e.stack ? String(e.stack) : String(e)
+    error = takeOutputTail(diagnosticBudget, e && e.stack ? String(e.stack) : String(e))
   } finally {
     console.log = origLog
     console.error = origErr
   }
-  return { stdout: out, stderr: err, error, result, cwd: process.cwd(), figures: [] }
+  return {
+    stdout: out,
+    stderr: err,
+    error,
+    result,
+    cwd: process.cwd(),
+    figures: [],
+    output_truncated: outputBudget.truncated || diagnosticBudget.truncated
+  }
 }
 
 const rl = readline.createInterface({ input: process.stdin })

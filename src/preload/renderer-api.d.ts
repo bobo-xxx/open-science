@@ -138,6 +138,7 @@ import type {
   NotebookRunSummary,
   NotebookSessionReference,
   NotebookSessionRequest,
+  NotebookSessionStateRequest,
   NotebookSessionState,
   RunNotebookCellRequest
 } from '../shared/notebook'
@@ -288,6 +289,7 @@ import type {
   ActiveSessionInfo,
   DataRootInspection,
   DataRootValidationResult,
+  DiscardMigratedCopyResult,
   MigrationOutcome,
   MigrationProgress,
   RevealAppStorageResult,
@@ -797,7 +799,7 @@ export interface OpenScienceAPI {
     removeGrantedRoot(request: RemoveGrantedLocalRootRequest): Promise<GrantedLocalRoot[]>
   }
   notebook: {
-    state(request: NotebookSessionRequest): Promise<NotebookSessionState>
+    state(request: NotebookSessionStateRequest): Promise<NotebookSessionState>
     readInputPreview(request: ReadArtifactPreviewRequest): Promise<ArtifactPreviewResult>
     getReference(request: NotebookSessionRequest): Promise<NotebookSessionReference | null>
     beginCodeCell(request: BeginNotebookCodeCellRequest): Promise<{
@@ -895,7 +897,7 @@ export interface OpenScienceAPI {
     ): Promise<DataRootValidationResult>
     cancelMigrate(): Promise<void>
     commitAndRelaunch(parent: string): Promise<MigrationOutcome>
-    discardMigratedCopy(parent: string): Promise<void>
+    discardMigratedCopy(parent: string): Promise<DiscardMigratedCopyResult>
     // Marks the one-time legacy-data-move prompt as answered (declined / keep-here) so it's not shown again.
     dismissLegacyMovePrompt(): Promise<void>
     onProgress(listener: AcpListener<MigrationProgress>): RemoveListener
