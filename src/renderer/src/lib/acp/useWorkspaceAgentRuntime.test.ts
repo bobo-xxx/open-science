@@ -3,7 +3,9 @@ import type {
   AcpRuntimeEvent,
   AcpStateSnapshot
 } from '../../../../shared/acp'
+import type { HistoryReplayTarget } from '../../../../shared/history-preamble'
 import type { PersistedChatSession } from '../../../../shared/session-persistence'
+import type { AgentFrameworkId } from '../../../../shared/settings'
 import type { UploadedAttachment } from '../../../../shared/uploads'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -41,11 +43,11 @@ import {
   cancelWorkspaceRun,
   compactWorkspaceSession,
   createWorkspaceRuntimeSessionLifecycleOwner,
-  deleteWorkspaceSession,
   processContextOverflowRecovery,
   recoverContextOverflowWorkspaceSession,
   resumeInterruptedWorkspaceSession
 } from './workspace-runtime-session-lifecycle-owner'
+import { deleteWorkspaceSession } from './workspace-session-deletion'
 
 const createEvent = (overrides: Partial<AcpRuntimeEvent>): AcpRuntimeEvent => ({
   id: 'event-1',
@@ -830,21 +832,73 @@ describe('workspace session deletion', () => {
     const runtime = { deleteSession: vi.fn().mockResolvedValue(createSnapshot()) }
     const persistDelete = vi.fn().mockResolvedValue(undefined)
 
-    await deleteWorkspaceSession(runtime, 'session-1', persistDelete)
+    await expect(deleteWorkspaceSession(runtime, 'session-1', persistDelete)).resolves.toEqual({
+      status: 'deleted',
+      runtimeDetached: true
+    })
 
     expect(persistDelete).toHaveBeenCalledWith({ projectId: 'project-1', sessionId: 'session-1' })
     expect(useSessionStore.getState().sessions).toEqual([])
   })
 
-  it('keeps the session visible when durable deletion fails', async () => {
+  it('keeps run state neutral and returns a retryable result when durable deletion fails', async () => {
     const runtime = { deleteSession: vi.fn().mockResolvedValue(createSnapshot()) }
     const persistDelete = vi.fn().mockRejectedValue(new Error('disk locked'))
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const statusBeforeDeletion = useSessionStore.getState().sessions[0].status
 
-    await expect(deleteWorkspaceSession(runtime, 'session-1', persistDelete)).rejects.toThrow(
-      'disk locked'
-    )
+    await expect(deleteWorkspaceSession(runtime, 'session-1', persistDelete)).resolves.toEqual({
+      status: 'failed',
+      reason: 'persistence',
+      runtimeDetached: true
+    })
 
     expect(useSessionStore.getState().sessions).toHaveLength(1)
+    expect(useSessionStore.getState().sessions[0].status).toBe(statusBeforeDeletion)
+    expect(useSessionStore.getState().sessions[0].error).toBeUndefined()
+    expect(warn).toHaveBeenCalledWith('Session persistence deletion failed', expect.any(Error))
+  })
+
+  it('keeps run state neutral when runtime deletion fails', async () => {
+    const runtime = { deleteSession: vi.fn().mockResolvedValue(undefined) }
+    const persistDelete = vi.fn()
+    const statusBeforeDeletion = useSessionStore.getState().sessions[0].status
+
+    await expect(deleteWorkspaceSession(runtime, 'session-1', persistDelete)).resolves.toEqual({
+      status: 'failed',
+      reason: 'runtime',
+      runtimeDetached: false
+    })
+
+    expect(persistDelete).not.toHaveBeenCalled()
+    expect(useSessionStore.getState().sessions[0].status).toBe(statusBeforeDeletion)
+    expect(useSessionStore.getState().sessions[0].error).toBeUndefined()
+  })
+
+  it('retries persistence idempotently after the runtime is already detached', async () => {
+    const runtime = { deleteSession: vi.fn().mockResolvedValue(createSnapshot()) }
+    const persistDelete = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('disk locked'))
+      .mockResolvedValueOnce(undefined)
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+
+    const first = await deleteWorkspaceSession(runtime, 'session-1', persistDelete)
+    expect(first).toEqual({
+      status: 'failed',
+      reason: 'persistence',
+      runtimeDetached: true
+    })
+
+    await expect(
+      deleteWorkspaceSession(runtime, 'session-1', persistDelete, {
+        runtimeDetached: first.runtimeDetached
+      })
+    ).resolves.toEqual({ status: 'deleted', runtimeDetached: true })
+
+    expect(runtime.deleteSession).toHaveBeenCalledOnce()
+    expect(persistDelete).toHaveBeenCalledTimes(2)
+    expect(useSessionStore.getState().sessions).toEqual([])
   })
 })
 
@@ -1169,60 +1223,92 @@ describe('workspace durable elicitation', () => {
     })
   })
 
-  it('reattaches a restored session before submitting its durable answer', async () => {
-    const resumeSession = vi.fn().mockResolvedValue({
-      sessionId: 'session-choice-1',
-      cwd: '/workspace/project',
-      contextReset: false,
-      frameworkId: 'opencode',
-      backendId: 'opencode:provider-1'
-    })
-    const respondToElicitation = vi.fn().mockResolvedValue(createSnapshot(['session-choice-1']))
-    const response = {
-      requestId: 'choice-1',
-      action: 'accept' as const,
-      answers: [{ fieldId: 'question_0', value: 'Minimal' }],
-      request: {
-        requestId: 'choice-1',
+  it.each<readonly [string, AgentFrameworkId, string, HistoryReplayTarget]>([
+    ['Claude Code', 'claude-code', 'claude-code:anthropic', 'claude-code'],
+    ['OpenCode', 'opencode', 'opencode:provider-1', 'opencode'],
+    ['Codex Responses', 'codex', 'codex:responses-provider', 'codex-response'],
+    ['Codex Bridge', 'codex', 'codex:bridge-provider', 'codex-bridge']
+  ])(
+    'reattaches a restored session before submitting its durable answer through %s',
+    async (_path, frameworkId, backendId, historyReplayTarget) => {
+      useSessionStore.setState((state) => ({
+        sessions: state.sessions.map((session) => ({
+          ...session,
+          agentFrameworkId: frameworkId,
+          agentBackendId: backendId
+        }))
+      }))
+      const resumeSession = vi.fn().mockResolvedValue({
         sessionId: 'session-choice-1',
-        toolCallId: 'tool-choice-1',
-        message: 'Choose an approach',
-        fields: [
-          {
-            id: 'question_0',
-            label: 'Approach',
-            kind: 'single-select' as const,
-            options: [
-              { value: 'Minimal', label: 'Minimal' },
-              { value: 'Expanded', label: 'Expanded' }
-            ]
-          }
-        ],
-        durable: { kind: 'agent-user-choice' as const, requestId: 'choice-1' }
+        cwd: '/workspace/project',
+        contextReset: true,
+        frameworkId,
+        backendId
+      })
+      const response = {
+        requestId: 'choice-1',
+        action: 'accept' as const,
+        answers: [{ fieldId: 'question_0', value: 'Minimal' }],
+        request: {
+          requestId: 'choice-1',
+          sessionId: 'session-choice-1',
+          toolCallId: 'tool-choice-1',
+          message: 'Choose an approach',
+          fields: [
+            {
+              id: 'question_0',
+              label: 'Approach',
+              kind: 'single-select' as const,
+              options: [
+                { value: 'Minimal', label: 'Minimal' },
+                { value: 'Expanded', label: 'Expanded' }
+              ]
+            }
+          ],
+          durable: { kind: 'agent-user-choice' as const, requestId: 'choice-1' }
+        }
       }
+      useSessionStore.getState().setElicitationPending(response.request.sessionId, true)
+      const respondToElicitation = vi.fn(async () => {
+        const persisted = useSessionStore
+          .getState()
+          .sessions.find((session) => session.id === response.request.sessionId)
+        if (persisted?.status !== 'waiting-for-user') {
+          throw new Error('Durable elicitation no longer matches the pending Session activity.')
+        }
+        return createSnapshot(['session-choice-1'])
+      })
+
+      await respondToWorkspaceElicitation(
+        { state: createSnapshot(), resumeSession, respondToElicitation },
+        response,
+        { historyReplayDescriptor: { target: historyReplayTarget } }
+      )
+
+      expect(resumeSession).toHaveBeenCalledWith(
+        'session-choice-1',
+        '/workspace/project',
+        'project-1',
+        'ask',
+        frameworkId,
+        backendId,
+        undefined,
+        undefined,
+        undefined
+      )
+      expect(resumeSession.mock.invocationCallOrder[0]).toBeLessThan(
+        respondToElicitation.mock.invocationCallOrder[0]
+      )
+      expect(respondToElicitation).toHaveBeenCalledWith({
+        ...response,
+        historyReplay: {
+          historyPreamble: expect.stringContaining('Build something'),
+          historyAttachments: [],
+          historyImages: []
+        }
+      })
     }
-
-    await respondToWorkspaceElicitation(
-      { state: createSnapshot(), resumeSession, respondToElicitation },
-      response
-    )
-
-    expect(resumeSession).toHaveBeenCalledWith(
-      'session-choice-1',
-      '/workspace/project',
-      'project-1',
-      'ask',
-      'opencode',
-      'opencode:provider-1',
-      undefined,
-      undefined,
-      undefined
-    )
-    expect(resumeSession.mock.invocationCallOrder[0]).toBeLessThan(
-      respondToElicitation.mock.invocationCallOrder[0]
-    )
-    expect(respondToElicitation).toHaveBeenCalledWith(response)
-  })
+  )
 
   it('replays prior history when restoring the provider resets its context', async () => {
     const resumeSession = vi.fn().mockResolvedValue({
