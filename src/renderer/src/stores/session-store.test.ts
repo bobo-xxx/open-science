@@ -28,6 +28,7 @@ import type { ActivePlanProjection } from '../../../shared/session-plan/contract
 import { createLinearConversationGraph } from '../../../shared/conversation-graph'
 import {
   createInitialSessionState,
+  projectSessionActionability,
   toPersistedSession,
   useSessionStore,
   type ChatMessage,
@@ -37,7 +38,7 @@ import {
 
 const createArtifactFile = (overrides: Partial<ArtifactFile> = {}): ArtifactFile => ({
   id: 'artifact-session-1:run-1:result.txt',
-  projectName: 'default-project',
+  projectId: 'default-project',
   sessionId: 'artifact-session-1',
   runId: 'run-1',
   name: 'result.txt',
@@ -103,6 +104,144 @@ describe('session store', () => {
   it('starts empty so New can stay outside store state', () => {
     expect(useSessionStore.getState().sessions).toEqual([])
     expect(useSessionStore.getState().selectedSessionId).toBeUndefined()
+  })
+
+  it('projects one priority for simultaneous Session interactions', () => {
+    const actionability = projectSessionActionability({
+      id: 'session-actionability',
+      projectId: 'project-1',
+      title: 'Actionability',
+      cwd: '/workspace',
+      status: 'waiting-plan-approval',
+      interactionState: { permission: true, elicitation: true, plan: true },
+      messages: [],
+      createdAt: 1,
+      updatedAt: 1
+    } as ChatSession)
+
+    expect(actionability).toMatchObject({
+      presentedStatus: 'waiting-permission',
+      activity: 'waiting',
+      attentionOwner: 'user',
+      waitReason: 'waiting-permission',
+      blockingInteraction: 'permission',
+      actions: {
+        startTurn: { allowed: false, disabledReason: 'permission-pending' },
+        revise: { allowed: false, disabledReason: 'permission-pending' },
+        branchFromMessage: { allowed: false, disabledReason: 'permission-pending' },
+        startSideChat: { allowed: false, disabledReason: 'permission-pending' }
+      }
+    })
+  })
+
+  it('keeps delegated Permission actionable without giving it the main Composer lane', () => {
+    const actionability = projectSessionActionability(
+      {
+        id: 'session-delegated-permission',
+        projectId: 'project-1',
+        title: 'Delegated permission',
+        cwd: '/workspace',
+        status: 'waiting-permission',
+        interactionState: { permission: true, elicitation: false, plan: false },
+        messages: [],
+        createdAt: 1,
+        updatedAt: 1
+      } as ChatSession,
+      { rootPermissionPending: false }
+    )
+
+    expect(actionability).toMatchObject({
+      activity: 'waiting',
+      attentionOwner: 'user',
+      waitReason: 'waiting-permission',
+      blockingInteraction: undefined,
+      actions: {
+        startTurn: { allowed: true },
+        revise: { allowed: true },
+        branchFromMessage: { allowed: false, disabledReason: 'permission-pending' },
+        startSideChat: { allowed: false, disabledReason: 'permission-pending' }
+      }
+    })
+  })
+
+  it('projects a pending Session as unavailable for a new Turn or Message branch', () => {
+    const actionability = projectSessionActionability({
+      id: 'session-pending',
+      projectId: 'project-1',
+      title: 'Pending Session',
+      cwd: '/workspace',
+      status: 'idle',
+      isPending: true,
+      messages: [],
+      createdAt: 1,
+      updatedAt: 1
+    } as ChatSession)
+
+    expect(actionability.actions).toMatchObject({
+      startTurn: { allowed: false, disabledReason: 'session-pending' },
+      revise: { allowed: true },
+      branchFromMessage: { allowed: false, disabledReason: 'session-pending' }
+    })
+  })
+
+  it('keeps restored durable root Permission authoritative over a delegated live hint', () => {
+    const actionability = projectSessionActionability(
+      {
+        id: 'session-restored-root-permission',
+        projectId: 'project-1',
+        title: 'Restored root permission',
+        cwd: '/workspace',
+        status: 'waiting-permission',
+        runtimeContext: {
+          version: 1,
+          revision: 1,
+          permission: {
+            state: 'pending',
+            request: {
+              requestId: 'permission-root',
+              sessionId: 'session-restored-root-permission',
+              toolCallId: 'tool-root',
+              title: 'Run root command',
+              options: []
+            },
+            originatingPromptMessageId: 'prompt-root',
+            fingerprint: 'a'.repeat(64),
+            createdAt: 1
+          }
+        },
+        messages: [],
+        createdAt: 1,
+        updatedAt: 1
+      } as ChatSession,
+      { rootPermissionPending: false }
+    )
+
+    expect(actionability).toMatchObject({
+      blockingInteraction: 'permission',
+      actions: { startTurn: { allowed: false, disabledReason: 'permission-pending' } }
+    })
+  })
+
+  it('gives a projected user wait priority over concurrent delegated work', () => {
+    const actionability = projectSessionActionability(
+      {
+        id: 'session-delegated-question',
+        projectId: 'project-1',
+        title: 'Delegated question',
+        cwd: '/workspace',
+        status: 'idle',
+        messages: [],
+        createdAt: 1,
+        updatedAt: 1
+      } as ChatSession,
+      { presentedWaitReason: 'waiting-for-user', hasRunningWork: true }
+    )
+
+    expect(actionability).toMatchObject({
+      presentedStatus: 'waiting-for-user',
+      activity: 'waiting',
+      attentionOwner: 'user'
+    })
   })
 
   it('keeps a Side chat relay distinct from a local user message with matching text', () => {
@@ -4443,6 +4582,7 @@ describe('session store public contract', () => {
       'src/renderer/src/lib/acp/workspace-runtime-event-owner.ts',
       'src/renderer/src/lib/acp/workspace-runtime-prompt-preparation-owner.ts',
       'src/renderer/src/lib/acp/workspace-runtime-save-as-skill-owner.ts',
+      'src/renderer/src/lib/acp/workspace-runtime-session-branch-owner.ts',
       'src/renderer/src/lib/acp/workspace-runtime-session-lifecycle-owner.ts',
       'src/renderer/src/lib/acp/workspace-subagent-runtime-presentation.ts',
       'src/renderer/src/lib/active-session-display.ts',
@@ -4489,12 +4629,15 @@ describe('session store public contract', () => {
       'src/renderer/src/pages/workspace/session-notebook-projection.ts',
       'src/renderer/src/pages/workspace/session-plan/active-branch-plan.ts',
       'src/renderer/src/pages/workspace/session-plan/respond-to-session-plan.ts',
+      'src/renderer/src/pages/workspace/session-wait-reason.ts',
       'src/renderer/src/pages/workspace/tool-execution-phase.ts',
       'src/renderer/src/pages/workspace/use-project-artifact-files.ts',
       'src/renderer/src/pages/workspace/use-side-chat-controller.ts',
+      'src/renderer/src/pages/workspace/use-workspace-branch-switch-guard.ts',
       'src/renderer/src/pages/workspace/visible-project-sessions.ts',
       'src/renderer/src/pages/workspace/workspace-conversation-controller.ts',
       'src/renderer/src/pages/workspace/workspace-conversation-items.ts',
+      'src/renderer/src/pages/workspace/workspace-message-queue-controller.ts',
       'src/renderer/src/pages/workspace/workspace-run-marks.ts',
       'src/renderer/src/pages/workspace/workspace-session-controller.ts',
       'src/renderer/src/pages/workspace/workspace-tool-activity-details.ts',
@@ -4638,6 +4781,57 @@ describe('branchInNewSession', () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-07-04T08:00:00.000Z'))
     useSessionStore.setState(createInitialSessionState())
+  })
+
+  it('copies history through a completed Agent Message into a selected idle Session', () => {
+    const firstPrompt = useSessionStore.getState().appendUserMessage({
+      sessionId: 'source-session',
+      content: 'first question',
+      cwd: '/workspace/project',
+      projectId: 'default-project'
+    })
+    const firstAnswer = useSessionStore.getState().appendAgentMessageChunk({
+      sessionId: 'source-session',
+      streamId: 'first-stream',
+      eventId: 'first-event',
+      content: 'first answer'
+    })
+    useSessionStore.getState().finishRun('source-session')
+    useSessionStore.getState().appendUserMessage({
+      sessionId: 'source-session',
+      content: 'second question'
+    })
+    useSessionStore.getState().appendAgentMessageChunk({
+      sessionId: 'source-session',
+      streamId: 'second-stream',
+      eventId: 'second-event',
+      content: 'second answer'
+    })
+    useSessionStore.getState().finishRun('source-session')
+
+    const result = useSessionStore.getState().branchInNewSession({
+      sourceSessionId: 'source-session',
+      sourceMessageId: firstAnswer?.messageId ?? ''
+    })
+
+    expect(result).toEqual({ sessionId: expect.stringMatching(/^pending-session-/) })
+    expect(useSessionStore.getState().selectedSessionId).toBe(result?.sessionId)
+    expect(useSessionStore.getState().sessions[0]).toMatchObject({
+      id: result?.sessionId,
+      isPending: true,
+      title: 'first question',
+      status: 'idle',
+      pendingHistoryReplay: { kind: 'all' },
+      branchSource: {
+        sessionId: 'source-session',
+        headMessageId: firstAnswer?.messageId
+      }
+    })
+    expect(useSessionStore.getState().sessions[0].activeRun).toBeUndefined()
+    expect(useSessionStore.getState().sessions[0].messages.map((message) => message.id)).toEqual([
+      firstPrompt?.messageId,
+      firstAnswer?.messageId
+    ])
   })
 
   it('copies only the active path into a fresh pending graph without mutating the source', () => {
@@ -5056,6 +5250,28 @@ describe('branchInNewSession', () => {
       useSessionStore.getState().branchInNewSession({
         sourceSessionId: 'source-session',
         content: 'must not snapshot an invalid graph'
+      })
+    ).toBeUndefined()
+    expect(useSessionStore.getState().sessions).toEqual([sourceBefore])
+  })
+
+  it('refuses a source that is waiting for Plan approval', () => {
+    useSessionStore.getState().appendUserMessage({
+      sessionId: 'source-session',
+      content: 'prepare a Plan'
+    })
+    useSessionStore.getState().finishRun('source-session')
+    useSessionStore.setState((state) => ({
+      sessions: state.sessions.map((session) =>
+        session.id === 'source-session' ? { ...session, status: 'waiting-plan-approval' } : session
+      )
+    }))
+    const sourceBefore = structuredClone(useSessionStore.getState().sessions[0])
+
+    expect(
+      useSessionStore.getState().branchInNewSession({
+        sourceSessionId: 'source-session',
+        content: 'bypass the pending Plan'
       })
     ).toBeUndefined()
     expect(useSessionStore.getState().sessions).toEqual([sourceBefore])
@@ -5604,7 +5820,7 @@ describe('truncateSessionFromMessage', () => {
     })
     const artifact = createArtifactFile({
       id: 'artifact-version-2',
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       runId: 'artifact-run-2',
       name: 'sin.png',

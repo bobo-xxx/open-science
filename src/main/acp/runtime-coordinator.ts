@@ -316,11 +316,11 @@ class AcpRuntimeCoordinator {
     return runtime.respondSessionPlan(input)
   }
 
-  getActivePromptSessions(): { projectName: string; sessionId: string }[] {
+  getActivePromptSessions(): { projectId: string; sessionId: string }[] {
     return Array.from(this.runtimes).flatMap((runtime) => runtime.getActivePromptSessions())
   }
 
-  getQuitBlockingPromptSessions(): { projectName: string; sessionId: string }[] {
+  getQuitBlockingPromptSessions(): { projectId: string; sessionId: string }[] {
     return Array.from(this.runtimes).flatMap((runtime) => runtime.getQuitBlockingPromptSessions())
   }
 
@@ -1146,7 +1146,7 @@ class AcpRuntimeCoordinator {
         const resumeRequest: AcpResumeSessionRequest = {
           sessionId: session.sessionId,
           cwd: session.cwd,
-          ...(session.projectName ? { projectName: session.projectName } : {}),
+          ...(session.projectId ? { projectId: session.projectId } : {}),
           ...(session.permissionProfile ? { permissionProfile: session.permissionProfile } : {}),
           ...(session.previousFrameworkId
             ? { previousFrameworkId: session.previousFrameworkId }
@@ -1192,25 +1192,26 @@ class AcpRuntimeCoordinator {
           false
         )
       },
-      sendApplicationPrompt: async (request, attribution) => {
-        this.assertPromptAdmissionOpen()
-        const contextReset = await ensureActivitySession(request.sessionId)
-        const historyPreamble = options.session?.historyPreamble
-        return this.dispatchPrompt(
-          contextReset
-            ? {
-                ...request,
-                contextReset: true,
-                ...(historyPreamble && !request.historyPreamble ? { historyPreamble } : {})
-              }
-            : request,
-          undefined,
-          'sendApplicationPrompt',
-          runtime,
-          false,
-          attribution
-        )
-      }
+      sendApplicationPrompt: (request, attribution) =>
+        this.linearizeRootAdmission(request.sessionId, async () => {
+          this.assertPromptAdmissionOpen()
+          const contextReset = await ensureActivitySession(request.sessionId)
+          const historyPreamble = options.session?.historyPreamble
+          return this.dispatchPrompt(
+            contextReset
+              ? {
+                  ...request,
+                  contextReset: true,
+                  ...(historyPreamble && !request.historyPreamble ? { historyPreamble } : {})
+                }
+              : request,
+            undefined,
+            'sendApplicationPrompt',
+            runtime,
+            false,
+            attribution
+          )
+        })
     }
   }
 

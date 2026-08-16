@@ -19,7 +19,11 @@ import {
   PROJECT_FILES_PREVIEW_ID,
   usePreviewWorkbenchStore
 } from '@/stores/preview-workbench-store'
-import { useSessionStore } from '@/stores/session-store'
+import {
+  projectSessionActionability,
+  resolveRootPermissionPending,
+  useSessionStore
+} from '@/stores/session-store'
 import { useSpecialistStore } from '@/stores/specialist-store'
 import { selectProjectSessionReviews, useReviewStore } from '@/stores/review-store'
 import {
@@ -51,16 +55,14 @@ import { SessionNotebookDialog } from './SessionNotebookDialog'
 import { JobDetailModal } from '@/components/JobDetailModal'
 import { useProjectFormDialog } from '@/hooks/useProjectFormDialog'
 import { ProjectFormDialog } from '../home/ProjectFormDialog'
-import {
-  getVisiblePermissionRequests,
-  hasBlockingRootPermissionRequest
-} from './session-permissions'
+import { getVisiblePermissionRequests } from './session-permissions'
 import { WorkspaceSidebarContainer } from './WorkspaceSidebarContainer'
 import { useJobAnalysisEffect } from '@/lib/compute/useJobAnalysisEffect'
 import { WorkspacePanelLayout } from './workspace-panel-layout'
 import { useWorkspaceComposerController } from './workspace-composer-controller'
 import { useWorkspaceConversationController } from './workspace-conversation-controller'
 import { useWorkspaceSessionController } from './workspace-session-controller'
+import { useWorkspaceBranchSwitchGuard } from './use-workspace-branch-switch-guard'
 import { useSideChatController } from './use-side-chat-controller'
 import { isSaveAsSkillRunning, resolveSaveAsSkillAvailability } from './save-as-skill-availability'
 
@@ -421,6 +423,11 @@ const WorkspacePage = ({
     () => pendingWorkspaceElicitations(activeSession),
     [activeSession]
   )
+  const activeSessionActionability = activeSession
+    ? projectSessionActionability(activeSession, {
+        rootPermissionPending: resolveRootPermissionPending(pendingPermissions, activeSession.id)
+      })
+    : undefined
   const activeNotebookReference = activeSession ? notebookReferences[activeSession.id] : undefined
   const activePermissionProfile =
     activeSession?.permissionProfile ?? newConversationPermissionProfile
@@ -468,10 +475,9 @@ const WorkspacePage = ({
     promptInFlightSessionIds,
     sendPreparationInFlightSessionIds,
     saveAsSkillInFlightSessionIds,
-    hasBlockingRootPermissionRequest: hasBlockingRootPermissionRequest(
-      pendingPermissions,
-      activeSession?.id
-    ),
+    actionability: activeSessionActionability,
+    hasPendingPermissionRequest: (sessionId) =>
+      pendingPermissions.some((request) => request.sessionId === sessionId),
     newConversationAutoReviewEnabled,
     newConversationEnabledComputeHosts,
     composer,
@@ -486,7 +492,8 @@ const WorkspacePage = ({
     },
     abortFixLoop: (request) => window.api.reviewer.abortFixLoop(request),
     getSession: (sessionId) =>
-      useSessionStore.getState().sessions.find((candidate) => candidate.id === sessionId)
+      useSessionStore.getState().sessions.find((candidate) => candidate.id === sessionId),
+    subscribeSessionChanges: useSessionStore.subscribe
   })
   // "Request review" is disabled when:
   //   - there is no active session or no completed agent turn yet, OR
@@ -556,23 +563,21 @@ const WorkspacePage = ({
     pendingArtifactMention
   ])
   const canEditMessage = conversation.availability.revise
-  useEffect(() => {
-    const sessionId = activeSession?.id
-    if (!sessionId) return
-    useSessionStore
-      .getState()
-      .setBranchSwitchBlocked(sessionId, !canEditMessage || activeSessionSaveAsSkillPending)
-    return () => useSessionStore.getState().setBranchSwitchBlocked(sessionId, false)
-  }, [activeSession?.id, activeSessionSaveAsSkillPending, canEditMessage])
+  useWorkspaceBranchSwitchGuard(
+    activeSession?.id,
+    !canEditMessage || activeSessionSaveAsSkillPending || conversation.queue.items.length > 0
+  )
   const canChangeAgentControls =
     isSessionPersistenceReady &&
-    activeSession?.status !== 'running' &&
-    activeSession?.status !== 'waiting-for-user' &&
-    activeSession?.status !== 'waiting-permission' &&
+    activeSessionActionability?.actions.changeAgentControls.allowed !== false &&
     !activeSessionHasRuntimeInteraction &&
-    !activeSession?.compacting
+    !activeSession?.compacting &&
+    conversation.queue.items.length === 0
   const canChangePermissionProfile =
-    isSessionPersistenceReady && !activeSessionHasSendPreparation && !activeSession?.compacting
+    isSessionPersistenceReady &&
+    !activeSessionHasSendPreparation &&
+    !activeSession?.compacting &&
+    conversation.queue.items.length === 0
   const canCompactContext =
     isSessionPersistenceReady &&
     activeSessionSupportsNativeCompaction &&

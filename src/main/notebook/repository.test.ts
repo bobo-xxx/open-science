@@ -29,7 +29,7 @@ describe('notebook run repository', () => {
     for (let index = 0; index < 9; index += 1) {
       const sessionId = `session-${index}`
       await repository.loadOrCreate({
-        projectName: 'default-project',
+        projectId: 'default-project',
         sessionId,
         workspaceCwd: '/workspace',
         lane: createRootNotebookLane('default-project', sessionId, `root-frame-${index}`)
@@ -50,7 +50,7 @@ describe('notebook run repository', () => {
 
     await expect(
       repository.loadOrCreate({
-        projectName: 'default-project',
+        projectId: 'default-project',
         sessionId: 'session-1',
         workspaceCwd: '/workspace'
       } as never)
@@ -62,14 +62,14 @@ describe('notebook run repository', () => {
     const repository = new NotebookRunRepository(root)
     const lane = createRootNotebookLane('default-project', 'session-1', 'root-frame-session-1')
     await repository.loadOrCreate({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       workspaceCwd: '/workspace',
       lane
     })
 
     const document = await repository.appendRun({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane,
       run: {
@@ -97,13 +97,13 @@ describe('notebook run repository', () => {
     const childLane = createFrameNotebookLane('default-project', 'session-1', 'child-frame-1')
 
     const rootDocument = await repository.loadOrCreate({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       workspaceCwd: '/workspace',
       lane: rootLane
     })
     const childDocument = await repository.loadOrCreate({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       workspaceCwd: '/workspace',
       lane: childLane
@@ -138,7 +138,7 @@ describe('notebook run repository', () => {
     })
 
     await repository.loadOrCreate({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane: createRootNotebookLane('default-project', 'session-1', 'root-frame-session-1'),
       workspaceCwd: '/workspace'
@@ -148,13 +148,13 @@ describe('notebook run repository', () => {
     legacyDocument.runs = [{ ...run('legacy'), environment: 'historical-python' }]
     await writeFile(legacyPath, JSON.stringify(legacyDocument, null, 2), 'utf8')
     await repository.loadOrCreate({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       workspaceCwd: '/workspace',
       lane: childLane
     })
     await repository.appendRun({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane: childLane,
       run: {
@@ -164,7 +164,7 @@ describe('notebook run repository', () => {
       }
     })
     await repository.appendRun({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane: childLane,
       run: run('child', 'child-frame-1')
@@ -213,7 +213,7 @@ describe('notebook run repository', () => {
     const repository = new NotebookRunRepository(root)
 
     const document = await repository.loadOrCreate({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane: createRootNotebookLane('default-project', 'session-1', 'root-frame-session-1'),
       workspaceCwd: '/workspace',
@@ -224,7 +224,6 @@ describe('notebook run repository', () => {
     expect(document).toMatchObject({
       version: 1,
       projectId: 'default-project',
-      projectName: 'default-project',
       sessionId: 'session-1',
       workspaceCwd: '/workspace',
       notebookSessionRoot: join(root, 'notebooks', 'default-project', 'session-1'),
@@ -253,13 +252,13 @@ describe('notebook run repository', () => {
     const repository = new NotebookRunRepository(root)
 
     await repository.loadOrCreate({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane: createRootNotebookLane('default-project', 'session-1', 'root-frame-session-1'),
       workspaceCwd: '/workspace'
     })
     await repository.appendRun({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane: createRootNotebookLane('default-project', 'session-1', 'root-frame-session-1'),
       run: {
@@ -324,13 +323,13 @@ describe('notebook run repository', () => {
     const repository = new NotebookRunRepository(root)
 
     await repository.loadOrCreate({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane: createRootNotebookLane('default-project', 'session-1', 'root-frame-session-1'),
       workspaceCwd: '/workspace'
     })
     await repository.appendRun({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane: createRootNotebookLane('default-project', 'session-1', 'root-frame-session-1'),
       run: {
@@ -353,7 +352,7 @@ describe('notebook run repository', () => {
       }
     })
     const document = await repository.updateRun({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane: createRootNotebookLane('default-project', 'session-1', 'root-frame-session-1'),
       run: {
@@ -394,7 +393,7 @@ describe('notebook run repository', () => {
     const sessionRoot = join(root, 'notebooks', 'default-project', 'session-1')
 
     await repository.loadOrCreate({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane: createRootNotebookLane('default-project', 'session-1', 'root-frame-session-1'),
       workspaceCwd: '/workspace'
@@ -410,13 +409,13 @@ describe('notebook run repository', () => {
     const lane = createRootNotebookLane('default-project', 'session-1', 'root-frame-session-1')
 
     await repository.loadOrCreate({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane,
       workspaceCwd: '/workspace'
     })
     await repository.appendRun({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane,
       run: {
@@ -436,7 +435,7 @@ describe('notebook run repository', () => {
     })
 
     const restarting = await repository.updateKernelStatus({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane,
       status: 'restarting'
@@ -445,7 +444,7 @@ describe('notebook run repository', () => {
     expect(restarting.runs).toHaveLength(1) // run history untouched
 
     const pythonTerminated = await repository.markKernelTerminated({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane,
       kernelInstance: { kind: 'python', environment: 'analysis' }
@@ -456,19 +455,19 @@ describe('notebook run repository', () => {
     })
 
     await repository.markKernelTerminated({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane,
       kernelInstance: { kind: 'python', environment: 'analysis' }
     })
     await repository.markKernelTerminated({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane,
       kernelInstance: { kind: 'python', environment: 'default-python' }
     })
     const bothTerminated = await repository.markKernelTerminated({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane,
       kernelInstance: { kind: 'r', environment: 'default-r' }
@@ -480,7 +479,7 @@ describe('notebook run repository', () => {
     ])
 
     const rStillTerminated = await repository.clearKernelTermination({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane,
       kernelInstance: { kind: 'python', environment: 'analysis' }
@@ -494,14 +493,14 @@ describe('notebook run repository', () => {
     })
 
     await repository.clearKernelTermination({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane,
       kernelInstance: { kind: 'python', environment: 'default-python' }
     })
 
     const recovered = await repository.clearKernelTermination({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane,
       kernelInstance: { kind: 'r', environment: 'default-r' }
@@ -511,13 +510,13 @@ describe('notebook run repository', () => {
     expect(recovered.runs).toHaveLength(1)
 
     await repository.markKernelTerminated({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane,
       kernelInstance: { kind: 'repl' }
     })
     const restartingClean = await repository.clearKernelTerminations({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane,
       status: 'restarting'
@@ -532,7 +531,7 @@ describe('notebook run repository', () => {
     const runJsonPath = join(root, 'notebooks', 'default-project', 'session-1', 'run.json')
 
     await repository.loadOrCreate({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane: createRootNotebookLane('default-project', 'session-1', 'root-frame-session-1'),
       workspaceCwd: '/workspace'
@@ -570,7 +569,7 @@ describe('notebook run repository', () => {
     const runJsonPath = join(root, 'notebooks', 'canonical-project', 'session-1', 'run.json')
 
     await repository.loadOrCreate({
-      projectName: 'canonical-project',
+      projectId: 'canonical-project',
       sessionId: 'session-1',
       lane: createRootNotebookLane('canonical-project', 'session-1', 'root-frame-session-1'),
       workspaceCwd: '/workspace'
@@ -611,13 +610,161 @@ describe('notebook run repository', () => {
 
     expect(reloaded).toMatchObject({
       projectId: 'canonical-project',
-      projectName: 'canonical-project',
       notebookSessionRoot: join(root, 'notebooks', 'canonical-project', 'session-1')
     })
-    expect(reloaded?.runs[0].artifacts[0]).toMatchObject({
-      projectId: 'canonical-project',
-      projectName: 'canonical-project'
+    expect(reloaded?.runs[0].artifacts[0]).toMatchObject({ projectId: 'canonical-project' })
+  })
+
+  it('keeps a matching legacy projectName document readable through loadOrCreate', async () => {
+    const root = await createStorageRoot()
+    const runJsonPath = join(root, 'notebooks', 'default-project', 'session-1', 'run.json')
+    const lane = createRootNotebookLane('default-project', 'session-1', 'root-frame-session-1')
+    await new NotebookRunRepository(root).loadOrCreate({
+      projectId: 'default-project',
+      sessionId: 'session-1',
+      lane,
+      workspaceCwd: '/workspace'
     })
+    const legacyDocument = JSON.parse(await readFile(runJsonPath, 'utf8'))
+    delete legacyDocument.projectId
+    legacyDocument.projectName = 'default-project'
+    legacyDocument.artifactSessionId = 'artifact-session-1'
+    await writeFile(runJsonPath, JSON.stringify(legacyDocument, null, 2), 'utf8')
+
+    const document = await new NotebookRunRepository(root).loadOrCreate({
+      projectId: 'default-project',
+      sessionId: 'session-1',
+      lane,
+      workspaceCwd: '/relocated-workspace'
+    })
+
+    expect(document).toMatchObject({
+      projectId: 'default-project',
+      sessionId: 'session-1',
+      artifactSessionId: 'artifact-session-1',
+      workspaceCwd: '/relocated-workspace'
+    })
+  })
+
+  it('rejects a project ownership mismatch before caching or changing the root document', async () => {
+    const root = await createStorageRoot()
+    const runJsonPath = join(root, 'notebooks', 'default-project', 'session-1', 'run.json')
+    await new NotebookRunRepository(root).loadOrCreate({
+      projectId: 'default-project',
+      sessionId: 'session-1',
+      lane: createRootNotebookLane('default-project', 'session-1', 'root-frame-session-1'),
+      workspaceCwd: '/workspace'
+    })
+    const misplacedDocument = JSON.parse(await readFile(runJsonPath, 'utf8'))
+    misplacedDocument.projectId = 'other-project'
+    const original = JSON.stringify(misplacedDocument, null, 2)
+    await writeFile(runJsonPath, original, 'utf8')
+    const repository = new NotebookRunRepository(root)
+
+    await expect(repository.findExisting('default-project', 'session-1')).rejects.toThrow(
+      'Notebook run document ownership mismatch: requested projectId "default-project", but run.json declares "other-project".'
+    )
+
+    expect(await readFile(runJsonPath, 'utf8')).toBe(original)
+    const cache = repository as unknown as { documentCache: Map<string, unknown> }
+    expect(cache.documentCache.size).toBe(0)
+  })
+
+  it('does not treat a session ownership mismatch as ENOENT in loadOrCreate', async () => {
+    const root = await createStorageRoot()
+    const runJsonPath = join(root, 'notebooks', 'default-project', 'session-1', 'run.json')
+    const lane = createRootNotebookLane('default-project', 'session-1', 'root-frame-session-1')
+    await new NotebookRunRepository(root).loadOrCreate({
+      projectId: 'default-project',
+      sessionId: 'session-1',
+      lane,
+      workspaceCwd: '/workspace'
+    })
+    const misplacedDocument = JSON.parse(await readFile(runJsonPath, 'utf8'))
+    misplacedDocument.sessionId = 'other-session'
+    misplacedDocument.runs = [{ sentinel: 'must-not-be-replaced' }]
+    const original = JSON.stringify(misplacedDocument, null, 2)
+    await writeFile(runJsonPath, original, 'utf8')
+    const repository = new NotebookRunRepository(root)
+
+    await expect(
+      repository.loadOrCreate({
+        projectId: 'default-project',
+        sessionId: 'session-1',
+        lane,
+        workspaceCwd: '/workspace'
+      })
+    ).rejects.toThrow(
+      'Notebook run document ownership mismatch: requested sessionId "session-1", but run.json declares "other-session".'
+    )
+
+    expect(await readFile(runJsonPath, 'utf8')).toBe(original)
+  })
+
+  it('rejects a canonical projectId mismatch even when legacy projectName matches', async () => {
+    const root = await createStorageRoot()
+    const runJsonPath = join(root, 'notebooks', 'default-project', 'session-1', 'run.json')
+    await new NotebookRunRepository(root).loadOrCreate({
+      projectId: 'default-project',
+      sessionId: 'session-1',
+      lane: createRootNotebookLane('default-project', 'session-1', 'root-frame-session-1'),
+      workspaceCwd: '/workspace'
+    })
+    const misplacedDocument = JSON.parse(await readFile(runJsonPath, 'utf8'))
+    misplacedDocument.projectId = 'canonical-other-project'
+    misplacedDocument.projectName = 'default-project'
+    await writeFile(runJsonPath, JSON.stringify(misplacedDocument, null, 2), 'utf8')
+
+    await expect(
+      new NotebookRunRepository(root).findExisting('default-project', 'session-1')
+    ).rejects.toThrow(/requested projectId "default-project".*"canonical-other-project"/)
+  })
+
+  it('rejects a mismatched Frame document before continuing a mutation', async () => {
+    const root = await createStorageRoot()
+    const lane = createFrameNotebookLane('default-project', 'session-1', 'child-frame-1')
+    const runJsonPath = join(
+      root,
+      'notebooks',
+      'default-project',
+      'session-1',
+      'frames',
+      'child-frame-1',
+      'run.json'
+    )
+    await new NotebookRunRepository(root).loadOrCreate({
+      projectId: 'default-project',
+      sessionId: 'session-1',
+      lane,
+      workspaceCwd: '/workspace'
+    })
+    const misplacedDocument = JSON.parse(await readFile(runJsonPath, 'utf8'))
+    misplacedDocument.sessionId = 'other-session'
+    const original = JSON.stringify(misplacedDocument, null, 2)
+    await writeFile(runJsonPath, original, 'utf8')
+
+    await expect(
+      new NotebookRunRepository(root).appendRun({
+        projectId: 'default-project',
+        sessionId: 'session-1',
+        lane,
+        run: {
+          runId: 'must-not-be-appended',
+          cellId: 'cell-1',
+          source: 'agent',
+          kernelKind: 'python',
+          script: '1',
+          status: 'completed',
+          startedAt: 1,
+          text: { stdout: '', stderr: '', traceback: '', plain: [] },
+          outputs: [],
+          artifacts: [],
+          workingFiles: []
+        }
+      })
+    ).rejects.toThrow(/requested sessionId "session-1".*"other-session"/)
+
+    expect(await readFile(runJsonPath, 'utf8')).toBe(original)
   })
 
   it('keeps an explicit kernelKind when loading a run record from disk', async () => {
@@ -626,7 +773,7 @@ describe('notebook run repository', () => {
     const runJsonPath = join(root, 'notebooks', 'default-project', 'session-1', 'run.json')
 
     await repository.loadOrCreate({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane: createRootNotebookLane('default-project', 'session-1', 'root-frame-session-1'),
       workspaceCwd: '/workspace'
@@ -666,7 +813,7 @@ describe('notebook run repository', () => {
     )
     await expect(
       repository.loadOrCreate({
-        projectName: 'default-project',
+        projectId: 'default-project',
         sessionId: 'session/1',
         lane: createRootNotebookLane('default-project', 'session-1', 'root-frame-session-1'),
         workspaceCwd: '/workspace'
@@ -679,14 +826,14 @@ describe('notebook run repository', () => {
     const repository = new NotebookRunRepository(root)
 
     await repository.loadOrCreate({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane: createRootNotebookLane('default-project', 'session-1', 'root-frame-session-1'),
       workspaceCwd: '/workspace'
     })
     // A run left 'running' when the previous process died (no endedAt).
     await repository.appendRun({
-      projectName: 'default-project',
+      projectId: 'default-project',
       sessionId: 'session-1',
       lane: createRootNotebookLane('default-project', 'session-1', 'root-frame-session-1'),
       run: {

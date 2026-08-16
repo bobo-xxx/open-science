@@ -57,7 +57,11 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { useFileDropZone } from '@/hooks/useFileDropZone'
 import { cn } from '@/lib/utils'
-import { useSessionStore, type ChatSession } from '@/stores/session-store'
+import {
+  projectSessionActionability,
+  useSessionStore,
+  type ChatSession
+} from '@/stores/session-store'
 import { useSessionJobStore } from '@/stores/session-job-store'
 import { useSettingsStore } from '@/stores/settings-store'
 import { useSpecialistStore } from '@/stores/specialist-store'
@@ -67,6 +71,7 @@ import { appendArtifactMention, docToSkillIds } from './composer/composer-doc'
 import { ComposerAgentControlsMenu } from './ComposerAgentControlsMenu'
 import { NotificationBell } from '@/components/NotificationBell'
 import { ComposerContextUsage } from './ComposerContextUsage'
+import { ComposerMessageQueueContent, ComposerMessageQueueTrigger } from './ComposerMessageQueue'
 import { ContextWindowDialog } from './ContextWindowDialog'
 import { ComposerModelPicker } from './ComposerModelPicker'
 import { ComposerYourFilesMenu } from './ComposerYourFilesMenu'
@@ -329,14 +334,22 @@ const ConversationPanel = ({
     }
   } = composer
   const {
-    availability: { submit: canSendMessage, revise: canEditMessage, resume: canResumeSession },
+    availability: {
+      submit: canSendMessage,
+      submitMode,
+      revise: canEditMessage,
+      resume: canResumeSession,
+      branch: canBranchInNewSession
+    },
     actions: {
       submit: { draft: submitDraft, restoredPlan: onRespondToRestoredPlan },
       revise: onSendEditedMessage,
+      branch: onBranchFromAgentMessage,
       sideChat: { start: onStartSideChat },
       resume: onResumeSession,
       cancel: onCancelRun
-    }
+    },
+    queue: messageQueue
   } = conversation
   const {
     view: sideChat,
@@ -417,6 +430,7 @@ const ConversationPanel = ({
   const openSettings = useSettingsStore((state) => state.openSettings)
   const stopSubmissionPendingRef = useRef(false)
   const [isStopping, setIsStopping] = useState(false)
+  const [messageQueueExpanded, setMessageQueueExpanded] = useState(false)
   const [stopError, setStopError] = useState<string>()
   const setElicitationDraftAnswers = useSessionStore((state) => state.setElicitationDraftAnswers)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
@@ -480,14 +494,6 @@ const ConversationPanel = ({
     ? t('Wait for all subagents to finish.')
     : saveAsSkillDisabledReasonFromParent
   const effectiveCanSend = canSendMessage && !isStopping
-  const rootTurnBusy =
-    activeSession?.status === 'running' ||
-    activeSession?.status === 'waiting-for-user' ||
-    (activeSession?.status === 'waiting-permission' &&
-      (pendingPermissions.length === 0 ||
-        pendingPermissions.some((permission) => !permission.delegated))) ||
-    activeSession?.compacting === true ||
-    activeSession?.fixLoopActive === true
   const activePendingPlan = activeBranchPlan?.approval === 'pending' ? activeBranchPlan : undefined
   const activePendingPlanKey = activePendingPlan
     ? `${activePendingPlan.artifactVersionId}:${activePendingPlan.revision}`
@@ -571,10 +577,38 @@ const ConversationPanel = ({
             state: 'pending'
           }
         : undefined
-  const hasPendingPermission = pendingPermissions.length > 0
+  const rootPermissionRequests = pendingPermissions.filter((request) => !request.delegated)
+  const rootPermissionPending =
+    rootPermissionRequests.length > 0 ? true : pendingPermissions.length > 0 ? false : undefined
+  const actionability = activeSession
+    ? projectSessionActionability(activeSession, {
+        rootPermissionPending,
+        elicitationPending: pendingElicitation ? true : undefined,
+        planPending:
+          pendingPlan !== undefined
+            ? true
+            : activePendingPlanKey && resolvedPlanKey === activePendingPlanKey
+              ? false
+              : undefined
+      })
+    : undefined
+  const blockingInteraction =
+    actionability?.blockingInteraction ??
+    (rootPermissionRequests.length > 0
+      ? 'permission'
+      : pendingElicitation
+        ? 'elicitation'
+        : pendingPlan
+          ? 'plan'
+          : undefined)
+  const hasPendingPermission = blockingInteraction === 'permission'
   const delegatedQuestion = projectDelegatedQuestionQueue(activeSession)[0]
-  const ordinaryComposerBlocked = Boolean(
-    sideChat || hasPendingPermission || pendingElicitation || pendingPlan
+  const ordinaryComposerBlocked = Boolean(sideChat || blockingInteraction)
+  const rootTurnBusy = Boolean(
+    blockingInteraction ||
+    actionability?.activity === 'running' ||
+    activeSession?.compacting ||
+    activeSession?.fixLoopActive
   )
 
   // Re-attaches the interrupted session; on success the banner unmounts, so guard the state update.
@@ -648,9 +682,7 @@ const ConversationPanel = ({
   const canStartSideChat =
     Boolean(activeSession) &&
     hasMainConversation(activeSession) &&
-    activeSession?.status !== 'waiting-for-user' &&
-    activeSession?.status !== 'waiting-permission' &&
-    activeSession?.status !== 'waiting-plan-approval' &&
+    actionability?.actions.startSideChat.allowed !== false &&
     canEditDraft &&
     hasTextDraft &&
     attachments.length === 0 &&
@@ -742,6 +774,8 @@ const ConversationPanel = ({
             isResumingSession={isResuming}
             notebookReference={notebookReference}
             onSendEditedMessage={onSendEditedMessage}
+            canBranchInNewSession={canBranchInNewSession}
+            onBranchInNewSession={onBranchFromAgentMessage}
             pendingElicitations={sideChat ? [] : sessionPendingElicitations}
             handoffLifecycleSource={workspaceHandoffLifecycleClient}
             onRetryHandoff={(request) => workspaceHandoffLifecycleClient.retry(request)}
@@ -853,14 +887,21 @@ const ConversationPanel = ({
                 !pendingElicitation &&
                 !pendingPlan &&
                 (notebookReference ||
+                  messageQueue.items.length > 0 ||
                   hasAnyJobs ||
                   hasSubagents ||
                   (activeBranchPlan ? isPlanProgressVisible(activeBranchPlan) : false)) ? (
                   <div
-                    key={notebookReference ? `notebook-${notebookReference.sessionId}` : 'jobs'}
+                    key={
+                      notebookReference
+                        ? `notebook-${notebookReference.sessionId}`
+                        : messageQueue.items.length > 0
+                          ? 'message-queue'
+                          : 'jobs'
+                    }
                     className={cn(
                       'flex px-2',
-                      notebookReference
+                      notebookReference || messageQueue.items.length > 0
                         ? 'relative -mb-8 min-h-[68px] items-start rounded-2xl bg-bg-200 pt-1 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:slide-in-from-bottom-1 motion-safe:duration-200 motion-safe:ease-out'
                         : 'mb-2 min-h-9 items-center rounded-lg border border-border-200 bg-bg-000 shadow-card'
                     )}
@@ -905,6 +946,11 @@ const ConversationPanel = ({
                         }
                       />
                     ) : null}
+                    <ComposerMessageQueueTrigger
+                      items={messageQueue.items}
+                      expanded={messageQueueExpanded}
+                      onExpandedChange={setMessageQueueExpanded}
+                    />
                   </div>
                 ) : null}
 
@@ -1001,9 +1047,9 @@ const ConversationPanel = ({
                       }
                     />
                   ) : hasPendingPermission ? (
-                    <ResizablePermissionComposer key={pendingPermissions[0]?.requestId}>
+                    <ResizablePermissionComposer key={rootPermissionRequests[0]?.requestId}>
                       <PermissionApprovalControls
-                        requests={pendingPermissions}
+                        requests={rootPermissionRequests}
                         onRespond={onRespondToPermission}
                         embedded
                         notebookLookup={
@@ -1064,6 +1110,10 @@ const ConversationPanel = ({
                     {isDragging ? (
                       <FileDropOverlay label={t('Drop files to attach')} className="rounded-2xl" />
                     ) : null}
+                    <ComposerMessageQueueContent
+                      {...messageQueue}
+                      expanded={messageQueueExpanded}
+                    />
                     <div className="flex flex-col gap-2">
                       {attachments.length > 0 || attachmentTransfers.length > 0 ? (
                         <div className="flex max-h-[92px] flex-wrap gap-2 overflow-y-auto border-b border-border-200 pb-2">
@@ -1504,8 +1554,18 @@ const ConversationPanel = ({
                           // reachable across the whole loop, not just the agent-fix running turn.
                           <div
                             data-testid="composer-running-control-slot"
-                            className="flex w-16 shrink-0 justify-end [@media(pointer:coarse)]:mx-3"
+                            className="flex w-24 shrink-0 justify-end [@media(pointer:coarse)]:mx-3"
                           >
+                            <button
+                              type="button"
+                              onClick={handleSubmit}
+                              disabled={!effectiveCanSend || submitMode !== 'queue'}
+                              className={composerIconButtonClassName}
+                              aria-label={t('Add message to queue')}
+                              data-testid="composer-queue-submit"
+                            >
+                              <ArrowUp className="size-4" strokeWidth={2.2} aria-hidden="true" />
+                            </button>
                             <button
                               type="button"
                               onClick={handleStop}

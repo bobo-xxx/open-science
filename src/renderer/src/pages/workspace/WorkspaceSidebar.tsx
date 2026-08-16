@@ -35,14 +35,16 @@ import { cn } from '@/lib/utils'
 import { GitHubStarBadge } from '@/components/GitHubStarBadge'
 import { NetworkStatusIndicator } from '@/components/NetworkStatusIndicator'
 import { UpdateCapsule } from '@/components/UpdateCapsule'
+import { sessionWaitReasonLabelKeys } from '@/lib/session-wait-reason-labels'
 import type { ChatSession, SessionStatus } from '@/stores/session-store'
 import type { ConversationExportFormat } from '../../../../shared/conversation-export'
 import { NotificationBell } from '@/components/NotificationBell'
 
-import { resolveSessionWaitReason, sessionWaitReasonLabelKeys } from './session-wait-reason'
+import { projectPresentedSessionActionability } from './session-wait-reason'
 
 type WorkspaceSidebarProps = {
   projectName: string
+  starNudgeKey?: string
   sessions: ChatSession[]
   activeSessionId: string | undefined
   canCreateConversation: boolean
@@ -113,16 +115,11 @@ const OPEN_DIALOG_SELECTOR =
   '[role="dialog"]:not([data-state="closed"]), [role="alertdialog"]:not([data-state="closed"])'
 
 const getPresentedSessionStatus = (session: ChatSession): SessionStatus =>
-  resolveSessionWaitReason(session) ?? session.status
+  projectPresentedSessionActionability(session).presentedStatus
 
 const isLiveSession = (session: ChatSession): boolean => {
-  const status = getPresentedSessionStatus(session)
-  return (
-    status === 'running' ||
-    status === 'waiting-for-user' ||
-    status === 'waiting-permission' ||
-    status === 'waiting-plan-approval'
-  )
+  const activity = projectPresentedSessionActionability(session).activity
+  return activity === 'running' || activity === 'waiting'
 }
 
 // The label is English source text that travels to the header as data, so it is translated where it
@@ -212,6 +209,7 @@ const sessionMenuIconClassName = 'flex size-4 shrink-0 items-center justify-cent
 // Left navigation owns session selection, creation entry, and workspace settings.
 const WorkspaceSidebarView = ({
   projectName,
+  starNudgeKey,
   sessions,
   activeSessionId,
   canCreateConversation,
@@ -253,6 +251,9 @@ const WorkspaceSidebarView = ({
       .map((session, index) => [session.id, index + 1])
   )
   const isMac = window.api?.platform === 'darwin'
+  const activeStarNudgeKey = (mobileMode ? isMobileOpen : sidebarToggle?.state !== 'collapsed')
+    ? starNudgeKey
+    : undefined
 
   return (
     <aside
@@ -681,7 +682,11 @@ const WorkspaceSidebarView = ({
                 className="size-8 rounded-md"
                 onOpen={mobileMode ? onMobileClose : undefined}
               />
-              <GitHubStarBadge />
+              <GitHubStarBadge
+                key={activeStarNudgeKey}
+                variant="workspace"
+                nudgeKey={activeStarNudgeKey}
+              />
               <NetworkStatusIndicator variant="icon" />
             </div>
           </div>

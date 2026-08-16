@@ -117,7 +117,7 @@ export type Run = {
 }
 
 export type SessionStatus =
-  'idle' | 'running' | 'waiting-permission' | 'waiting-plan-approval' | 'error'
+  'idle' | 'running' | 'waiting-for-user' | 'waiting-permission' | 'waiting-plan-approval' | 'error'
 
 export type Session = {
   id: string
@@ -161,7 +161,7 @@ export class OpenScienceClient {
   health(): Promise<unknown>
   listProjects(): Promise<Project[]>
   createProject(request: { name: string; description?: string }): Promise<Project>
-  listSessions(project?: string): Promise<Session[]>
+  listSessions(projectId?: string): Promise<Session[]>
   getSession(sessionId: string): Promise<Session>
   getSessionPlan(sessionId: string): Promise<SessionPlan | null>
   respondSessionPlan(

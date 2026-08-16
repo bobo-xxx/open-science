@@ -83,7 +83,6 @@ import {
 } from './lifecycle-shutdown'
 import { registerLifecycleIpcHandlers } from './lifecycle-broadcast'
 import { createLogsCommandOwner, registerLogsIpcHandlers } from './logs-ipc'
-import { registerNetworkIpcHandlers } from './network-ipc'
 import { registerWindowIpcHandlers } from './window-ipc'
 import { registerWindowFindIpcHandlers } from './window-find-ipc'
 import { TaskNotificationService } from './notifications/task-notifications'
@@ -143,7 +142,7 @@ import { HostViewImageService } from './notebook/host-view-image-service'
 import type { NotebookEnvironmentManager } from './notebook/runtime-service'
 import { parseArtifactVersionLocator } from '../shared/artifact-provenance'
 import { parseUploadVersionReference } from '../shared/uploads'
-import { DEFAULT_ARTIFACT_PROJECT_NAME } from '../shared/artifacts'
+import { DEFAULT_ARTIFACT_PROJECT_ID } from '../shared/artifacts'
 import type { NotebookLanguage } from '../shared/notebook'
 import { MAIN_ENABLED_COMPUTE_HOSTS_LIFECYCLE_CLIENT_ID } from '../shared/lifecycle-events'
 import { OFFICE_PREVIEW_STATE_CHANNEL } from '../shared/office-preview'
@@ -455,7 +454,7 @@ const createApplicationModules = async (
   }
   const sessionRepository = createDefaultSessionRepository((projectId, sessionId) =>
     (runtimeRef.current?.getActivePromptSessions() ?? []).some(
-      (session) => session.projectName === projectId && session.sessionId === sessionId
+      (session) => session.projectId === projectId && session.sessionId === sessionId
     )
   )
   const projectRepository = createDefaultProjectRepository()
@@ -552,11 +551,11 @@ const createApplicationModules = async (
     return Promise.reject(new Error(`Unsupported managed preview source: ${String(unhandled)}`))
   }
   const resolveSessionArtifactFilePath = createSessionArtifactFileResolver({
-    compatibilityProjectName: DEFAULT_ARTIFACT_PROJECT_NAME,
+    compatibilityProjectId: DEFAULT_ARTIFACT_PROJECT_ID,
     resolveVersionContent: (identity) =>
       artifactProvenanceRepository.resolveVersionContent(identity),
-    resolveLegacyArtifactPath: (projectName, sessionId, path) =>
-      artifactRepository.resolveSessionArtifactFilePath(projectName, sessionId, path)
+    resolveLegacyArtifactPath: (projectId, sessionId, path) =>
+      artifactRepository.resolveSessionArtifactFilePath(projectId, sessionId, path)
   })
   // One registry owns short-lived capability URLs for both managed artifact repositories.
   const previewResources = new ManagedPreviewResources({
@@ -667,7 +666,7 @@ const createApplicationModules = async (
   // close/quit and storage-migration safety gates. The selector deliberately ignores active routes:
   // inactive-branch work still owns processes/files and must block disruptive operations.
   const delegatedActivity = createDelegatedActivityProjection()
-  const getActiveDelegatedSessions = (): { projectName: string; sessionId: string }[] =>
+  const getActiveDelegatedSessions = (): { projectId: string; sessionId: string }[] =>
     delegatedActivity.getActiveDelegatedSessions()
 
   const sessionPersistenceCoordinator = new SessionPersistenceCoordinator(
@@ -911,7 +910,7 @@ const createApplicationModules = async (
     {
       configRoot: resolveConfigRoot(),
       dataRoot: resolveDataRoot(),
-      projectId: DEFAULT_ARTIFACT_PROJECT_NAME,
+      projectId: DEFAULT_ARTIFACT_PROJECT_ID,
       repository: new NotebookRunRepository(resolveDataRoot()),
       getPackageMirror: () => settingsService.getPackageMirror(),
       notebookRuntimeSettings,
@@ -1478,7 +1477,7 @@ const createApplicationModules = async (
       project: (scope) =>
         scope.terminalMessageId
           ? artifactRepository.listMessageFiles({
-              projectName: scope.session.projectId,
+              projectId: scope.session.projectId,
               sessionId: scope.session.sessionId,
               messageId: scope.terminalMessageId
             })
@@ -1575,7 +1574,7 @@ const createApplicationModules = async (
                   await runtime.resumeSession({
                     sessionId: latest.id,
                     cwd: latest.cwd,
-                    projectName: latest.projectId,
+                    projectId: latest.projectId,
                     ...(latest.permissionProfile
                       ? { permissionProfile: latest.permissionProfile }
                       : {}),
@@ -1828,7 +1827,6 @@ const createApplicationModules = async (
     registerFileSaveHandlers({ resolveManagedFilePath, resolveSessionArtifactFilePath })
     registerLogsIpcHandlers(logsCommandOwner)
     registerGithubIpcHandlers({}, githubCommandOwner)
-    registerNetworkIpcHandlers()
     registerCliInstallIpcHandlers(cliCommandOwner)
     registerWindowIpcHandlers()
     registerWindowFindIpcHandlers()
@@ -2661,7 +2659,7 @@ const createApplicationModules = async (
         .getActivePromptSessions()
         .some(
           (activeSession) =>
-            activeSession.projectName === projectId && activeSession.sessionId === sessionId
+            activeSession.projectId === projectId && activeSession.sessionId === sessionId
         )
   })
   declareElectronAdapter('conversation-export', () =>

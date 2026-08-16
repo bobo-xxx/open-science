@@ -284,7 +284,7 @@ const createFrameworkCompositionHarness = async (
   const service = new NotebookRuntimeService({
     configRoot: dataRoot,
     dataRoot,
-    projectName: 'project-1',
+    projectId: 'project-1',
     repository: new NotebookRunRepository(dataRoot),
     executorFactory: () => ({
       execute: async (request) => ({
@@ -737,6 +737,8 @@ describe('production delegated-work composition', () => {
   it('records the admitted cross-provider model on every child Runtime Segment', async () => {
     root = await mkdtemp(join(tmpdir(), 'delegated-production-model-snapshot-'))
     const execution = createDeterministicDelegateExecution()
+    execution.plan({ status: 'completed', response: 'first complete' })
+    execution.plan({ status: 'completed', response: 'second complete' })
     const resolveExecutionModel = vi.fn(async () => ({
       snapshot: {
         frameworkId: 'opencode' as const,
@@ -757,16 +759,10 @@ describe('production delegated-work composition', () => {
       resolveExecutionModel
     )
 
-    await harness.composition.host.delegate(
-      harness.caller,
-      [
-        { task: 'first', name: 'first' },
-        { task: 'second', name: 'second' }
-      ],
-      { wait: false }
-    )
-    await expect.poll(() => harness.execution.controls()).toHaveLength(2)
-    await expect.poll(() => harness.durable().conversationGraph?.runtimeSegments.length).toBe(3)
+    await harness.composition.host.delegate(harness.caller, [
+      { task: 'first', name: 'first' },
+      { task: 'second', name: 'second' }
+    ])
 
     expect(resolveExecutionModel).toHaveBeenCalledOnce()
     expect(harness.durable().conversationGraph?.runtimeSegments.slice(-2)).toEqual([
@@ -1852,7 +1848,7 @@ describe('production delegated-work composition', () => {
       id: 'version-atomic',
       artifactId: 'artifact-atomic',
       versionId: 'version-atomic',
-      projectName: 'project-1',
+      projectId: 'project-1',
       sessionId: durable.id,
       runId: 'run-atomic',
       name: 'atomic.md',
@@ -1956,7 +1952,7 @@ describe('production delegated-work composition', () => {
         project: (scope) =>
           scope.terminalMessageId
             ? artifactRepository.listMessageFiles({
-                projectName: scope.session.projectId,
+                projectId: scope.session.projectId,
                 sessionId: scope.session.sessionId,
                 messageId: scope.terminalMessageId
               })
@@ -1983,7 +1979,7 @@ describe('production delegated-work composition', () => {
     const notebookDataDir = join(notebookSessionRoot, 'data')
     const lane = createFrameNotebookLane('project-1', 'session-codex', control.input.frameId)
     await notebookRepository.loadOrCreate({
-      projectName: 'project-1',
+      projectId: 'project-1',
       sessionId: 'session-codex',
       workspaceCwd: control.input.workspaceCwd!,
       lane
@@ -1994,7 +1990,7 @@ describe('production delegated-work composition', () => {
     const sourceStat = await stat(sourcePath)
     const rootFrameId = harness.durable().conversationGraph!.rootFrameId
     await notebookRepository.appendRun({
-      projectName: 'project-1',
+      projectId: 'project-1',
       sessionId: 'session-codex',
       lane,
       run: {
@@ -2028,7 +2024,7 @@ describe('production delegated-work composition', () => {
     })
     const environment = {
       storageRoot: root,
-      projectName: 'project-1',
+      projectId: 'project-1',
       sessionId: 'session-codex',
       currentRunFile: control.input.artifactCurrentRunFile!,
       allowedImportRoots: [control.input.workspaceCwd!],
@@ -2135,7 +2131,7 @@ describe('production delegated-work composition', () => {
         listRunVersions: async ({ artifactRunId }) => versionsByRun.get(artifactRunId) ?? [],
         writeAppGeneratedVersion: async (request) => {
           const pendingFile = await artifactRepository.writePendingFile({
-            projectName: request.projectId,
+            projectId: request.projectId,
             sessionId: request.artifactStorageSessionId,
             runId: request.artifactRunId,
             filename: request.filename,
