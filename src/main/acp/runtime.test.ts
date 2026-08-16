@@ -9169,7 +9169,12 @@ describe('ACP runtime session management', () => {
         appSessionId: session.sessionId,
         artifactRunId: capturedContext?.artifactRunId,
         rootFrameId: 'root-frame-1',
-        allowedMethods: ['artifactCreateVersion', 'artifactReplayVersion']
+        allowedMethods: [
+          'artifactReserveWrite',
+          'artifactReleaseWrite',
+          'artifactCreateVersion',
+          'artifactReplayVersion'
+        ]
       })
     ])
     expect(revokedTokens).toEqual(['run-capability-1'])
@@ -19983,11 +19988,16 @@ describe('ACP runtime session management', () => {
     const rpcServer = new NotebookLocalRpcServer(notebookService, {
       transport: 'tcp',
       artifactProvenance: {
-        createVersion: async (request) => {
+        createVersion: async (request, signal) => {
           rpcWriteStarted.resolve()
           await releaseRpcWrite.promise
-          return durableProvenance.createVersion(request)
-        }
+          return durableProvenance.createVersion(request, signal)
+        },
+        reserveWrite: (request) => durableProvenance.reserveWrite(request),
+        releaseWriteReservation: (request) => durableProvenance.releaseWriteReservation(request),
+        releaseRunWriteReservations: (request) =>
+          durableProvenance.releaseRunWriteReservations(request),
+        releaseAllWriteReservations: () => durableProvenance.releaseAllWriteReservations()
       }
     })
     const rpcConnection = await rpcServer.ensureStarted()
@@ -19995,6 +20005,10 @@ describe('ACP runtime session management', () => {
     let rpcWrite: Promise<Response> | undefined
     let artifactClaimId: string | undefined
     let currentRunFile = ''
+    const rpcFilename = 'rpc-late.txt'
+    const rpcContent = 'accepted RPC bytes'
+    const rpcSizeBytes = Buffer.byteLength(rpcContent)
+    const rpcChecksum = createHash('sha256').update(rpcContent).digest('hex')
     const process = new FakeAgentProcess()
     const fakeAgent = startFakeAgent(process, ['remote-session-1'], {
       onPrompt: async ({ sessionId }) => {
@@ -20016,9 +20030,30 @@ describe('ACP runtime session management', () => {
           projectName: 'project-1',
           sessionId: artifactStorageSessionId,
           runId: context.artifactRunId,
-          filename: 'rpc-late.txt',
-          source: { kind: 'inline', content: 'accepted RPC bytes', encoding: 'utf8' }
+          filename: rpcFilename,
+          source: { kind: 'inline', content: rpcContent, encoding: 'utf8' }
         })
+        const reservationResponse = await fetch(rpcConnection.endpoint, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${context.rpcCapabilityToken}`,
+            'content-type': 'application/json'
+          },
+          body: JSON.stringify({
+            method: 'artifactReserveWrite',
+            params: {
+              projectId: 'project-1',
+              appSessionId: sessionId,
+              artifactStorageSessionId,
+              artifactRunId: context.artifactRunId,
+              writeOperationId: 'write-rpc-late',
+              filename: rpcFilename,
+              fileBytes: rpcSizeBytes
+            }
+          })
+        })
+        expect(reservationResponse.status).toBe(200)
+        const reservation = (await reservationResponse.json()) as { result: { id: string } }
         rpcWrite = fetch(rpcConnection.endpoint, {
           method: 'POST',
           headers: {
@@ -20034,12 +20069,15 @@ describe('ACP runtime session management', () => {
               artifactRunId: context.artifactRunId,
               writeOperationId: 'write-rpc-late',
               writeRequestChecksum: 'c'.repeat(64),
+              resourceReservationId: reservation.result.id,
+              resourceSizeBytes: rpcSizeBytes,
+              resourceChecksum: rpcChecksum,
               rootFrameId: context.rootFrameId,
               agentFrameId: context.agentFrameId,
               messageBranchId: context.messageBranchId,
               runtimeSegmentId: context.runtimeSegmentId,
               promptMessageId: context.promptMessageId,
-              filename: 'rpc-late.txt',
+              filename: rpcFilename,
               contentType: 'text/plain'
             }
           })
@@ -22150,6 +22188,44 @@ describe('ACP runtime — model hot switch', () => {
       })
     }
   }
+
+  it('reports model facts only while the Session has an active attachment', async () => {
+    const initialProcess = new FakeAgentProcess()
+    const resumedProcess = new FakeAgentProcess()
+    startFakeAgent(initialProcess, ['s-model'], { configOptions: [modelOption()] })
+    startFakeAgent(resumedProcess, [], { configOptions: [modelOption()] })
+    let spawnCount = 0
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      resolveBackend: () => ({
+        framework: {
+          ...claudeCodeFramework,
+          spawn: () => asAgentProcess(spawnCount++ === 0 ? initialProcess : resumedProcess)
+        },
+        backendId: 'claude-code:provider-a',
+        modelRoute: 'claude-anthropic',
+        executablePath: '/bin/claude',
+        env: {},
+        sessionModel: 'model-a',
+        supportsImageInput: true,
+        contextUsageModel: 'model-a'
+      })
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    expect(runtime.captureSessionModel(session.sessionId)).toMatchObject({
+      backend: { context: { model: 'model-a' } }
+    })
+
+    await runtime.disconnect()
+    expect(runtime.captureSessionModel(session.sessionId)).toBeUndefined()
+
+    await runtime.resumeSession({ sessionId: session.sessionId, cwd: '/workspace' })
+    expect(runtime.captureSessionModel(session.sessionId)).toMatchObject({
+      backend: { context: { model: 'model-a' } }
+    })
+  })
 
   it('switches every idle session and the generation default without replacing the process', async () => {
     const process = new FakeAgentProcess()

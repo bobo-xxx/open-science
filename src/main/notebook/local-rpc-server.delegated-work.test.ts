@@ -126,9 +126,13 @@ describe('authenticated delegatedWorkCall route', () => {
     ).toEqual({
       'host.children': 'unavailable',
       'host.collect': 'unavailable',
+      'host.currentModel': 'unavailable',
       'host.delegate': 'unavailable',
+      'host.listModels': 'unavailable',
+      'host.llm': 'unavailable',
       'host.messageReceipt': 'unavailable',
       'host.resolveMessage': 'unavailable',
+      'host.sessions': 'unavailable',
       'host.sendFrameMessage': 'unavailable',
       'host.stopChild': 'unavailable',
       'host.submitOutput': 'unavailable',

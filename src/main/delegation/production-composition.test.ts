@@ -558,6 +558,117 @@ afterEach(async () => {
 })
 
 describe('production delegated-work composition', () => {
+  it('lets a legacy Session without delegated history establish its durable framework identity', async () => {
+    root = await mkdtemp(join(tmpdir(), 'delegated-production-legacy-identity-'))
+    const harness = await createCompositionHarness(root, 'claude-code')
+    const legacy = structuredClone(harness.session)
+    delete legacy.agentFrameworkId
+    harness.replaceDurable(legacy)
+
+    await expect(harness.composition.root.wakeMessages?.(legacy.id)).resolves.toBeUndefined()
+    expect(harness.selected).toEqual([])
+
+    harness.replaceDurable({ ...harness.durable(), agentFrameworkId: 'claude-code' })
+    await expect(harness.composition.root.wakeMessages?.(legacy.id)).resolves.toBeUndefined()
+    expect(harness.selected).toEqual(['claude-code'])
+  })
+
+  it('rejects a missing framework identity when delegated history already exists', async () => {
+    root = await mkdtemp(join(tmpdir(), 'delegated-production-invalid-identity-'))
+    const harness = await createCompositionHarness(root, 'opencode')
+    const invalid = structuredClone(harness.session)
+    delete invalid.agentFrameworkId
+    invalid.runtimeContext = {
+      version: 1,
+      revision: 1,
+      delegatedWork: { records: [] }
+    }
+    harness.replaceDurable(invalid)
+
+    await expect(harness.composition.root.wakeMessages?.(invalid.id)).rejects.toThrow(
+      'Delegated Work requires a durable Session framework identity.'
+    )
+  })
+
+  it('blocks only new child admission when the Session delegation policy is deny', async () => {
+    root = await mkdtemp(join(tmpdir(), 'delegated-production-policy-'))
+    const harness = await createCompositionHarness(root, 'codex')
+    harness.replaceDurable({ ...harness.durable(), delegationPolicy: 'deny' })
+
+    await expect(
+      harness.composition.host.delegate(
+        harness.caller,
+        { task: 'blocked child', name: 'blocked child' },
+        { wait: false }
+      )
+    ).rejects.toMatchObject({
+      code: 'admission_rejection',
+      message: expect.stringMatching(/delegation is disabled/i)
+    })
+    expect(harness.execution.reservationCounts()).toEqual([])
+
+    harness.replaceDurable({ ...harness.durable(), delegationPolicy: 'allow' })
+    const admitted = await harness.composition.host.delegate(
+      harness.caller,
+      { task: 'existing child', name: 'existing child' },
+      { wait: false }
+    )
+    expect(admitted).toMatchObject({
+      kind: 'receipts',
+      children: [{ name: 'existing child' }]
+    })
+
+    harness.replaceDurable({ ...harness.durable(), delegationPolicy: 'deny' })
+    await expect(harness.composition.host.children(harness.caller)).resolves.toEqual([
+      expect.objectContaining({ name: 'existing child' })
+    ])
+  })
+
+  it('rechecks authoritative delegation policy inside durable child admission', async () => {
+    root = await mkdtemp(join(tmpdir(), 'delegated-production-policy-race-'))
+    const harness = await createCompositionHarness(root, 'codex')
+    let firstRead = true
+    const racingComposition = createProductionDelegatedWorkComposition({
+      dataRoot: root,
+      sessions: {
+        commands: harness.commands,
+        readSession: async () => {
+          const snapshot = structuredClone(harness.durable())
+          if (firstRead) {
+            firstRead = false
+            harness.replaceDurable({ ...snapshot, delegationPolicy: 'deny' })
+          }
+          return snapshot
+        }
+      },
+      resolveInput: async () => {
+        throw new Error('no inputs')
+      },
+      frameworks: {
+        async forSession(current) {
+          return {
+            frameworkId: current.agentFrameworkId!,
+            execution: harness.execution,
+            assertAvailable: async () => undefined
+          }
+        }
+      },
+      resolveExecutionModel: async () => testExecutionModel('codex')
+    })
+
+    await expect(
+      racingComposition.host.delegate(
+        harness.caller,
+        { task: 'racing child', name: 'racing child' },
+        { wait: false }
+      )
+    ).rejects.toMatchObject({
+      code: 'admission_rejection',
+      message: expect.stringMatching(/delegation is disabled/i)
+    })
+    expect(harness.durable().runtimeContext?.delegatedWork?.records ?? []).toEqual([])
+  })
+
   it('rejects a removed own context field before reservation, workspace, or durable mutation', async () => {
     root = await mkdtemp(join(tmpdir(), 'delegated-production-removed-context-'))
     const harness = await createCompositionHarness(root, 'codex')
@@ -1809,8 +1920,12 @@ describe('production delegated-work composition', () => {
     server = new NotebookLocalRpcServer({ execute: async () => ({}) } as never, {
       transport: 'tcp',
       artifactProvenance: {
-        createVersion: (request) => provenance.createVersion(request),
-        replayVersion: (request) => provenance.replayVersion(request)
+        createVersion: (request, signal) => provenance.createVersion(request, signal),
+        replayVersion: (request) => provenance.replayVersion(request),
+        reserveWrite: (request) => provenance.reserveWrite(request),
+        releaseWriteReservation: (request) => provenance.releaseWriteReservation(request),
+        releaseRunWriteReservations: (request) => provenance.releaseRunWriteReservations(request),
+        releaseAllWriteReservations: () => provenance.releaseAllWriteReservations()
       }
     })
     const connection = await server.ensureStarted()

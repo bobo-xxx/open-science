@@ -1521,6 +1521,120 @@ describe('repl_loop local RPC transport', () => {
     }
   }, 60_000)
 
+  it('validates and freezes Host model introspection results', async () => {
+    const requests: Array<{ method?: string; params?: Record<string, unknown> }> = []
+    const server = createServer((request, response) => {
+      let body = ''
+      request.on('data', (chunk) => (body += chunk))
+      request.on('end', () => {
+        const parsed = JSON.parse(body) as { method?: string; params?: Record<string, unknown> }
+        requests.push(parsed)
+        const result = parsed.method === 'currentModelCall' ? 'model-b' : ['model-a', 'model-b']
+        response
+          .writeHead(200, { 'content-type': 'application/json' })
+          .end(JSON.stringify({ result }))
+      })
+    })
+    const connection = await listenForLocalRpc(server, {
+      name: 'repl-loop-host-model-introspection-test',
+      transport: 'pipe'
+    })
+    const { child, send } = startLoop({
+      OPEN_SCIENCE_MCP_RPC_ENDPOINT: connection.endpoint,
+      OPEN_SCIENCE_MCP_RPC_SOCKET_PATH: connection.socketPath,
+      OPEN_SCIENCE_MCP_RPC_TOKEN: 'test-token'
+    })
+
+    try {
+      const result = await send(
+        'const current = await host.currentModel(); const models = await host.listModels(); ' +
+          'return JSON.stringify({ current, models, frozen: Object.isFrozen(models) })'
+      )
+
+      expect(result.error).toBeNull()
+      expect(JSON.parse(result.result ?? '{}')).toEqual({
+        current: 'model-b',
+        models: ['model-a', 'model-b'],
+        frozen: true
+      })
+      expect(requests).toEqual([
+        { method: 'currentModelCall', params: {} },
+        { method: 'listModelsCall', params: {} }
+      ])
+
+      const extraCurrent = await send(
+        "try { await host.currentModel('forged'); return 'no error' } " +
+          "catch (error) { return error.name + ': ' + error.message }"
+      )
+      expect(extraCurrent.result).toBe('TypeError: host.currentModel accepts no arguments')
+      expect(requests).toHaveLength(2)
+
+      const extraList = await send(
+        "try { await host.listModels({ providerId: 'forged' }); return 'no error' } " +
+          "catch (error) { return error.name + ': ' + error.message }"
+      )
+      expect(extraList.result).toBe('TypeError: host.listModels accepts no arguments')
+      expect(requests).toHaveLength(2)
+    } finally {
+      child.kill()
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      )
+    }
+  }, 60_000)
+
+  it('rejects malformed Host model introspection results', async () => {
+    const results: unknown[] = [
+      '',
+      'provider-default',
+      [],
+      ['model-b', 'model-a'],
+      ['model-a', 'model-a'],
+      ['model-a', 42]
+    ]
+    const server = createServer((request, response) => {
+      request.resume()
+      request.on('end', () => {
+        response
+          .writeHead(200, { 'content-type': 'application/json' })
+          .end(JSON.stringify({ result: results.shift() }))
+      })
+    })
+    const connection = await listenForLocalRpc(server, {
+      name: 'repl-loop-host-model-introspection-invalid-test',
+      transport: 'pipe'
+    })
+    const { child, send } = startLoop({
+      OPEN_SCIENCE_MCP_RPC_ENDPOINT: connection.endpoint,
+      OPEN_SCIENCE_MCP_RPC_SOCKET_PATH: connection.socketPath,
+      OPEN_SCIENCE_MCP_RPC_TOKEN: 'test-token'
+    })
+
+    try {
+      for (let index = 0; index < 2; index += 1) {
+        const current = await send(
+          "try { await host.currentModel(); return 'no error' } " +
+            'catch (error) { return error.message }'
+        )
+        expect(current.result).toBe('host.currentModel returned an invalid model id')
+      }
+
+      for (let index = 0; index < 4; index += 1) {
+        const models = await send(
+          "try { await host.listModels(); return 'no error' } " +
+            'catch (error) { return error.message }'
+        )
+        expect(models.result).toBe('host.listModels returned an invalid model catalog')
+      }
+      expect(results).toEqual([])
+    } finally {
+      child.kill()
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      )
+    }
+  }, 60_000)
+
   it('validates and deeply freezes host.llm single and batch results', async () => {
     const requests: Array<{ method?: string; params?: Record<string, unknown> }> = []
     const server = createServer((request, response) => {
@@ -2077,6 +2191,139 @@ describe('repl_loop local RPC transport', () => {
           'catch (error) { return error.message }'
       )
       expect(invalid.result).toBe('host.frames.list returned an invalid result')
+      expect(requests).toHaveLength(3)
+    } finally {
+      child.kill()
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      )
+    }
+  }, 60_000)
+
+  it('validates and freezes camelCase host.sessions list and inspect projections', async () => {
+    const requests: Array<{ method?: string; params?: Record<string, unknown> }> = []
+    const session = {
+      session_id: 'session-a',
+      title: 'Research session',
+      status: 'running',
+      created_at: '2026-08-01T00:00:00.000Z',
+      updated_at: '2026-08-01T00:01:00.000Z',
+      active_run_started_at: '2026-08-01T00:00:30.000Z',
+      runtime: {
+        attached: true,
+        connection_status: 'connected',
+        prompt_in_flight: true,
+        agent_prompt_in_flight: true,
+        permission_pending: false,
+        user_input_pending: false
+      },
+      active_conversation: {
+        frame_id: 'frame-1',
+        branch_id: 'branch-1',
+        message_count: 2
+      },
+      latest_observation: {
+        timestamp: '2026-08-01T00:00:45.000Z',
+        kind: 'tool',
+        level: 'info',
+        status: 'in_progress'
+      }
+    }
+    const server = createServer((request, response) => {
+      let body = ''
+      request.on('data', (chunk) => (body += chunk))
+      request.on('end', () => {
+        const parsed = JSON.parse(body) as {
+          method?: string
+          params?: Record<string, unknown>
+        }
+        requests.push(parsed)
+        const result =
+          requests.length === 3
+            ? { total_count: 0, sessions: [], private_path: '/private' }
+            : parsed.params?.op === 'inspect'
+              ? session
+              : { total_count: 1, next_cursor: 'next', sessions: [session] }
+        response
+          .writeHead(200, { 'content-type': 'application/json' })
+          .end(JSON.stringify({ result }))
+      })
+    })
+    const connection = await listenForLocalRpc(server, {
+      name: 'repl-loop-sessions-test',
+      transport: 'pipe'
+    })
+    const { child, send } = startLoop({
+      OPEN_SCIENCE_MCP_RPC_ENDPOINT: connection.endpoint,
+      OPEN_SCIENCE_MCP_RPC_SOCKET_PATH: connection.socketPath,
+      OPEN_SCIENCE_MCP_RPC_TOKEN: 'test-token'
+    })
+
+    try {
+      const projection = await send(
+        "const page = await host.sessions.list({ archived: 'include', search: 'research', limit: 2 }); " +
+          "const detail = await host.sessions.inspect('session-a'); " +
+          'return JSON.stringify({ page, detail, pageFrozen: Object.isFrozen(page), ' +
+          'sessionsFrozen: Object.isFrozen(page.sessions), sessionFrozen: Object.isFrozen(page.sessions[0]), ' +
+          'detailFrozen: Object.isFrozen(detail), runtimeFrozen: Object.isFrozen(detail.runtime), ' +
+          'conversationFrozen: Object.isFrozen(detail.activeConversation), ' +
+          'observationFrozen: Object.isFrozen(detail.latestObservation) })'
+      )
+      expect(projection.error).toBeNull()
+      expect(JSON.parse(projection.result ?? '{}')).toMatchObject({
+        page: {
+          totalCount: 1,
+          nextCursor: 'next',
+          sessions: [{ sessionId: 'session-a', activeRunStartedAt: expect.any(String) }]
+        },
+        detail: {
+          sessionId: 'session-a',
+          runtime: { connectionStatus: 'connected', promptInFlight: true },
+          activeConversation: { frameId: 'frame-1', branchId: 'branch-1', messageCount: 2 },
+          latestObservation: { kind: 'tool', status: 'in_progress' }
+        },
+        pageFrozen: true,
+        sessionsFrozen: true,
+        sessionFrozen: true,
+        detailFrozen: true,
+        runtimeFrozen: true,
+        conversationFrozen: true,
+        observationFrozen: true
+      })
+      expect(requests).toEqual([
+        {
+          method: 'sessionsCall',
+          params: {
+            op: 'list',
+            options: { archived: 'include', search: 'research', limit: 2 }
+          }
+        },
+        {
+          method: 'sessionsCall',
+          params: { op: 'inspect', session_id: 'session-a' }
+        }
+      ])
+
+      const oldOptions = await send(
+        'const errors = []; for (const call of [' +
+          "() => host.sessions.list({ projectId: 'project-a' }), " +
+          "() => host.sessions.list({ project_id: 'project-a' }), " +
+          "() => host.sessions.inspect('session-a', {})]) { " +
+          "try { await call() } catch (error) { errors.push(error.name + ': ' + error.message) } } " +
+          'return JSON.stringify(errors)'
+      )
+      expect(JSON.parse(oldOptions.result ?? '[]')).toEqual([
+        'TypeError: host.sessions.list options unknown option: projectId',
+        'TypeError: host.sessions.list options unknown option: project_id',
+        'TypeError: host.sessions.inspect accepts one sessionId'
+      ])
+      expect(requests).toHaveLength(2)
+
+      const invalid = await send(
+        "try { await host.sessions.list(); return 'no error' } " +
+          'catch (error) { return error.message }'
+      )
+      expect(invalid.result).toBe('host.sessions.list returned an invalid result')
       expect(requests).toHaveLength(3)
     } finally {
       child.kill()

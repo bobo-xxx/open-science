@@ -1,6 +1,6 @@
 ---
 name: self-awareness
-description: Inspect Open Science's JavaScript control REPL, discover managed Project files and Agent Frames, and safely feature-gate host.* calls with host.capabilities(). Use when an Agent needs to discover available host APIs, locate an Artifact or Upload Version, or read a Frame transcript in the current Project.
+description: Inspect Open Science's JavaScript control REPL, discover managed Project files, Sessions, and Agent Frames, and safely feature-gate host.* calls with host.capabilities(). Use when an Agent needs to discover available host APIs, locate an Artifact or Upload Version, diagnose a Session, or read a Frame transcript in the current Project.
 ---
 
 # Self-awareness
@@ -14,19 +14,27 @@ JavaScript control REPL; Python and R data kernels do not receive it.
 const caps = await host.capabilities()
 ```
 
-The current project-native result contains 17 known boolean keys:
+The current project-native result contains 20 known boolean keys:
 
-- `mcp` gates `host.mcp` connector calls.
+- `mcp` gates connector calls through `host.mcp(server, method, args?)`.
 - `compute` gates the `host.compute` namespace.
 - `agents` gates the `host.agents` namespace.
 - `skills` gates the `host.skills` namespace.
-- `artifacts` gates `host.artifacts` and `host.artifactPath`.
+- `artifacts` gates managed-file discovery through `host.artifacts(options?)` and exact path
+  resolution through `host.artifactPath(versionId)`.
 - `lineage` gates the read-only `host.lineage` namespace.
 - `frames` gates the read-only `host.frames` namespace.
-- `llm` gates `host.llm` one-shot, tool-less inference.
-- `viewImage` gates transient `host.viewImage(source, options?)` image attachment from an Artifact or
-  Upload Version in the current Project, or a path relative to the current execution workspace. For
-  a generated file, pass the same relative path used to save it.
+- `sessions` gates Main-only, read-only Session diagnostics through `host.sessions.list(options?)`
+  and exact lookup through `host.sessions.inspect(sessionId)` in the current Project.
+- `llm` gates one-shot, tool-less inference through `host.llm(request, options?)`.
+- `currentModel` gates exact current-model lookup through `host.currentModel()`. It returns the
+  calling Session's exact current model id and fails when the live backend cannot establish one.
+- `listModels` gates configured Host LLM model discovery through `host.listModels()`. It returns the
+  frozen, stable-sorted configured model ids for the current Host LLM Provider and framework. It
+  never refreshes over the network or merges ids across Providers.
+- `viewImage` gates transient image attachment through `host.viewImage(source, options?)`. Sources
+  may be an Artifact or Upload Version in the current Project, or a path relative to the current
+  execution workspace. For a generated file, pass the same relative path used to save it.
 - `delegate`, `children`, `collect`, `stopChild`, and `resolveMessage` are Main/root-only delegated
   work operations.
 - `sendFrameMessage` and `messageReceipt` are available to Main/root and Delegate agents when their
@@ -55,6 +63,18 @@ if (caps.llm === true) {
   const result = await host.llm('Summarize the current findings.')
 }
 
+if (caps.currentModel === true) {
+  const sessionModel = await host.currentModel()
+}
+
+if (caps.listModels === true) {
+  const hostLlmModels = await host.listModels()
+}
+
+if (caps.sessions === true) {
+  const recentSessions = await host.sessions.list({ limit: 20 })
+}
+
 if (caps.viewImage === true) {
   await host.viewImage({ path: 'results/plot.png' }, { maxSize: 1200 })
 }
@@ -67,6 +87,9 @@ if (caps.sendFrameMessage === true) {
 Do not infer capabilities by reflecting over `host`, and do not treat this result as a resource,
 credential, permission, or readiness inventory. Call it again when current availability matters; each
 call returns a fresh frozen projection.
+
+`host.help()` documents registered topics only. A `not_found` result identifies missing Help
+documentation: `not_found` does not override `host.capabilities()` or prove that a method is absent.
 
 ## Discover managed Project files
 
@@ -161,6 +184,29 @@ response never returns private reasoning, tool activities and raw inputs/outputs
 image bytes, local paths, storage and provider identifiers, internal event/stream identifiers, cost,
 or synthesized summaries. Missing, ambiguous, wrong-Session, invalid-Branch, and stale-cursor reads fail
 explicitly without enabling cross-Project discovery.
+
+## Diagnose Project Sessions
+
+When `caps.sessions === true`, use `await host.sessions.list(options)` to inspect durable Session
+metadata and bounded live runtime evidence across the token-owned current Project. This capability
+is available only to Main through its session-bound control route. Optional camelCase fields are
+`archived` (`exclude`/`include`/`only`, default `exclude`), `search`, `cursor`, and `limit` (default
+20, maximum 100). Search fuzzily matches Session title and exact Session identity. Results are
+ordered by most recent update and return `totalCount`, frozen Session projections, and `nextCursor`
+when another page exists.
+
+Use `await host.sessions.inspect(sessionId)` for one exact Session in the current Project. Both
+operations report durable identity, title, status, timestamps, archive/run metadata, current runtime
+attachment and pending-work flags, and the latest bounded runtime observation when available. Live
+runtime fields are current evidence only: a detached Session or an omitted observation does not
+rewrite or infer historical state. Missing or unreadable Sessions fail explicitly, and an incomplete
+Project catalog fails closed rather than returning a partial list.
+
+`activeConversation` contains only `frameId`, `branchId`, and `messageCount` navigation metadata.
+It never returns messages, transcripts, private reasoning, tool payloads, terminal output, or
+synthesized diagnosis. Use `host.frames.get(frameId, { sessionId, branchId })` when transcript detail
+is required. There is no Project override, mutation, recovery, cancellation, or message-send API in
+`host.sessions`; all returned projections are fresh and frozen.
 
 ## Continue with the owning Skill
 

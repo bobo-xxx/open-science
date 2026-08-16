@@ -137,7 +137,8 @@ import { runtimeRoot } from './notebook/runtime-paths'
 import { HostArtifactsService } from './notebook/host-artifacts-service'
 import { HostLineageService } from './notebook/host-lineage-service'
 import { HostFramesService } from './notebook/host-frames-service'
-import { HostLlmService } from './notebook/host-llm-service'
+import { HostSessionsService } from './notebook/host-sessions-service'
+import { HostModelService } from './notebook/host-model-service'
 import { HostViewImageService } from './notebook/host-view-image-service'
 import type { NotebookEnvironmentManager } from './notebook/runtime-service'
 import { parseArtifactVersionLocator } from '../shared/artifact-provenance'
@@ -291,6 +292,7 @@ import { ConversationSkillImporter, SkillImportApprovalBroker } from './skills/c
 import { HostSkillsService, type HostSkillsCatalog } from './skills/host-skills-service'
 import { UserSkillCatalogObserver } from './skills/user-skill-catalog-observer'
 import type { ConversationSkillImportApprovalResponse } from '../shared/settings'
+import type { TaskControlPorts } from './tasks/task-control-ports'
 import type { TaskAgentPort } from './tasks/task-runner'
 
 const permissionGrantsLog = createLogger('permission-grants')
@@ -324,6 +326,7 @@ export type ApplicationRuntimeInterfaces = {
   >
   settingsService: WindowSettingsCapabilities
   taskAgent: TaskAgentPort
+  taskControls: TaskControlPorts
   sessionDeletionCapability: Pick<SessionPersistenceCoordinator, 'setSessionDeletionHandlers'>
   archiveCapability: Pick<ArchiveCoordinator, 'isSessionAvailableById' | 'setMarkReadSessions'>
   detectActiveSessions: () => ReturnType<typeof detectActiveSessions>
@@ -723,7 +726,6 @@ const createApplicationModules = async (
   const projectDeletionCoordinator = new ProjectDeletionCoordinator(
     projectRepository,
     sessionPersistenceCoordinator,
-    previewStateRepository,
     reviewRepository,
     artifactProvenanceRepository,
     permissionGrantRegistry,
@@ -859,6 +861,10 @@ const createApplicationModules = async (
         )
       }
       return { created, session: durableSession }
+    },
+    setDelegationPolicy: async (projectId, sessionId, policy) => {
+      await projectDeletionCoordinator.recoverPendingDeletions()
+      return sessionPersistenceCoordinator.setSessionDelegationPolicy(projectId, sessionId, policy)
     },
     updateArchive: async (request) => {
       await projectDeletionCoordinator.recoverPendingDeletions()
@@ -1618,8 +1624,16 @@ const createApplicationModules = async (
     onPublishedSkillsChanged: requestSkillCatalogRefresh
   })
   const hostLlmLog = createLogger('notebook:host-llm')
-  const hostLlmService = new HostLlmService({
+  const hostModelService = new HostModelService({
     captureTarget: () => settingsService.captureActiveExplicitAgentBackendTarget(),
+    captureSessionModel: (sessionId) => runtimeRef.current?.captureSessionModel(sessionId),
+    captureModelCatalog: async () => {
+      const settings = await settingsService.getSettingsView()
+      return {
+        providers: settings.providers,
+        claudeSubscriptionProviderId: settings.claudeSubscriptionProviderId
+      }
+    },
     runner: new RestrictedInferenceRunner({
       appVersion: app.getVersion(),
       configRoot,
@@ -1667,11 +1681,18 @@ const createApplicationModules = async (
         return runtime.requestUserInput(request)
       },
       artifactProvenance: {
-        createVersion: (request) =>
+        reserveWrite: (request) => artifactProvenanceRepository.reserveWrite(request),
+        releaseWriteReservation: (request) =>
+          artifactProvenanceRepository.releaseWriteReservation(request),
+        releaseRunWriteReservations: (request) =>
+          artifactProvenanceRepository.releaseRunWriteReservations(request),
+        releaseAllWriteReservations: () =>
+          artifactProvenanceRepository.releaseAllWriteReservations(),
+        createVersion: (request, signal) =>
           sessionPersistenceCoordinator.runSessionMutation(
             request.projectId,
             request.appSessionId,
-            () => artifactProvenanceRepository.createVersion(request)
+            () => artifactProvenanceRepository.createVersion(request, signal)
           ),
         replayVersion: (request) =>
           sessionPersistenceCoordinator.runSessionMutation(
@@ -1696,22 +1717,33 @@ const createApplicationModules = async (
             mode: 'read-only'
           })
       }),
+      hostSessions: new HostSessionsService(
+        {
+          readProject: (projectId) =>
+            sessionRepository.loadProjectWithDiagnostics(projectId, { mode: 'read-only' }),
+          readSession: (projectId, sessionId) =>
+            sessionRepository.loadSessionWithDiagnostics(projectId, sessionId, {
+              mode: 'read-only'
+            })
+        },
+        { getSnapshot: () => runtimeRef.current?.getSnapshot() }
+      ),
       inputRegistry: notebookInputRegistry,
       agentsService,
       delegatedWorkService: delegatedWork.host,
       skillsService: hostSkillsService,
-      hostLlm: hostLlmService,
+      hostModel: hostModelService,
       hostViewImage: hostViewImageService
     }),
     createNotebookLocalRpcModule
   )
   // Reverse module disposal cancels active inference before the RPC server waits for its handlers.
-  await modules.add(hostLlmService, (service) => ({
-    name: 'host-llm-service',
+  await modules.add(hostModelService, (service) => ({
+    name: 'host-model-service',
     capability: service,
     dispose: () => service.shutdown()
   }))
-  void hostLlmService
+  void hostModelService
     .sweepStaleProfiles()
     .catch((error) =>
       hostLlmLog.error('stale host.llm profile cleanup failed', diagnosticErrorFields(error))
@@ -2847,6 +2879,11 @@ const createApplicationModules = async (
     notificationInbox,
     settingsService,
     taskAgent,
+    taskControls: {
+      specialists: {
+        resolve: (reference) => profileService.resolveRunnableByReference(reference)
+      }
+    },
     sessionDeletionCapability: sessionPersistenceCoordinator,
     archiveCapability: archiveCoordinator,
     detectActiveSessions: () =>

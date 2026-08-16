@@ -6,7 +6,10 @@ const HOST_CAPABILITY_BASE_KEYS = [
   'artifacts',
   'lineage',
   'frames',
+  'sessions',
   'llm',
+  'currentModel',
+  'listModels',
   'viewImage'
 ] as const
 
@@ -46,7 +49,10 @@ type HostCapabilityProjectionContext = Readonly<{
     artifacts: boolean
     lineage: boolean
     frames: boolean
+    sessions: boolean
     llm: boolean
+    currentModel: boolean
+    listModels: boolean
     viewImage: boolean
     delegate: boolean
     children: boolean
@@ -79,7 +85,14 @@ const projectHostCapabilities = (
     artifacts: allows('artifactsCall') && context.services.artifacts,
     lineage: allows('lineageCall') && context.services.lineage,
     frames: context.isControl && allows('framesCall') && context.services.frames,
+    sessions:
+      context.callerRole === 'main' &&
+      context.isControl &&
+      allows('sessionsCall') &&
+      context.services.sessions,
     llm: context.isControl && allows('llmCall') && context.services.llm,
+    currentModel: context.isControl && allows('currentModelCall') && context.services.currentModel,
+    listModels: context.isControl && allows('listModelsCall') && context.services.listModels,
     viewImage:
       context.isControl &&
       context.hasActiveControlInvocation &&

@@ -24,8 +24,11 @@ import type {
 import type {
   ArtifactRpcCapabilityBinding,
   ArtifactRpcMethod,
+  ArtifactWriteReservation,
   ArtifactVersionFile,
   CreateArtifactVersionRequest,
+  ReleaseArtifactWriteReservationRequest,
+  ReserveArtifactWriteRequest,
   ReplayArtifactVersionRequest
 } from '../../shared/artifact-provenance'
 import {
@@ -49,8 +52,13 @@ import {
   type LocalRpcListenOptions
 } from '../local-rpc-transport'
 import { createLogger, errorLogFields } from '../logger'
+import {
+  LOCAL_RESOURCE_BUDGETS,
+  ResourceBudgetExceededError,
+  readBoundedJsonBody
+} from '../resource-budget'
 import { PlanCommandError } from '../../shared/session-plan/contract'
-import type { HostLlmCallInput, HostLlmResult, HostLlmBatchItem } from './host-llm-service'
+import type { HostLlmCallInput, HostLlmResult, HostLlmBatchItem } from './host-model-service'
 import type {
   AuthenticatedDelegateCaller,
   DurableDelegatedWork
@@ -74,6 +82,7 @@ const log = createLogger('notebook:local-rpc')
 type NotebookLocalRpcServerOptions = {
   token?: string
   host?: string
+  requestBytes?: number
   now?: () => number
   onSessionReleased?: (sessionId: string) => void
   transport?: LocalRpcListenOptions['transport']
@@ -152,8 +161,20 @@ type NotebookLocalRpcServerOptions = {
   }
   requestUserInput?: (request: AgentUserChoiceRequest) => Promise<AgentUserChoiceResult>
   artifactProvenance?: {
-    createVersion(request: CreateArtifactVersionRequest): Promise<ArtifactVersionFile>
+    createVersion(
+      request: CreateArtifactVersionRequest,
+      signal?: AbortSignal
+    ): Promise<ArtifactVersionFile>
     replayVersion?(request: ReplayArtifactVersionRequest): Promise<ArtifactVersionFile | undefined>
+    reserveWrite?(request: ReserveArtifactWriteRequest): Promise<ArtifactWriteReservation>
+    releaseWriteReservation?(request: ReleaseArtifactWriteReservationRequest): Promise<void>
+    releaseRunWriteReservations?(request: {
+      projectId: string
+      appSessionId: string
+      artifactStorageSessionId: string
+      artifactRunId: string
+    }): Promise<void>
+    releaseAllWriteReservations?(): Promise<void>
   }
   inputRegistry?: Pick<NotebookInputRegistry, 'registerTurn' | 'getTurnInputs' | 'clearSession'> &
     Partial<Pick<NotebookInputRegistry, 'openRun'>>
@@ -183,6 +204,16 @@ type NotebookLocalRpcServerOptions = {
       context: { projectId: string; sessionId: string }
     ): Promise<unknown>
   }
+  hostSessions?: {
+    list(
+      options: unknown,
+      context: { projectId: string; sessionId: string; callerRole: 'main' }
+    ): Promise<unknown>
+    inspect(
+      sessionId: unknown,
+      context: { projectId: string; sessionId: string; callerRole: 'main' }
+    ): Promise<unknown>
+  }
   // host.agents control-plane SDK (issue 02): exposes the Specialist/catalog surface to the
   // JavaScript control-plane REPL via the extensible dispatcher. Never routed through host.mcp();
   // carries the trusted calling session identity captured outside the sandbox so switch()
@@ -209,8 +240,12 @@ type NotebookLocalRpcServerOptions = {
   skillsService?: {
     dispatch(op: unknown, context: TrustedCallingSession): Promise<unknown>
   }
-  hostLlm?: {
-    isAvailable(): Promise<boolean>
+  hostModel?: {
+    isLlmAvailable(): Promise<boolean>
+    isCurrentModelAvailable(sessionId: string): Promise<boolean>
+    isListModelsAvailable(): Promise<boolean>
+    currentModel(sessionId: string): Promise<string>
+    listModels(): Promise<readonly string[]>
     call(
       input: HostLlmCallInput,
       signal?: AbortSignal
@@ -311,6 +346,8 @@ class RpcHttpError extends Error {
 }
 
 const ARTIFACT_RPC_METHODS = new Set<ArtifactRpcMethod>([
+  'artifactReserveWrite',
+  'artifactReleaseWrite',
   'artifactCreateVersion',
   'artifactReplayVersion'
 ])
@@ -326,6 +363,7 @@ const CONTROL_RPC_METHODS = new Set([
   'artifactsCall',
   'lineageCall',
   'framesCall',
+  'sessionsCall',
   'mcpCall',
   'computeCall',
   'agentsCall',
@@ -333,6 +371,8 @@ const CONTROL_RPC_METHODS = new Set([
   'delegatedWorkCall',
   'skillsCall',
   'llmCall',
+  'currentModelCall',
+  'listModelsCall',
   'viewImageCall',
   'requestUserInput'
 ])
@@ -385,17 +425,6 @@ const notebookExecutionInputFingerprint = (
     .digest('hex')
 }
 
-// Reads the full HTTP request body and parses it as the notebook RPC payload.
-const readJsonBody = async (request: IncomingMessage): Promise<NotebookRpcPayload> => {
-  const chunks: Buffer[] = []
-
-  for await (const chunk of request) {
-    chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk)
-  }
-
-  return JSON.parse(Buffer.concat(chunks).toString('utf8')) as NotebookRpcPayload
-}
-
 // Writes one JSON response with an explicit HTTP status code.
 const writeJson = (response: ServerResponse, statusCode: number, payload: unknown): void => {
   response.writeHead(statusCode, { 'content-type': 'application/json' })
@@ -414,6 +443,7 @@ const closeRequestAfterResponse = (request: IncomingMessage, response: ServerRes
 class NotebookLocalRpcServer {
   private readonly token: string
   private readonly host: string
+  private readonly requestBytes: number
   private readonly now: () => number
   private readonly onSessionReleased: NotebookLocalRpcServerOptions['onSessionReleased']
   private readonly transport: NotebookLocalRpcServerOptions['transport']
@@ -427,10 +457,11 @@ class NotebookLocalRpcServer {
   private readonly hostArtifacts: NotebookLocalRpcServerOptions['hostArtifacts']
   private readonly hostLineage: NotebookLocalRpcServerOptions['hostLineage']
   private readonly hostFrames: NotebookLocalRpcServerOptions['hostFrames']
+  private readonly hostSessions: NotebookLocalRpcServerOptions['hostSessions']
   private readonly agentsService: NotebookLocalRpcServerOptions['agentsService']
   private readonly delegatedWorkService: NotebookLocalRpcServerOptions['delegatedWorkService']
   private readonly skillsService: NotebookLocalRpcServerOptions['skillsService']
-  private readonly hostLlm: NotebookLocalRpcServerOptions['hostLlm']
+  private readonly hostModel: NotebookLocalRpcServerOptions['hostModel']
   private readonly hostViewImage: NotebookLocalRpcServerOptions['hostViewImage']
   private server: Server | undefined
   private serverLifecycle: NotebookRpcServerLifecycle | undefined
@@ -463,6 +494,7 @@ class NotebookLocalRpcServer {
   ) {
     this.token = options.token ?? randomUUID()
     this.host = options.host ?? '127.0.0.1'
+    this.requestBytes = options.requestBytes ?? LOCAL_RESOURCE_BUDGETS.requestBytes
     this.now = options.now ?? Date.now
     this.onSessionReleased = options.onSessionReleased
     this.transport = options.transport
@@ -476,10 +508,11 @@ class NotebookLocalRpcServer {
     this.hostArtifacts = options.hostArtifacts
     this.hostLineage = options.hostLineage
     this.hostFrames = options.hostFrames
+    this.hostSessions = options.hostSessions
     this.agentsService = options.agentsService
     this.delegatedWorkService = options.delegatedWorkService
     this.skillsService = options.skillsService
-    this.hostLlm = options.hostLlm
+    this.hostModel = options.hostModel
     this.hostViewImage = options.hostViewImage
   }
 
@@ -498,7 +531,12 @@ class NotebookLocalRpcServer {
         : undefined,
       messageAncestry: binding.messageAncestry ? [...binding.messageAncestry] : undefined,
       allowedMethods: new Set(
-        binding.allowedMethods ?? ['artifactCreateVersion', 'artifactReplayVersion']
+        binding.allowedMethods ?? [
+          'artifactReserveWrite',
+          'artifactReleaseWrite',
+          'artifactCreateVersion',
+          'artifactReplayVersion'
+        ]
       ),
       expiresAt: this.now() + ttlMs,
       inFlightRequests: 0,
@@ -507,13 +545,24 @@ class NotebookLocalRpcServer {
     return token
   }
 
-  revokeArtifactRunCapability(token: string): Promise<void> {
+  async revokeArtifactRunCapability(token: string): Promise<void> {
     const draining = this.drainingArtifactRpcCapabilities.get(token)
     if (draining) return draining
 
     const capability = this.artifactRpcCapabilities.get(token)
     this.artifactRpcCapabilities.delete(token)
-    if (!capability || capability.inFlightRequests === 0) return Promise.resolve()
+    if (!capability) return
+    const releaseReservations = (): Promise<void> =>
+      this.artifactProvenance?.releaseRunWriteReservations?.({
+        projectId: capability.projectId,
+        appSessionId: capability.appSessionId,
+        artifactStorageSessionId: capability.artifactStorageSessionId,
+        artifactRunId: capability.artifactRunId
+      }) ?? Promise.resolve()
+    if (capability.inFlightRequests === 0) {
+      await releaseReservations()
+      return
+    }
 
     const drain = new Promise<void>((resolve) => {
       capability.drainWaiters.add(resolve)
@@ -524,7 +573,8 @@ class NotebookLocalRpcServer {
         this.drainingArtifactRpcCapabilities.delete(token)
       }
     })
-    return drain
+    await drain
+    await releaseReservations()
   }
 
   // Starts the server once on an ephemeral port and returns the connection details for MCP env.
@@ -594,7 +644,9 @@ class NotebookLocalRpcServer {
     this.executionAuthorizations.clear()
     this.consumedExecutionToolCalls.clear()
 
-    if (!server || !lifecycle) return Promise.resolve()
+    if (!server || !lifecycle) {
+      return this.artifactProvenance?.releaseAllWriteReservations?.() ?? Promise.resolve()
+    }
 
     lifecycle.closing = true
 
@@ -643,7 +695,10 @@ class NotebookLocalRpcServer {
         }
       }
     })
-    const ownedClose = operation.finally(() => {
+    const operationWithReservationCleanup = operation.finally(() =>
+      this.artifactProvenance?.releaseAllWriteReservations?.()
+    )
+    const ownedClose = operationWithReservationCleanup.finally(() => {
       if (forceCloseTimer) clearTimeout(forceCloseTimer)
       if (this.closePromise === ownedClose) this.closePromise = undefined
     })
@@ -1244,7 +1299,12 @@ class NotebookLocalRpcServer {
         artifacts: Boolean(this.hostArtifacts),
         lineage: Boolean(this.hostLineage),
         frames: Boolean(this.hostFrames),
-        llm: Boolean(this.hostLlm) && (await this.hostLlm!.isAvailable()),
+        sessions: Boolean(this.hostSessions),
+        llm: Boolean(this.hostModel) && (await this.hostModel!.isLlmAvailable()),
+        currentModel:
+          Boolean(this.hostModel) &&
+          (await this.hostModel!.isCurrentModelAvailable(sessionBinding.sessionId)),
+        listModels: Boolean(this.hostModel) && (await this.hostModel!.isListModelsAvailable()),
         viewImage:
           Boolean(this.hostViewImage) &&
           (await this.hostViewImage!.isAvailable({ sessionId: sessionBinding.sessionId })),
@@ -1318,7 +1378,7 @@ class NotebookLocalRpcServer {
         writeJson(response, 401, { error: 'Invalid notebook RPC token.' })
         return
       }
-      const payload = await readJsonBody(request)
+      const payload = await readBoundedJsonBody<NotebookRpcPayload>(request, this.requestBytes)
       activeRequest.bodyComplete = true
       const method = typeof payload.method === 'string' ? payload.method : ''
       activeRequest.method = method
@@ -1359,8 +1419,37 @@ class NotebookLocalRpcServer {
           if (method === 'framesCall' && !sessionBinding.isControl) {
             throw new RpcHttpError(403, 'host.frames requires a control-plane REPL capability.')
           }
-          if (method === 'llmCall' && !sessionBinding.isControl) {
-            throw new RpcHttpError(403, 'host.llm requires a control-plane REPL capability.')
+          if (
+            method === 'sessionsCall' &&
+            (!sessionBinding.isControl || sessionBinding.delegatedWorkRole === 'delegate')
+          ) {
+            throw new RpcHttpError(
+              403,
+              'host.sessions requires a Main control-plane REPL capability.'
+            )
+          }
+          if (
+            (method === 'llmCall' ||
+              method === 'currentModelCall' ||
+              method === 'listModelsCall') &&
+            !sessionBinding.isControl
+          ) {
+            const hostMethod =
+              method === 'currentModelCall'
+                ? 'host.currentModel'
+                : method === 'listModelsCall'
+                  ? 'host.listModels'
+                  : 'host.llm'
+            throw new RpcHttpError(403, `${hostMethod} requires a control-plane REPL capability.`)
+          }
+          if (
+            (method === 'currentModelCall' || method === 'listModelsCall') &&
+            Object.keys(params).length > 0
+          ) {
+            throw new RpcHttpError(
+              400,
+              `${method === 'currentModelCall' ? 'host.currentModel' : 'host.listModels'} RPC params must be empty.`
+            )
           }
           if (method === 'viewImageCall') {
             if (!sessionBinding.isControl || !sessionBinding.activeControlInvocation) {
@@ -1604,9 +1693,19 @@ class NotebookLocalRpcServer {
               }
             : message
 
-      writeJson(response, error instanceof RpcHttpError ? error.statusCode : 500, {
-        error: serializedError
-      })
+      if (error instanceof ResourceBudgetExceededError) {
+        closeRequestAfterResponse(request, response)
+      }
+
+      writeJson(
+        response,
+        error instanceof RpcHttpError
+          ? error.statusCode
+          : error instanceof ResourceBudgetExceededError
+            ? 413
+            : 500,
+        { error: serializedError }
+      )
     } finally {
       request.off('aborted', abortDisconnectedRequest)
       response.off('close', abortDisconnectedResponse)
@@ -1629,8 +1728,26 @@ class NotebookLocalRpcServer {
       if (!this.artifactProvenance) {
         throw new Error('Artifact Provenance persistence is not configured.')
       }
-
-      return this.artifactProvenance.createVersion(params as CreateArtifactVersionRequest)
+      const request = params as CreateArtifactVersionRequest
+      if (!request.resourceReservationId) {
+        throw new Error('Artifact Version creation requires a write reservation.')
+      }
+      return this.artifactProvenance.createVersion(request, signal)
+    }
+    if (method === 'artifactReserveWrite') {
+      if (!this.artifactProvenance?.reserveWrite) {
+        throw new Error('Artifact write reservation is not configured.')
+      }
+      return this.artifactProvenance.reserveWrite(params as ReserveArtifactWriteRequest)
+    }
+    if (method === 'artifactReleaseWrite') {
+      if (!this.artifactProvenance?.releaseWriteReservation) {
+        throw new Error('Artifact write reservation is not configured.')
+      }
+      await this.artifactProvenance.releaseWriteReservation(
+        params as ReleaseArtifactWriteReservationRequest
+      )
+      return { released: true }
     }
     if (method === 'artifactReplayVersion') {
       if (!this.artifactProvenance?.replayVersion) {
@@ -1775,12 +1892,39 @@ class NotebookLocalRpcServer {
       throw new Error('Unknown host Frame operation.')
     }
 
+    if (method === 'sessionsCall') {
+      if (!this.hostSessions) throw new Error('Host Session diagnostics are not configured.')
+      const projectId = typeof params.projectId === 'string' ? params.projectId : ''
+      const sessionId = typeof params.sessionId === 'string' ? params.sessionId : ''
+      if (!projectId || !sessionId) {
+        throw new Error('Host Session diagnostics require a session-bound Project scope.')
+      }
+      const context = { projectId, sessionId, callerRole: 'main' as const }
+      if (params.op === 'list') return this.hostSessions.list(params.options, context)
+      if (params.op === 'inspect') return this.hostSessions.inspect(params.session_id, context)
+      throw new Error('Unknown host Session operation.')
+    }
+
     if (method === 'llmCall') {
-      if (!this.hostLlm) throw new Error('host.llm is not configured.')
+      if (!this.hostModel) throw new Error('host.llm is not configured.')
       const { sessionId: _sessionId, projectId: _projectId, ...input } = params
       void _sessionId
       void _projectId
-      return this.hostLlm.call(input as HostLlmCallInput, signal)
+      return this.hostModel.call(input as HostLlmCallInput, signal)
+    }
+
+    if (method === 'currentModelCall') {
+      if (!this.hostModel) throw new Error('host.currentModel is not configured.')
+      const sessionId = typeof params.sessionId === 'string' ? params.sessionId : ''
+      if (!sessionId) {
+        throw new RpcHttpError(403, 'host.currentModel trusted Session identity is incomplete.')
+      }
+      return this.hostModel.currentModel(sessionId)
+    }
+
+    if (method === 'listModelsCall') {
+      if (!this.hostModel) throw new Error('host.listModels is not configured.')
+      return this.hostModel.listModels()
     }
 
     if (method === 'viewImageCall') {

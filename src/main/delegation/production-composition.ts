@@ -264,6 +264,14 @@ const createProductionDelegatedWorkComposition = (
   const host: ProductionDelegatedWorkComposition['host'] = Object.freeze({
     async delegate(caller, request, delegateOptions) {
       try {
+        const policySession = await options.sessions.readSession(caller.session)
+        if (policySession?.delegationPolicy === 'deny') {
+          throw new DurableDelegatedWorkError(
+            'admission_rejection',
+            'delegation is disabled for this Session',
+            'Delegation is disabled for this Session. Enable delegation before creating a Subagent.'
+          )
+        }
         const result = await (
           await workFor(caller.session)
         ).work.delegate(caller, request, delegateOptions)
@@ -405,6 +413,15 @@ const createProductionDelegatedWorkComposition = (
       await Promise.all(
         durableSessions
           .filter((session) => session.id === sessionId)
+          // A pre-framework-identity Session cannot contain app-owned delegated work. Let its ACP
+          // resume return the resolved framework so the existing renderer persistence path can
+          // durably adopt it. If delegated state exists, keep createScopedWork's strict identity
+          // check because guessing would risk replaying work through the wrong framework.
+          .filter(
+            (session) =>
+              session.agentFrameworkId !== undefined ||
+              session.runtimeContext?.delegatedWork !== undefined
+          )
           .map((session) => workFor({ projectId: session.projectId, sessionId: session.id }))
       )
       const scoped = await worksForSession(sessionId)
