@@ -10,7 +10,8 @@ import {
   type SaveSessionOptions,
   type SessionConflictRebaseField,
   type SessionLoadDiagnostics,
-  type SaveSessionManifestRequest
+  type SaveSessionManifestRequest,
+  type SessionDeletionResult
 } from '../../../../shared/session-persistence'
 import { PENDING_UPLOAD_SESSION_ID } from '../../../../shared/uploads'
 import {
@@ -27,9 +28,12 @@ type SessionPersistenceApi = {
     session: PersistedChatSession,
     options?: SaveSessionOptions
   ) => Promise<PersistedChatSession>
-  deleteSession: (request: DeleteSessionRequest) => Promise<void>
+  deleteSession: (request: DeleteSessionRequest) => Promise<SessionDeletionResult>
   saveManifest: (request: SaveSessionManifestRequest) => Promise<void>
 }
+
+const deleteSession = (request: DeleteSessionRequest): Promise<SessionDeletionResult> =>
+  window.api.sessions.deleteSession(request)
 
 type LatestSessionSaveTask = (options?: SaveSessionOptions) => Promise<PersistedChatSession>
 
@@ -216,6 +220,10 @@ type SessionCatalogRecovery =
       kind: 'damaged-authority'
       affectedFileCount: number
     }
+  | {
+      kind: 'unsupported-version'
+      affectedFileCount: number
+    }
   | { kind: 'project-deletion-recovery' }
 
 const READY_SESSION_CATALOG_RECOVERY: SessionCatalogRecovery = Object.freeze({ kind: 'ready' })
@@ -229,6 +237,15 @@ const deriveSessionCatalogRecovery = (
   }
 
   const sessionWarnings = diagnostics.warnings.filter((warning) => 'projectId' in warning)
+  const unsupportedVersionWarnings = sessionWarnings.filter(
+    (warning) => warning.kind === 'unsupported-version'
+  )
+  if (unsupportedVersionWarnings.length > 0) {
+    return {
+      kind: 'unsupported-version',
+      affectedFileCount: unsupportedVersionWarnings.length
+    }
+  }
   if (diagnostics.isComplete === false) {
     return {
       kind: 'repairable',
@@ -814,6 +831,7 @@ export {
   loadPersistedSessions,
   reconcilePendingArtifacts,
   deriveSessionCatalogRecovery,
+  deleteSession,
   saveSessionInOrder,
   useSessionPersistence
 }
