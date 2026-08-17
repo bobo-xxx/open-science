@@ -18,6 +18,8 @@ import {
 import type { ChatSession } from '@/stores/session-store'
 import type { ActivePlanProjection } from '../../../../shared/session-plan/contract'
 import type { DelegatedQuestionRequest } from '../../../../shared/session-persistence'
+import { VISION_MODEL_NOT_CONFIGURED_MESSAGE } from '../../../../shared/run-error-classification'
+import { createInitialSettingsState, useSettingsStore } from '@/stores/settings-store'
 
 // React's act() refuses to run unless the environment opts in to act-aware scheduling.
 ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
@@ -591,6 +593,7 @@ beforeEach(() => {
   onStageAttachmentFiles.mockClear()
   respondToSessionPlanMock.mockReset().mockResolvedValue(undefined)
   usePreviewWorkbenchStore.setState(createInitialPreviewWorkbenchState())
+  useSettingsStore.setState(createInitialSettingsState())
   mockHasRunningJobs = false
   mockAllJobs = []
 })
@@ -2827,6 +2830,14 @@ describe('ConversationPanel interrupted Session recovery', () => {
     await act(async () => resolveResume?.())
   })
 
+  it('does not show Session resume progress for a new conversation with no active Session', () => {
+    // Regression: `activeSession?.id === resumingSessionId` is true when both are undefined, which
+    // marked every brand-new conversation as "resuming" and suppressed the empty-state banner.
+    renderPanel()
+
+    expect(container.querySelector('[data-testid="resume-progress-indicator"]')).toBeNull()
+  })
+
   it('keeps Resume disabled while Session persistence is unavailable', () => {
     const onResumeSession = vi.fn().mockResolvedValue(undefined)
     const interruptedSession: ChatSession = {
@@ -2996,7 +3007,11 @@ describe('ConversationPanel + menu', () => {
         ?.click()
     })
     expect(usePreviewWorkbenchStore.getState().panelState).toBe('open')
-    expect(usePreviewWorkbenchStore.getState().activeItemId).toBe('tool:session-plan:plan')
+    // The pending card's Open must reuse the version-scoped Plan tab id, so the bottom
+    // progress chip and the "view plan" menu entry land on this same tab instead of a duplicate.
+    expect(usePreviewWorkbenchStore.getState().activeItemId).toBe(
+      `tool:${session.id}:plan:${completedPlanProjection.artifactVersionId}`
+    )
 
     await act(async () => {
       ;[...container.querySelectorAll<HTMLButtonElement>('button')]
@@ -4391,6 +4406,46 @@ describe('ConversationPanel error box + report affordance', () => {
     expect(reportButton()).toBeNull()
   })
 
+  it('opens Model settings from the image-support action error', () => {
+    const openSettingsToPanel = vi.fn()
+    useSettingsStore.setState({ openSettingsToPanel })
+    renderPanel({
+      view: {
+        activeSession: { ...errorSession, status: 'idle', error: undefined },
+        actionError: VISION_MODEL_NOT_CONFIGURED_MESSAGE
+      }
+    })
+
+    expect(errorBoxText()).toContain("The selected model doesn't support images.")
+    const button = Array.from(container.querySelectorAll('button')).find(
+      (candidate) => candidate.textContent === 'Model settings'
+    )
+    expect(button).toBeDefined()
+    act(() => button?.click())
+    expect(openSettingsToPanel).toHaveBeenCalledWith('model')
+  })
+
+  it('keeps the Model settings recovery action for a persisted legacy Vision error', () => {
+    const openSettingsToPanel = vi.fn()
+    useSettingsStore.setState({ openSettingsToPanel })
+    renderPanel({
+      view: {
+        activeSession: {
+          ...errorSession,
+          error: 'Configure a Vision model in Settings > Model before sending images to this model.'
+        }
+      }
+    })
+
+    expect(errorBoxText()).toContain("The selected model doesn't support images.")
+    expect(reportButton()).toBeNull()
+    const button = Array.from(container.querySelectorAll('button')).find(
+      (candidate) => candidate.textContent === 'Model settings'
+    )
+    act(() => button?.click())
+    expect(openSettingsToPanel).toHaveBeenCalledWith('model')
+  })
+
   it('shows both a transient actionError and the run failure, keeping the Report button', () => {
     // Both present: each error gets its own row, and the run failure keeps its report entry — a
     // transient error must not suppress the ability to report the actual failure.
@@ -4469,6 +4524,22 @@ describe('ConversationPanel error box + report affordance', () => {
       }
     })
     expect(errorBoxText()).toContain('Session workspace is missing')
+    expect(reportButton()).toBeNull()
+  })
+
+  it('unwraps and localizes an app-owned Vision relay failure', () => {
+    renderPanel({
+      view: {
+        activeSession: {
+          ...errorSession,
+          error:
+            "Error invoking remote method 'acp:send-prompt': Error: The Vision model returned invalid image evidence."
+        }
+      }
+    })
+
+    expect(errorBoxText()).toContain('The Vision model returned invalid image evidence.')
+    expect(errorBoxText()).not.toContain('Error invoking remote method')
     expect(reportButton()).toBeNull()
   })
 

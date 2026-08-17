@@ -4,18 +4,18 @@ import { join } from 'node:path'
 import { Prisma, PrismaClient } from '@prisma/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { applyRuntimeSchemaBaseline } from '../database/legacy-baseline-adapter'
-import { ProjectRepository } from './repository'
+import { applyRuntimeSchemaBaseline } from './legacy-baseline-adapter'
+import { ProjectRepository } from '../projects/repository'
 import {
   createProjectDbClient,
   disconnectProjectDbClient,
   migrateApplicationDatabase,
   getProjectDbClient
-} from './prisma-client'
+} from '../projects/prisma-client'
 import { ReviewRepository } from '../reviewer/repository'
 
-// Proves the runtime CREATE TABLE IF NOT EXISTS DDL is byte-compatible with the generated Prisma client
-// against a real (temp) SQLite database. Requires the query engine, which is present in dev installs.
+// Proves the application database schema and migration adapters are compatible with the generated
+// Prisma client against a real SQLite database. Requires the query engine from development installs.
 
 let storageRoot: string | undefined
 let disconnect: (() => Promise<void>) | undefined
@@ -30,7 +30,7 @@ afterEach(async () => {
   }
 })
 
-describe('project prisma client (integration)', () => {
+describe('application database (integration)', () => {
   it('covers every Prisma scalar field in the runtime SQLite schema', async () => {
     storageRoot = await mkdtemp(join(tmpdir(), 'open-science-project-schema-parity-'))
 
@@ -109,7 +109,8 @@ describe('project prisma client (integration)', () => {
         '0005_project_preview_state_owner_fk',
         '0006_database_domain_constraints',
         '0007_notification_attention_metadata',
-        '0008_database_json_constraints'
+        '0008_database_json_constraints',
+        '0009_vision_evidence'
       ]
     })
 
@@ -1020,7 +1021,8 @@ describe('project prisma client (integration)', () => {
         '0005_project_preview_state_owner_fk',
         '0006_database_domain_constraints',
         '0007_notification_attention_metadata',
-        '0008_database_json_constraints'
+        '0008_database_json_constraints',
+        '0009_vision_evidence'
       ]
     })
 

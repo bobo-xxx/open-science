@@ -17,7 +17,11 @@ import type {
   SessionPermissionProfileState
 } from '../../../../shared/permission-profiles'
 import { MAX_UPLOAD_FILE_BYTES, formatUploadSizeLimit } from '../../../../shared/uploads'
-import { isReportableRunFailure } from '../../../../shared/run-error-classification'
+import {
+  isReportableRunFailure,
+  VISION_MODEL_NOT_CONFIGURED_MESSAGE,
+  visionRunFailureMessage
+} from '../../../../shared/run-error-classification'
 import {
   AlertTriangle,
   ArrowUp,
@@ -102,6 +106,30 @@ import { hasMainConversation, type SideChatController } from './use-side-chat-co
 import type { WorkspaceComposerController } from './workspace-composer-controller'
 import type { WorkspaceConversationController } from './workspace-conversation-controller'
 import type { WorkspaceSessionController } from './workspace-session-controller'
+
+const localizeVisionRunFailure = (
+  error: string | null | undefined,
+  t: TFunction
+): string | undefined => {
+  switch (visionRunFailureMessage(error)) {
+    case VISION_MODEL_NOT_CONFIGURED_MESSAGE:
+      return t(
+        "The selected model doesn't support images. Configure a Vision model in Settings > Model to enable image support."
+      )
+    case 'The attached image is too large to prepare for the Vision model.':
+      return t('The attached image is too large to prepare for the Vision model.')
+    case 'The attached image is invalid.':
+      return t('The attached image is invalid.')
+    case 'The current images exceed the Vision evidence request budget.':
+      return t('The current images exceed the Vision evidence request budget.')
+    case 'The current Vision evidence exceeds the request budget.':
+      return t('The current Vision evidence exceeds the request budget.')
+    case 'The Vision model returned invalid image evidence.':
+      return t('The Vision model returned invalid image evidence.')
+    default:
+      return undefined
+  }
+}
 
 const composerInteractiveTransitionClassName = 'transition-colors duration-200 ease-out'
 
@@ -428,6 +456,7 @@ const ConversationPanel = ({
   const agentFrameworks = useSettingsStore((state) => state.agentFrameworks)
   const settingsLoaded = useSettingsStore((state) => state.isLoaded)
   const openSettings = useSettingsStore((state) => state.openSettings)
+  const openSettingsToPanel = useSettingsStore((state) => state.openSettingsToPanel)
   const stopSubmissionPendingRef = useRef(false)
   const [isStopping, setIsStopping] = useState(false)
   const [messageQueueExpanded, setMessageQueueExpanded] = useState(false)
@@ -437,7 +466,10 @@ const ConversationPanel = ({
   const globalSearchShortcut = window.api?.platform === 'darwin' ? '⌘K' : 'Ctrl+K'
   // Local so the interrupted banner can show a spinner and block a double-resume until the request settles.
   const [resumingSessionId, setResumingSessionId] = useState<string>()
-  const isResuming = activeSession?.id === resumingSessionId
+  const isResuming =
+    activeSession !== undefined &&
+    resumingSessionId !== undefined &&
+    activeSession.id === resumingSessionId
   // Opens the reviewable, consent-gated error report dialog for a failed run.
   const [isReportOpen, setIsReportOpen] = useState(false)
   const [isContextWindowOpen, setIsContextWindowOpen] = useState(false)
@@ -505,7 +537,13 @@ const ConversationPanel = ({
     activeSession?.status === 'waiting-plan-approval'
       ? activePendingPlan
       : undefined
-  const resolvedRunError = normalizeRunFailureError(activeSession?.error)
+  const resolvedRunError =
+    localizeVisionRunFailure(activeSession?.error, t) ??
+    normalizeRunFailureError(activeSession?.error)
+  const resolvedActionError = localizeVisionRunFailure(actionError, t) ?? actionError
+  const showVisionModelSettings =
+    visionRunFailureMessage(actionError) === VISION_MODEL_NOT_CONFIGURED_MESSAGE ||
+    visionRunFailureMessage(activeSession?.error) === VISION_MODEL_NOT_CONFIGURED_MESSAGE
   // Only unknown/opaque ACP-layer failures offer the "Report error → GitHub issue" affordance. The
   // reportability is resolved at failure time and persisted on the session: a model-provider error is
   // tagged non-reportable at the ACP layer, and an app-crafted reminder is recognized by its own text.
@@ -668,11 +706,14 @@ const ConversationPanel = ({
 
   const openPendingPlan = (): void => {
     if (!activeSession || !pendingPlan) return
-    usePreviewWorkbenchStore
-      .getState()
-      .upsertAndActivateItem(
-        createSessionPlanPreviewItem(activeSession.id, activeSession.projectId)
+    usePreviewWorkbenchStore.getState().upsertAndActivateItem(
+      createSessionPlanPreviewItem(
+        activeSession.id,
+        activeSession.projectId,
+        // Version-scoped id keeps this tab identical to the progress chip / "view plan" entry.
+        pendingPlan.artifactVersionId
       )
+    )
   }
 
   const hasTextDraft = draftDoc.nodes.some(
@@ -812,12 +853,12 @@ const ConversationPanel = ({
                     <Loader2 className="size-3.5 animate-spin" strokeWidth={2} aria-hidden="true" />
                     {t('Compacting conversation to fit the context limit…')}
                   </div>
-                ) : actionError || activeSession?.status === 'error' ? (
+                ) : resolvedActionError || activeSession?.status === 'error' ? (
                   <div className="mb-2 flex flex-col gap-1.5 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-[12px] leading-5 text-red-700 dark:border-red-800/50 dark:bg-red-950/20 dark:text-red-300">
                     {/* Transient action errors and a run failure can coexist; show each on its own row
                         so the run's report affordance is never suppressed by a transient error. */}
-                    {actionError ? (
-                      <span className="min-w-0 break-words">{actionError}</span>
+                    {resolvedActionError ? (
+                      <span className="min-w-0 break-words">{resolvedActionError}</span>
                     ) : null}
                     {activeSession?.status === 'error' ? (
                       <div className="flex items-start gap-2">
@@ -837,6 +878,17 @@ const ConversationPanel = ({
                             {t('Report error')}
                           </button>
                         ) : null}
+                      </div>
+                    ) : null}
+                    {showVisionModelSettings ? (
+                      <div>
+                        <button
+                          type="button"
+                          onClick={() => openSettingsToPanel('model')}
+                          className="inline-flex h-6 items-center rounded-md border border-red-200 bg-red-100/60 px-2 font-medium text-red-700 hover:bg-red-100 dark:border-red-800/50 dark:bg-red-900/30 dark:text-red-300 dark:hover:bg-red-900/40"
+                        >
+                          {t('Model settings')}
+                        </button>
                       </div>
                     ) : null}
                   </div>
@@ -1823,6 +1875,7 @@ const ConversationPanel = ({
         <ContextWindowDialog
           open={isContextWindowOpen}
           session={activeSession}
+          contextUsage={contextUsage}
           onOpenChange={setIsContextWindowOpen}
         />
       </section>
