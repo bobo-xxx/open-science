@@ -222,6 +222,9 @@ import { SpecialistRepository } from './specialist/repository'
 import { BuiltinSpecialistRegistry } from './specialist/builtin-registry'
 import { composeBuiltinSkillCatalog } from './specialist/package/builtin-skill-catalog'
 import { SpecialistPackageService } from './specialist/package/service'
+import { OFFICIAL_MARKETPLACE_SOURCE } from './specialist/marketplace/official-source'
+import { MarketplaceRepository } from './specialist/marketplace/repository'
+import { MarketplaceService } from './specialist/marketplace/service'
 import {
   saveSpecialistExport,
   saveSpecialistPackageReport,
@@ -397,7 +400,10 @@ const createApplicationModules = async (
     createApplicationEventModule
   )
   // One settings service backs both the settings IPC and the ACP spawn config (single source of truth).
-  const settingsRepository = new SettingsRepository(resolveStorageRoot())
+  const specialistPackageSkillAdapter = new UserSkillSpecialistPackageAdapter(resolveStorageRoot())
+  const settingsRepository = new SettingsRepository(resolveStorageRoot(), (operation) =>
+    specialistPackageSkillAdapter.runMutationExclusive(operation)
+  )
   const networkProxyRuntime = new NetworkProxyRuntime({
     setProxy: (config) => session.defaultSession.setProxy(config)
   })
@@ -457,7 +463,10 @@ const createApplicationModules = async (
       void observer.notifyCatalogChanged()
       return
     }
-    void runtimeRef.current?.requestSkillsReload()
+    if (runtimeRef.current) {
+      broadcastToRenderers('skills:catalog-changed', undefined)
+      void runtimeRef.current.requestSkillsReload()
+    }
   }
   const sideChatOwnerRef: { current: SideChatRuntimeOwner | undefined } = {
     current: undefined
@@ -955,7 +964,6 @@ const createApplicationModules = async (
   const specialistRepository = new SpecialistRepository(resolveStorageRoot())
   const appVersion = app.getVersion()
   const specialistSkills = await settingsService.listSpecialistSkillCatalog()
-  const specialistPackageSkillAdapter = new UserSkillSpecialistPackageAdapter(resolveStorageRoot())
   const packageSkills = await specialistPackageSkillAdapter.snapshot()
   const builtinRegistry = new BuiltinSpecialistRegistry({
     appVersion,
@@ -968,6 +976,7 @@ const createApplicationModules = async (
         builtin: skill.source === 'featured',
         displayName: skill.displayName,
         source: skill.source,
+        mainEnabled: skill.mainEnabled,
         ...(packageSkill ?? {})
       }
     }),
@@ -999,6 +1008,7 @@ const createApplicationModules = async (
             builtin: skill.source === 'featured',
             displayName: skill.displayName,
             source: skill.source,
+            mainEnabled: skill.mainEnabled,
             ...(packageSkill ?? {})
           }
         }),
@@ -1039,6 +1049,36 @@ const createApplicationModules = async (
       void runtime.requestSkillsReload()
     }
   })
+  const marketplaceService = new MarketplaceService({
+    repository: new MarketplaceRepository(resolveStorageRoot()),
+    packages: specialistPackageService,
+    fetch: netFetchStandard,
+    officialSource: OFFICIAL_MARKETPLACE_SOURCE,
+    getDisabledSkillIds: async () =>
+      (await settingsRepository.getSettings()).disabledSkillIds ?? [],
+    getInstalledSpecialists: async () =>
+      (await profileService.list()).map((profile) => ({
+        id: profile.id,
+        ...(profile.origin ? { origin: profile.origin } : {}),
+        ...(profile.importBaseline?.archiveDigest
+          ? { archiveDigest: profile.importBaseline.archiveDigest }
+          : {})
+      })),
+    setSkillsMainEnabled: async (ids, enabled) => {
+      await settingsRepository.setSkillsEnabled([...new Set(ids)], enabled)
+      // Startup recovery runs before the ACP runtime exists, so its initial catalog reads the
+      // restored settings directly. Later recovery must refresh the already-live catalog.
+      requestSkillCatalogRefresh()
+    }
+  })
+  try {
+    await marketplaceService.recover()
+  } catch (error) {
+    createLogger('specialist:marketplace').error(
+      'Marketplace install recovery incomplete; Marketplace remains fail-closed',
+      diagnosticErrorFields(error)
+    )
+  }
   settingsService.setSkillDeletionGuard((skillId) =>
     specialistPackageService.assertSkillDeletionAllowed(skillId)
   )
@@ -2516,7 +2556,8 @@ const createApplicationModules = async (
             },
             archive
           )
-      }
+      },
+      marketplaceService
     )
   )
   // Runtime selection UI (Settings/Onboarding): survey managed+external per language, persist the
