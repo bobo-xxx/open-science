@@ -76,7 +76,15 @@ import type {
   ComputeApprovalDecision,
   ComputeApprovalRequest,
   ComputeHost,
+  ComputeHostDeletionStatus,
+  ComputePasswordCapability,
   CreateComputeHostRequest,
+  CreatePasswordComputeHostRequest,
+  CreatePasswordComputeHostResult,
+  ResetPasswordComputeHostRequest,
+  ResetPasswordComputeHostResult,
+  ChangeComputeHostAuthenticationRequest,
+  ChangeComputeHostAuthenticationResult,
   DeleteComputeHostRequest,
   DetailsAuthor,
   JobSummary,
@@ -704,6 +712,15 @@ export interface OpenScienceAPI {
     list(): Promise<ComputeHost[]>
     get(providerId: string): Promise<ComputeHost | null>
     create(request: CreateComputeHostRequest): Promise<ComputeHost>
+    createPassword(
+      request: CreatePasswordComputeHostRequest
+    ): Promise<CreatePasswordComputeHostResult>
+    resetPassword(request: ResetPasswordComputeHostRequest): Promise<ResetPasswordComputeHostResult>
+    changeAuthentication(
+      request: ChangeComputeHostAuthenticationRequest
+    ): Promise<ChangeComputeHostAuthenticationResult>
+    passwordCapability(): Promise<ComputePasswordCapability>
+    deletionStatus(request: DeleteComputeHostRequest): Promise<ComputeHostDeletionStatus>
     delete(request: DeleteComputeHostRequest): Promise<void>
     // Selectable Host aliases parsed from ~/.ssh/config (patterns / Match blocks excluded).
     sshConfigAliases(): Promise<string[]>
@@ -924,8 +941,8 @@ export interface OpenScienceAPI {
     // Onboarding location step: check a candidate parent before letting the user commit to it.
     // The final data root is always `<parent>/OpenScience`, never the parent itself.
     validateDataRoot(parent: string): Promise<DataRootValidationResult>
-    // Settings + onboarding: classify a candidate parent (move/adopt/invalid) without committing;
-    // `dataRoot` on the result is the derived `<parent>/OpenScience` path.
+    // Settings + onboarding: classify a candidate parent (move/adopt/recover/invalid) without
+    // committing; `dataRoot` on the result is the derived `<parent>/OpenScience` path.
     inspectDataRoot(parent: string): Promise<DataRootInspection>
     migrate(parent: string): Promise<MigrationOutcome>
     // No-move pointer switch: set dataRoot then relaunch. Accepts both a 'move' (first-run, no

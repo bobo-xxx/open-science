@@ -46,7 +46,10 @@ type AcpHandlerWorkflowRuntime = {
   sendPrompt(request: AcpPromptRequest): Promise<unknown>
   getLatestUserPrompt(sessionId: string, promptMessageId: string): AcpPromptRequest | undefined
   startContinuation(request: AcpPromptRequest): Promise<void>
-  startContinuationWhen(request: AcpPromptRequest, validate: () => Promise<void>): Promise<unknown>
+  startContinuationWhenDispatchAdmitted(
+    request: AcpPromptRequest,
+    validate: () => Promise<void>
+  ): Promise<unknown>
 }
 
 type PromptNotifications = Pick<TaskNotificationService, 'trackPrompt' | 'untrackPrompt'>
@@ -117,10 +120,11 @@ const prepareSaveAsSkillContinuation = (
   }
   const preparedControlRun =
     session.status === 'running' && session.activeRun?.promptMessageId === request.promptMessageId
+  // Repository reads normalize a persisted prepared control into recovery before runtime admission.
+  // A simultaneous replay is accepted only when it passes the verified context-reset checks below.
   const recoveredPreparedControlRun =
     session.resumeRecovery?.kind === 'resume-required' &&
     session.resumeRecovery.promptMessageId === request.promptMessageId &&
-    !session.pendingHistoryReplay &&
     runtime.hasLiveSession(session.projectId, session.id)
   const graph = session.conversationGraph
   const frame = graph?.frames.find(({ id }) => id === graph.activeFrameId)
@@ -152,7 +156,7 @@ const prepareSaveAsSkillContinuation = (
     (!session.agentFrameworkId || session.agentFrameworkId === sessionBackend.framework.id)
   )
   const preparedContextResetReplay = Boolean(
-    preparedControlRun &&
+    (preparedControlRun || recoveredPreparedControlRun) &&
     preparedControlTurn &&
     session.pendingHistoryReplay?.kind === 'all' &&
     verifiedContextReset
@@ -348,7 +352,7 @@ const createAcpHandlerWorkflows = (
         text: 'Save as skill'
       })
       try {
-        await runtime.startContinuationWhen(prepared.continuation, async () => {
+        await runtime.startContinuationWhenDispatchAdmitted(prepared.continuation, async () => {
           await saveAsSkillAdmission?.(request.sessionId)
           const admitted = prepareSaveAsSkillContinuation(
             runtime,
