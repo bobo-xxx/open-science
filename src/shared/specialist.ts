@@ -1,6 +1,8 @@
 // Shared types and validation for Personal Specialist Profiles.
 // All mutation rules live here so Settings, SDK, and runtime share one contract.
 
+import { RESOURCE_ID_MAX_LENGTH, inferResourceId, validateResourceId } from './resource-id'
+
 // IPC channel names shared between main, preload, and renderer.
 export const SPECIALIST_IPC = {
   LIST: 'specialist:list',
@@ -84,13 +86,20 @@ export type SetSessionSpecialistRequest = {
   specialistId: string | undefined
 }
 
-// Response for SET_SESSION_SPECIALIST. `contextReset` is true when the live agent session was
-// replaced so the new specialist identity could take effect (Claude bakes identity into session
-// _meta at creation, so a switch requires a fresh session). When true, the renderer must replay the
-// conversation history into the next prompt so the new specialist retains continuity.
-export type SetSessionSpecialistResponse = {
-  contextReset: boolean
-}
+// Response for SET_SESSION_SPECIALIST. Persistence is committed before runtime application, so a
+// post-commit runtime/clear failure is reported as an explicit pending state and is never presented
+// as a rollback. While pending, Main rejects new user prompts and the renderer keeps drafts queued.
+export type SetSessionSpecialistResponse =
+  | {
+      status: 'applied'
+      // True when the live agent session was replaced. The renderer must replay the active Branch
+      // history into the next prompt so the new Specialist retains continuity.
+      contextReset: boolean
+    }
+  | {
+      status: 'pending'
+      reason: 'runtime-application-failed' | 'pending-state-clear-failed'
+    }
 
 export type ResolveSessionSpecialistRequest = {
   sessionId: string
@@ -241,6 +250,30 @@ export type BuiltinSpecialistEntry = {
 export type SpecialistListItem =
   ({ kind: 'custom' } & SpecialistProfileView) | BuiltinSpecialistEntry | ReviewerEntry
 
+export type SpecialistDocumentIntegrityIssue = Readonly<{
+  code:
+    | 'document-invalid'
+    | 'version-unsupported'
+    | 'legacy-schema-unsupported'
+    | 'record-invalid'
+    | 'record-sanitized'
+  // Position only; never return the malformed record because it may contain system instructions or
+  // unexpected sensitive fields.
+  recordIndex?: number
+}>
+
+export type SpecialistDocumentIntegrity =
+  | Readonly<{ status: 'ok' }>
+  | Readonly<{
+      status: 'degraded'
+      issues: readonly SpecialistDocumentIntegrityIssue[]
+    }>
+
+export type SpecialistCatalogSnapshot = Readonly<{
+  items: SpecialistListItem[]
+  integrity: SpecialistDocumentIntegrity
+}>
+
 // Resolution of a session's specialist binding at send time (requires SpecialistProfileView above).
 // 'main'        — no binding, main agent is used.
 // 'bound'       — a valid enabled profile was found.
@@ -314,33 +347,12 @@ export type SpecialistFieldError = {
 // the three never drift apart.
 export const SPECIALIST_NAME_MAX_LENGTH = 80
 export const SPECIALIST_DISPLAY_NAME_MAX_LENGTH = 80
-export const SPECIALIST_ID_MAX_LENGTH = 128
+export const SPECIALIST_ID_MAX_LENGTH = RESOURCE_ID_MAX_LENGTH
 export const SPECIALIST_DESCRIPTION_MAX_LENGTH = 200
 export const SPECIALIST_SYSTEM_PROMPT_MAX_LENGTH = 32_768
 
-const SPECIALIST_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,127}$/
-const SPECIALIST_ID_RESERVED_PREFIXES = ['os-', 'mcp-'] as const
-
-export const validateSpecialistId = (id: string): string | undefined => {
-  if (!SPECIALIST_ID_PATTERN.test(id)) {
-    return 'ID may only contain lowercase letters, numbers, and hyphens.'
-  }
-  if (SPECIALIST_ID_RESERVED_PREFIXES.some((prefix) => id.startsWith(prefix))) {
-    return 'IDs starting with os- or mcp- are reserved.'
-  }
-  return undefined
-}
-
-export const inferSpecialistId = (name: string): string | undefined => {
-  const id = name
-    .normalize('NFKC')
-    .trim()
-    .toLocaleLowerCase('en-US')
-    .replace(/[\s_]+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-+|-+$/g, '')
-  return validateSpecialistId(id) === undefined ? id : undefined
-}
+export const validateSpecialistId = validateResourceId
+export const inferSpecialistId = inferResourceId
 
 const SEMVER_PATTERN =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/
