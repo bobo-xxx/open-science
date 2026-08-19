@@ -186,6 +186,14 @@ import type {
   UpdateProjectRequest
 } from '../shared/projects'
 import type {
+  CreateTagRequest,
+  DeleteTagRequest,
+  SetTagAssignmentRequest,
+  TagSnapshot,
+  TagsChangedEvent,
+  UpdateTagRequest
+} from '../shared/tags'
+import type {
   ArtifactGroupPage,
   GetProjectFilesOverviewRequest,
   ListArtifactGroupsRequest,
@@ -361,6 +369,7 @@ import type {
   CancelMarketplaceCandidateRequest,
   GetMarketplaceReleaseRequest,
   InspectGitHubMarketplaceSourceRequest,
+  ListMarketplaceRequest,
   MarketplaceDownloadProgress,
   MarketplaceInstallPreview,
   MarketplaceInstallRequest,
@@ -600,7 +609,7 @@ export interface OpenScienceAPI {
   }
   specialist: {
     list(): Promise<SpecialistCatalogSnapshot>
-    listMarketplace(): Promise<MarketplaceSnapshot>
+    listMarketplace(request?: ListMarketplaceRequest): Promise<MarketplaceSnapshot>
     inspectGitHubMarketplaceSource(
       request: InspectGitHubMarketplaceSourceRequest
     ): Promise<MarketplaceSourceCandidate>
@@ -708,6 +717,14 @@ export interface OpenScienceAPI {
     onCreated(listener: AcpListener<Project>): RemoveListener
     onUpdated(listener: AcpListener<Project>): RemoveListener
     onDeleted(listener: AcpListener<ProjectDeletedEvent>): RemoveListener
+  }
+  tags: {
+    snapshot(): Promise<TagSnapshot>
+    create(request: CreateTagRequest): Promise<TagSnapshot>
+    update(request: UpdateTagRequest): Promise<TagSnapshot>
+    delete(request: DeleteTagRequest): Promise<TagSnapshot>
+    setAssignment(request: SetTagAssignmentRequest): Promise<TagSnapshot>
+    onChanged(listener: AcpListener<TagsChangedEvent>): RemoveListener
   }
   projectFiles: {
     getOverview(request: GetProjectFilesOverviewRequest): Promise<ProjectFilesOverview>

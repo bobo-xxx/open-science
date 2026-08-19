@@ -10,6 +10,7 @@ import { i18next } from '@/i18n'
 import { useProjectStore } from '@/stores/project-store'
 import { useSettingsStore } from '@/stores/settings-store'
 import { useSpecialistStore } from '@/stores/specialist-store'
+import { createInitialTagState, useTagStore } from '@/stores/tag-store'
 import type { SpecialistListItem } from '../../../../shared/specialist'
 import type { SpecialistExportPreview } from '../../../../shared/specialist-package'
 
@@ -95,6 +96,7 @@ beforeEach(() => {
     specialist: {
       list: vi.fn().mockResolvedValue({ items: specialistItems, integrity: { status: 'ok' } }),
       create: vi.fn(),
+      update: vi.fn(),
       setEnabled: vi.fn(),
       onCatalogChanged: vi.fn(() => vi.fn())
     },
@@ -110,6 +112,27 @@ beforeEach(() => {
     ...initialStore,
     isLoaded: true,
     items: specialistItems
+  })
+  useTagStore.setState({
+    ...createInitialTagState(),
+    status: 'ready',
+    revision: 1,
+    tags: [
+      {
+        id: 'tag-research',
+        name: 'Research',
+        iconKey: 'flask-conical',
+        colorKey: 'purple',
+        createdAt: 1,
+        updatedAt: 1
+      }
+    ],
+    assignments: ['rna-reviewer', 'builtin-curator'].map((resourceId) => ({
+      tagId: 'tag-research',
+      resourceType: 'catalog.specialist' as const,
+      resourceId,
+      createdAt: 1
+    }))
   })
   container = document.createElement('div')
   document.body.appendChild(container)
@@ -189,6 +212,11 @@ describe('SpecialistsPanel', () => {
     expect(document.body.textContent).toContain('RNA Reviewer')
     expect(
       document.body.querySelector<HTMLButtonElement>('[aria-label="Edit RNA Reviewer"]')?.disabled
+    ).toBe(true)
+    expect(
+      document.body.querySelector<HTMLButtonElement>(
+        '[aria-label="Change appearance for RNA Reviewer"]'
+      )?.disabled
     ).toBe(true)
     expect(
       document.body.querySelector<HTMLButtonElement>('[aria-label="Toggle RNA Reviewer"]')?.disabled
@@ -403,16 +431,16 @@ describe('SpecialistsPanel', () => {
           <SpecialistsPanel view={{ kind: 'export', id: 'rna-reviewer' }} onNavigate={onNavigate} />
         )
       })
-      expect(document.body.textContent).toContain('Skill 名称重复')
-      expect(document.body.textContent).toContain('Skill 列表不得包含重复名称')
+      expect(document.body.textContent).toContain('技能名称重复')
+      expect(document.body.textContent).toContain('技能列表不得包含重复名称')
       expect(document.body.textContent).toContain('无效的描述')
       expect(document.body.textContent).toContain('描述必须是长度限制内的非空字符串')
 
       await act(async () => {
         await i18next.changeLanguage('zh-Hant')
       })
-      expect(document.body.textContent).toContain('Skill 名稱重複')
-      expect(document.body.textContent).toContain('Skill 清單不得包含重複名稱')
+      expect(document.body.textContent).toContain('技能名稱重複')
+      expect(document.body.textContent).toContain('技能清單不得包含重複名稱')
       expect(document.body.textContent).toContain('無效的描述')
       expect(document.body.textContent).toContain('描述必須是長度限制內的非空字串')
       expect(document.body.textContent).not.toContain('specialist.skillIds-duplicate')
@@ -934,6 +962,21 @@ describe('SpecialistsPanel', () => {
     expect(document.body.textContent).toContain('Modified after import')
   })
 
+  it('keeps Specialist Tags in the third metadata row', async () => {
+    await act(async () => {
+      root.render(<SpecialistsPanel view={{ kind: 'list' }} onNavigate={vi.fn()} />)
+    })
+
+    for (const resourceId of ['rna-reviewer', 'builtin-curator']) {
+      const metadata = document.body.querySelector(
+        `[data-specialist-metadata-group="${resourceId}"]`
+      )
+      const tagName = metadata?.querySelector('[title="Research"]')
+      expect(metadata).not.toBeNull()
+      expect(tagName).not.toBeNull()
+    }
+  })
+
   it('distinguishes a Marketplace install from a manually imported ZIP', async () => {
     const installed: SpecialistListItem = {
       ...(specialistItems[0] as Extract<SpecialistListItem, { kind: 'custom' }>),
@@ -1011,6 +1054,9 @@ describe('SpecialistsPanel', () => {
     expect(builtin).not.toBeNull()
     expect(document.body.querySelector('[aria-label="Toggle Builtin Curator"]')).toBeNull()
     expect(document.body.querySelector('[aria-label="Actions for Builtin Curator"]')).toBeNull()
+    expect(
+      document.body.querySelector('[aria-label="Change appearance for Builtin Curator"]')
+    ).toBeNull()
     await act(async () => builtin!.click())
     expect(onNavigate).toHaveBeenCalledWith({ kind: 'builtin', id: 'builtin-curator' })
 
@@ -1063,6 +1109,122 @@ describe('SpecialistsPanel', () => {
     })
 
     expect(document.body.querySelector('[data-specialist-icon="microscope"]')).not.toBeNull()
+  })
+
+  it('updates a custom specialist color from the avatar without opening the editor', async () => {
+    const onNavigate = vi.fn()
+    const current = specialistItems[0] as Extract<SpecialistListItem, { kind: 'custom' }>
+    const updated = { ...current, colorKey: 'purple', revision: 2 }
+    window.api.specialist.update = vi.fn().mockResolvedValue(updated)
+    window.api.specialist.list = vi
+      .fn()
+      .mockResolvedValueOnce({ items: specialistItems, integrity: { status: 'ok' } })
+      .mockResolvedValue({
+        items: [updated, ...specialistItems.slice(1)],
+        integrity: { status: 'ok' }
+      })
+
+    await act(async () => {
+      root.render(<SpecialistsPanel view={{ kind: 'list' }} onNavigate={onNavigate} />)
+    })
+
+    const trigger = document.body.querySelector<HTMLButtonElement>(
+      '[aria-label="Change appearance for RNA Reviewer"]'
+    )
+    expect(trigger).not.toBeNull()
+    openRadixMenu(trigger)
+
+    const purple = document.body.querySelector<HTMLButtonElement>('[aria-label="Purple"]')
+    expect(purple).not.toBeNull()
+    await act(async () => purple!.click())
+
+    await vi.waitFor(() =>
+      expect(window.api.specialist.update).toHaveBeenCalledWith({
+        id: 'rna-reviewer',
+        revision: 1,
+        colorKey: 'purple'
+      })
+    )
+    expect(onNavigate).not.toHaveBeenCalled()
+    expect(document.body.textContent).toContain('Saved')
+    expect(document.body.querySelector('[aria-label="Purple"]')).not.toBeNull()
+  })
+
+  it('routes wheel input from the popover to the hidden icon scroller', async () => {
+    await act(async () => {
+      root.render(<SpecialistsPanel view={{ kind: 'list' }} onNavigate={vi.fn()} />)
+    })
+    openRadixMenu(
+      document.body.querySelector<HTMLButtonElement>(
+        '[aria-label="Change appearance for RNA Reviewer"]'
+      )
+    )
+
+    const scroller = document.body.querySelector<HTMLElement>(
+      '[data-slot="specialist-icon-picker-scroll"]'
+    )
+    const content = Array.from(document.body.querySelectorAll('p')).find(
+      (element) => element.textContent === 'Appearance'
+    )?.parentElement
+    expect(scroller).not.toBeNull()
+    expect(content).not.toBeNull()
+
+    await act(async () => {
+      content!.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: 96 }))
+    })
+    expect(scroller!.scrollTop).toBe(96)
+    expect(scroller!.className).toContain('[scrollbar-width:none]')
+  })
+
+  it('rolls back a failed appearance update and retries it inline', async () => {
+    const current = specialistItems[0] as Extract<SpecialistListItem, { kind: 'custom' }>
+    const updated = { ...current, iconKey: 'atom', revision: 2 }
+    window.api.specialist.update = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('revision conflict'))
+      .mockResolvedValueOnce(updated)
+    window.api.specialist.list = vi
+      .fn()
+      .mockResolvedValueOnce({ items: specialistItems, integrity: { status: 'ok' } })
+      .mockResolvedValue({
+        items: [updated, ...specialistItems.slice(1)],
+        integrity: { status: 'ok' }
+      })
+
+    await act(async () => {
+      root.render(<SpecialistsPanel view={{ kind: 'list' }} onNavigate={vi.fn()} />)
+    })
+    openRadixMenu(
+      document.body.querySelector<HTMLButtonElement>(
+        '[aria-label="Change appearance for RNA Reviewer"]'
+      )
+    )
+
+    expect(document.body.querySelector('[aria-label="Statistician"]')).not.toBeNull()
+    await act(async () =>
+      document.body.querySelector<HTMLButtonElement>('[aria-label="Atom"]')?.click()
+    )
+    await vi.waitFor(() =>
+      expect(document.body.textContent).toContain('Appearance wasn’t saved. Try again.')
+    )
+    expect(
+      document.body
+        .querySelector('[aria-label="Change appearance for RNA Reviewer"]')
+        ?.getAttribute('aria-invalid')
+    ).toBe('true')
+
+    await act(async () =>
+      Array.from(document.body.querySelectorAll<HTMLButtonElement>('button'))
+        .find((button) => button.textContent === 'Try again')
+        ?.click()
+    )
+    await vi.waitFor(() => expect(window.api.specialist.update).toHaveBeenCalledTimes(2))
+    expect(window.api.specialist.update).toHaveBeenLastCalledWith({
+      id: 'rna-reviewer',
+      revision: 1,
+      iconKey: 'atom'
+    })
+    expect(document.body.textContent).toContain('Saved')
   })
 
   it('navigates to the edit view when a custom specialist row body is clicked', async () => {

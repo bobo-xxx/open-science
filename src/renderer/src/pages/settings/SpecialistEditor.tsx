@@ -4,7 +4,14 @@ import { ChevronDown, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
-import { Select, SelectContent, SelectItem, SelectTrigger } from '@/components/ui/select'
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectLabel,
+  SelectTrigger
+} from '@/components/ui/select'
 import { cn } from '@/lib/utils'
 import { formatDisplayNumber } from '@/lib/locale-format'
 import {
@@ -22,13 +29,16 @@ import {
   type SpecialistProfileView
 } from '../../../../shared/specialist'
 import { SpecialistAvatar } from './specialist-avatar'
-import { AVATAR_COLORS, AVATAR_ICONS } from './specialist-icons'
+import { AVATAR_COLORS, SPECIALIST_COLOR_OPTIONS } from './specialist-icons'
+import { APP_ICON_GROUPS, APP_ICONS, DEFAULT_APP_ICON } from '@/components/app-icons/registry'
 import { useSettingsStore } from '@/stores/settings-store'
+import { useTagStore } from '@/stores/tag-store'
 import { SettingsIconAction } from './SettingsLayout'
 import {
   getSettingsSearchKeyShortcuts,
   useSettingsSearchShortcut
 } from './settings-search-shortcut'
+import { TagFilter } from './ResourceTagControls'
 
 type SpecialistEditorProps = {
   onCancel: () => void
@@ -83,23 +93,8 @@ type SkillRow = {
   missing: boolean
 }
 
-const ICON_OPTIONS = [
-  { key: 'brain', label: 'Brain' },
-  { key: 'beaker', label: 'Beaker' },
-  { key: 'book-open', label: 'Book' },
-  { key: 'flask-conical', label: 'Flask' },
-  { key: 'microscope', label: 'Microscope' },
-  { key: 'search', label: 'Search' }
-] as const
-
-const COLOR_OPTIONS = [
-  { key: 'blue', label: 'Blue' },
-  { key: 'green', label: 'Green' },
-  { key: 'teal', label: 'Teal' },
-  { key: 'amber', label: 'Amber' },
-  { key: 'purple', label: 'Purple' },
-  { key: 'slate', label: 'Slate' }
-] as const
+// Flat view of the grouped registry for selected-value lookups (trigger label, previews).
+const ICON_ENTRIES = APP_ICON_GROUPS.flatMap((group) => group.icons)
 
 const SpecialistEditor = ({
   onCancel,
@@ -112,6 +107,15 @@ const SpecialistEditor = ({
   initialInput
 }: SpecialistEditorProps): React.JSX.Element => {
   const { t } = useTranslation()
+
+  // Group headers for the icon picker. Literal t() call sites keep the i18n catalog
+  // guard able to see them; a dynamic t(group.label) lookup would be invisible to it.
+  const iconGroupLabels: Record<string, string> = {
+    science: t('Science'),
+    research: t('Research'),
+    roles: t('Roles'),
+    engineering: t('Engineering')
+  }
 
   const isEdit = editSpecialist !== undefined
   const connectors = useSettingsStore((state) => state.connectors)
@@ -166,6 +170,9 @@ const SpecialistEditor = ({
   const [activeCapTab, setActiveCapTab] = useState<'skills' | 'connectors'>('skills')
   const [skillSearchQuery, setSkillSearchQuery] = useState('')
   const [connectorSearchQuery, setConnectorSearchQuery] = useState('')
+  const [skillTagFilter, setSkillTagFilter] = useState('all')
+  const [connectorTagFilter, setConnectorTagFilter] = useState('all')
+  const tagAssignments = useTagStore((state) => state.assignments)
   const skillSearchRef = useRef<HTMLInputElement>(null)
   const connectorSearchRef = useRef<HTMLInputElement>(null)
   const [skillPopoverOpen, setSkillPopoverOpen] = useState(false)
@@ -338,24 +345,46 @@ const SpecialistEditor = ({
   }, [connectors, customServers, form.connectorIds])
 
   const filteredAddableSkills = useMemo(() => {
-    if (!skillSearchQuery.trim()) return addableSkills
+    const tagged =
+      skillTagFilter === 'all'
+        ? addableSkills
+        : addableSkills.filter((skill) =>
+            tagAssignments.some(
+              (assignment) =>
+                assignment.tagId === skillTagFilter &&
+                assignment.resourceType === 'catalog.skill' &&
+                assignment.resourceId === skill.id
+            )
+          )
+    if (!skillSearchQuery.trim()) return tagged
     const q = skillSearchQuery.toLowerCase()
-    return addableSkills.filter(
+    return tagged.filter(
       (skill) =>
         skill.name.toLowerCase().includes(q) ||
         (skill.description && skill.description.toLowerCase().includes(q))
     )
-  }, [addableSkills, skillSearchQuery])
+  }, [addableSkills, skillSearchQuery, skillTagFilter, tagAssignments])
 
   const filteredAddableConnectors = useMemo(() => {
-    if (!connectorSearchQuery.trim()) return addableConnectors
+    const tagged =
+      connectorTagFilter === 'all'
+        ? addableConnectors
+        : addableConnectors.filter((connector) =>
+            tagAssignments.some(
+              (assignment) =>
+                assignment.tagId === connectorTagFilter &&
+                assignment.resourceType === 'catalog.connector' &&
+                assignment.resourceId === connector.id
+            )
+          )
+    if (!connectorSearchQuery.trim()) return tagged
     const q = connectorSearchQuery.toLowerCase()
-    return addableConnectors.filter(
+    return tagged.filter(
       (connector) =>
         connector.name.toLowerCase().includes(q) ||
         (connector.description && connector.description.toLowerCase().includes(q))
     )
-  }, [addableConnectors, connectorSearchQuery])
+  }, [addableConnectors, connectorSearchQuery, connectorTagFilter, tagAssignments])
 
   const addSkill = (id: string): void =>
     setForm((prev) =>
@@ -633,24 +662,33 @@ const SpecialistEditor = ({
                 <SelectTrigger aria-label={t('Specialist icon')}>
                   <span className="flex items-center gap-2">
                     {(() => {
-                      const Icon = AVATAR_ICONS[form.iconKey] ?? AVATAR_ICONS.brain
+                      const Icon = APP_ICONS[form.iconKey] ?? DEFAULT_APP_ICON
                       return <Icon className="size-4 shrink-0" aria-hidden="true" />
                     })()}
-                    <span>{ICON_OPTIONS.find((option) => option.key === form.iconKey)?.label}</span>
+                    <span>
+                      {(() => {
+                        const label = ICON_ENTRIES.find(
+                          (option) => option.key === form.iconKey
+                        )?.label
+                        return label === undefined ? undefined : t(label)
+                      })()}
+                    </span>
                   </span>
                 </SelectTrigger>
                 <SelectContent>
-                  {ICON_OPTIONS.map((option) => {
-                    const Icon = AVATAR_ICONS[option.key] ?? AVATAR_ICONS.brain
-                    return (
-                      <SelectItem key={option.key} value={option.key}>
-                        <span className="flex items-center gap-2">
-                          <Icon className="size-4 shrink-0" aria-hidden="true" />
-                          {option.label}
-                        </span>
-                      </SelectItem>
-                    )
-                  })}
+                  {APP_ICON_GROUPS.map((group) => (
+                    <SelectGroup key={group.key}>
+                      <SelectLabel>{iconGroupLabels[group.key] ?? group.label}</SelectLabel>
+                      {group.icons.map((option) => (
+                        <SelectItem key={option.key} value={option.key}>
+                          <span className="flex items-center gap-2">
+                            <option.Icon className="size-4 shrink-0" aria-hidden="true" />
+                            {t(option.label)}
+                          </span>
+                        </SelectItem>
+                      ))}
+                    </SelectGroup>
+                  ))}
                 </SelectContent>
               </Select>
             </div>
@@ -668,12 +706,15 @@ const SpecialistEditor = ({
                       aria-hidden="true"
                     />
                     <span>
-                      {COLOR_OPTIONS.find((option) => option.key === form.colorKey)?.label}
+                      {t(
+                        SPECIALIST_COLOR_OPTIONS.find((option) => option.key === form.colorKey)
+                          ?.label ?? 'Purple'
+                      )}
                     </span>
                   </span>
                 </SelectTrigger>
                 <SelectContent>
-                  {COLOR_OPTIONS.map((option) => (
+                  {SPECIALIST_COLOR_OPTIONS.map((option) => (
                     <SelectItem key={option.key} value={option.key}>
                       <span className="flex items-center gap-2">
                         <span
@@ -681,7 +722,7 @@ const SpecialistEditor = ({
                           style={{ background: AVATAR_COLORS[option.key] }}
                           aria-hidden="true"
                         />
-                        {option.label}
+                        {t(option.label)}
                       </span>
                     </SelectItem>
                   ))}
@@ -1036,6 +1077,12 @@ const SpecialistEditor = ({
                             onChange={(e) => setSkillSearchQuery(e.target.value)}
                             className="w-full rounded-md border border-border bg-card px-2.5 py-1.5 text-[12.5px] text-foreground placeholder:text-muted-foreground outline-none focus:border-primary"
                           />
+                          <TagFilter
+                            resourceType="catalog.skill"
+                            value={skillTagFilter}
+                            onChange={setSkillTagFilter}
+                            className="mt-2 w-full"
+                          />
                         </div>
                         <div className="flex-1">
                           {filteredAddableSkills.length === 0 ? (
@@ -1091,6 +1138,12 @@ const SpecialistEditor = ({
                             value={connectorSearchQuery}
                             onChange={(e) => setConnectorSearchQuery(e.target.value)}
                             className="w-full rounded-md border border-border bg-card px-2.5 py-1.5 text-[12.5px] text-foreground placeholder:text-muted-foreground outline-none focus:border-primary"
+                          />
+                          <TagFilter
+                            resourceType="catalog.connector"
+                            value={connectorTagFilter}
+                            onChange={setConnectorTagFilter}
+                            className="mt-2 w-full"
                           />
                         </div>
                         <div className="flex-1">

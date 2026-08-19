@@ -24,6 +24,7 @@ import { notificationAttentionMetadataMigration } from './migrations/0007-notifi
 import { databaseJsonConstraintsMigration } from './migrations/0008-database-json-constraints'
 import { visionEvidenceMigration } from './migrations/0009-vision-evidence'
 import { computePasswordAuthMigration } from './migrations/0010-compute-password-auth'
+import { crossResourceTagsMigration } from './migrations/0011-cross-resource-tags'
 import {
   applySqliteMigrationOperations,
   type SqliteMigrationOperation
@@ -202,6 +203,12 @@ const COMPUTE_PASSWORD_AUTH_CHECKSUM = checksumMigrationPayload(
   computePasswordAuthMigration.verifiers,
   computePasswordAuthMigration.operations
 )
+const CROSS_RESOURCE_TAGS_CHECKSUM = checksumMigrationPayload(
+  crossResourceTagsMigration.id,
+  crossResourceTagsMigration.statements,
+  crossResourceTagsMigration.verifiers,
+  crossResourceTagsMigration.operations
+)
 const DATABASE_DOMAIN_ALLOWED_SUFFIX_CHECKS: AllowedSuffixCheckConstraints = Object.fromEntries(
   databaseDomainConstraintsMigration.verifiers[0].tables.map(({ table, constraints }) => [
     table,
@@ -246,6 +253,15 @@ const COMPUTE_PASSWORD_AUTH_ALLOWED_SUFFIX_CHECKS: AllowedSuffixCheckConstraints
         Object.fromEntries(constraints.map(({ name, expression }) => [name, expression]))
       ])
   )
+const CROSS_RESOURCE_TAGS_ALLOWED_SUFFIX_CHECKS: AllowedSuffixCheckConstraints = Object.fromEntries(
+  crossResourceTagsMigration.verifiers
+    .filter((verifier) => verifier.kind === 'check-constraints-exist')
+    .flatMap((verifier) => verifier.tables)
+    .map(({ table, constraints }) => [
+      table,
+      Object.fromEntries(constraints.map(({ name, expression }) => [name, expression]))
+    ])
+)
 const mergeAllowedSuffixChecks = (
   ...contracts: readonly AllowedSuffixCheckConstraints[]
 ): AllowedSuffixCheckConstraints => {
@@ -315,6 +331,12 @@ const MIGRATION_MANIFEST = [
   {
     ...computePasswordAuthMigration,
     checksum: COMPUTE_PASSWORD_AUTH_CHECKSUM,
+    backupOnApply: 'required',
+    backupRetention: 'retain'
+  },
+  {
+    ...crossResourceTagsMigration,
+    checksum: CROSS_RESOURCE_TAGS_CHECKSUM,
     backupOnApply: 'required',
     backupRetention: 'retain'
   }
@@ -403,6 +425,13 @@ type MigrationManifestEntry = {
   verifiers: MigrationVerifiers
   backupOnApply: 'required' | 'none'
   backupRetention: 'retain' | 'delete-after-success'
+}
+
+const RETAINED_DATABASE_MIGRATION_BACKUP_LIMIT = 2
+
+type DatabaseMigrationBackupRetirementScope = {
+  throughMigrationId: string
+  includeDeleteAfterSuccess: boolean
 }
 
 const runMigrationVerifiers = async (
@@ -698,10 +727,29 @@ const createDatabaseMigrationBackup = async (
 const retireDatabaseMigrationBackups = async (
   client: PrismaClient,
   manifest: readonly MigrationManifestEntry[],
-  options: SchemaMigrationOptions
+  options: SchemaMigrationOptions,
+  scope: DatabaseMigrationBackupRetirementScope
 ): Promise<void> => {
+  const boundaryIndex = manifest.findIndex((migration) => migration.id === scope.throughMigrationId)
+  if (boundaryIndex < 0) {
+    throw new Error(`Unknown database backup retention boundary ${scope.throughMigrationId}.`)
+  }
+  const retainedMigrationIds = new Set(
+    manifest
+      .slice(0, boundaryIndex + 1)
+      .filter(
+        (migration) =>
+          migration.backupOnApply === 'required' && migration.backupRetention === 'retain'
+      )
+      .slice(-RETAINED_DATABASE_MIGRATION_BACKUP_LIMIT)
+      .map((migration) => migration.id)
+  )
   const retired = manifest.filter(
-    (migration) => migration.backupRetention === 'delete-after-success'
+    (migration) =>
+      (scope.includeDeleteAfterSuccess && migration.backupRetention === 'delete-after-success') ||
+      (migration.backupOnApply === 'required' &&
+        migration.backupRetention === 'retain' &&
+        !retainedMigrationIds.has(migration.id))
   )
   if (retired.length === 0) return
   let databasePath: string | undefined
@@ -1064,7 +1112,10 @@ const migrateApplicationDatabaseWithManifest = async (
       throw classifyDatabaseFailure(error, 'validation', latest.id)
     }
     await reportDatabaseCompatibility(client, options)
-    await retireDatabaseMigrationBackups(client, manifest, options)
+    await retireDatabaseMigrationBackups(client, manifest, options, {
+      throughMigrationId: latest.id,
+      includeDeleteAfterSuccess: true
+    })
     try {
       options.onCompleted?.(result)
     } catch {
@@ -1102,6 +1153,10 @@ const migrateApplicationDatabaseWithManifest = async (
     } catch {
       // A diagnostic sink failure must not invalidate a durable database backup.
     }
+    await retireDatabaseMigrationBackups(client, manifest, options, {
+      throughMigrationId: migrationId,
+      includeDeleteAfterSuccess: false
+    })
   }
   const repairsPreviewStateForeignKeyViolations = manifest.some(
     (candidate) =>
@@ -1132,6 +1187,11 @@ const migrateApplicationDatabaseWithManifest = async (
       candidate.id === computePasswordAuthMigration.id &&
       candidate.checksum === COMPUTE_PASSWORD_AUTH_CHECKSUM
   )
+  const adoptsCrossResourceTags = manifest.some(
+    (candidate) =>
+      candidate.id === crossResourceTagsMigration.id &&
+      candidate.checksum === CROSS_RESOURCE_TAGS_CHECKSUM
+  )
   const applied: string[] = []
   const adoptedLegacy = appliedCount === 0 && hadApplicationTablesAtStart
   const allowedSuffixChecks = mergeAllowedSuffixChecks(
@@ -1139,7 +1199,8 @@ const migrateApplicationDatabaseWithManifest = async (
     adoptsNotificationAttentionMetadata ? NOTIFICATION_ATTENTION_ALLOWED_SUFFIX_CHECKS : {},
     adoptsDatabaseJsonConstraints ? DATABASE_JSON_ALLOWED_SUFFIX_CHECKS : {},
     adoptsVisionEvidence ? VISION_EVIDENCE_ALLOWED_SUFFIX_CHECKS : {},
-    adoptsComputePasswordAuth ? COMPUTE_PASSWORD_AUTH_ALLOWED_SUFFIX_CHECKS : {}
+    adoptsComputePasswordAuth ? COMPUTE_PASSWORD_AUTH_ALLOWED_SUFFIX_CHECKS : {},
+    adoptsCrossResourceTags ? CROSS_RESOURCE_TAGS_ALLOWED_SUFFIX_CHECKS : {}
   )
 
   let nextIndex = appliedCount

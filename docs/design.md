@@ -761,6 +761,38 @@ colors communicate a successful or failed probe/migration result.
 - Specialist package schema v1 uses snake_case JSON keys (`display_name`, `system_prompt`, `skill_ids`, and `connector_ids`) while application-facing TypeScript objects remain camelCase. Package `name` stays the immutable invocation identity, the capability arrays contain portable names, and local Specialist persistence contains installation IDs. Import rejects the earlier camelCase JSON keys. Featured Skills are exported as references and are never copied into `skills/`.
 - Public JavaScript host APIs and their object fields use camelCase (`listSkills`, `listConnectors`, `attachSkill`, `displayName`, `systemPrompt`, and related fields). Internal transport operation names may remain snake_case behind that boundary.
 
+#### Cross-resource Tags
+
+- Settings -> Capabilities -> Tags is the shared organization surface for catalog resources. V1
+  adapters cover Skills, Connectors, and runnable Specialists; the Reviewer placeholder is excluded.
+  The left column manages Tags and the right column aggregates assigned resources with resource-type
+  and text filters. Selecting a result navigates through the existing Settings history to that
+  resource's detail or editor.
+- A Tag may belong to any number of resources and a resource may have any number of Tags. The same
+  Tag filter is available in the three catalog panels and in the Specialist capability picker, but
+  Specialist persistence continues to store concrete Skill and Connector IDs rather than a dynamic
+  Tag query.
+- Favorites is a protected built-in Tag. Its persisted row has the stable `systemKey` `favorite` and
+  fixed seed ID `tag-favorite`; application behavior checks `systemKey`, never the ID. Its localized
+  label, star icon, and amber color come from the renderer registry. Custom Tags persist one
+  user-entered display name plus fixed-palette icon and color keys; custom names are not translated.
+- Custom Tag IDs use Prisma CUID generation. `nameKey` is a main-process-only uniqueness key derived
+  from the cleaned display name with NFKC normalization and deterministic lowercase; it never crosses
+  the renderer contract. Names compare case-insensitively without changing the cleaned display value
+  shown to the user.
+- SQLite owns `Tag` definitions and `TagAssignment` edges. An assignment's composite identity is
+  `(tagId, resourceType, resourceId)`; deleting a custom Tag cascades its edges. `resourceType` stays a
+  registry-validated string so later resource adapters do not require a table rebuild. Catalog
+  reconciliation prunes references to deleted resources, while each V1 resource-deletion workflow
+  also removes its assignments before the deleted ID can be reused. Skill, Connector, and Specialist
+  file formats are unchanged, and no pin, bookmark, Group, import/export, or cloud-sync data is
+  migrated.
+- Resource rows and detail/editor surfaces share the same searchable assignment menu. Creating a Tag
+  from that menu assigns it immediately with the default visual; the Tags manager can then change its
+  icon or color. Assignment changes update optimistically and reload the authoritative snapshot after
+  a failure. The Tags browser keeps its selected Tag, resource filter, query, and scroll position when
+  Settings history opens a resource and returns.
+
 #### Specialist-scoped resources and Marketplace
 
 - A Skill or Connector's scope is a renderer-derived relationship, never a persisted scope enum. The four displayed states are **Main only**, **Specialist only**, **Shared with Main**, and **Not in use**, computed from the existing Main enablement preference plus durable Specialist capability memberships. Disabled Specialists still count because scope describes configuration, not current runnability.
@@ -770,6 +802,7 @@ colors communicate a successful or failed probe/migration result.
 - Settings deletion remains a device-level action, distinct from removing a capability from one Specialist. A shared resource requires an impact preview before device deletion/removal; Specialist detail changes only that Specialist's membership. Bundled Connectors are never physically deletable.
 - The Specialist Marketplace is external content, not a built-in catalog. The app loads signed static metadata from configured official mirrors or user-approved GitHub repositories, downloads a digest-pinned export-compatible ZIP only during the reviewed install flow, and defaults newly installed Skills to Main off. Marketplace rows derive **Installed** / **Update available** from persisted provenance plus the current imported Specialist identity; deleting or replacing that Specialist must not leave a stale installed badge. New provenance stores both the upstream artifact digest and the selection-filtered ZIP digest actually installed. Historical records without the latter remain readable but fail closed without an exact installed badge until a later reinstall/update records it.
 - Installed custom Specialist rows render capability scope, acquisition source, publisher, package version, and local-change status as separate read-only badges rather than one separator-delimited sentence. Exact digest-linked provenance shows **Marketplace** plus its publisher; ordinary or unverifiable historical imports show **Imported ZIP**. If more than one Marketplace source has exact provenance for the same installed archive, the latest `installedAt` record supplies the displayed publisher.
+- A custom Specialist row's avatar is a separate 44 px quick-edit trigger rather than part of the detail button. It opens a compact, collision-aware appearance popover containing the same grouped shared app icon registry and six colors as the full editor; the icon groups sit in an aligned, bounded scroll area so the quick surface stays compact. Each choice saves immediately through the existing revision-checked Specialist update path, updates the avatar optimistically, stays open for a second choice, and rolls back with an inline retry on failure. Built-in Specialists and Reviewer remain display-only, while the rest of the row continues to open the full editor.
 - After successful signature and digest verification, Marketplace root and release bytes are retained as a replaceable last-known-good cache. An unavailable source may show those verified listings with their refresh time, but installation still requires a currently downloadable ZIP with the pinned digest. User-added source removal deletes its cache without deleting installed Specialist provenance.
 - Marketplace updates use the same two-stage download/review interaction and atomic Specialist package overwrite transaction as installation. The user explicitly confirms the installed and incoming versions plus any local-change or shared-Skill conflicts; newly added Skills remain disabled for Main, and existing resources are retained unless the user removes them separately.
 

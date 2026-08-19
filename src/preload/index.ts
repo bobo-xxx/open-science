@@ -59,6 +59,7 @@ import type {
   CancelMarketplaceCandidateRequest,
   GetMarketplaceReleaseRequest,
   InspectGitHubMarketplaceSourceRequest,
+  ListMarketplaceRequest,
   MarketplaceDownloadProgress,
   MarketplaceInstallRequest,
   PrepareMarketplaceInstallRequest,
@@ -396,7 +397,8 @@ const api: OpenScienceAPI = {
   },
   specialist: {
     list: () => electronRendererContracts.invoke('specialist.list'),
-    listMarketplace: () => electronRendererContracts.invoke('specialist.listMarketplace'),
+    listMarketplace: (request?: ListMarketplaceRequest) =>
+      electronRendererContracts.invoke('specialist.listMarketplace', request),
     inspectGitHubMarketplaceSource: (request: InspectGitHubMarketplaceSourceRequest) =>
       electronRendererContracts.invoke('specialist.inspectGitHubMarketplaceSource', request),
     addMarketplaceSource: (request: AddMarketplaceSourceRequest) =>
@@ -522,6 +524,14 @@ const api: OpenScienceAPI = {
     onCreated: (listener) => electronRendererContracts.subscribe('projects.onCreated', listener),
     onUpdated: (listener) => electronRendererContracts.subscribe('projects.onUpdated', listener),
     onDeleted: (listener) => electronRendererContracts.subscribe('projects.onDeleted', listener)
+  },
+  tags: {
+    snapshot: () => electronRendererContracts.invoke('tags.snapshot'),
+    create: (request) => electronRendererContracts.invoke('tags.create', request),
+    update: (request) => electronRendererContracts.invoke('tags.update', request),
+    delete: (request) => electronRendererContracts.invoke('tags.delete', request),
+    setAssignment: (request) => electronRendererContracts.invoke('tags.setAssignment', request),
+    onChanged: (listener) => electronRendererContracts.subscribe('tags.onChanged', listener)
   },
   // Files exposes metadata pages only. Thumbnail/full-preview bytes continue through the existing
   // artifact/upload APIs after a visible item has been selected or rendered.

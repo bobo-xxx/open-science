@@ -1,13 +1,5 @@
 import type { CSSProperties } from 'react'
-import {
-  Brain,
-  Beaker,
-  BookOpen,
-  FlaskConical,
-  Microscope,
-  Search,
-  type LucideIcon
-} from 'lucide-react'
+import { APP_ICONS } from '@/components/app-icons/registry'
 
 // The color palette used for specialist avatar backgrounds. Shared between the
 // list and the editor so the preview matches the rendered row exactly.
@@ -24,14 +16,19 @@ export const DEFAULT_AVATAR_COLOR = '#ececea'
 export const getAvatarColor = (colorKey?: string): string =>
   colorKey ? (AVATAR_COLORS[colorKey] ?? DEFAULT_AVATAR_COLOR) : DEFAULT_AVATAR_COLOR
 
-export const AVATAR_ICONS: Record<string, LucideIcon> = {
-  brain: Brain,
-  beaker: Beaker,
-  'book-open': BookOpen,
-  'flask-conical': FlaskConical,
-  microscope: Microscope,
-  search: Search
-}
+// Avatar glyphs come from the shared app icon registry; the alias keeps existing
+// consumers on a stable name.
+export const AVATAR_ICONS = APP_ICONS
+
+// Colors remain shared by the compact picker and the full editor.
+export const SPECIALIST_COLOR_OPTIONS = [
+  { key: 'blue', label: 'Blue' },
+  { key: 'green', label: 'Green' },
+  { key: 'teal', label: 'Teal' },
+  { key: 'amber', label: 'Amber' },
+  { key: 'purple', label: 'Purple' },
+  { key: 'slate', label: 'Slate' }
+] as const
 
 export const getAvatarStyle = (colorKey?: string): CSSProperties => ({
   background: getAvatarColor(colorKey)
