@@ -12,6 +12,7 @@ import { createInitialProjectState, useProjectStore } from '@/stores/project-sto
 import { createInitialSessionState, useSessionStore } from '@/stores/session-store'
 import { useSpecialistStore } from '@/stores/specialist-store'
 import { createInitialSettingsState, useSettingsStore } from '@/stores/settings-store'
+import { createInitialTagState, useTagStore } from '@/stores/tag-store'
 import { SettingsPage, type SettingsPageHandle } from './SettingsPage'
 import { clickRadixMenuItem, openRadixMenu } from './test-utils'
 
@@ -183,6 +184,14 @@ const installApi = (): void => {
       create: vi.fn(),
       setEnabled: vi.fn(),
       onCatalogChanged: vi.fn(() => vi.fn())
+    },
+    tags: {
+      snapshot: vi.fn().mockResolvedValue({
+        revision: 1,
+        tags: [{ id: 'tag-favorite', systemKey: 'favorite', createdAt: 1, updatedAt: 1 }],
+        assignments: []
+      }),
+      onChanged: vi.fn(() => vi.fn())
     }
   }
 }
@@ -192,6 +201,9 @@ beforeEach(() => {
   useSettingsStore.setState(createInitialSettingsState())
   useProjectStore.setState(createInitialProjectState())
   useSessionStore.setState(createInitialSessionState())
+  useTagStore.setState(createInitialTagState())
+  // Editor drafts persist across mounts by design; keep tests independent of each other.
+  useSpecialistStore.setState({ editorDrafts: {} })
   container = document.createElement('div')
   document.body.appendChild(container)
   root = createRoot(container)
@@ -226,6 +238,214 @@ const settingsSection = (title: string): HTMLElement | undefined =>
   )
 
 describe('SettingsPage layout', () => {
+  it('opens a resource Tag through Settings history and returns to the catalog with Back', async () => {
+    vi.mocked(window.api.tags.snapshot).mockResolvedValue({
+      revision: 2,
+      tags: [{ id: 'tag-favorite', systemKey: 'favorite', createdAt: 1, updatedAt: 1 }],
+      assignments: [
+        {
+          tagId: 'tag-favorite',
+          resourceType: 'catalog.skill',
+          resourceId: 'alpha',
+          createdAt: 1
+        }
+      ]
+    })
+
+    await act(async () => root.render(<SettingsPage open onClose={vi.fn()} />))
+    await act(async () => navButton('Skills')?.click())
+
+    const tag = Array.from(document.body.querySelectorAll<HTMLButtonElement>('button')).find(
+      (button) => button.textContent?.trim() === 'Favorites'
+    )
+    expect(tag).toBeDefined()
+    expect(document.body.querySelector('button button')).toBeNull()
+    await act(async () => tag?.click())
+
+    expect(document.body.querySelector('nav [aria-current="page"]')?.textContent?.trim()).toBe(
+      'Tags'
+    )
+    expect(document.body.textContent).toContain('Alpha')
+    expect(document.body.querySelector<HTMLButtonElement>('[aria-label="Back"]')?.disabled).toBe(
+      false
+    )
+
+    await act(async () =>
+      document.body.querySelector<HTMLButtonElement>('[aria-label="Back"]')?.click()
+    )
+    expect(document.body.querySelector('nav [aria-current="page"]')?.textContent?.trim()).toBe(
+      'Skills'
+    )
+  })
+
+  it('restores the Tag selected by a Settings history entry', async () => {
+    vi.mocked(window.api.tags.snapshot).mockResolvedValue({
+      revision: 2,
+      tags: [
+        { id: 'tag-favorite', systemKey: 'favorite', createdAt: 1, updatedAt: 1 },
+        {
+          id: 'tag-research',
+          name: 'Research',
+          iconKey: 'book-open',
+          colorKey: 'purple',
+          createdAt: 2,
+          updatedAt: 2
+        }
+      ],
+      assignments: [
+        {
+          tagId: 'tag-favorite',
+          resourceType: 'catalog.skill',
+          resourceId: 'alpha',
+          createdAt: 1
+        },
+        {
+          tagId: 'tag-research',
+          resourceType: 'catalog.skill',
+          resourceId: 'alpha',
+          createdAt: 2
+        }
+      ]
+    })
+
+    await act(async () => root.render(<SettingsPage open onClose={vi.fn()} />))
+    await act(async () => navButton('Skills')?.click())
+
+    const favorite = Array.from(document.body.querySelectorAll<HTMLButtonElement>('button')).find(
+      (button) => button.textContent?.trim() === 'Favorites'
+    )
+    await act(async () => favorite?.click())
+    await act(async () =>
+      document.body.querySelector<HTMLButtonElement>('[aria-label="Back"]')?.click()
+    )
+    act(() => useTagStore.getState().setBrowserSelectedId('tag-research'))
+    await act(async () =>
+      document.body.querySelector<HTMLButtonElement>('[aria-label="Forward"]')?.click()
+    )
+
+    const selectedTag = Array.from(
+      document.body.querySelectorAll<HTMLButtonElement>('aside button')
+    ).find((button) => button.getAttribute('aria-current') === 'page')
+    expect(selectedTag?.textContent).toContain('Favorites')
+  })
+
+  it('preserves an in-panel Tag selection when returning from a resource', async () => {
+    vi.mocked(window.api.tags.snapshot).mockResolvedValue({
+      revision: 2,
+      tags: [
+        { id: 'tag-favorite', systemKey: 'favorite', createdAt: 1, updatedAt: 1 },
+        {
+          id: 'tag-research',
+          name: 'Research',
+          iconKey: 'book-open',
+          colorKey: 'purple',
+          createdAt: 2,
+          updatedAt: 2
+        }
+      ],
+      assignments: [
+        {
+          tagId: 'tag-favorite',
+          resourceType: 'catalog.skill',
+          resourceId: 'alpha',
+          createdAt: 1
+        },
+        {
+          tagId: 'tag-research',
+          resourceType: 'catalog.skill',
+          resourceId: 'alpha',
+          createdAt: 2
+        }
+      ]
+    })
+
+    await act(async () => root.render(<SettingsPage open onClose={vi.fn()} />))
+    await act(async () => navButton('Skills')?.click())
+
+    const favorite = Array.from(document.body.querySelectorAll<HTMLButtonElement>('button')).find(
+      (button) => button.textContent?.trim() === 'Favorites'
+    )
+    await act(async () => favorite?.click())
+
+    const research = Array.from(
+      document.body.querySelectorAll<HTMLButtonElement>('aside button')
+    ).find((button) => button.textContent?.includes('Research'))
+    await act(async () => research?.click())
+
+    const resource = Array.from(
+      document.body.querySelectorAll<HTMLButtonElement>('aside + section button')
+    ).find((button) => button.textContent?.includes('Alpha'))
+    await act(async () => resource?.click())
+    await act(async () =>
+      document.body.querySelector<HTMLButtonElement>('[aria-label="Back"]')?.click()
+    )
+
+    const selectedTag = Array.from(
+      document.body.querySelectorAll<HTMLButtonElement>('aside button')
+    ).find((button) => button.getAttribute('aria-current') === 'page')
+    expect(selectedTag?.textContent).toContain('Research')
+  })
+
+  it('records the default Tag in history before navigating through a resource', async () => {
+    vi.mocked(window.api.tags.snapshot).mockResolvedValue({
+      revision: 2,
+      tags: [
+        { id: 'tag-favorite', systemKey: 'favorite', createdAt: 1, updatedAt: 1 },
+        {
+          id: 'tag-research',
+          name: 'Research',
+          iconKey: 'book-open',
+          colorKey: 'purple',
+          createdAt: 2,
+          updatedAt: 2
+        }
+      ],
+      assignments: [
+        {
+          tagId: 'tag-favorite',
+          resourceType: 'catalog.skill',
+          resourceId: 'alpha',
+          createdAt: 1
+        },
+        {
+          tagId: 'tag-research',
+          resourceType: 'catalog.skill',
+          resourceId: 'alpha',
+          createdAt: 2
+        }
+      ]
+    })
+
+    await act(async () => root.render(<SettingsPage open onClose={vi.fn()} />))
+    await act(async () => navButton('Tags')?.click())
+
+    const selectedDefault = Array.from(
+      document.body.querySelectorAll<HTMLButtonElement>('aside button')
+    ).find((button) => button.getAttribute('aria-current') === 'page')
+    expect(selectedDefault?.textContent).toContain('Favorites')
+
+    const resource = Array.from(
+      document.body.querySelectorAll<HTMLButtonElement>('aside + section button')
+    ).find((button) => button.textContent?.includes('Alpha'))
+    await act(async () => resource?.click())
+
+    const research = Array.from(document.body.querySelectorAll<HTMLButtonElement>('button')).find(
+      (button) => button.textContent?.trim() === 'Research'
+    )
+    await act(async () => research?.click())
+    await act(async () =>
+      document.body.querySelector<HTMLButtonElement>('[aria-label="Back"]')?.click()
+    )
+    await act(async () =>
+      document.body.querySelector<HTMLButtonElement>('[aria-label="Back"]')?.click()
+    )
+
+    const restoredDefault = Array.from(
+      document.body.querySelectorAll<HTMLButtonElement>('aside button')
+    ).find((button) => button.getAttribute('aria-current') === 'page')
+    expect(restoredDefault?.textContent).toContain('Favorites')
+  })
+
   it('renders the model-dependent reasoning effort explanation naturally in Japanese', async () => {
     await i18next.changeLanguage('ja')
     try {
@@ -2175,6 +2395,230 @@ describe('SettingsPage layout', () => {
     expect(document.body.querySelector('section[aria-label="Providers"]')).toBeNull()
     // The pending id is consumed so a later normal open won't jump back to it.
     expect(useSettingsStore.getState().pendingSpecialistId).toBeUndefined()
+  })
+
+  it('navigates from a specialist capability row to the skill detail and back', async () => {
+    const researcher: SpecialistProfileView = {
+      id: 'spc-1',
+      name: 'RESEARCHER',
+      displayName: 'Researcher',
+      description: 'Conducts systematic literature reviews.',
+      systemPrompt: 'You are a literature review specialist.',
+      iconKey: 'search',
+      colorKey: 'blue',
+      enabled: true,
+      capabilityMode: 'selected',
+      fullAccess: { excludedSkillIds: [], excludedConnectorIds: [], connectorTools: [] },
+      selectedCapabilities: { skillIds: ['alpha'], connectorIds: [], connectorTools: [] },
+      revision: 1
+    }
+    ;(window.api.specialist.list as ReturnType<typeof vi.fn>).mockResolvedValue({
+      items: [{ kind: 'custom', ...researcher }],
+      integrity: { status: 'ok' }
+    })
+    useSpecialistStore.setState({ items: [{ kind: 'custom', ...researcher }], isLoaded: true })
+    useSettingsStore.setState({ pendingSpecialistId: researcher.id })
+
+    await act(async () => {
+      root.render(<SettingsPage open onClose={vi.fn()} />)
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    // The capabilities whitelist lists Alpha; clicking the row navigates.
+    await act(async () => {
+      fireEvent.click(
+        document.body.querySelector<HTMLElement>('[aria-label="View Alpha details"]')!
+      )
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    // Landed on Skills › Alpha: the mocked detail metadata renders.
+    expect(navButton('Skills')?.getAttribute('aria-current')).toBe('page')
+    expect(document.body.textContent).toContain('Test Author')
+
+    // Back returns to the specialist editor.
+    await act(async () => {
+      document.body.querySelector<HTMLButtonElement>('[aria-label="Back"]')?.click()
+    })
+    expect(document.body.querySelector<HTMLInputElement>('#sp-name')?.value).toBe('Researcher')
+  })
+
+  it('routes connector capability rows to detail or edit by server kind', async () => {
+    const researcher: SpecialistProfileView = {
+      id: 'spc-2',
+      name: 'RESEARCHER',
+      displayName: 'Researcher',
+      description: '',
+      systemPrompt: '',
+      iconKey: 'search',
+      colorKey: 'blue',
+      enabled: true,
+      capabilityMode: 'selected',
+      fullAccess: { excludedSkillIds: [], excludedConnectorIds: [], connectorTools: [] },
+      selectedCapabilities: {
+        skillIds: [],
+        connectorIds: ['chemistry', 'route-uuid'],
+        connectorTools: []
+      },
+      revision: 1
+    }
+    ;(window.api.specialist.list as ReturnType<typeof vi.fn>).mockResolvedValue({
+      items: [{ kind: 'custom', ...researcher }],
+      integrity: { status: 'ok' }
+    })
+    ;(window.api.settings.listConnectors as ReturnType<typeof vi.fn>).mockResolvedValue({
+      connectors: [
+        {
+          id: 'chemistry',
+          displayName: 'Chemistry',
+          description: 'Small-molecule chemistry via PubChem.',
+          sources: ['PubChem'],
+          requiresNcbi: false,
+          enabled: true,
+          autoAllow: false
+        }
+      ],
+      customServers: [
+        {
+          id: 'route-uuid',
+          name: 'route',
+          displayName: 'Public Route',
+          transport: 'stdio',
+          enabled: true
+        }
+      ],
+      ncbi: { hasApiKey: false }
+    })
+    ;(
+      window.api.settings as unknown as Record<string, ReturnType<typeof vi.fn>>
+    ).getConnectorDetail = vi.fn().mockResolvedValue({
+      id: 'chemistry',
+      name: 'chemistry',
+      displayName: 'Chemistry',
+      description: 'Small-molecule chemistry via PubChem.',
+      sources: ['PubChem'],
+      requiresNcbi: false,
+      enabled: true,
+      autoAllow: false,
+      tools: []
+    })
+    useSpecialistStore.setState({ items: [{ kind: 'custom', ...researcher }], isLoaded: true })
+    useSettingsStore.setState({ pendingSpecialistId: researcher.id })
+
+    await act(async () => {
+      root.render(<SettingsPage open onClose={vi.fn()} />)
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    // Open the Connectors capability tab.
+    await act(async () => {
+      fireEvent.click(
+        Array.from(document.body.querySelectorAll<HTMLButtonElement>('[role="tab"]')).find((tab) =>
+          tab.textContent?.includes('Connectors')
+        )!
+      )
+    })
+
+    const crumb = (): string =>
+      document.body.querySelector<HTMLButtonElement>('[aria-label="Back"]')?.closest('div')
+        ?.textContent ?? ''
+
+    // A bundled connector lands on its detail page.
+    await act(async () => {
+      fireEvent.click(
+        document.body.querySelector<HTMLElement>('[aria-label="View Chemistry details"]')!
+      )
+    })
+    expect(navButton('Connectors')?.getAttribute('aria-current')).toBe('page')
+    expect(crumb()).toContain('Connectors›Chemistry')
+
+    // Back to the editor (capability tabs reset to Skills on remount), then a
+    // custom server lands on its edit page.
+    await act(async () => {
+      document.body.querySelector<HTMLButtonElement>('[aria-label="Back"]')?.click()
+    })
+    await act(async () => {
+      fireEvent.click(
+        Array.from(document.body.querySelectorAll<HTMLButtonElement>('[role="tab"]')).find((tab) =>
+          tab.textContent?.includes('Connectors')
+        )!
+      )
+    })
+    await act(async () => {
+      fireEvent.click(
+        document.body.querySelector<HTMLElement>('[aria-label="View Public Route details"]')!
+      )
+    })
+    expect(navButton('Connectors')?.getAttribute('aria-current')).toBe('page')
+    expect(crumb()).toContain('Connectors›Edit route')
+  })
+
+  it('keeps unsaved specialist edits across a capability detail round trip', async () => {
+    const researcher: SpecialistProfileView = {
+      id: 'spc-3',
+      name: 'RESEARCHER',
+      displayName: 'Researcher',
+      description: 'Conducts systematic literature reviews.',
+      systemPrompt: 'You are a literature review specialist.',
+      iconKey: 'search',
+      colorKey: 'blue',
+      enabled: true,
+      capabilityMode: 'selected',
+      fullAccess: { excludedSkillIds: [], excludedConnectorIds: [], connectorTools: [] },
+      selectedCapabilities: { skillIds: ['alpha'], connectorIds: [], connectorTools: [] },
+      revision: 1
+    }
+    ;(window.api.specialist.list as ReturnType<typeof vi.fn>).mockResolvedValue({
+      items: [{ kind: 'custom', ...researcher }],
+      integrity: { status: 'ok' }
+    })
+    useSpecialistStore.setState({ items: [{ kind: 'custom', ...researcher }], isLoaded: true })
+    useSettingsStore.setState({ pendingSpecialistId: researcher.id })
+
+    await act(async () => {
+      root.render(<SettingsPage open onClose={vi.fn()} />)
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    // An unsaved edit in the specialist editor.
+    await act(async () => {
+      fireEvent.change(document.body.querySelector<HTMLInputElement>('#sp-description')!, {
+        target: { value: 'My unsaved edit' }
+      })
+    })
+
+    // Round trip through the skill detail page.
+    await act(async () => {
+      fireEvent.click(
+        document.body.querySelector<HTMLElement>('[aria-label="View Alpha details"]')!
+      )
+    })
+    expect(document.body.textContent).toContain('Test Author')
+    await act(async () => {
+      document.body.querySelector<HTMLButtonElement>('[aria-label="Back"]')?.click()
+    })
+
+    // Back on the editor, the unsaved edit survived the trip.
+    expect(document.body.querySelector<HTMLInputElement>('#sp-description')?.value).toBe(
+      'My unsaved edit'
+    )
   })
 
   it('opens the specialist creation form from Write from scratch', async () => {

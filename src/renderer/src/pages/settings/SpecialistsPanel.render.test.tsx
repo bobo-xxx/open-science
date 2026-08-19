@@ -977,6 +977,25 @@ describe('SpecialistsPanel', () => {
     }
   })
 
+  it('keeps non-Tag metadata connected to specialist row navigation', async () => {
+    const onNavigate = vi.fn()
+    await act(async () => {
+      root.render(<SpecialistsPanel view={{ kind: 'list' }} onNavigate={onNavigate} />)
+    })
+
+    const customMetadata = document.body.querySelector<HTMLElement>(
+      '[data-specialist-metadata-group="rna-reviewer"] [data-specialist-metadata="capabilities"]'
+    )
+    await act(async () => customMetadata?.click())
+    expect(onNavigate).toHaveBeenLastCalledWith({ kind: 'edit', id: 'rna-reviewer' })
+
+    const builtinMetadata = document.body.querySelector<HTMLButtonElement>(
+      '[data-specialist-metadata-group="builtin-curator"] button'
+    )
+    await act(async () => builtinMetadata?.click())
+    expect(onNavigate).toHaveBeenLastCalledWith({ kind: 'builtin', id: 'builtin-curator' })
+  })
+
   it('distinguishes a Marketplace install from a manually imported ZIP', async () => {
     const installed: SpecialistListItem = {
       ...(specialistItems[0] as Extract<SpecialistListItem, { kind: 'custom' }>),
@@ -1148,6 +1167,35 @@ describe('SpecialistsPanel', () => {
     expect(onNavigate).not.toHaveBeenCalled()
     expect(document.body.textContent).toContain('Saved')
     expect(document.body.querySelector('[aria-label="Purple"]')).not.toBeNull()
+  })
+
+  it('finishes an appearance save without waiting for the catalog reload', async () => {
+    const current = specialistItems[0] as Extract<SpecialistListItem, { kind: 'custom' }>
+    const updated = { ...current, colorKey: 'purple', revision: 2 }
+    window.api.specialist.update = vi.fn().mockResolvedValue(updated)
+    window.api.specialist.list = vi
+      .fn()
+      .mockResolvedValueOnce({ items: specialistItems, integrity: { status: 'ok' } })
+      .mockReturnValue(new Promise(() => undefined))
+
+    await act(async () => {
+      root.render(<SpecialistsPanel view={{ kind: 'list' }} onNavigate={vi.fn()} />)
+    })
+
+    const trigger = document.body.querySelector<HTMLButtonElement>(
+      '[aria-label="Change appearance for RNA Reviewer"]'
+    )
+    expect(trigger).not.toBeNull()
+    openRadixMenu(trigger)
+
+    await act(async () =>
+      document.body.querySelector<HTMLButtonElement>('[aria-label="Purple"]')?.click()
+    )
+    await vi.waitFor(() => expect(window.api.specialist.update).toHaveBeenCalledOnce())
+    await act(async () => Promise.resolve())
+
+    expect(trigger?.getAttribute('data-appearance-state')).toBe('success')
+    expect(document.body.textContent).toContain('Saved')
   })
 
   it('routes wheel input from the popover to the hidden icon scroller', async () => {
@@ -1425,7 +1473,7 @@ describe('SpecialistsPanel', () => {
           id: 'personal-exclusive',
           displayName: 'Exclusive Skill',
           source: 'personal',
-          kind: 'owned-exclusive',
+          kind: 'exclusive',
           deletable: true,
           reasons: []
         },
@@ -1438,12 +1486,20 @@ describe('SpecialistsPanel', () => {
           reasons: [{ code: 'builtin', specialistIds: [] }]
         },
         {
+          id: 'main-enabled-tool',
+          displayName: 'Main Enabled Tool',
+          source: 'personal',
+          kind: 'main-enabled',
+          deletable: false,
+          reasons: [{ code: 'main-enabled', specialistIds: [] }]
+        },
+        {
           id: 'standalone-tool',
           displayName: 'Gene Protein Expression Matrix Normalization',
           source: 'personal',
-          kind: 'standalone',
-          deletable: false,
-          reasons: [{ code: 'standalone', specialistIds: [] }]
+          kind: 'exclusive',
+          deletable: true,
+          reasons: []
         },
         {
           id: 'shared-tool',
@@ -1496,6 +1552,9 @@ describe('SpecialistsPanel', () => {
 
     expect(previewDelete).toHaveBeenCalledWith('rna-reviewer')
     expect(document.body.textContent).toContain('Skills you can also delete')
+    expect(document.body.textContent).toContain(
+      'Select all selects only deletable Skills. Skills used by the Main Agent or another Specialist will be kept.'
+    )
     expect(document.body.textContent).not.toContain('Exclusive Skill')
     expect(document.body.textContent).not.toContain('Shared Tool')
     expect(document.body.textContent).not.toContain('Built-in Tool')
@@ -1532,7 +1591,7 @@ describe('SpecialistsPanel', () => {
     expect(document.body.textContent).toContain('Shared Tool')
     expect(document.body.textContent).toContain('Imported')
     expect(document.body.textContent).toContain('Personal')
-    expect(document.body.textContent).toContain('Already exists independently and will be kept.')
+    expect(document.body.textContent).toContain('Used by the Main Agent and will be kept.')
     expect(document.body.textContent).toContain(
       'Also owned by another Specialist and will be kept.'
     )
@@ -1546,9 +1605,9 @@ describe('SpecialistsPanel', () => {
     const checkboxes = Array.from(
       document.body.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')
     )
-    expect(checkboxes).toHaveLength(4)
+    expect(checkboxes).toHaveLength(5)
     const disabledCheckboxes = checkboxes.filter((input) => input.disabled)
-    expect(checkboxes.filter((input) => !input.disabled)).toHaveLength(1)
+    expect(checkboxes.filter((input) => !input.disabled)).toHaveLength(2)
     expect(disabledCheckboxes).toHaveLength(3)
     expect(checkboxes.filter((input) => !input.disabled).every((input) => input.checked)).toBe(true)
     expect(disabledCheckboxes.every((input) => !input.checked)).toBe(true)
@@ -1562,7 +1621,7 @@ describe('SpecialistsPanel', () => {
     expect(disabledSkillTriggers.every((trigger) => trigger.tabIndex === 0)).toBe(true)
     await act(async () => disabledSkillTriggers[0]?.focus())
     expect(document.body.querySelector('[role="tooltip"]')?.textContent).toBe(
-      'Already exists independently and will be kept.'
+      'Used by the Main Agent and will be kept.'
     )
 
     const confirmBtn = Array.from(document.body.querySelectorAll<HTMLButtonElement>('button')).find(
@@ -1574,7 +1633,10 @@ describe('SpecialistsPanel', () => {
       confirmBtn!.click()
     })
 
-    expect(deleteMock).toHaveBeenCalledWith('rna-reviewer', 1, ['personal-exclusive'])
+    expect(deleteMock).toHaveBeenCalledWith('rna-reviewer', 1, [
+      'personal-exclusive',
+      'standalone-tool'
+    ])
   })
 })
 
