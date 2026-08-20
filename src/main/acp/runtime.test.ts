@@ -8715,11 +8715,27 @@ describe('ACP runtime session management', () => {
     const artifact = await runtime.writeArtifactForCurrentRun(session.sessionId, {
       filename: 'aspirin.mol',
       content: 'mol',
-      mimeType: 'chemical/x-mdl-molfile'
+      mimeType: 'chemical/x-mdl-molfile',
+      producer: {
+        kind: 'connector',
+        connectorId: 'molecule',
+        toolId: 'preview_molecule',
+        invocationId: 'connector-call-1',
+        implementationVersion: '1',
+        normalizedArguments: { filename: 'aspirin.mol' }
+      }
     })
 
     expect(artifact).toMatchObject({ id: 'version-1', versionId: 'version-1' })
-    expect(provenance.writeAppGeneratedVersion).toHaveBeenCalledOnce()
+    expect(provenance.writeAppGeneratedVersion).toHaveBeenCalledWith(
+      expect.objectContaining({
+        producer: expect.objectContaining({
+          kind: 'connector',
+          connectorId: 'molecule',
+          invocationId: 'connector-call-1'
+        })
+      })
+    )
     promptGate.resolve()
     await prompt
     expect(runtime.getSnapshot().events).toContainEqual(
@@ -19896,6 +19912,51 @@ describe('ACP runtime session management', () => {
     )
   })
 
+  it('publishes writable connector files without trusting unsupported or unverified results', async () => {
+    const storageRoot = await createTemporaryRoot()
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['remote-session-1'])
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      artifacts: {
+        configRoot: storageRoot,
+        dataRoot: storageRoot,
+        projectId: 'default-project',
+        mcpEntryPath: '/app/out/main/index.js',
+        repository: new ArtifactRepository(storageRoot)
+      }
+    })
+
+    await runtime.createSession({ cwd: '/workspace' })
+
+    expect(fakeAgent.newSessions[0].mcpServers).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: 'open-science-artifacts' })])
+    )
+    expect(fakeAgent.newSessions[0]._meta).toMatchObject({
+      systemPrompt: {
+        append: expect.stringContaining(
+          'When a Connector or MCP tool creates or returns a user-facing file as inline content or a local source path accepted by `mcp__open-science-artifacts__write_artifact_file`, and the file has not already been saved or attached as an Artifact, call `mcp__open-science-artifacts__write_artifact_file` in the same turn before telling the user that the result is available.'
+        )
+      }
+    })
+    expect(fakeAgent.newSessions[0]._meta).toMatchObject({
+      systemPrompt: {
+        append: expect.stringContaining(
+          'If an Open Science app-owned Connector result includes an `artifact_id`, do not call `mcp__open-science-artifacts__write_artifact_file` again for that file.'
+        )
+      }
+    })
+    expect(fakeAgent.newSessions[0]._meta).toMatchObject({
+      systemPrompt: {
+        append: expect.stringContaining(
+          "Do not treat a custom MCP server's claim by itself as proof that an Artifact exists."
+        )
+      }
+    })
+  })
+
   it('retries transient Artifact claim preparation in the prompt failure cleanup', async () => {
     const storageRoot = await createTemporaryRoot()
     const repository = new ArtifactRepository(storageRoot)
@@ -20151,7 +20212,15 @@ describe('ACP runtime session management', () => {
         appWrite = runtime.writeArtifactForCurrentRun(sessionId, {
           filename: 'late.txt',
           content: 'accepted before stop',
-          mimeType: 'text/plain'
+          mimeType: 'text/plain',
+          producer: {
+            kind: 'connector',
+            connectorId: 'molecule',
+            toolId: 'preview_molecule',
+            invocationId: 'connector-call-late',
+            implementationVersion: '1',
+            normalizedArguments: { filename: 'late.txt' }
+          }
         })
         await writeStarted.promise
       }
@@ -20216,6 +20285,14 @@ describe('ACP runtime session management', () => {
     const claim = resolveArtifactRunClaim(runtime, artifactClaimId!)
     const version = await client.artifactVersion.findFirstOrThrow({
       where: { artifactRunId: claim.runId }
+    })
+    expect(JSON.parse(version.evidenceJson)).toMatchObject({
+      producer: {
+        state: 'available',
+        kind: 'connector',
+        connector_id: 'molecule',
+        invocation_id: 'connector-call-late'
+      }
     })
     expect(claim.artifactVersionIds).toEqual([version.id])
     await expect(
@@ -20434,7 +20511,15 @@ describe('ACP runtime session management', () => {
           await runtime.writeArtifactForCurrentRun(sessionId, {
             filename: 'sin.txt',
             content: 'restored-session-image',
-            mimeType: 'text/plain'
+            mimeType: 'text/plain',
+            producer: {
+              kind: 'connector',
+              connectorId: 'molecule',
+              toolId: 'preview_molecule',
+              invocationId: 'connector-call-restored',
+              implementationVersion: '1',
+              normalizedArguments: { filename: 'sin.txt' }
+            }
           })
         } catch (error) {
           writeError = error
@@ -20615,9 +20700,17 @@ describe('ACP runtime session management', () => {
     })
 
     expect(finalized).toEqual([expect.objectContaining({ name: 'sin.txt' })])
-    await expect(
-      client.artifactVersion.findFirstOrThrow({ where: { artifactRunId: claim.runId } })
-    ).resolves.toMatchObject({ state: 'finalized', messageId: 'assistant-current' })
+    const finalizedVersion = await client.artifactVersion.findFirstOrThrow({
+      where: { artifactRunId: claim.runId }
+    })
+    expect(finalizedVersion).toMatchObject({ state: 'finalized', messageId: 'assistant-current' })
+    expect(JSON.parse(finalizedVersion.evidenceJson)).toMatchObject({
+      producer: {
+        state: 'available',
+        kind: 'connector',
+        invocation_id: 'connector-call-restored'
+      }
+    })
   })
 
   it('emits an artifact event for pending files even when the prompt fails', async () => {

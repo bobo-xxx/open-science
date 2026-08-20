@@ -37,9 +37,15 @@ import type {
   DiscardMigratedCopyResult,
   MigrationOutcome,
   RevealAppStorageResult,
-  StorageInfo
+  StorageInfo,
+  StorageStatus
 } from '../shared/storage'
-import type { AppInfo, UpdateStatus } from '../shared/update'
+import type {
+  AppInfo,
+  UpdateApplyOptions,
+  UpdateDownloadOptions,
+  UpdateStatus
+} from '../shared/update'
 import {
   defineApplicationCommand,
   defineApplicationCommandGroup,
@@ -250,6 +256,9 @@ const storageCommands = Object.freeze({
     readonly [],
     void
   >('storage:dismiss-legacy-move-prompt'),
+  getStatus: defineApplicationCommand<'storage:get-status', readonly [], StorageStatus>(
+    'storage:get-status'
+  ),
   getInfo: defineApplicationCommand<'storage:get-info', readonly [], StorageInfo>(
     'storage:get-info'
   ),
@@ -284,12 +293,18 @@ const storageCommands = Object.freeze({
 })
 
 const updateCommands = Object.freeze({
-  apply: defineApplicationCommand<'update:apply', readonly [], UpdateStatus>('update:apply'),
+  apply: defineApplicationCommand<
+    'update:apply',
+    readonly [options?: UpdateApplyOptions],
+    UpdateStatus
+  >('update:apply'),
   cancel: defineApplicationCommand<'update:cancel', readonly [], UpdateStatus>('update:cancel'),
   check: defineApplicationCommand<'update:check', readonly [], UpdateStatus>('update:check'),
-  download: defineApplicationCommand<'update:download', readonly [], UpdateStatus>(
-    'update:download'
-  ),
+  download: defineApplicationCommand<
+    'update:download',
+    readonly [options?: UpdateDownloadOptions],
+    UpdateStatus
+  >('update:download'),
   getAppInfo: defineApplicationCommand<'update:get-app-info', readonly [], AppInfo>(
     'update:get-app-info'
   ),
@@ -355,6 +370,7 @@ type HostApplicationCommandDependencies = Readonly<{
   >
   reviewer: Pick<ReviewerCommandOwner, 'run' | 'getForSession' | 'abort' | 'abortFixLoop'>
   storage: Readonly<{
+    getStatus: () => Promise<StorageStatus>
     getInfo: () => Promise<StorageInfo>
     revealAppStorage: () => Promise<RevealAppStorageResult>
     detectActive: () => ActiveSessionInfo[]
@@ -528,6 +544,7 @@ const registerHostApplicationCommands = (
           dependencies.storage.discardMigratedCopy(args[0])
         ),
       'storage:dismiss-legacy-move-prompt': () => dependencies.storage.dismissLegacyMovePrompt(),
+      'storage:get-status': () => dependencies.storage.getStatus(),
       'storage:get-info': () => dependencies.storage.getInfo(),
       'storage:inspect-data-root': ({ args, callerContext }) =>
         localCommand(callerContext, 'storage:inspect-data-root', () =>
@@ -553,13 +570,13 @@ const registerHostApplicationCommands = (
         )
     })
     scope.registerGroup(hostApplicationCommandGroups[8], {
-      'update:apply': ({ callerContext }) =>
-        localCommand(callerContext, 'update:apply', () => dependencies.update.apply()),
+      'update:apply': ({ args, callerContext }) =>
+        localCommand(callerContext, 'update:apply', () => dependencies.update.apply(args[0])),
       'update:cancel': ({ callerContext }) =>
         localCommand(callerContext, 'update:cancel', () => dependencies.update.cancel()),
       'update:check': () => dependencies.update.check(),
-      'update:download': ({ callerContext }) =>
-        localCommand(callerContext, 'update:download', () => dependencies.update.download()),
+      'update:download': ({ args, callerContext }) =>
+        localCommand(callerContext, 'update:download', () => dependencies.update.download(args[0])),
       'update:get-app-info': () => dependencies.update.getAppInfo(),
       'update:get-status': () => dependencies.update.getStatus()
     })
