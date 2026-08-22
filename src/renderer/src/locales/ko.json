@@ -2601,7 +2601,6 @@
   "OAuth configuration only; tokens excluded": "OAuth 구성에만 해당; 토큰 제외됨",
   "Names only: {{names}}": "이름만: {{names}}",
   "Save configuration": "구성 저장",
-  "Connecting…": "연결 중…",
   "GitHub token · {{mask}}": "GitHub 토큰 · {{mask}}",
   "GitHub token": "GitHub 토큰",
   "Setup incomplete": "설정이 완료되지 않았습니다.",
@@ -3188,5 +3187,16 @@
   "This imported Connector requires a client secret entered locally.": "가져온 커넥터에는 로컬에서 입력한 클라이언트 시크릿이 필요합니다.",
   "Authorization server URL is required for a pre-registered client.": "사전 등록된 클라이언트에는 인증 서버 URL이 필요합니다.",
   "Client ID is required when a client secret is configured.": "클라이언트 시크릿을 구성할 때 클라이언트 ID가 필요합니다.",
-  "Client metadata URL cannot be combined with a pre-registered client.": "클라이언트 메타데이터 URL은 사전 등록된 클라이언트와 함께 사용할 수 없습니다."
+  "Client metadata URL cannot be combined with a pre-registered client.": "클라이언트 메타데이터 URL은 사전 등록된 클라이언트와 함께 사용할 수 없습니다.",
+  "Add and sign in": "추가하고 로그인",
+  "Sign in to {{name}}": "{{name}}에 로그인",
+  "Complete authorization in your browser. This dialog will update when sign-in finishes.": "브라우저에서 인증을 완료하세요. 로그인이 끝나면 이 대화 상자가 업데이트됩니다.",
+  "Finish later": "나중에 완료",
+  "{{name}} needs sign-in": "{{name}}에 로그인이 필요합니다",
+  "Authorization expired or was revoked. Sign in again to keep this Connector available.": "인증이 만료되었거나 취소되었습니다. 이 커넥터를 계속 사용하려면 다시 로그인하세요.",
+  "Open Connectors": "커넥터 열기",
+  "Variable changed after this run": "이 실행 후 변수가 변경됨",
+  "Variable tracking is limited": "변수 추적에 제한이 있음",
+  "Run [{{index}}] later changed {{names}}. This output is the snapshot recorded before that change; this run completed normally.": "실행 [{{index}}]에서 나중에 {{names}}을(를) 변경했습니다. 이 출력은 변경 전에 기록된 스냅샷이며, 이 실행 자체는 정상적으로 완료되었습니다.",
+  "This run completed normally. Some variable relationships in this code could not be determined automatically, so later variable changes may not be linked back to this run.": "이 실행은 정상적으로 완료되었습니다. 이 코드의 일부 변수 관계를 자동으로 확인할 수 없어 이후 변수 변경이 이 실행에 연결되지 않을 수 있습니다."
 }
