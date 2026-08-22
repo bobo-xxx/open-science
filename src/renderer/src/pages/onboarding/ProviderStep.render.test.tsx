@@ -151,6 +151,7 @@ describe('ProviderStep', () => {
   it('preserves any user-edited custom draft when the active framework changes', async () => {
     await renderStep()
 
+    await clickButton(/Advanced settings/)
     await act(async () => {
       container.querySelector<HTMLButtonElement>('[aria-label="Supports image input"]')?.click()
     })
@@ -224,6 +225,36 @@ describe('ProviderStep', () => {
 
     expect(saveAndActivateProvider).toHaveBeenCalledWith(
       expect.objectContaining({ reasoningEffortPreset: 'none-high' })
+    )
+  })
+
+  it('includes custom model token limits in the provider request', async () => {
+    readyClaudeEnvironment()
+    const saveAndActivateProvider = vi
+      .fn()
+      .mockResolvedValue({ providerId: 'p1', validation: { ok: true, category: 'ok' } })
+    useSettingsStore.setState({ saveAndActivateProvider })
+
+    await renderStep({
+      initialValue: createEmptyProviderFormValue({
+        type: 'custom',
+        name: 'Gateway',
+        baseUrl: 'https://gateway.example',
+        model: 'model-a',
+        key: 'sk-test',
+        contextWindow: '400000',
+        maxInputTokens: '272000',
+        maxOutputTokens: '128000'
+      })
+    })
+    await clickButton(/test & continue/i)
+
+    expect(saveAndActivateProvider).toHaveBeenCalledWith(
+      expect.objectContaining({
+        contextWindow: 400_000,
+        maxInputTokens: 272_000,
+        maxOutputTokens: 128_000
+      })
     )
   })
 
