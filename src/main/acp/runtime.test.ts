@@ -24,6 +24,7 @@ import { composeAcpRuntimeBaseOwners } from './runtime-base-composition'
 import type { RuntimeEventInput } from './runtime-snapshot-owner'
 import { AcpPermissionContext } from './permission-context'
 import { permissionRequestFingerprint } from './permission-broker'
+import { ACP_STEERING_METHOD } from './native-follow-up'
 import { ContextUsageTracker, type TokenCounter } from './context-usage-tracker'
 import {
   ACP_PROMPT_FAILED_EVENT_TITLE,
@@ -750,6 +751,8 @@ const startPermissionProbeAgent = (
       kind: 'allow_once' | 'allow_always' | 'reject_once' | 'reject_always'
     }>
     onPermissionResponse?: (response: unknown) => void
+    onSteer?: (params: unknown) => void
+    advertiseSteering?: boolean
     resume?: 'ok' | 'notFound'
   }
 ): void => {
@@ -761,6 +764,7 @@ const startPermissionProbeAgent = (
         loadSession: false,
         sessionCapabilities: { close: {}, ...(options.resume ? { resume: {} } : {}) }
       },
+      ...(options.advertiseSteering ? { _meta: { steering: { supported: true } } } : {}),
       authMethods: []
     }))
     .onRequest(acp.methods.agent.session.new, () => ({
@@ -877,6 +881,14 @@ const startPermissionProbeAgent = (
 
       return { stopReason: 'end_turn' }
     })
+    .onRequest(
+      ACP_STEERING_METHOD,
+      (params) => params,
+      (ctx) => {
+        options.onSteer?.(ctx.params)
+        return { outcome: 'injected' }
+      }
+    )
     .onNotification(acp.methods.agent.session.cancel, () => undefined)
     .onRequest(acp.methods.agent.session.close, () => ({}))
     .connect(
@@ -1114,7 +1126,7 @@ describe('ACP runtime migration write-gate', () => {
           _meta: { 'api-key': { apiKey: 'test-only-key' } }
         },
         providerConfiguration: {
-          providerId: 'custom-gateway',
+          providerId: 'openai',
           apiType: 'openai',
           baseUrl: 'http://127.0.0.1:1234/v1',
           headers: { authorization: 'Bearer local-token' }
@@ -1129,7 +1141,7 @@ describe('ACP runtime migration write-gate', () => {
     ])
     expect(fakeAgent.providerConfigurations).toEqual([
       {
-        providerId: 'custom-gateway',
+        providerId: 'openai',
         apiType: 'openai',
         baseUrl: 'http://127.0.0.1:1234/v1',
         headers: { authorization: 'Bearer local-token' }
@@ -1182,7 +1194,7 @@ describe('ACP runtime migration write-gate', () => {
         env: {},
         authentication: { methodId: 'api-key' },
         providerConfiguration: {
-          providerId: 'custom-gateway',
+          providerId: 'openai',
           apiType: 'openai',
           baseUrl: 'http://127.0.0.1:1234/v1',
           headers: {}
@@ -1234,7 +1246,7 @@ describe('ACP runtime migration write-gate', () => {
         env: {},
         authentication: { methodId: 'api-key' },
         providerConfiguration: {
-          providerId: 'custom-gateway',
+          providerId: 'openai',
           apiType: 'openai',
           baseUrl: 'http://127.0.0.1:1234/v1',
           headers: {}
@@ -1386,7 +1398,7 @@ describe('ACP runtime migration write-gate', () => {
             _meta: { 'api-key': { apiKey: 'test-only-key' } }
           },
           providerConfiguration: {
-            providerId: 'custom-gateway',
+            providerId: 'openai',
             apiType: 'openai',
             baseUrl: 'http://127.0.0.1:1234/v1',
             headers: { authorization: 'Bearer test-only-token' }
@@ -9417,7 +9429,7 @@ describe('ACP runtime session management', () => {
         executablePath: '/bin/codex-acp',
         env: {},
         providerConfiguration: {
-          providerId: 'custom-gateway',
+          providerId: 'openai',
           apiType: 'openai',
           baseUrl: 'http://127.0.0.1:1234/v1',
           headers: { authorization: 'Bearer bridge-token' }
@@ -9457,7 +9469,7 @@ describe('ACP runtime session management', () => {
         executablePath: '/bin/codex-acp',
         env: {},
         providerConfiguration: {
-          providerId: 'custom-gateway',
+          providerId: 'openai',
           apiType: 'openai',
           baseUrl: 'http://127.0.0.1:1234/v1',
           headers: { authorization: 'Bearer bridge-token' }
@@ -16807,6 +16819,43 @@ describe('ACP runtime session management', () => {
     expect(sharedAgent.resumedSessions).toEqual([])
   })
 
+  it('refuses native follow-up while a permission request is pending', async () => {
+    const process = new FakeAgentProcess()
+    const steeringRequests: unknown[] = []
+    startPermissionProbeAgent(process, {
+      newSessionId: 's1',
+      toolCallId: 'pending-command',
+      toolTitle: 'Run command',
+      advertiseSteering: true,
+      onSteer: (params) => steeringRequests.push(params),
+      permissionOptions: [
+        { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
+        { optionId: 'reject', name: 'Reject', kind: 'reject_once' }
+      ]
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process)
+    })
+
+    const session = await runtime.createSession({ cwd: '/workspace' })
+    const prompt = runtime.sendPrompt({ sessionId: session.sessionId, text: 'request permission' })
+    await vi.waitFor(() => expect(runtime.getSnapshot().pendingPermissions).toHaveLength(1))
+
+    const result = await runtime.steerFollowUp({
+      sessionId: session.sessionId,
+      text: 'follow up at the permission boundary'
+    })
+
+    const [pendingPermission] = runtime.getSnapshot().pendingPermissions
+    runtime.respondToPermission({ requestId: pendingPermission.requestId, optionId: 'reject' })
+    await prompt
+
+    expect(result.injected).toBe(false)
+    expect(steeringRequests).toEqual([])
+  })
+
   it('returns detached snapshot collections without collapsing hidden event sequence slots', async () => {
     const process = new FakeAgentProcess()
     startPermissionProbeAgent(process, {
@@ -17073,7 +17122,7 @@ describe('ACP runtime session management', () => {
         executablePath: '/bin/codex-acp',
         env: {},
         providerConfiguration: {
-          providerId: 'custom-gateway',
+          providerId: 'openai',
           apiType: 'openai',
           baseUrl: 'http://127.0.0.1:1234/v1',
           headers: { authorization: 'Bearer bridge' }
@@ -18711,7 +18760,7 @@ describe('ACP runtime session management', () => {
         executablePath: '/bin/codex-acp',
         env: {},
         providerConfiguration: {
-          providerId: 'custom-gateway',
+          providerId: 'openai',
           apiType: 'openai',
           baseUrl: 'http://127.0.0.1:1/v1',
           headers: { authorization: 'Bearer bridge' }
@@ -20907,6 +20956,11 @@ describe('ACP runtime session management', () => {
       'Claude Code explicit 4xx',
       { errorKind: 'unknown' },
       'API Error: 400 Authentication Fails, Your api key: ****e52d is invalid'
+    ],
+    [
+      'Claude Code API connection refused',
+      { errorKind: 'unknown' },
+      'API Error: Unable to connect to API (ConnectionRefused)'
     ],
     [
       'provider bridge error kind',

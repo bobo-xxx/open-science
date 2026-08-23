@@ -543,10 +543,13 @@ colors communicate a successful or failed probe/migration result.
 - User Message copy and edit actions sit immediately left of the bubble and use the standard inline-action opacity transition on row hover or keyboard focus. When editing creates multiple Branches, keep the Branch navigation persistently visible at the right end of the metadata footer below the bubble, after the sent time, with previous/next controls around a Branch icon and the current/total count. Let the footer wrap on narrow surfaces so the navigation remains the final bottom row without colliding with the sent time.
 - Tool row: `h-8 rounded-lg px-2 text-[13px] hover:bg-foreground/[0.04]`.
 - Context compaction is a standalone, non-interactive activity row rather than a generic Tool group.
-  Keep the existing Tool-row geometry inside a quiet `bg-bg-200/70` surface. Show a spinner with
-  `Compacting context` while active, a check with `Context compacted` when complete, the standard
-  failure icon on error, and a neutral cancelled state. Persist the row on its originating Message
-  Branch and do not let duplicate, replayed, or late lifecycle events reopen a terminal row.
+  Render it as a conversation-boundary milestone with subtle horizontal rules rather than a Tool
+  surface. Pair its lifecycle title with one short explanation: earlier context is being summarized,
+  was summarized so the Session can continue, or remains unchanged after failure/cancellation. Use a
+  spinner while active, the compression glyph when complete, the standard failure icon on error, and
+  a neutral cancelled state. The Context-window chart uses the same compression glyph instead of
+  scissors. Persist the row on its originating Message Branch and do not let duplicate, replayed, or
+  late lifecycle events reopen a terminal row.
 - Tool row metadata: `text-[12.5px] text-muted-foreground tabular-nums`.
 - Link: `text-primary underline-offset-4 hover:underline`.
 - Inline code / resource reference: `rounded-md bg-accent/50 px-1.5 py-0.5 font-mono text-sm text-primary`.
@@ -590,9 +593,13 @@ colors communicate a successful or failed probe/migration result.
   hairline separators rather than nested cards. Dragging over another row moves neighboring rows
   aside to preview whether the item will land before or after it. Each row also supports Arrow
   Up/Arrow Down keyboard reordering, Edit, Remove, and Send now. Edit moves an item back into an
-  unchanged empty composer; Send now promotes the item, waits for cancellation and prompt admission
-  to settle, then sends it. Cancellation or admission failures keep the row and show a recoverable
-  inline error.
+  unchanged empty composer. Send now promotes the item and first tries to inject it into the current
+  run through the agent framework's native follow-up, without cancelling that run. While inject is in
+  flight, the row shows a sending state. If inject is unavailable or refused, Send now stops the live
+  turn and dispatches the promoted item as soon as the Session becomes sendable; the row shows a
+  stopping state while cancellation is in flight. Stop remains the explicit control for cancelling a
+  live turn without sending a queued message. Branch, admission, cancellation, or edit failures keep
+  the row and show a recoverable inline error.
 - Queued messages are transient and Session-scoped. They are not persisted across renderer restart.
   Bind each item to its admission Message Branch and block branch switching or inline message edits
   while that Session has queued work so a later dispatch cannot silently retarget it. Pause queue
@@ -764,7 +771,7 @@ colors communicate a successful or failed probe/migration result.
 - A Specialist also has an immutable public `id`. Create infers it from a compatible `name` by normalizing case, whitespace, underscores, and repeated hyphens; an unsafe, reserved, or already-used inferred value falls back to a UUID. Advanced settings may override the ID before creation, subject to the same lowercase-letter, number, hyphen, reserved-prefix, and uniqueness checks. Export writes this stored ID to `manifest.json`, so marketplace folders can use the stable `specialists/<id>/versions/<version>` path. Existing Specialist IDs are preserved without migration.
 - Connector context follows a distinct derived path: after live tool discovery the app generates an on-demand `mcp-<name>/SKILL.md`. Its frontmatter identity and every `host.mcp` example use immutable `name`; `displayName` may appear only in generated prose (or through an explicit `listConnectors()` result). Updating a Connector regenerates this document and reloads Skills without creating an invocation alias. Auth-recovery guidance derived from Connector configuration and discovered login tools remains part of the generated document.
 - A custom Connector also has an immutable local `id`. Create infers it from a compatible `name` by normalizing case, whitespace, underscores, and repeated hyphens; an unsafe, reserved, or already-used inferred value falls back to a UUID. Advanced settings may override the ID before creation, subject to the same lowercase-letter, number, hyphen, reserved-prefix, and uniqueness checks used by Specialist IDs. Local Specialist capability references and durable permission grants use the stored ID, while runtime calls, generated Connector Skills, and portable package references use the immutable lowercase-hyphenated `name`. Package import/export resolves between the two through the live Connector catalog. Existing Connector IDs are preserved without migration. Deletion atomically removes the Connector and records its ID in an optional pending-deletion journal before permission grants are pruned; the ID remains reserved until cleanup succeeds, and startup retries journaled cleanup before refreshing Connector Skills.
-- Connector template schemas use snake_case JSON keys while application-facing TypeScript objects remain camelCase. Schema v1 treats the public `oauth.client_id` and boolean `required_secrets.oauth_client_secret` marker as optional additions, so existing v1 templates remain importable and pre-registered OAuth clients can round-trip without a schema-version bump. Export never includes secret values, and import does not synthesize compatibility aliases from a display name or accept the earlier camelCase JSON keys.
+- Connector template schemas use snake_case JSON keys while application-facing TypeScript objects remain camelCase. Schema v1 treats the public `oauth.client_id`, `oauth.redirect_uri`, and boolean `required_secrets.oauth_client_secret` marker as optional additions, so existing v1 templates remain importable and pre-registered OAuth clients can round-trip without a schema-version bump. Export never includes secret values, and import does not synthesize compatibility aliases from a display name or accept the earlier camelCase JSON keys.
 - Specialist package schema v1 uses snake_case JSON keys (`display_name`, `system_prompt`, `skill_ids`, and `connector_ids`) while application-facing TypeScript objects remain camelCase. Package `name` stays the immutable invocation identity, the capability arrays contain portable names, and local Specialist persistence contains installation IDs. Import rejects the earlier camelCase JSON keys. Featured Skills are exported as references and are never copied into `skills/`.
 - Public JavaScript host APIs and their object fields use camelCase (`listSkills`, `listConnectors`, `attachSkill`, `displayName`, `systemPrompt`, and related fields). The agent-facing `host.compute` discovery/detail contract preserves its documented wire field names: `listRegistered()` and `listPreferred()` summaries use `provider_id` and `display_name`, while the `details(providerId, { mode: 'read' })` probe snapshot uses `probed_at`, `exit_code`, `error_tail`, `mem_mib`, and `detected_scheduler`; its public method names remain camelCase. Internal transport operation names may remain snake_case behind that boundary.
 

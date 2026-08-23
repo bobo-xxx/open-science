@@ -2282,7 +2282,7 @@ describe('ConversationPanel composer intake', () => {
     expect(agentControls?.getAttribute('data-grants-read-only')).toBe('true')
     expect(agentControls?.getAttribute('data-auto-review-disabled')).toBe('true')
     expect(agentControls?.getAttribute('data-specialist-read-only')).toBe('true')
-    expect((modelPicker as HTMLButtonElement).disabled).toBe(false)
+    expect(modelPicker).toBeNull()
     const followUp = container.querySelector('textarea[placeholder="Follow up…"]')
     expect(followUp).not.toBeNull()
     expect(document.activeElement).toBe(followUp)
@@ -4902,5 +4902,19 @@ describe('ConversationPanel error box + report affordance', () => {
       }
     })
     expect(reportButton()).not.toBeNull()
+  })
+
+  it('hides the Report button for a persisted Claude API connection failure without the reportable flag', () => {
+    renderPanel({
+      view: {
+        activeSession: {
+          ...errorSession,
+          error: 'Internal error: API Error: Unable to connect to API (ConnectionRefused)',
+          errorReportable: undefined
+        }
+      }
+    })
+    expect(errorBoxText()).toContain('Unable to connect to API (ConnectionRefused)')
+    expect(reportButton()).toBeNull()
   })
 })
