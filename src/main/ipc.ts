@@ -104,7 +104,7 @@ import {
   buildTaskNotificationShow
 } from './notifications/electron-wiring'
 import { createLogger, diagnosticErrorFields, errorLogFields } from './logger'
-import { startDiagnosticOperation } from './diagnostics/operation'
+import { startDiagnosticOperation, type DiagnosticOperation } from './diagnostics/operation'
 import { broadcastNotebookEnvProgress, registerNotebookEnvIpcHandlers } from './notebook/env-ipc'
 import {
   createNotebookApplicationModule,
@@ -232,6 +232,7 @@ import { SpecialistPackageService } from './specialist/package/service'
 import { OFFICIAL_MARKETPLACE_SOURCE } from './specialist/marketplace/official-source'
 import { MarketplaceRepository } from './specialist/marketplace/repository'
 import { MarketplaceService } from './specialist/marketplace/service'
+import { MarketplaceOperationCoordinator } from './specialist/marketplace/operation-coordinator'
 import {
   saveSpecialistExport,
   saveSpecialistPackageReport,
@@ -386,7 +387,8 @@ const createApplicationModules = async (
     listAppIconPreviews,
     confirmUpdateRendererDurability = () => Promise.resolve(true)
   }: IpcRegistrationOptions,
-  modules: ApplicationModuleBuilder
+  modules: ApplicationModuleBuilder,
+  composition: DiagnosticOperation
 ): Promise<ApplicationModuleInterfaces> => {
   const beforeComputeAdapters: NamedElectronSurfaceAdapter[] = []
   const beforeAcpAdapters: NamedElectronSurfaceAdapter[] = []
@@ -459,6 +461,7 @@ const createApplicationModules = async (
   storageLog.info('data root resolved', {
     location: samePath(resolveDataRoot(), computeDefaultDataRoot()) ? 'default' : 'custom'
   })
+  composition.phase('data-root')
 
   // Constructed once here (rather than left to each register*IpcHandlers' own default) so the
   // one-time legacy-path normalization pass below can share the exact instances the IPC surface uses.
@@ -634,6 +637,7 @@ const createApplicationModules = async (
       })
   })
   await seedDefaultPermissionGrants(permissionGrantRegistry, await getProjectDbClient(configRoot))
+  composition.phase('permission-grants')
   const projectFilesRepository = createManagedFileIndexRepository(
     getProjectDbClient,
     configRoot,
@@ -990,6 +994,7 @@ const createApplicationModules = async (
     localRpc: notebookLocalRpc
   } = notebookApplication
   notebookActivityRef.current = notebookService
+  composition.phase('notebook-runtime')
 
   // Builtins are validated once at startup from read-only repository resources. Package imports use
   // the same repository while keeping their dynamic Connector/custom-Skill catalog separate.
@@ -997,6 +1002,7 @@ const createApplicationModules = async (
   const appVersion = app.getVersion()
   const specialistSkills = await settingsService.listSpecialistSkillCatalog()
   const packageSkills = await specialistPackageSkillAdapter.snapshot()
+  composition.phase('specialist-catalog')
   const builtinRegistry = new BuiltinSpecialistRegistry({
     appVersion,
     builtinSkills: composeBuiltinSkillCatalog(appVersion, specialistSkills),
@@ -1017,7 +1023,10 @@ const createApplicationModules = async (
     protectedSpecialistNames: ['Reviewer']
   })
   const profileService = new ProfileService(specialistRepository, builtinRegistry)
+  const marketplaceRepository = new MarketplaceRepository(resolveStorageRoot())
+  const marketplaceOperationCoordinator = new MarketplaceOperationCoordinator()
   await profileService.ensureBuiltinCatalogReady()
+  composition.phase('builtin-specialists')
   const tagService = new TagService(
     new TagRepository(() => getProjectDbClient(configRoot)),
     new TagResourceCatalog({
@@ -1096,6 +1105,9 @@ const createApplicationModules = async (
       }
     },
     skillPort: specialistPackageSkillAdapter,
+    marketplaceOperationCoordinator,
+    onSpecialistDeleted: (specialistId) =>
+      marketplaceRepository.removeInstallationsForSpecialist(specialistId),
     onSkillsDeleted: async (skillIds) => {
       if (skillIds.length > 0) {
         // User Skills are default-on. Remove disabled-ID tombstones so reinstalling the same
@@ -1117,7 +1129,8 @@ const createApplicationModules = async (
     }
   })
   const marketplaceService = new MarketplaceService({
-    repository: new MarketplaceRepository(resolveStorageRoot()),
+    repository: marketplaceRepository,
+    operationCoordinator: marketplaceOperationCoordinator,
     packages: specialistPackageService,
     fetch: netFetchStandard,
     officialSource: OFFICIAL_MARKETPLACE_SOURCE,
@@ -1126,11 +1139,18 @@ const createApplicationModules = async (
     getInstalledSpecialists: async () =>
       (await profileService.list()).map((profile) => ({
         id: profile.id,
+        revision: profile.revision,
+        ...(profile.modifiedSinceImport === undefined
+          ? {}
+          : { modifiedSinceImport: profile.modifiedSinceImport }),
         ...(profile.origin ? { origin: profile.origin } : {}),
         ...(profile.importBaseline?.archiveDigest
           ? { archiveDigest: profile.importBaseline.archiveDigest }
           : {})
       })),
+    markMarketplaceManaged: async (id, expectedRevision) => {
+      await profileService.markMarketplaceManaged(id, expectedRevision)
+    },
     setSkillsMainEnabled: async (ids, enabled) => {
       await settingsRepository.setSkillsEnabled([...new Set(ids)], enabled)
       // Startup recovery runs before the ACP runtime exists, so its initial catalog reads the
@@ -1146,6 +1166,7 @@ const createApplicationModules = async (
       diagnosticErrorFields(error)
     )
   }
+  composition.phase('marketplace-recover')
   settingsService.setSkillDeletionGuard((skillId) =>
     specialistPackageService.assertSkillDeletionAllowed(skillId)
   )
@@ -1343,6 +1364,7 @@ const createApplicationModules = async (
     connectorApprovals: approvalBroker,
     skillImportApprovals: skillImportApprovalBroker
   } = connectorApplication
+  composition.phase('connectors')
   // Register compute IPC handlers early so computeService can be wired into the notebook RPC server.
   // The approval broker in compute/ipc.ts broadcasts via BrowserWindow.getAllWindows(), which requires
   // Electron to be ready — this is always the case here since we're inside registerIpcHandlers.
@@ -1401,6 +1423,7 @@ const createApplicationModules = async (
   computeJobDeletionRef.current = jobDeletionOwner
   await projectDeletionCoordinator.restorePendingDeletionBarriers()
   await jobDeletionOwner.restoreOrphanJobDeletionBarriers(isComputeJobOwnerLive)
+  composition.phase('deletion-barriers')
   const dataRoot = resolveDataRoot()
   // Start the JobPoller wired to the shared broadcaster so every state/tail change is pushed to all
   // renderer windows via 'compute:job-updated' (Phase 3d, design.md §9 + §15.3). The dispatcher
@@ -1898,6 +1921,7 @@ const createApplicationModules = async (
     })
   )
   notebookRpcServerRef.current = notebookRpcServer
+  composition.phase('notebook-rpc')
   // Register ownership before ACP construction. Reverse disposal therefore drains ACP + Notebook
   // through the coordinator first, then releases the local bridge without creating a second runtime
   // shutdown owner; rollback also closes a server started during partial composition.
@@ -2059,6 +2083,7 @@ const createApplicationModules = async (
   )
   surfaceAdapters = afterAcpAdapters
   runtimeRef.current = runtime
+  composition.phase('acp-runtime')
   runtime.setSessionResumeObserver(async (request) => {
     if (request.specialistBindingPending !== true) return
     await sessionSpecialistReconfiguration.completeResume(request.sessionId, request.specialistId)
@@ -2084,6 +2109,7 @@ const createApplicationModules = async (
     }
   )
   userSkillCatalogObserverRef.current = userSkillCatalogObserver
+  composition.phase('skills')
   const sideChatLog = createLogger('side-chat')
   const sideChatRuntime = await modules.add(
     {
@@ -2161,6 +2187,7 @@ const createApplicationModules = async (
   } catch (error) {
     sideChatLog.error('durable Side chat hydration failed', diagnosticErrorFields(error))
   }
+  composition.phase('side-chat')
   // Recovery quiesces every runtime owner, so do not start its first attempt until ACP, Delegation,
   // Notebook, Side Chat, and the composed quiescence boundary are all initialized. The bounded
   // durable barrier restoration above still runs early enough to block admission during startup.
@@ -2781,6 +2808,7 @@ const createApplicationModules = async (
     // a redundant named env.
     notebookService.setDefaultEnvProvisioner(serialized, broadcastNotebookEnvProgress)
   }
+  composition.phase('notebook-provisioner')
 
   // Registered after the acp/notebook handlers exist: migration needs to interrupt both runtimes.
   const storageCommandOwner = createStorageCommandOwner({
@@ -3094,6 +3122,7 @@ const createApplicationModules = async (
   declareElectronAdapter('application-projects', () =>
     registerApplicationCommandElectronAdapter(applicationCommandComposition.electron)
   )
+  composition.phase('commands')
 
   return {
     applicationCommands: {
@@ -3150,13 +3179,24 @@ const createApplicationModules = async (
 }
 
 const registerIpcHandlers = async (options: IpcRegistrationOptions): Promise<IpcRegistration> => {
-  const applicationRuntime = await composeApplicationRuntimeWithAdapters(
-    (modules) => createApplicationModules(options, modules),
-    installElectronRuntimeAdapters
-  )
-  return {
-    ...applicationRuntime.interfaces,
-    dispose: applicationRuntime.dispose
+  const composition = startDiagnosticOperation(createLogger('startup'), {
+    operation: 'application-composition',
+    cpuUsage: process.cpuUsage
+  })
+  try {
+    const applicationRuntime = await composeApplicationRuntimeWithAdapters(
+      (modules) => createApplicationModules(options, modules, composition),
+      installElectronRuntimeAdapters
+    )
+    composition.phase('ipc-adapters')
+    composition.complete()
+    return {
+      ...applicationRuntime.interfaces,
+      dispose: applicationRuntime.dispose
+    }
+  } catch (error) {
+    composition.fail(error)
+    throw error
   }
 }
 
