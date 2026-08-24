@@ -524,7 +524,11 @@ class AcpRuntime {
       livePrompt: (sessionId) => {
         const current = this.sessionInteractions.current(sessionId)
         return current?.kind === 'prompt'
-          ? { turnToken: current.turnToken, signal: current.signal }
+          ? {
+              turnToken: current.turnToken,
+              signal: current.signal,
+              ...(current.promptMessageId ? { promptMessageId: current.promptMessageId } : {})
+            }
           : undefined
       },
       sessionCwd: (sessionId) => this.sessionRegistry.lookup(sessionId)?.aggregate.snapshot().cwd,
@@ -1126,6 +1130,14 @@ class AcpRuntime {
     )
   }
 
+  async steerSideChatAdvisory(
+    request: AcpSteerFollowUpRequest
+  ): ReturnType<AcpNativeFollowUpWorkflow['steerSideChatAdvisory']> {
+    return this.withOperationLease(() =>
+      withDataRootWrite(() => this.nativeFollowUp.steerSideChatAdvisory(request))
+    )
+  }
+
   private async prepareNativeFollowUpContent(
     request: AcpSteerFollowUpRequest
   ): Promise<NativeFollowUpPreparedContent> {
@@ -1133,6 +1145,7 @@ class AcpRuntime {
       frameworkId: this.framework.id,
       text: request.text,
       selectedSkillIds: request.forcedSkillIds ?? [],
+      role: this.sessionEnvironment.role(),
       specialistId: this.sessionRegistry.lookup(request.sessionId)?.aggregate.snapshot()
         .specialistId,
       codexHome: this.backendGeneration.current.adapter.codexHome

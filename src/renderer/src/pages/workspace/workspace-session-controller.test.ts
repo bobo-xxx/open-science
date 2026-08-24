@@ -7,7 +7,10 @@ import type {
   CompletionHandoffLifecycleEvent,
   SpecialistListItem
 } from '../../../../shared/specialist'
-import type { SessionDeletionResult } from '../../../../shared/session-persistence'
+import type {
+  PersistedChatSession,
+  SessionDeletionResult
+} from '../../../../shared/session-persistence'
 import { createLinearConversationGraph } from '../../../../shared/conversation-graph'
 import { useArchiveUndoStore } from '@/stores/archive-undo-store'
 import {
@@ -167,6 +170,98 @@ afterEach(() => {
 })
 
 describe('workspace session controller', () => {
+  it('loads an unopened Session before opening conversation export', async () => {
+    const summary = session({ contentLoaded: false, activeMessageCount: 1 })
+    const persisted: PersistedChatSession = {
+      id: summary.id,
+      projectId: summary.projectId,
+      title: summary.title,
+      cwd: summary.cwd,
+      status: summary.status,
+      messages: [
+        {
+          id: 'message-1',
+          role: 'user',
+          content: 'Export me',
+          status: 'complete',
+          eventIds: [],
+          createdAt: 1,
+          updatedAt: 1
+        }
+      ],
+      createdAt: summary.createdAt,
+      updatedAt: summary.updatedAt
+    }
+    const loadOne = vi.fn().mockResolvedValue(persisted)
+    window.api = { sessions: { loadOne } } as unknown as Window['api']
+    useSessionStore.setState({ sessions: [summary], selectedSessionId: summary.id })
+    const hook = renderController({ activeSession: summary })
+    mounted.push(hook)
+
+    await act(async () => {
+      hook.result.current.actions.openExportConversation(summary)
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(loadOne).toHaveBeenCalledWith({
+      projectId: summary.projectId,
+      sessionId: summary.id
+    })
+    expect(hook.result.current.view.dialogs.exportConversation?.messages).toHaveLength(1)
+    expect(useSessionStore.getState().sessions[0]?.contentLoaded).not.toBe(false)
+  })
+
+  it('does not resurrect a deleted Session when export hydration finishes', async () => {
+    const summary = session({ contentLoaded: false, activeMessageCount: 1 })
+    const persisted: PersistedChatSession = {
+      id: summary.id,
+      projectId: summary.projectId,
+      title: summary.title,
+      cwd: summary.cwd,
+      status: summary.status,
+      messages: [],
+      createdAt: summary.createdAt,
+      updatedAt: summary.updatedAt
+    }
+    const load = deferred<PersistedChatSession | undefined>()
+    const loadOne = vi.fn(() => load.promise)
+    window.api = { sessions: { loadOne } } as unknown as Window['api']
+    useSessionStore.setState({ sessions: [summary], selectedSessionId: summary.id })
+    const hook = renderController({ activeSession: summary })
+    mounted.push(hook)
+
+    act(() => hook.result.current.actions.openExportConversation(summary))
+    expect(loadOne).toHaveBeenCalledOnce()
+
+    await act(async () => {
+      useSessionStore.getState().deleteSession(summary.id)
+      load.resolve(persisted)
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(useSessionStore.getState().sessions).toEqual([])
+    expect(hook.result.current.view.dialogs.exportConversation).toBeNull()
+  })
+
+  it('localizes an unopened Session export load failure', async () => {
+    const summary = session({ contentLoaded: false })
+    window.api = {
+      sessions: { loadOne: vi.fn().mockRejectedValue(new Error('private path leaked')) }
+    } as unknown as Window['api']
+    const hook = renderController({ activeSession: summary })
+    mounted.push(hook)
+
+    await act(async () => {
+      hook.result.current.actions.openExportConversation(summary)
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(hook.result.current.view.exportError).toBe('Could not load this session for export.')
+  })
+
   it('keeps rename whitespace while using trim only as the empty-title gate', () => {
     const active = session()
     useSessionStore.setState({ sessions: [active], selectedSessionId: active.id })
@@ -223,6 +318,17 @@ describe('workspace session controller', () => {
     mounted.push(hook)
 
     expect(hook.result.current.lifecycle.canStartSend(inactive.id)).toBe(true)
+  })
+
+  it('blocks sends until active and background Session content is loaded', () => {
+    const active = session({ contentLoaded: false })
+    const inactive = session({ id: 'session-b', contentLoaded: false })
+    useSessionStore.setState({ sessions: [active, inactive], selectedSessionId: active.id })
+    const hook = renderController({ activeSession: active })
+    mounted.push(hook)
+
+    expect(hook.result.current.lifecycle.canStartSend()).toBe(false)
+    expect(hook.result.current.lifecycle.canStartSend(inactive.id)).toBe(false)
   })
 
   it('archives durably before enqueueing undo and clearing the active selection', async () => {
@@ -340,6 +446,7 @@ describe('workspace session controller', () => {
       message: 'switch rejected',
       committed: false
     })
+    expect(hook.result.current.view.specialist.historyId).toBe('specialist-a')
     expect(hook.result.current.view.specialist.barrierInFlight).toBe(false)
 
     await act(async () => {
@@ -354,6 +461,39 @@ describe('workspace session controller', () => {
     })
     expect(useSessionStore.getState().sessions[0].specialistId).toBe('specialist-b')
     expect(hook.result.current.view.specialist.reconfigureError).toBeNull()
+  })
+
+  it('exposes an idle Session Specialist selection while reconfiguration is in flight', async () => {
+    const active = session({ specialistId: 'specialist-a' })
+    const switchRequest = deferred<{ status: 'applied'; contextReset: boolean }>()
+    const setSessionSpecialist = vi.fn(() => switchRequest.promise)
+    useSessionStore.setState({ sessions: [active], selectedSessionId: active.id })
+    window.api = { specialist: { setSessionSpecialist } } as unknown as Window['api']
+    const hook = renderController({
+      activeSession: active,
+      specialistItems: [
+        specialist('specialist-a', 'Specialist A'),
+        specialist('specialist-b', 'Specialist B')
+      ]
+    })
+    mounted.push(hook)
+
+    act(() => hook.result.current.actions.selectSpecialist('specialist-b'))
+
+    expect(setSessionSpecialist).toHaveBeenCalledWith({
+      sessionId: active.id,
+      specialistId: 'specialist-b'
+    })
+    expect(hook.result.current.view.specialist.barrierInFlight).toBe(true)
+    const visibleSpecialistWhilePending = hook.result.current.view.specialist.historyId
+
+    await act(async () => {
+      switchRequest.resolve({ status: 'applied', contextReset: false })
+      await switchRequest.promise
+    })
+
+    expect(visibleSpecialistWhilePending).toBe('specialist-b')
+    expect(useSessionStore.getState().sessions[0].specialistId).toBe('specialist-b')
   })
 
   it('keeps idle Specialist failures scoped to each Session', async () => {
@@ -549,6 +689,62 @@ describe('workspace session controller', () => {
     expect(hook.result.current.view.specialist.reconfigureError).toBeNull()
     expect(hook.result.current.actions.retrySpecialistSelection()).toBe(false)
     expect(setSessionSpecialist).toHaveBeenCalledOnce()
+  })
+
+  it('clears an in-flight idle selection after an authoritative handoff supersedes it', async () => {
+    const active = session({ specialistId: 'specialist-a' })
+    const authoritative = specialist('specialist-c', 'Specialist C')
+    const switchRequest = deferred<{ status: 'applied'; contextReset: boolean }>()
+    let handoffListener: ((event: CompletionHandoffLifecycleEvent) => void) | undefined
+    useSessionStore.setState({ sessions: [active], selectedSessionId: active.id })
+    window.api = {
+      specialist: {
+        setSessionSpecialist: vi.fn(() => switchRequest.promise),
+        resolveSessionSpecialist: vi.fn().mockResolvedValue({
+          kind: 'bound',
+          profile: authoritative
+        }),
+        onHandoffLifecycleEvent: vi.fn((listener) => {
+          handoffListener = listener
+          return () => undefined
+        })
+      }
+    } as unknown as Window['api']
+    const hook = renderController({
+      activeSession: active,
+      specialistItems: [specialist('specialist-b', 'Specialist B'), authoritative]
+    })
+    mounted.push(hook)
+
+    act(() => hook.result.current.actions.selectSpecialist('specialist-b'))
+    await act(async () => {
+      handoffListener?.({
+        id: 'handoff-1',
+        sessionId: active.id,
+        sequence: 1,
+        observedAt: 1,
+        phase: 'continuation-start',
+        target: 'Specialist C',
+        provenance: { originatingTurnId: 'turn-1', attachmentIds: [], artifactIds: [] }
+      })
+      await Promise.resolve()
+    })
+    hook.rerender(useSessionStore.getState().sessions[0])
+
+    expect(hook.result.current.view.specialist.historyId).toBe('specialist-c')
+    expect(hook.result.current.lifecycle.captureSendIntent(false)).toMatchObject({
+      hasPendingSwitch: false,
+      pendingSpecialistId: 'specialist-c'
+    })
+
+    await act(async () => {
+      switchRequest.resolve({ status: 'applied', contextReset: false })
+      await switchRequest.promise
+    })
+    hook.rerender(useSessionStore.getState().sessions[0])
+
+    expect(useSessionStore.getState().sessions[0].specialistId).toBe('specialist-c')
+    expect(hook.result.current.view.specialist.historyId).toBe('specialist-c')
   })
 
   it('discards an idle Specialist failure after a newer pending-switch update', async () => {
