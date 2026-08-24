@@ -417,7 +417,8 @@ export type NotebookRunRecord = {
   environmentManifest?: NotebookEnvironmentManifest
   environmentManifestChecksum?: string
   // Trusted turn/Branch attribution injected by the main-process RPC bridge. Legacy and user-run
-  // records may omit it; a supplied Artifact producer must match all five fields.
+  // records may omit it. An Artifact producer must share root/agent identity, belong to the trusted
+  // Branch and message ancestry, and match the active Runtime Segment for the active prompt.
   rootFrameId?: string
   agentFrameId?: string
   messageBranchId?: string
@@ -517,6 +518,18 @@ export type NotebookRunHistorySummary = {
   latestDataKernel?: 'python' | 'r'
 }
 
+// Stable chronological cursor for renderer history pagination. runId disambiguates runs that share
+// the same millisecond timestamp across Notebook lanes.
+export type NotebookRunCursor = {
+  startedAt: number
+  runId: string
+}
+
+export type NotebookRunPage = {
+  hasEarlierRuns: boolean
+  oldestCursor?: NotebookRunCursor
+}
+
 // Renderer-facing snapshot of one shared notebook interpreter session.
 export type NotebookSessionState = {
   id: string
@@ -541,6 +554,8 @@ export type NotebookSessionState = {
   executionEnvironments?: Partial<Record<'python' | 'r', string>>
   // Present only when state() requested one Agent's complete-history discovery metadata.
   historySummary?: NotebookRunHistorySummary
+  // Present on normal and cursor-paged renderer reads; omitted for sparse run-id/summary requests.
+  historyPage?: NotebookRunPage
   runs: NotebookRunRecord[]
   recentRuns: NotebookRunRecord[]
   // Derived from run history and the rebuildable dependency-analysis sidecar; never written into
@@ -594,10 +609,25 @@ export type NotebookSessionRequest = OptionalProjectIdScope & {
 // request immutable historical Runs by id without changing or widening that default window.
 export const NOTEBOOK_STATE_TARGET_RUN_LIMIT = 20
 export const NOTEBOOK_STATE_HISTORY_FRAME_ID_LIMIT_BYTES = 1_024
+export const NOTEBOOK_STATE_HISTORY_PAGE_LIMIT = 100
+export const NOTEBOOK_STATE_HISTORY_CURSOR_RUN_ID_LIMIT = 1_024
+
+export const isNotebookRunCursor = (value: unknown): value is NotebookRunCursor => {
+  if (!value || typeof value !== 'object') return false
+  const cursor = value as Partial<NotebookRunCursor>
+  return (
+    Number.isFinite(cursor.startedAt) &&
+    typeof cursor.runId === 'string' &&
+    cursor.runId.length > 0 &&
+    cursor.runId.length <= NOTEBOOK_STATE_HISTORY_CURSOR_RUN_ID_LIMIT
+  )
+}
 
 export type NotebookSessionStateRequest = NotebookSessionRequest & {
   runIds?: string[]
   historySummaryFrameId?: string
+  historyBefore?: NotebookRunCursor
+  historyLimit?: number
 }
 
 // Resolves the data kernel ('python' or 'r') that owns a given tab. For python/r tabs the
