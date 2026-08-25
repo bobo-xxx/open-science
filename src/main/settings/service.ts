@@ -136,8 +136,7 @@ export type SettingsServiceOptions = {
   // The machine's own Claude config dir, used by the shared provider for auth/spawn and scanned as a
   // user skill source. Injectable so tests don't touch the real ~/.claude.
   userClaudeDir?: string
-  // The machine's own Codex config dir, scanned for installed skills while Codex is active.
-  // Injectable for the same reason as userClaudeDir.
+  // The machine's own Codex config dir, scanned for installed skills; injectable like userClaudeDir.
   userCodexDir?: string
   // The framework-neutral Agents config dir. Codex and other compatible agents discover skills
   // under ~/.agents/skills; it is scanned regardless of the active framework.
@@ -665,8 +664,7 @@ class SettingsService {
     return this.skills.importSkillArchiveBatch(zip, items)
   }
 
-  // Lazily loads one selected GitHub candidate. The repository's bounded helper downloads only its
-  // SKILL.md; the display label is reconstructed from the public URL and contains no host paths.
+  // Lazily previews one GitHub skill without exposing host paths.
   async previewGitHubSkill(
     request: PreviewGitHubSkillRequest,
     signal?: AbortSignal
