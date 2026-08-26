@@ -534,6 +534,7 @@ describe('Settings backend ownership architecture', () => {
       'src/main/settings/agent-runtime-manager.ts',
       'src/main/settings/compute-grant-port.ts',
       'src/main/settings/connector-settings.ts',
+      'src/main/settings/network-proxy-settings-owner.ts',
       'src/main/settings/notebook-runtime-settings.ts',
       'src/main/settings/preferences.ts',
       'src/main/settings/provider-accounts.ts',
@@ -793,10 +794,12 @@ describe('Settings backend ownership architecture', () => {
       'src/main/settings/provider-token-limits.ts'
     ])
     expect(manifest.modules.settings_provider_accounts.ownerPaths).toEqual([
+      'src/main/settings/bounded-response.ts',
       'src/main/settings/provider-accounts.ts',
       'src/main/settings/provider-auth-lifecycle.ts',
       'src/main/settings/provider-draft-projection.ts',
       'src/main/settings/provider-model-catalog-owner.ts',
+      'src/main/settings/provider-resource-limits.ts',
       'src/main/settings/provider-runtime-projection.ts',
       'src/main/settings/xai-oauth.ts',
       'src/main/settings/xai-provider-account-owner.ts'
@@ -830,6 +833,7 @@ describe('Settings backend ownership architecture', () => {
     ])
     expect(manifest.modules.settings_service_facade.ownerPaths).toEqual([
       'src/main/settings/service.ts',
+      'src/main/settings/network-proxy-settings-owner.ts',
       'src/main/settings/reviewer-model-owner.ts',
       'src/main/settings/subagent-model-owner.ts',
       'src/main/settings/vision-model-owner.ts'
