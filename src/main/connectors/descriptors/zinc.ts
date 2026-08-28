@@ -1,5 +1,7 @@
 import type { ToolDescriptor } from '../types'
 import { netFetchStandard } from '../../skills/net-fetch'
+import { abortableDelay } from '../abortable-delay'
+import { withTimeoutSignal } from '../request-policy'
 
 // CartBlanche22 (ZINC22 purchasable-compound search) — every search endpoint is ASYNC and
 // POST-only (form-encoded): submit returns a task receipt {"task": "<uuid>"}, and the result is
@@ -181,42 +183,19 @@ function bodyExcerpt(text: string, n = 200): string {
   return excerpt || '<empty body>'
 }
 
-const sleep = (ms: number, signal?: AbortSignal): Promise<void> => {
-  signal?.throwIfAborted()
-  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms))
-  return new Promise((resolve, reject) => {
-    const finish = (): void => {
-      signal.removeEventListener('abort', abort)
-      resolve()
-    }
-    const abort = (): void => {
-      clearTimeout(timer)
-      reject(signal.reason)
-    }
-    const timer = setTimeout(finish, ms)
-    signal.addEventListener('abort', abort, { once: true })
-  })
-}
-
 async function fetchWithTimeout(
   url: string,
   init: RequestInit,
   timeoutMs: number,
   signal?: AbortSignal
 ): Promise<Response> {
-  signal?.throwIfAborted()
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), Math.max(1, timeoutMs))
-  const requestSignal = signal ? AbortSignal.any([controller.signal, signal]) : controller.signal
-  try {
-    return await netFetchStandard(url, {
+  return withTimeoutSignal(Math.max(1, timeoutMs), signal, (requestSignal) =>
+    netFetchStandard(url, {
       ...init,
       headers: { 'user-agent': USER_AGENT, ...init.headers },
       signal: requestSignal
     })
-  } finally {
-    clearTimeout(timer)
-  }
+  )
 }
 
 // POST form fields to a CartBlanche22 search endpoint; return the task uuid.
@@ -317,7 +296,7 @@ async function poll(task: string, deadline: number, signal?: AbortSignal): Promi
       )
     }
     const wait = Math.min(POLL_INTERVAL_MS, Math.max(0, deadline - Date.now()))
-    await sleep(wait, signal)
+    await abortableDelay(wait, signal)
   }
 }
 
