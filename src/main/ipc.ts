@@ -32,6 +32,8 @@ import { createApplicationEventModule, type ApplicationEventSource } from './app
 import { TagRepository } from './tags/repository'
 import { TagResourceCatalog } from './tags/resource-catalog'
 import { TagService } from './tags/service'
+import { MemoryRepository } from './memory/repository'
+import { MemoryService } from './memory/service'
 import {
   LIFECYCLE_CHANNELS,
   MAIN_DELEGATED_WORK_LIFECYCLE_CLIENT_ID,
@@ -123,6 +125,7 @@ import {
 import { ManagedPreviewResources } from './managed-preview-resources'
 import type { PreviewProtocolRegistrar } from './managed-preview-protocol'
 import type { ManagedPreviewSource } from '../shared/preview-resources'
+import { resolveEffectiveSpecialistSkills } from '../shared/specialist'
 import {
   createOfficePreviewFrameProcessResolver,
   createOfficePreviewProcessMemoryReader
@@ -504,8 +507,19 @@ const createApplicationModules = async (
       return
     }
     if (runtimeRef.current) {
-      broadcastToRenderers('skills:catalog-changed', undefined)
-      void runtimeRef.current.requestSkillsReload()
+      void settingsService
+        .registeredHelperCatalog()
+        .refresh()
+        .then(() => {
+          broadcastToRenderers('skills:catalog-changed', undefined)
+          return runtimeRef.current?.requestSkillsReload()
+        })
+        .catch((error) => {
+          createLogger('skills').warn(
+            'Skill catalog reconciliation failed',
+            diagnosticErrorFields(error)
+          )
+        })
     }
   }
   const sideChatOwnerRef: { current: SideChatRuntimeOwner | undefined } = {
@@ -839,7 +853,8 @@ const createApplicationModules = async (
         sideChatOwnerRef.current?.restoreProject(projectId)
         await computeJobDeletionPort.abortProjectJobDeletion(projectId)
       }
-    }
+    },
+    applicationEvents
   )
   const detectArchiveBlockingSessions = (): ReturnType<typeof detectActiveSessions> =>
     detectActiveSessions({
@@ -1066,6 +1081,7 @@ const createApplicationModules = async (
       locale: app.getLocale(),
       appVersion: app.getVersion(),
       translate,
+      helperModuleCatalog: settingsService.registeredHelperCatalog(),
       events: applicationEvents,
       disposeTimeoutMs: QUIT_SHUTDOWN_BUDGET_MS,
       isBackendTeardownOwned: () => backendTeardownOwnedByCoordinator
@@ -1116,6 +1132,10 @@ const createApplicationModules = async (
       listSpecialists: async () =>
         (await profileService.listForSettings()).filter(({ kind }) => kind !== 'reviewer')
     }),
+    applicationEvents
+  )
+  const memoryService = new MemoryService(
+    new MemoryRepository(() => getProjectDbClient(configRoot)),
     applicationEvents
   )
   const tagCleanupLog = createLogger('tags:cleanup')
@@ -1824,6 +1844,7 @@ const createApplicationModules = async (
                     ...(latest.permissionProfile
                       ? { permissionProfile: latest.permissionProfile }
                       : {}),
+                    memoryEnabled: latest.memoryEnabled !== false,
                     ...(latest.agentFrameworkId
                       ? { previousFrameworkId: latest.agentFrameworkId }
                       : {}),
@@ -1933,8 +1954,21 @@ const createApplicationModules = async (
       onSessionReleased: (sessionId) => completionGateCoordinator.releaseSession(sessionId),
       isHostSkillsAvailable: (sessionId) =>
         runtimeRef.current?.getSessionFramework(sessionId) !== 'codebuddy',
+      resolveSpecialistSkillIds: async (specialistId) => {
+        const profile = await profileService.resolveRunnableById(specialistId)
+        if (!profile.enabled) return []
+        const effective = resolveEffectiveSpecialistSkills(
+          profile,
+          await settingsService.listSpecialistSkillCatalog()
+        )
+        return effective.kind === 'specialist' ? [...new Set(effective.skillIds)] : []
+      },
       connectorService,
       computeService: agentComputeService,
+      memoryService,
+      isMemoryEnabledForSession: async (sessionId) =>
+        (runtimeRef.current?.isSessionMemoryEnabled(sessionId) ?? false) &&
+        (await memoryService.isEnabled()),
       skillImporter: conversationSkillImporter,
       planService: {
         call: (input) => {
@@ -1973,6 +2007,7 @@ const createApplicationModules = async (
         artifact: artifactProvenanceRepository,
         upload: uploadRepository
       }),
+      delegationInputCatalog: projectFilesRepository,
       hostLineage: new HostLineageService({
         catalog: projectFilesRepository,
         provenance: artifactProvenanceRepository
@@ -2210,6 +2245,7 @@ const createApplicationModules = async (
       delegatedWork: delegatedWork.root,
       sideChatRelays: mainPromptSideChatRelay,
       imageInputCompatibility,
+      memory: memoryService,
       resolveComputeExecutionTargetIds: (sessionId) => hostsRegistry.getSelected(sessionId)
     },
     (options) => {
@@ -2237,6 +2273,7 @@ const createApplicationModules = async (
       storageRoot: configRoot,
       catalog: { list: () => settingsService.listUserSkills() },
       onCatalogChanged: async () => {
+        await settingsService.registeredHelperCatalog().refresh()
         broadcastToRenderers('skills:catalog-changed', undefined)
         await runtime.requestSkillsReload()
       }
@@ -3303,6 +3340,22 @@ const createApplicationModules = async (
     },
     permissionGrants: permissionGrantProjection,
     tags: tagService,
+    memory: {
+      snapshot: () => memoryService.snapshot(),
+      setEnabled: async (request) => {
+        const before = await memoryService.isEnabled()
+        const snapshot = await memoryService.setEnabled(request)
+        if (before !== snapshot.enabled) await runtime.requestSkillsReload()
+        return snapshot
+      },
+      createCategory: (request) => memoryService.createCategory(request),
+      updateCategory: (request) => memoryService.updateCategory(request),
+      deleteCategory: (request) => memoryService.deleteCategory(request),
+      createEntry: (request) => memoryService.createEntry(request),
+      updateEntry: (request) => memoryService.updateEntry(request),
+      deleteEntry: (request) => memoryService.deleteEntry(request),
+      clearAll: () => memoryService.clearAll()
+    },
     dataContent: {
       artifacts: artifactHandlers,
       electron: {
@@ -3430,6 +3483,18 @@ const createApplicationModules = async (
         sessionAdmission: {
           withSessionAvailableById: (sessionId, operation) =>
             archiveCoordinator.withSessionAvailableById(sessionId, operation)
+        },
+        resolveMemoryEnabled: async ({ sessionId, projectId }) => {
+          const sessions = projectId
+            ? [await sessionRepository.loadSession(projectId, sessionId)].filter(
+                (session): session is PersistedChatSession => session !== undefined
+              )
+            : (await sessionRepository.loadAll()).sessions.filter(
+                (session) => session.id === sessionId
+              )
+          if (sessions.length === 0) return undefined
+          if (sessions.length !== 1) return false
+          return sessions[0].memoryEnabled !== false
         },
         respondDelegatedQuestion: (input) => {
           if (!delegatedWork.root.respondQuestion) {

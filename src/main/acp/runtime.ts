@@ -196,6 +196,13 @@ type AcpRuntimeOptions = {
     resolveRoot: (rootId: string) => Promise<Pick<GrantedLocalRoot, 'path' | 'access'> | undefined>
   }
   notebook?: AcpRuntimeNotebookOptions
+  memory?: {
+    isEnabled?(): Promise<boolean>
+    recallForPrompt(
+      requestText: string,
+      context: { projectId: string }
+    ): Promise<string | undefined>
+  }
   skillImport?: AcpRuntimeSkillImportOptions
   skills?: AcpTurnSkillHooks
   plan?: AcpRuntimePlanOptions
@@ -307,9 +314,12 @@ type AcpRuntimeNotebookOptions = {
   projectId: string
   mcpEntryPath: string
   mcpCommand?: string
+  memoryTools?: boolean
+  isMemoryEnabled?: () => Promise<boolean>
   getRpcConnection?: (binding: {
     sessionId: string
     projectId: string
+    memoryTools: boolean
   }) => Promise<NotebookRpcConnection>
   registerSessionAlias?: (aliasSessionId: string, sessionId: string) => void
   releaseSessionCapabilities?: (sessionId: string) => void
@@ -321,10 +331,15 @@ type AcpRuntimeNotebookOptions = {
     method: NotebookExecutionRpcMethod
     rawInput?: unknown
   }) => string | undefined
-  setArtifactProvenanceContext?: (
+  setArtifactTurnBinding?: (
     sessionId: string,
-    context: import('../../shared/notebook').NotebookRunProvenanceContext | undefined
+    binding: {
+      ownerExecutionId: string
+      projectId: string
+      provenanceContext: import('../../shared/notebook').NotebookRunProvenanceContext
+    }
   ) => void
+  clearArtifactTurnBinding?: (sessionId: string, ownerExecutionId: string) => void
   registerTurnInputs?: (request: {
     projectId: string
     appSessionId: string
@@ -495,6 +510,7 @@ class AcpRuntime {
     Readonly<{
       sessionId: string
       provenanceContext?: NonNullable<AcpPromptRequest['provenanceContext']>
+      memoryEnabled?: boolean
       referencedSessions?: AcpPromptRequest['referencedSessions']
     }>
   >()
@@ -760,6 +776,10 @@ class AcpRuntime {
       this.activeSessionFor(sessionId) !== undefined &&
       this.sessionRegistry.lookup(sessionId)?.aggregate.snapshot().projectId === projectId
     )
+  }
+
+  isSessionMemoryEnabled(sessionId: string): boolean {
+    return this.sessionRegistry.lookup(sessionId)?.aggregate.snapshot().memoryEnabled ?? false
   }
 
   liveSessionProjectId(sessionId: string): string | undefined {
@@ -1481,6 +1501,9 @@ class AcpRuntime {
         request: {
           sessionId: permissionRequest.sessionId,
           text: PERMISSION_DENIED_CONTINUATION_TEXT,
+          ...(promptInteraction.memoryEnabled !== undefined
+            ? { memoryEnabled: promptInteraction.memoryEnabled }
+            : {}),
           suppressUserMessage: true,
           ...(promptInteraction.promptMessageId
             ? { provenanceContext: { promptMessageId: promptInteraction.promptMessageId } }
@@ -1617,6 +1640,7 @@ class AcpRuntime {
       request: {
         sessionId: restored.sessionId,
         text,
+        memoryEnabled: continuation.memoryEnabled,
         suppressUserMessage: true,
         provenanceContext: continuation.provenanceContext,
         ...(continuation.referencedSessions?.length
@@ -1716,6 +1740,7 @@ class AcpRuntime {
         resolution.response,
         restoredContinuation?.historyReplay,
         restoredContinuation?.provenanceContext ?? livePromptContext?.provenanceContext,
+        restoredContinuation?.memoryEnabled ?? livePromptContext?.memoryEnabled,
         restoredContinuation?.referencedSessions ?? livePromptContext?.referencedSessions
       )
       if (continuation) {
@@ -1827,12 +1852,17 @@ class AcpRuntime {
     const referencedSessions = this.handoffContinuity.copyReferencedSessions(request.sessionId)
     if (
       promptInteraction?.kind === 'prompt' &&
-      (promptInteraction.provenanceContext || referencedSessions?.length)
+      (promptInteraction.provenanceContext ||
+        promptInteraction.memoryEnabled !== undefined ||
+        referencedSessions?.length)
     ) {
       this.userChoiceProvenanceContexts.set(requestId, {
         sessionId: request.sessionId,
         ...(promptInteraction.provenanceContext
           ? { provenanceContext: promptInteraction.provenanceContext }
+          : {}),
+        ...(promptInteraction.memoryEnabled !== undefined
+          ? { memoryEnabled: promptInteraction.memoryEnabled }
           : {}),
         ...(referencedSessions?.length ? { referencedSessions } : {})
       })
@@ -1845,6 +1875,7 @@ class AcpRuntime {
     response: CreateElicitationResponse,
     historyReplay?: ElicitationResponse['historyReplay'],
     provenanceContext?: AcpPromptRequest['provenanceContext'],
+    memoryEnabled?: boolean,
     referencedSessions?: AcpPromptRequest['referencedSessions']
   ): AcpPromptRequest | undefined {
     if (response.action === 'cancel') return undefined
@@ -1897,6 +1928,7 @@ class AcpRuntime {
     return {
       sessionId: request.sessionId,
       text,
+      ...(memoryEnabled !== undefined ? { memoryEnabled } : {}),
       suppressUserMessage: true,
       ...(continuationProvenance ? { provenanceContext: continuationProvenance } : {}),
       ...(referencedSessions?.length ? { referencedSessions } : {}),
@@ -2066,6 +2098,7 @@ class AcpRuntime {
           : 'The user approved the pending Session Plan. Continue execution of exactly that ' +
             `approved Plan Artifact Version (artifact_version_id=${plan.artifactVersionId}). ` +
             'Do not regenerate, broaden, or reinterpret the approved Plan.',
+      memoryEnabled: continuation.memoryEnabled,
       suppressUserMessage: true,
       provenanceContext: continuation.provenanceContext,
       ...(continuation.referencedSessions?.length
