@@ -138,6 +138,70 @@ describe('workspace runtime events', () => {
     })
   })
 
+  it('keeps CodeBuddy assistant segments on each side of later tool calls', async () => {
+    const promptMessageId = useSessionStore.getState().sessions[0].activeRun?.promptMessageId
+    useSessionStore.setState((state) => ({
+      sessions: state.sessions.map((session) => ({
+        ...session,
+        agentFrameworkId: 'codebuddy'
+      }))
+    }))
+    await applyWorkspaceRuntimeEvent(
+      createEvent({
+        id: 'codebuddy-prose',
+        timestamp: Date.now(),
+        role: 'assistant',
+        messageId: 'codebuddy-provider-message',
+        promptMessageId,
+        text: 'I will search the selected source.'
+      })
+    )
+    vi.advanceTimersByTime(1)
+    await applyWorkspaceRuntimeEvent(
+      createEvent({
+        id: 'codebuddy-tool-1',
+        timestamp: Date.now(),
+        kind: 'tool',
+        toolCallId: 'codebuddy-notebook-state',
+        providerToolName: 'open-science-notebook/notebook_state',
+        promptMessageId,
+        status: 'in_progress'
+      })
+    )
+    vi.advanceTimersByTime(1)
+    await applyWorkspaceRuntimeEvent(
+      createEvent({
+        id: 'codebuddy-tool-2',
+        timestamp: Date.now(),
+        kind: 'tool',
+        toolCallId: 'codebuddy-write-artifact',
+        providerToolName: 'open-science-artifacts/write_artifact_file',
+        promptMessageId,
+        status: 'in_progress'
+      })
+    )
+    vi.advanceTimersByTime(1)
+    await applyWorkspaceRuntimeEvent(
+      createEvent({
+        id: 'codebuddy-final-prose',
+        timestamp: Date.now(),
+        role: 'assistant',
+        messageId: 'codebuddy-provider-message:codebuddy-write-artifact',
+        promptMessageId,
+        text: 'The search results are ready.'
+      })
+    )
+
+    const session = useSessionStore.getState().sessions[0]
+    const messages = session.messages.filter((item) => item.role === 'agent')
+    expect(session.activities).toHaveLength(2)
+    expect(messages).toHaveLength(2)
+    expect(messages[0]?.sortIndex).toBeLessThan(session.activities?.[0]?.sortIndex ?? 0)
+    expect(
+      session.activities?.every((activity) => activity.sortIndex < (messages[1]?.sortIndex ?? 0))
+    ).toBe(true)
+  })
+
   it('keeps a pending Plan actionable after the runtime reports a timeout stop', async () => {
     await applyWorkspaceRuntimeEvent(
       createEvent({ id: 'plan-ready', kind: 'plan', planProjection: pendingPlanProjection })
@@ -1017,6 +1081,54 @@ describe('workspace runtime events', () => {
     const session = useSessionStore.getState().sessions[0]
     expect(session.status).toBe('error')
     expect(session.errorReportable).toBe(false)
+  })
+
+  it('projects a Claude Code mid-response connection closure as a resumable interrupted turn', async () => {
+    const promptMessageId = useSessionStore.getState().sessions[0].activeRun?.promptMessageId
+    await applyWorkspaceRuntimeEvent(
+      createEvent({
+        id: 'event-partial-response',
+        role: 'assistant',
+        messageId: 'assistant-message-1',
+        promptMessageId,
+        text: 'The first result is complete. Next I will'
+      })
+    )
+
+    const errorText =
+      'Internal error: API Error: Connection closed mid-response. The response above may be incomplete.'
+    const applied = await applyWorkspaceRuntimeEvent(
+      createEvent({
+        id: 'event-mid-response-closed',
+        kind: 'error',
+        level: 'error',
+        providerError: true,
+        promptMessageId,
+        title: 'Prompt failed',
+        text: errorText,
+        turnUsage: { inputTokens: 21, cacheTokens: 8, outputTokens: 13, turnCount: 1 }
+      })
+    )
+
+    expect(applied).toBe(true)
+    const session = useSessionStore.getState().sessions[0]
+    expect(session).toMatchObject({
+      status: 'error',
+      interrupted: true,
+      error: errorText,
+      resumeRecovery: {
+        kind: 'resume-required',
+        cause: 'connection-lost',
+        promptMessageId
+      }
+    })
+    expect(session.errorReportable).toBeUndefined()
+    expect(session.messages[0]).toMatchObject({ id: promptMessageId, interrupted: true })
+    expect(session.messages[1]).toMatchObject({
+      content: 'The first result is complete. Next I will',
+      status: 'error',
+      turnUsage: { inputTokens: 21, cacheTokens: 8, outputTokens: 13, turnCount: 1 }
+    })
   })
 
   it('surfaces a session-scoped agent warning as the waiting-indicator status, cleared on stop', async () => {

@@ -8,6 +8,9 @@ import OpenCode from '@lobehub/icons/es/OpenCode/components/Mono'
 import { cn } from '@/lib/utils'
 import anthropicLogo from '@/assets/provider-icons/anthropic.svg'
 import claudeLogo from '@/assets/provider-icons/claude.svg'
+// CodeBuddy is a third-party product mark used only to identify its compatible ACP runtime.
+// Keep it separate from Open Science branding and avoid implying affiliation or endorsement.
+import codebuddyLogo from '@/assets/provider-icons/codebuddy.svg'
 import grokLogo from '@/assets/provider-icons/grok.svg'
 import bailianLogo from '@/assets/provider-icons/bailian.svg'
 import deepseekLogo from '@/assets/provider-icons/deepseek.svg'
@@ -36,6 +39,9 @@ export const AgentFrameworkIcon = ({
   if (frameworkId === 'claude-code') return <ClaudeColor size={size} className={className} />
   if (frameworkId === 'opencode') {
     return <OpenCode size={size} className={cn('text-foreground', className)} />
+  }
+  if (frameworkId === 'codebuddy') {
+    return <img src={codebuddyLogo} alt="" width={size} height={size} className={className} />
   }
   return <Codex size={size} className={cn('text-foreground', className)} />
 }
