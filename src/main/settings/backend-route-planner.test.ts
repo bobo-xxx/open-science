@@ -298,7 +298,7 @@ describe('BackendRoutePlanner provider candidates', () => {
     })
     const targetB = makeTarget(providerB, {
       apiEndpoints: ['anthropic'],
-      provider: { apiEndpoints: ['anthropic'] }
+      provider: { apiEndpoints: ['anthropic'], vendorId: 'tencent' }
     })
     const providers: BackendRouteProviderPort = {
       resolveRuntimeTarget: vi.fn((provider) => {
@@ -333,7 +333,8 @@ describe('BackendRoutePlanner provider candidates', () => {
           id: JSON.stringify(['provider-b', 'model-b']),
           baseUrl: 'https://provider-b.example/anthropic',
           key: 'plain-provider-key',
-          model: 'model-b'
+          model: 'model-b',
+          useApiKeyHeader: true
         }
       ],
       initialTargetId: JSON.stringify(['provider-a', 'model-a'])
@@ -769,6 +770,7 @@ describe('BackendRoutePlanner model-change projection', () => {
 
     expect(target).toEqual({
       frameworkId: 'codex',
+      providerId: 'provider-a',
       backendId: 'codex:provider-a',
       route: 'codex-bridge',
       model: 'model-a',
