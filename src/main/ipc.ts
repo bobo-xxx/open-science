@@ -212,6 +212,10 @@ import { registerSideChatIpcHandlers } from './side-chat/ipc'
 import { SideChatRuntimeOwner } from './side-chat/runtime-owner'
 import { type SessionPersistenceBackend } from './session-persistence/ipc'
 import { MainMessageAttributionAuthority } from './session-persistence/message-attribution-authority'
+import {
+  SessionAuxiliaryTurnUsageRecorder,
+  type SessionAuxiliaryTurnUsageRecord
+} from './session-persistence/auxiliary-turn-usage'
 import { SessionDeletionOwner } from './session-deletion/owner'
 import { buildSessionDetailsUserPrompt, createSessionDetailsOwner } from './session-details/owner'
 import { tryDecryptKey } from './settings/crypto'
@@ -235,7 +239,7 @@ import {
 import { createDelegationSettlementContinuationDispatch } from './delegation/settlement-continuation-dispatch'
 import { createSettingsWorkflows } from './settings/workflows'
 import { showSettingsSaveDialog } from './settings/save-dialog'
-import { ProfileService } from './specialist/service'
+import { SpecialistService } from './specialist/service'
 import { SpecialistRepository } from './specialist/repository'
 import { BuiltinSpecialistRegistry } from './specialist/builtin-registry'
 import { composeBuiltinSkillCatalog } from './specialist/package/builtin-skill-catalog'
@@ -532,6 +536,20 @@ const createApplicationModules = async (
       ),
     (projectId, sessionId) => runtimeRef.current?.hasLiveSession(projectId, sessionId) ?? false
   )
+  const auxiliaryUsageLog = createLogger('session-usage:auxiliary')
+  const auxiliaryUsageRecorder = new SessionAuxiliaryTurnUsageRecorder(() =>
+    getProjectDbClient(resolveStorageRoot())
+  )
+  const recordAuxiliaryUsage = async (record: SessionAuxiliaryTurnUsageRecord): Promise<void> => {
+    try {
+      await auxiliaryUsageRecorder.record(record)
+    } catch (error) {
+      auxiliaryUsageLog.warn('auxiliary turn Usage persistence failed', {
+        source: record.source,
+        ...diagnosticErrorFields(error)
+      })
+    }
+  }
   const projectRepository = createDefaultProjectRepository()
   const previewStateRepository = createDefaultPreviewStateRepository()
 
@@ -1119,10 +1137,10 @@ const createApplicationModules = async (
     protectedSpecialistIds: ['reviewer'],
     protectedSpecialistNames: ['Reviewer']
   })
-  const profileService = new ProfileService(specialistRepository, builtinRegistry)
+  const specialistService = new SpecialistService(specialistRepository, builtinRegistry)
   const marketplaceRepository = new MarketplaceRepository(resolveStorageRoot())
   const marketplaceOperationCoordinator = new MarketplaceOperationCoordinator()
-  await profileService.ensureBuiltinCatalogReady()
+  await specialistService.ensureBuiltinCatalogReady()
   composition.phase('builtin-specialists')
   const tagService = new TagService(
     new TagRepository(() => getProjectDbClient(configRoot)),
@@ -1130,7 +1148,7 @@ const createApplicationModules = async (
       listSkills: () => settingsService.listSkills(),
       listConnectors: () => settingsService.listConnectors(),
       listSpecialists: async () =>
-        (await profileService.listForSettings()).filter(({ kind }) => kind !== 'reviewer')
+        (await specialistService.listForSettings()).filter(({ kind }) => kind !== 'reviewer')
     }),
     applicationEvents
   )
@@ -1238,7 +1256,7 @@ const createApplicationModules = async (
     getDisabledSkillIds: async () =>
       (await settingsRepository.getSettings()).disabledSkillIds ?? [],
     getInstalledSpecialists: async () =>
-      (await profileService.list()).map((profile) => ({
+      (await specialistService.list()).map((profile) => ({
         id: profile.id,
         revision: profile.revision,
         ...(profile.modifiedSinceImport === undefined
@@ -1250,7 +1268,7 @@ const createApplicationModules = async (
           : {})
       })),
     markMarketplaceManaged: async (id, expectedRevision) => {
-      await profileService.markMarketplaceManaged(id, expectedRevision)
+      await specialistService.markMarketplaceManaged(id, expectedRevision)
     },
     setSkillsMainEnabled: async (ids, enabled) => {
       await settingsRepository.setSkillsEnabled([...new Set(ids)], enabled)
@@ -1273,7 +1291,7 @@ const createApplicationModules = async (
   )
   // Per-session specialist binding store. Shared between the SET_SESSION_SPECIALIST barrier
   // (validate + record) and the runtime switch so a hot-switch lands on the same source of truth.
-  const sessionBindingService = new SessionBindingService(profileService)
+  const sessionBindingService = new SessionBindingService(specialistService)
   const specialistPersistLog = createLogger('specialist:persist')
   const loadSessionSpecialistBinding = async (
     sessionId: string
@@ -1332,7 +1350,7 @@ const createApplicationModules = async (
     (event) => broadcastToRenderers(SPECIALIST_IPC.HANDOFF_LIFECYCLE_CHANGED, event),
     async ({ targetName }) => {
       if (targetName === null) return undefined
-      const profile = await profileService.resolveRunnableByName(targetName)
+      const profile = await specialistService.resolveRunnableByName(targetName)
       return { specialistId: profile.id, revision: profile.revision }
     }
   )
@@ -1452,7 +1470,7 @@ const createApplicationModules = async (
       permissionGrantRegistry,
       resolveSpecialistProfile: async (specialistId) => {
         try {
-          return await profileService.resolveRunnableById(specialistId)
+          return await specialistService.resolveRunnableById(specialistId)
         } catch {
           return undefined
         }
@@ -1562,7 +1580,7 @@ const createApplicationModules = async (
   const agentComputeService = new AgentComputeService(computeService, hostsRegistry)
   // host.agents control-plane SDK (issue 02/05): read Specialist/catalog surface plus the durable
   // immediate-handoff lifecycle. The catalog adapter delegates to the authoritative
-  // SettingsService + ProfileService; switch() reuses the SAME SessionBindingService and durable
+  // SettingsService + SpecialistService; switch() reuses the SAME SessionBindingService and durable
   // session-file persistence seam the SET_SESSION_SPECIALIST IPC handler uses (no parallel switch
   // service). The runtime reconfigure callback is intentionally NOT wired here — it runs at the safe
   // next-message boundary, not inside the SDK call. Privileged operations use the existing ACP
@@ -1593,7 +1611,7 @@ const createApplicationModules = async (
     })
   })
   const agentsService = new AgentsService({
-    profileService,
+    specialistService,
     catalog: {
       listSkillCatalog: () => settingsService.listSpecialistSkillCatalog(),
       getConnectors: () => settingsService.getConnectors()
@@ -1609,7 +1627,7 @@ const createApplicationModules = async (
     deleteSpecialist: (request) => specialistPackageService.deleteSpecialist(request),
     // Catalog invalidation after a successful privileged mutation: reconnect live sessions so the
     // agent respawns (re-provisioning skills) and re-applies the updated Specialist whitelist. The
-    // ProfileService already broadcasts specialist:catalog-changed on update/delete; this refreshes the
+    // SpecialistService already broadcasts specialist:catalog-changed on update/delete; this refreshes the
     // RUNTIME capability resolution (mirrors the Settings IPC path's onProfilesChanged callback).
     invalidateCatalog: () => void runtime.requestSkillsReload(),
     persistSessionSpecialist: (sessionId, specialistId) =>
@@ -1634,7 +1652,7 @@ const createApplicationModules = async (
         conversationSkillImporter.authorizeReferencedUploads(projectId, sessionId, paths),
       settingsService,
       permissionGrantRegistry,
-      profileService,
+      specialistService,
       sessionPersistenceCoordinator
     },
     notebookRpcServer: requireNotebookRpcServer,
@@ -1713,9 +1731,9 @@ const createApplicationModules = async (
       return { path: resolved.path, filename: resolved.name }
     },
     frameworks: delegatedFrameworks,
-    resolveSpecialist: (profileId) => profileService.resolveRunnableById(profileId),
+    resolveSpecialist: (profileId) => specialistService.resolveRunnableById(profileId),
     resolveSpecialistReference: (profileReference) =>
-      profileService.resolveRunnableByReference(profileReference),
+      specialistService.resolveRunnableByReference(profileReference),
     artifactEvidence: {
       turns: delegatedArtifactTurns,
       artifactStorageSessionId: ({ sessionId }) => sessionId,
@@ -1911,7 +1929,8 @@ const createApplicationModules = async (
       profileNamespace: 'host-llm',
       resolveTarget: (target, context) =>
         settingsService.resolveExplicitAgentBackend(target, context)
-    })
+    }),
+    recordUsage: recordAuxiliaryUsage
   })
   const hostViewImageService = new HostViewImageService({
     catalog: projectFilesRepository,
@@ -1955,7 +1974,7 @@ const createApplicationModules = async (
       isHostSkillsAvailable: (sessionId) =>
         runtimeRef.current?.getSessionFramework(sessionId) !== 'codebuddy',
       resolveSpecialistSkillIds: async (specialistId) => {
-        const profile = await profileService.resolveRunnableById(specialistId)
+        const profile = await specialistService.resolveRunnableById(specialistId)
         if (!profile.enabled) return []
         const effective = resolveEffectiveSpecialistSkills(
           profile,
@@ -2072,7 +2091,8 @@ const createApplicationModules = async (
     new ImageInputCompatibilityOwner({
       captureTarget: () => settingsService.admitVisionModel(),
       runner: visionInferenceRunner,
-      evidenceRepository: visionEvidenceRepository
+      evidenceRepository: visionEvidenceRepository,
+      recordUsage: recordAuxiliaryUsage
     }),
     (owner) => ({
       name: 'image-input-compatibility',
@@ -2240,12 +2260,17 @@ const createApplicationModules = async (
       afterSessionDelete: (sessionId, retained) =>
         computeIpcModule.handlers.approvalFinishSessionDeletion(sessionId, retained),
       initializationBarrier: initialConnectorSkillsReady,
-      profileService,
+      specialistService,
       sessionPersistenceCoordinator,
       delegatedWork: delegatedWork.root,
       sideChatRelays: mainPromptSideChatRelay,
       imageInputCompatibility,
       memory: memoryService,
+      auxiliaryUsage: {
+        projectIdForSession: (sessionId) =>
+          sessionPersistenceCoordinator.sessionProjectId(sessionId),
+        record: recordAuxiliaryUsage
+      },
       resolveComputeExecutionTargetIds: (sessionId) => hostsRegistry.getSelected(sessionId)
     },
     (options) => {
@@ -2316,6 +2341,7 @@ const createApplicationModules = async (
             sideChatId
           })
       },
+      recordUsage: recordAuxiliaryUsage,
       onEvent: (event) => broadcastToRenderers('side-chat:event', event),
       setParentInteractionsPaused: (sessionId, paused) => {
         if (paused) {
@@ -2428,7 +2454,8 @@ const createApplicationModules = async (
       configRoot,
       captureTarget: () => settingsService.captureActiveExplicitAgentBackendTarget(),
       resolveTarget: (target, context) =>
-        settingsService.resolveExplicitAgentBackend(target, context)
+        settingsService.resolveExplicitAgentBackend(target, context),
+      recordUsage: recordAuxiliaryUsage
     },
     (options) => {
       const runner = new ArtifactCodeReconstructionRunner(options)
@@ -2535,7 +2562,7 @@ const createApplicationModules = async (
     resolveSwitchReadBack: async (sessionId, targetName) => {
       const specialistId = sessionBindingService.getBinding(sessionId)
       const revision = specialistId
-        ? (await profileService.resolveRunnableById(specialistId)).revision
+        ? (await specialistService.resolveRunnableById(specialistId)).revision
         : undefined
       return {
         status: 'approved',
@@ -2872,7 +2899,7 @@ const createApplicationModules = async (
   )
   declareElectronAdapter('specialist', () =>
     registerSpecialistIpcHandlers(
-      profileService,
+      specialistService,
       sessionBindingService,
       sessionSpecialistReconfiguration,
       // A specialist capability edit (skills/connectors/enabled) must reach live sessions on the next
@@ -3273,7 +3300,8 @@ const createApplicationModules = async (
       projectId: string,
       sessionId: string,
       mutation: () => Promise<Result>
-    ) => sessionPersistenceCoordinator.runSessionMutation(projectId, sessionId, mutation)
+    ) => sessionPersistenceCoordinator.runSessionMutation(projectId, sessionId, mutation),
+    recordUsage: recordAuxiliaryUsage
   }
   const reviewerCommandOwner = createReviewerCommandOwner(reviewerOptions)
   reviewerCommandOwnerRef.current = reviewerCommandOwner
@@ -3456,7 +3484,7 @@ const createApplicationModules = async (
     taskAgent,
     taskControls: {
       specialists: {
-        resolve: (reference) => profileService.resolveRunnableByReference(reference)
+        resolve: (reference) => specialistService.resolveRunnableByReference(reference)
       }
     },
     computePreferences: sessionEnabledComputeHostsOwner,

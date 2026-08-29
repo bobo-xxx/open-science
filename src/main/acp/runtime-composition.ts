@@ -38,7 +38,7 @@ import {
   buildSpecialistIdentityAppend,
   buildSpecialistIdentityPrefix
 } from '../specialist/identity'
-import type { ProfileService } from '../specialist/service'
+import type { SpecialistService } from '../specialist/service'
 import { resolveConfigRoot, resolveDataRoot, resolveStorageRoot } from '../storage-root'
 import type { UploadRepository } from '../uploads/repository'
 import type { SessionPersistenceCoordinator } from '../session-persistence/coordinator'
@@ -138,7 +138,7 @@ type AcpRuntimeCompositionOptions = AcpRuntimeArtifacts & {
   onSessionDeleteStarted?: (sessionId: string) => void
   beforeSessionDelete?: (sessionId: string) => Promise<void>
   afterSessionDelete?: (sessionId: string, retained: boolean) => void
-  profileService?: ProfileService
+  specialistService?: SpecialistService
   sessionPersistenceCoordinator?: Pick<
     SessionPersistenceCoordinator,
     | 'readSessionRuntimeContext'
@@ -158,6 +158,7 @@ type AcpRuntimeCompositionOptions = AcpRuntimeArtifacts & {
   imageInputCompatibility?: AcpRuntimeOptions['imageInputCompatibility']
   resolveComputeExecutionTargetIds?: AcpRuntimeOptions['resolveComputeExecutionTargetIds']
   memory?: AcpRuntimeOptions['memory']
+  auxiliaryUsage?: AcpRuntimeOptions['auxiliaryUsage']
 }
 
 // Composes the compatibility façade while the coordinator remains the cross-generation Session owner.
@@ -188,7 +189,7 @@ const createAcpRuntime = ({
   onSessionDeleteStarted,
   beforeSessionDelete,
   afterSessionDelete,
-  profileService,
+  specialistService,
   sessionPersistenceCoordinator,
   delegatedWork,
   fixedBackend,
@@ -199,7 +200,8 @@ const createAcpRuntime = ({
   sideChatRelays,
   imageInputCompatibility,
   resolveComputeExecutionTargetIds,
-  memory
+  memory,
+  auxiliaryUsage
 }: AcpRuntimeCompositionOptions): AcpRuntimeCoordinator => {
   const configRoot = resolveConfigRoot()
   const dataRoot = resolveDataRoot()
@@ -254,6 +256,7 @@ const createAcpRuntime = ({
           : settingsService.captureActiveAgentBackendSelection()
       const runtimeOptions: AcpRuntimeOptions = {
         appVersion: app.getVersion(),
+        auxiliaryUsage,
         // Packaged macOS apps often start with cwd at "/" or the app bundle; use home instead.
         defaultCwd,
         resolveBackend: async (context) =>
@@ -461,11 +464,11 @@ const createAcpRuntime = ({
               }
             }
           : {}),
-        resolveSpecialistIdentity: profileService
+        resolveSpecialistIdentity: specialistService
           ? async (specialistId: string, frameworkId: string) => {
               let profile
               try {
-                profile = await profileService.resolveRunnableById(specialistId)
+                profile = await specialistService.resolveRunnableById(specialistId)
               } catch {
                 // Profile not found or corrupt
                 return undefined
@@ -477,10 +480,10 @@ const createAcpRuntime = ({
               return { append: '', prefix }
             }
           : undefined,
-        resolveSpecialistSkills: profileService
+        resolveSpecialistSkills: specialistService
           ? async (specialistId) => {
               try {
-                const profile = await profileService.resolveRunnableById(specialistId)
+                const profile = await specialistService.resolveRunnableById(specialistId)
                 if (!profile.enabled) {
                   return { kind: 'unavailable', reason: 'The bound specialist is disabled.' }
                 }

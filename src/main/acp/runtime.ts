@@ -175,6 +175,12 @@ type AcpRuntimeOptions = {
   appVersion: string
   defaultCwd: string
   callbacks?: AcpRuntimeCallbacks
+  auxiliaryUsage?: Readonly<{
+    projectIdForSession: (sessionId: string) => Promise<string | undefined>
+    record: (
+      input: import('../session-persistence/auxiliary-turn-usage').SessionAuxiliaryTurnUsageRecord
+    ) => Promise<unknown>
+  }>
   permissionGrantStore?: ConversationPermissionGrantStore
   permissionGrantRegistry?: PermissionGrantRegistry
   permissionGrantContext?: Readonly<{ projectId: string; sessionId: string }>
@@ -258,7 +264,7 @@ type AcpRuntimeOptions = {
   // Injectable only for the authenticated OpenCode loopback usage snapshots; production uses fetch.
   opencodeUsageFetch?: typeof fetch
   // Resolves the identity-inject text for a specialist UUID at session-creation time.
-  // The main process reads the latest Profile from ProfileService; the runtime never caches it.
+  // The main process reads the latest Profile from SpecialistService; the runtime never caches it.
   // Returns undefined when the specialist is not found, disabled, or its Profile is corrupt —
   // the caller should have validated before calling createSession.
   resolveSpecialistIdentity?: (
@@ -717,6 +723,16 @@ class AcpRuntime {
 
   captureBackend(): AcpBackendGenerationView {
     return this.backend
+  }
+
+  beginProviderTurnObservation(input: {
+    providerSessionId: string
+    cwd: string
+  }): ReturnType<AcpProviderPromptExecutor['beginObservation']> {
+    return this.providerPromptExecutor.beginObservation({
+      ...input,
+      frameworkId: this.framework.id
+    })
   }
 
   captureSessionModel(
