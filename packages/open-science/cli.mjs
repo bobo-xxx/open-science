@@ -121,6 +121,15 @@ export class CliUsageError extends Error {
   }
 }
 
+const parsePortOption = (value) => {
+  const normalized = value.trim()
+  const port = Number(normalized)
+  if (!/^\d+$/.test(normalized) || !Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new CliUsageError(`Invalid port: ${value}`)
+  }
+  return port
+}
+
 export const parseCliArgs = (argv) => {
   const args = [...argv]
   const command = args.shift()
@@ -179,11 +188,7 @@ export const parseCliArgs = (argv) => {
     }
   }
   if (options.port !== undefined) {
-    const port = Number.parseInt(options.port, 10)
-    if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      throw new CliUsageError(`Invalid port: ${options.port}`)
-    }
-    options.port = port
+    options.port = parsePortOption(options.port)
   }
   if (options.approvalProfile && !['ask', 'auto', 'full'].includes(options.approvalProfile)) {
     throw new CliUsageError(`Invalid approval profile: ${options.approvalProfile}`)
@@ -853,6 +858,7 @@ export const updateCommand = async (options, dependencies = {}) => {
   const quietLog = options.json ? () => {} : (...args) => console.log(...args)
   const deps = {
     ensureService: (startOptions) => startCommand(startOptions, { ...DEFAULT_DEPS, log: quietLog }),
+    stopService: (stopOptions) => stopCommand(stopOptions, { ...DEFAULT_DEPS, log: quietLog }),
     connect: (connectOptions) => connectToOpenScience(connectOptions),
     sleep,
     getBootstrap: updateBootstrap,
@@ -864,7 +870,7 @@ export const updateCommand = async (options, dependencies = {}) => {
     },
     ...dependencies
   }
-  await deps.ensureService({ ...options, open: false })
+  const serviceStart = await deps.ensureService({ ...options, open: false })
   const client = await deps.connect({ configRoot: options.configRoot })
   let result
 
@@ -934,6 +940,34 @@ export const updateCommand = async (options, dependencies = {}) => {
             throw new Error(`Update apply ended in an unexpected state: ${status.state}`)
           }
         }
+      }
+    }
+  }
+
+  if (result.outcome === 'manual-action-required' && result.installerPath) {
+    const attachedToDesktopApp = serviceStart?.state?.attached === true
+    const ownedConfigRoot = serviceStart?.state?.configRoot
+    const ownsService =
+      serviceStart?.started === true && !attachedToDesktopApp && typeof ownedConfigRoot === 'string'
+    let requiresManualStop = !ownsService
+    if (ownsService) {
+      try {
+        await deps.stopService({ ...options, configRoot: ownedConfigRoot })
+      } catch {
+        // Keep the verified installer handoff actionable even if graceful shutdown fails. The user
+        // can retry the existing stop command without downloading the installer again.
+        requiresManualStop = true
+      }
+    }
+    if (attachedToDesktopApp) {
+      result = {
+        ...result,
+        nextAction: `Quit the running Open Science app, then run the installer at ${result.installerPath} and start Open Science again.`
+      }
+    } else if (requiresManualStop) {
+      result = {
+        ...result,
+        nextAction: `Run "open-science stop", then run the installer at ${result.installerPath} and start Open Science again.`
       }
     }
   }

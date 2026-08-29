@@ -190,6 +190,7 @@ import type {
   CreateProjectRequest,
   DeleteProjectRequest,
   Project,
+  ProjectDeletionOutcome,
   UpdateProjectArchiveRequest,
   UpdateProjectRequest
 } from './projects'
@@ -1238,13 +1239,10 @@ export const RENDERER_API_CONTRACT = Object.freeze({
     undefined,
     RUNTIME_VALIDATED
   ]),
-  'projects.delete': callable<(request: DeleteProjectRequest) => Promise<void>>()('projects', [
-    'projects:delete',
-    WEB,
-    undefined,
-    undefined,
-    RUNTIME_VALIDATED
-  ]),
+  'projects.delete': callable<(request: DeleteProjectRequest) => Promise<ProjectDeletionOutcome>>()(
+    'projects',
+    ['projects:delete', WEB, undefined, undefined, RUNTIME_VALIDATED]
+  ),
   'projects.get': callable<(id: string) => Promise<Project | null>>()('projects', [
     'projects:get',
     WEB,
@@ -1416,12 +1414,12 @@ export const RENDERER_API_CONTRACT = Object.freeze({
   ),
   'sessions.onFlushAborted': callable<(listener: () => void) => RemoveListener>()(
     'sessions',
-    ['sessions:flush-aborted', ELECTRON_EVENT],
+    ['sessions:flush-aborted', EVENT],
     { optionalMember: true }
   ),
   'sessions.onFlushRequest': callable<
     (listener: AcpListener<SessionPersistenceFlushRequest>) => RemoveListener
-  >()('sessions', ['sessions:flush-request', ELECTRON_EVENT], { optionalMember: true }),
+  >()('sessions', ['sessions:flush-request', EVENT], { optionalMember: true }),
   'sessions.onUpdated': callable<(listener: AcpListener<SessionUpsertEvent>) => RemoveListener>()(
     'sessions',
     ['session:updated', EVENT]
@@ -1935,6 +1933,9 @@ export const RENDERER_API_CONTRACT = Object.freeze({
     'specialist',
     ['specialist:update', ELECTRON]
   ),
+  'storage.ackDataRootHandoffFlush': callable<
+    (response: SessionPersistenceFlushResponse) => Promise<void>
+  >()('storage', ['storage:ack-data-root-handoff-flush', LOCAL]),
   'storage.cancelMigrate': callable<() => Promise<void>>()('storage', [
     'storage:cancel-migrate',
     LOCAL
