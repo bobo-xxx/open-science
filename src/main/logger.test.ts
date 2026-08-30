@@ -1,8 +1,17 @@
+import { readdirSync, readFileSync } from 'node:fs'
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
+
+const renameFile = vi.hoisted(() => vi.fn())
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const original = await importOriginal<typeof import('node:fs/promises')>()
+  renameFile.mockImplementation(original.rename)
+  return { ...original, rename: renameFile }
+})
 
 import {
   createLogger,
@@ -10,6 +19,7 @@ import {
   errorLogFields,
   flushLogs,
   formatLine,
+  getLogFileStatus,
   initLogger,
   runWithDiagnosticCorrelation,
   writeFatalLogSync
@@ -27,6 +37,26 @@ afterEach(async () => {
     await rm(logDir, { recursive: true, force: true })
     logDir = undefined
   }
+})
+
+const productionTypeScriptFiles = (directory: string): string[] =>
+  readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const path = resolve(directory, entry.name)
+    if (entry.isDirectory()) return productionTypeScriptFiles(path)
+    if (!entry.isFile() || !/\.tsx?$/.test(entry.name)) return []
+    if (/\.(?:test|integration|certification)\.tsx?$/.test(entry.name)) return []
+    return path.endsWith(`${join('src', 'main', 'logger.ts')}`) ? [] : [path]
+  })
+
+describe('logger: main-process boundary', () => {
+  it('keeps the central logger as the only production console adapter', () => {
+    const directConsoleCalls = productionTypeScriptFiles(__dirname).flatMap((path) => {
+      const source = readFileSync(path, 'utf8')
+      return /\bconsole\s*(?:\.|\[)/.test(source) ? [path.slice(__dirname.length + 1)] : []
+    })
+
+    expect(directConsoleCalls).toEqual([])
+  })
 })
 
 describe('logger: formatLine', () => {
@@ -1339,6 +1369,28 @@ describe('logger: fatal process diagnostics', () => {
 })
 
 describe('logger: rotation (auto-cleanup)', () => {
+  it('reports file existence and the most recent successful write', async () => {
+    logDir = await mkdtemp(join(tmpdir(), 'os-logger-'))
+    initLogger({ logDir, fileName: 'main.log', mirrorToConsole: false })
+
+    await expect(getLogFileStatus()).resolves.toMatchObject({
+      configured: true,
+      path: join(logDir, 'main.log'),
+      existing: false,
+      lastWriteSucceeded: null,
+      lastFailureCategory: null
+    })
+
+    createLogger('test').info('created')
+    await flushLogs()
+
+    await expect(getLogFileStatus()).resolves.toMatchObject({
+      existing: true,
+      lastWriteSucceeded: true,
+      lastFailureCategory: null
+    })
+  })
+
   it('caps total files, rotating oldest out so logs never grow unbounded', async () => {
     logDir = await mkdtemp(join(tmpdir(), 'os-logger-'))
 
@@ -1372,5 +1424,42 @@ describe('logger: rotation (auto-cleanup)', () => {
     const files = (await readdir(logDir)).filter((name) => name.startsWith('main'))
 
     expect(files).toEqual(['main.log'])
+  })
+
+  it('does not append past the cap while replacing the live file keeps failing', async () => {
+    logDir = await mkdtemp(join(tmpdir(), 'os-logger-'))
+    const runId = 'rotation-failure-run'
+    const firstLineBytes =
+      Buffer.byteLength(formatLine('info', 'test', 'seed', undefined, runId)) + 1
+
+    initLogger({
+      logDir,
+      fileName: 'main.log',
+      maxBytes: firstLineBytes + 1,
+      maxFiles: 2,
+      mirrorToConsole: false,
+      runId
+    })
+    const log = createLogger('test')
+    log.info('seed')
+    await flushLogs()
+
+    renameFile.mockClear()
+    renameFile.mockRejectedValue(new Error('simulated Windows file lock'))
+
+    log.info('blocked-1')
+    log.info('blocked-2')
+    log.info('blocked-3')
+    await flushLogs()
+
+    const records = (await readFile(join(logDir, 'main.log'), 'utf8')).trim().split('\n')
+    expect(renameFile).toHaveBeenCalledTimes(3)
+    expect(records).toHaveLength(1)
+    expect(JSON.parse(records[0]!) as { msg: string }).toMatchObject({ msg: 'seed' })
+    await expect(getLogFileStatus()).resolves.toMatchObject({
+      existing: true,
+      lastWriteSucceeded: false,
+      lastFailureCategory: 'rotation'
+    })
   })
 })

@@ -13,6 +13,17 @@ const paths = (
 ): string[] => RENDERER_CONTRACT_CATALOG.filter(predicate).map(({ publicPath }) => publicPath)
 
 describe('renderer contract catalog', () => {
+  it('keeps every logs command local-only', () => {
+    const logs = RENDERER_CONTRACT_GROUPS.find(({ capability }) => capability === 'logs')
+
+    expect(logs?.contracts.length).toBeGreaterThan(0)
+    expect(
+      logs?.contracts.every(
+        ({ surfaceInstallation }) => surfaceInstallation.remoteWeb === 'rejecting-stub'
+      )
+    ).toBe(true)
+  })
+
   it('pins the complete capability-owned inventory and legacy map projection', () => {
     const projection = projectRendererContractMaps(RENDERER_CONTRACT_CATALOG)
 
@@ -189,6 +200,25 @@ describe('renderer contract catalog', () => {
           surfaceInstallation.remoteWeb === 'web-rpc'
       )
     ).toBe(true)
+  })
+
+  it('keeps opening Session recovery folders on the Electron surface', () => {
+    expect(
+      RENDERER_CONTRACT_CATALOG.find(
+        ({ publicPath }) => publicPath === 'sessions.openRecoveryFolder'
+      )
+    ).toMatchObject({
+      surfaceInstallation: {
+        electron: 'preload',
+        localWeb: 'unavailable',
+        remoteWeb: 'unavailable'
+      },
+      dispatchPolicy: {
+        electron: 'electron-ipc-request',
+        localWeb: 'none',
+        remoteWeb: 'none'
+      }
+    })
   })
 
   it('records the paired window lifecycle channels and teardown ordering', () => {

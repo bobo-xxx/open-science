@@ -150,6 +150,7 @@ const WEB_UNAVAILABLE_CHANNELS = [
   'file:save-project-artifacts',
   'file:save-session-artifacts',
   'sessions:export-conversation',
+  'sessions:open-recovery-folder',
   'settings:import-agent-home-skills',
   'settings:list-agent-home-skills',
   'uploads:stage-local-file',
@@ -179,7 +180,7 @@ const REMOTE_LOCAL_ONLY_CHANNELS: GroupedInventory = {
     'read-preview',
     'reveal'
   ],
-  logs: ['open-file', 'reveal-in-folder'],
+  logs: ['get-status', 'open-file', 'reveal-in-folder'],
   'notebook-env': ['cancel', 'provision', 'repair'],
   notebook: ['export-ipynb', 'export-ipynb-all'],
   runtime: [
@@ -249,6 +250,7 @@ const ELECTRON_ONLY_CALLABLE_PATHS = [
   ...GENERATED_SOURCE_OMISSIONS.filter((path) => path !== 'getRuntimeVersions'),
   'saveSessionArtifacts',
   'sessions.exportConversation',
+  'sessions.openRecoveryFolder',
   'settings.importAgentHomeSkills',
   'settings.listAgentHomeSkills',
   'uploads.stageLocalFile'

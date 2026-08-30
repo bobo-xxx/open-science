@@ -322,6 +322,10 @@ import {
   withDataRootWrite
 } from './storage/migration-state'
 import { normalizeLegacyDataPaths } from './storage/normalize-legacy-paths'
+import { DataRootCleanupJournal } from './storage/data-root-cleanup'
+import { deleteSources } from './storage/data-migration'
+import { removeMicromambaCacheForRoot } from './notebook/micromamba-cache'
+import { removeNotebookWorkloadCache } from './notebook/notebook-workload-cache-paths'
 import { createDelegatedActivityProjection, detectActiveSessions } from './storage/detect-active'
 import {
   computeDefaultDataRoot,
@@ -357,6 +361,7 @@ import type { TaskAgentPort } from './tasks/task-runner'
 import { englishNativeTranslator, type NativeTranslator } from './locale/main-process-messages'
 
 const permissionGrantsLog = createLogger('permission-grants')
+const notebookStartupLog = createLogger('notebook:startup')
 
 type IpcRegistrationOptions = {
   mainEntryPath: string
@@ -403,6 +408,7 @@ export type ApplicationRuntimeInterfaces = {
   sessionDeletionCapability: Pick<SessionPersistenceCoordinator, 'setSessionDeletionHandlers'>
   archiveCapability: Pick<ArchiveCoordinator, 'isSessionAvailableById' | 'setMarkReadSessions'>
   detectActiveSessions: () => ReturnType<typeof detectActiveSessions>
+  hasActiveReviewerWork: () => boolean
   prepareForQuit: () => Promise<Extract<ShutdownStepOutcome, 'completed' | 'timeout' | 'failed'>>
   abortQuitPreparation: () => void
 }
@@ -492,6 +498,26 @@ const createApplicationModules = async (
   // Prime the data-root cache from settings before any data repository is constructed below. A change
   // to this value only takes effect after a restart, so reading it once here is sufficient.
   initDataRoot(storedSettings.dataRoot)
+  const dataRootCleanupJournal = new DataRootCleanupJournal(resolveConfigRoot())
+  try {
+    const cleanup = await dataRootCleanupJournal.recover(
+      resolveDataRoot(),
+      deleteSources,
+      (sourceRoot) => {
+        const runtimeRoot = join(sourceRoot, 'runtime')
+        const workloadRemoved = removeNotebookWorkloadCache(runtimeRoot)
+        const micromambaRemoved = removeMicromambaCacheForRoot(runtimeRoot)
+        return workloadRemoved && micromambaRemoved
+      }
+    )
+    if (cleanup.pending) {
+      storageLog.warn('old data root cleanup remains pending', {
+        cleanupFailureCount: cleanup.failureCount
+      })
+    }
+  } catch (error) {
+    storageLog.warn('old data root cleanup recovery failed', diagnosticErrorFields(error))
+  }
   const notificationInbox = createNotificationInboxController({
     headless,
     repository: new NotificationInboxDbRepository(() => getProjectDbClient(resolveStorageRoot())),
@@ -3149,7 +3175,7 @@ const createApplicationModules = async (
     // Warm the process-local mirror cache after provisioner construction succeeds. This stays outside
     // the startup critical path; a later named-env create awaits the same memoized probe if necessary.
     void effectiveMirror().catch((error) =>
-      console.error('Notebook package mirror warmup failed:', error)
+      notebookStartupLog.error('package mirror warmup failed', errorLogFields(error))
     )
     // One serialized wrapper shared by the startup gate and the notebook service's on-demand default
     // provisioning, so a concurrent build of the same default env (UI R-tab + an agent R run) can't
@@ -3158,7 +3184,7 @@ const createApplicationModules = async (
   } catch (error) {
     // micromamba missing (e.g. dev without a staged binary): the notebook env stays unprovisioned and
     // the UI surfaces "runtime unavailable" rather than crashing startup or dropping the IPC handlers.
-    console.error('Notebook environment provisioning unavailable:', error)
+    notebookStartupLog.error('environment provisioning unavailable', errorLogFields(error))
   }
   // Crash recovery (WS13): reconcile any runtime operation the previous process left in flight (orphan
   // download staging, a half-built prefix, an interrupted install). Kicked off HERE — before the env
@@ -3169,7 +3195,7 @@ const createApplicationModules = async (
   // actually orders the prefix work.
   void notebookService
     .recoverInterruptedOperations()
-    .catch((error) => console.error('Notebook operation recovery failed:', error))
+    .catch((error) => notebookStartupLog.error('operation recovery failed', errorLogFields(error)))
   const waitForRecovery = (): Promise<void> => notebookService.ensureRecovered()
   // Lets UI provision/repair refuse when recovery left the default env's prefix blocked (an
   // unknown-liveness orphan may still be writing it) — throws with an actionable message.
@@ -3228,7 +3254,8 @@ const createApplicationModules = async (
     prepareDataRootHandoff: async (target, confirmedInterruption) => {
       const readiness = await durableDataRootHandoffGate(target, confirmedInterruption)
       return readiness.completed && readiness.reaped
-    }
+    },
+    cleanupJournal: dataRootCleanupJournal
   })
   declareElectronAdapter('storage', () =>
     registerStorageIpcHandlers(
@@ -3309,6 +3336,10 @@ const createApplicationModules = async (
             diagnosticErrorFields(error)
           )
         }
+      },
+      async (request) => {
+        const error = await shell.openPath(sessionRepository.recoveryFolderPath(request.projectId))
+        if (error) throw new Error('Session recovery folder could not be opened.')
       }
     )
   })
@@ -3593,6 +3624,7 @@ const createApplicationModules = async (
         delegated: { getActiveDelegatedSessions },
         notebook: notebookService
       }),
+    hasActiveReviewerWork: () => reviewerModelRuntimeShutdown?.hasActiveWork() ?? false,
     prepareForQuit: () => runtime.prepareForQuit(),
     abortQuitPreparation: () => runtime.abortQuitPreparation(),
     electronAdapters: {

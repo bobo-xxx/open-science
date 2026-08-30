@@ -106,7 +106,7 @@ import type {
   SetGrantedLocalRootAccessRequest
 } from './local-fs'
 import type { RendererFailureReport } from './diagnostics'
-import type { OpenLogFileResult, RevealLogFileResult } from './logs'
+import type { LogFileStatus, OpenLogFileResult, RevealLogFileResult } from './logs'
 import type {
   NotificationInboxChanged,
   NotificationInboxSnapshot,
@@ -232,6 +232,7 @@ import type {
   LoadAllSessionsResult,
   ListSessionSummariesResult,
   LoadSessionRequest,
+  OpenSessionRecoveryFolderRequest,
   PersistedChatSession,
   SaveSessionOptions,
   SaveSessionManifestRequest,
@@ -987,7 +988,7 @@ export const RENDERER_API_CONTRACT = Object.freeze({
   'localFs.setGrantedRootAccess': callable<
     (request: SetGrantedLocalRootAccessRequest) => Promise<GrantedLocalRoot[]>
   >()('local-fs', ['local-fs:granted-roots:set-access', LOCAL]),
-  'logs.getPath': callable<() => Promise<string | null>>()('logs', ['logs:get-path']),
+  'logs.getStatus': callable<() => Promise<LogFileStatus>>()('logs', ['logs:get-status', LOCAL]),
   'logs.openFile': callable<() => Promise<OpenLogFileResult>>()('logs', ['logs:open-file', LOCAL]),
   'logs.revealInFolder': callable<() => Promise<RevealLogFileResult>>()('logs', [
     'logs:reveal-in-folder',
@@ -1404,6 +1405,9 @@ export const RENDERER_API_CONTRACT = Object.freeze({
   'sessions.loadUsage': callable<() => Promise<SessionUsageProjection>>()('sessions', [
     'sessions:load-usage'
   ]),
+  'sessions.openRecoveryFolder': callable<
+    (request: OpenSessionRecoveryFolderRequest) => Promise<void>
+  >()('sessions', ['sessions:open-recovery-folder', MAPPED_ELECTRON], { optionalMember: true }),
   'sessions.onCreated': callable<(listener: AcpListener<SessionUpsertEvent>) => RemoveListener>()(
     'sessions',
     ['session:created', EVENT]
