@@ -131,6 +131,7 @@ import type {
   HandoffRetryRequest
 } from './handoff-lifecycle'
 import type {
+  PermissionGrantDefaultsRestoreView,
   PermissionGrantMutationView,
   PermissionGrantRestoreRequest,
   PermissionGrantRevokeRequest,
@@ -327,6 +328,7 @@ import type {
   OpenAlexCredentialValidation,
   AddCustomServerRequest,
   AuthenticateCustomServerRequest,
+  DisconnectCustomServerRequest,
   SetCustomServerEnabledRequest,
   RemoveCustomServerRequest,
   UpdateCustomServerRequest,
@@ -1210,6 +1212,10 @@ export const RENDERER_API_CONTRACT = Object.freeze({
   'permissions.list': callable<() => Promise<PermissionGrantSnapshot>>()('permissions', [
     'permissions:list'
   ]),
+  'permissions.restoreDefaults': callable<() => Promise<PermissionGrantDefaultsRestoreView>>()(
+    'permissions',
+    ['permissions:restore-defaults']
+  ),
   'permissions.onChanged': callable<
     (listener: AcpListener<PermissionGrantsChangedEvent>) => RemoveListener
   >()('permissions', ['permissions:changed', EVENT]),
@@ -1492,9 +1498,9 @@ export const RENDERER_API_CONTRACT = Object.freeze({
   >()('sessions', ['sessions:unlink-pdf-context', WEB, undefined, undefined, RUNTIME_VALIDATED]),
   'settings.addCustomServer': callable<
     (request: AddCustomServerRequest) => Promise<ConnectorsSnapshot>
-  >()('settings', ['settings:add-custom-server']),
+  >()('settings', ['settings:add-custom-server', LOCAL]),
   'settings.authenticateCustomServer': callable<
-    (request: AuthenticateCustomServerRequest) => Promise<ConnectorsSnapshot>
+    (request: DisconnectCustomServerRequest) => Promise<ConnectorsSnapshot>
   >()('settings', ['settings:authenticate-custom-server', LOCAL]),
   'settings.beginXaiOAuthLogin': callable<() => Promise<XaiOAuthDeviceAuthorization>>()(
     'settings',
@@ -1511,6 +1517,9 @@ export const RENDERER_API_CONTRACT = Object.freeze({
   'settings.cancelCustomServerAuthentication': callable<
     (request: AuthenticateCustomServerRequest) => Promise<void>
   >()('settings', ['settings:cancel-custom-server-authentication', LOCAL]),
+  'settings.disconnectCustomServer': callable<
+    (request: AuthenticateCustomServerRequest) => Promise<ConnectorsSnapshot>
+  >()('settings', ['settings:disconnect-custom-server', LOCAL]),
   'settings.cancelIsolatedClaudeLogin': callable<() => Promise<void>>()('settings', [
     'settings:cancel-isolated-claude-login',
     LOCAL
@@ -1699,7 +1708,7 @@ export const RENDERER_API_CONTRACT = Object.freeze({
   >()('settings', ['settings:refresh-provider-models']),
   'settings.removeCustomServer': callable<
     (request: RemoveCustomServerRequest) => Promise<ConnectorsSnapshot>
-  >()('settings', ['settings:remove-custom-server']),
+  >()('settings', ['settings:remove-custom-server', LOCAL]),
   'settings.removeGitHubToken': callable<() => Promise<GitHubTokenStatus>>()('settings', [
     'settings:remove-github-token',
     LOCAL
@@ -1765,7 +1774,7 @@ export const RENDERER_API_CONTRACT = Object.freeze({
   >()('settings', ['settings:set-conversation-skill-import-enabled']),
   'settings.setCustomServerEnabled': callable<
     (request: SetCustomServerEnabledRequest) => Promise<ConnectorsSnapshot>
-  >()('settings', ['settings:set-custom-server-enabled']),
+  >()('settings', ['settings:set-custom-server-enabled', LOCAL]),
   'settings.setDefaultPermissionProfile': callable<
     (request: SetDefaultPermissionProfileRequest) => Promise<SettingsSnapshot>
   >()('settings', ['settings:set-default-permission-profile', LOCAL]),
@@ -1836,7 +1845,7 @@ export const RENDERER_API_CONTRACT = Object.freeze({
   ]),
   'settings.updateCustomServer': callable<
     (request: UpdateCustomServerRequest) => Promise<ConnectorsSnapshot>
-  >()('settings', ['settings:update-custom-server']),
+  >()('settings', ['settings:update-custom-server', LOCAL]),
   'settings.updateSkill': callable<(request: UpdateSkillRequest) => Promise<SkillView[]>>()(
     'settings',
     ['settings:update-skill']

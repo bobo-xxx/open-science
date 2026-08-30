@@ -471,7 +471,7 @@ describe('Settings backend ownership architecture', () => {
         addCustomServer addManualInterpreter admitReviewerExecutionModel admitSessionDetailsExecutionTarget admitSubagentExecutionModel admitVisionModel authenticateCustomServer buildCustomServerTemplateExport
         buildSkillExport beginXaiOAuthLogin cancelClaudeIsolatedLogin cancelClaudeLogin cancelCodexLogin cancelCustomServerAuthentication cancelXaiOAuthLogin captureActiveAgentBackendSelection captureActiveExplicitAgentBackendTarget checkEnvironment clearGrantedLocalRoots codeBuddySkillCatalog codexSkillCatalog
         codexSkillDescriptorsForIds createSkill deleteProvider deleteSkill detectClaude detectCodeBuddy detectCodex
-        detectOpencode dismissLegacyDataMovePrompt getAppIconVariant getClosePreference
+        detectOpencode disconnectCustomServer dismissLegacyDataMovePrompt getAppIconVariant getClosePreference
         getComputeBookmarks getConnectorDetail getConnectors getConversationSkillImportEnabled getGitHubTokenStatus getGrantedLocalRoots getManualInterpreters getNotificationsEnabled getPackageMirror
         getPreflight getRuntimeEnablement getRuntimeSelection getSettingsView getShowNotificationContent getSkillDetail
         getStoredSettings importAgentHomeSkills importSkill importSkillArchiveBatch importSkillZip
@@ -479,7 +479,7 @@ describe('Settings backend ownership architecture', () => {
         isNpmAvailable listAgentHomeSkills listConnectors listHostSkills listSkills listSpecialistSkillCatalog listUserSkills
         loginClaudeShared loginIsolatedClaude loginIsolatedClaudeBrowser loginIsolatedCodex
         logoutClaudeShared logoutIsolatedClaude logoutIsolatedCodex logoutXaiOAuth markOnboardingComplete
-        markPathsNormalized previewAgentHomeSkill previewCustomServerTemplateExport
+        markPathsNormalized migrateAgentHomeSkillIdentities previewAgentHomeSkill previewCustomServerTemplateExport
         previewCustomServerTemplateImport previewGitHubSkill previewSkillArchive previewSkillZip
         provisionedConnectorSkillNames publishHostSkill refreshProviderModels registeredHelperCatalog removeCustomServer removeGitHubToken
         removeManualInterpreter resolveActiveModelChangeTarget resolveActiveReasoningEffort
@@ -751,6 +751,7 @@ describe('Settings backend ownership architecture', () => {
       /registerIpcHandlers\(\{\s+mainEntryPath,\s+settingsStore,\s+translate,/u
     )
     expect(mainIpc).toContain('settingsStore ?? resolveStorageRoot()')
+    expect(mainIpc).toContain('await settingsService.migrateAgentHomeSkillIdentities()')
     expect(mainIpc).toContain(
       'capability: new SettingsService({\n      repository: settingsRepository,\n      skillRuntimeMcpEntryPath: mainEntryPath,\n      openAlexFetch: netFetchStandard,\n      applyNetworkProxy:'
     )
