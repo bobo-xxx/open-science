@@ -327,7 +327,11 @@ async function startElectronApp(mainEntryPath: string): Promise<void> {
       const databaseStartupLogging = createDatabaseStartupLogging(log, app.getVersion())
       const databaseStartupOwner = createDatabaseStartupOwner({
         reportBlocked: databaseStartupLogging.reportBlocked,
-        buildDiagnostics: (error) => buildStartupDiagnostics(error),
+        buildDiagnostics: (error) =>
+          buildStartupDiagnostics(error, {
+            configRoot: resolveStorageRoot(),
+            dataRoot: startupSettings.dataRoot
+          }),
         environment: {
           appVersion: app.getVersion(),
           platform: process.platform,
@@ -614,8 +618,9 @@ async function startElectronApp(mainEntryPath: string): Promise<void> {
                 getWindow: () => InstanceType<typeof BrowserWindow> | undefined
               ) => createElectronSessionPersistenceFlush(getWindow),
               notifySessionPersistenceFlushAborted: (
-                getWindow: () => InstanceType<typeof BrowserWindow> | undefined
-              ) => notifyRendererSessionPersistenceFlushAborted(getWindow),
+                getWindow: () => InstanceType<typeof BrowserWindow> | undefined,
+                reason?: Parameters<typeof notifyRendererSessionPersistenceFlushAborted>[1]
+              ) => notifyRendererSessionPersistenceFlushAborted(getWindow, reason),
               createConfirmClose: (
                 getWindow: () => InstanceType<typeof BrowserWindow> | undefined
               ) =>
@@ -720,9 +725,12 @@ async function startElectronApp(mainEntryPath: string): Promise<void> {
             detectActiveSessions: ctx.detectActiveSessions,
             hasActiveReviewerWork: ctx.hasActiveReviewerWork,
             prepareForQuit: ctx.prepareForQuit,
-            abortQuitPreparation: () => {
+            abortQuitPreparation: (reason) => {
               ctx.abortQuitPreparation()
-              ctx.notifySessionPersistenceFlushAborted(() => ctx.mainWindowGetterBox.current?.())
+              ctx.notifySessionPersistenceFlushAborted(
+                () => ctx.mainWindowGetterBox.current?.(),
+                reason
+              )
             },
             flushSessionPersistence: ctx.createSessionPersistenceFlush(() =>
               ctx.mainWindowGetterBox.current?.()

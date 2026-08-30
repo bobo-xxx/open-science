@@ -72,6 +72,9 @@ const GENERATED_SOURCE_OMISSIONS = [
   'officePreview.onState',
   'officePreview.open',
   'officePreview.reportState',
+  'remoteAccess.detect',
+  'remoteAccess.disable',
+  'remoteAccess.setMode',
   'sessions.sendFlushResponse',
   'settings.exportCustomServerTemplate',
   'settings.exportSkill',
@@ -183,6 +186,7 @@ const REMOTE_LOCAL_ONLY_CHANNELS: GroupedInventory = {
   logs: ['get-status', 'open-file', 'reveal-in-folder'],
   'notebook-env': ['cancel', 'provision', 'repair'],
   notebook: ['export-ipynb', 'export-ipynb-all'],
+  'remote-access': ['probe'],
   runtime: [
     'pick-interpreter',
     'register-interpreter',

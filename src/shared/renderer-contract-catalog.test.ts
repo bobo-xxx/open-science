@@ -13,6 +13,18 @@ const paths = (
 ): string[] => RENDERER_CONTRACT_CATALOG.filter(predicate).map(({ publicPath }) => publicPath)
 
 describe('renderer contract catalog', () => {
+  it('keeps the Remote Access probe local-only', () => {
+    expect(
+      RENDERER_CONTRACT_CATALOG.find(({ publicPath }) => publicPath === 'remoteAccess.probe')
+    ).toMatchObject({
+      surfaceInstallation: {
+        electron: 'preload',
+        localWeb: 'web-rpc',
+        remoteWeb: 'rejecting-stub'
+      }
+    })
+  })
+
   it('keeps every logs command local-only', () => {
     const logs = RENDERER_CONTRACT_GROUPS.find(({ capability }) => capability === 'logs')
 
@@ -22,6 +34,32 @@ describe('renderer contract catalog', () => {
         ({ surfaceInstallation }) => surfaceInstallation.remoteWeb === 'rejecting-stub'
       )
     ).toBe(true)
+  })
+
+  it('publishes remote-access route management only on Electron', () => {
+    expect(
+      RENDERER_CONTRACT_CATALOG.filter(({ publicPath }) =>
+        ['remoteAccess.detect', 'remoteAccess.disable', 'remoteAccess.setMode'].includes(publicPath)
+      ).map(({ publicPath, surfaceInstallation, dispatchPolicy }) => ({
+        publicPath,
+        surfaceInstallation,
+        dispatchPolicy
+      }))
+    ).toEqual(
+      ['remoteAccess.detect', 'remoteAccess.disable', 'remoteAccess.setMode'].map((publicPath) => ({
+        publicPath,
+        surfaceInstallation: {
+          electron: 'preload',
+          localWeb: 'unavailable',
+          remoteWeb: 'unavailable'
+        },
+        dispatchPolicy: {
+          electron: 'electron-ipc-request',
+          localWeb: 'none',
+          remoteWeb: 'none'
+        }
+      }))
+    )
   })
 
   it('pins the complete capability-owned inventory and legacy map projection', () => {

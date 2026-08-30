@@ -135,7 +135,10 @@ describe('RemoteSessionPairingManager', () => {
         }),
         new URL('https://home.example.ts.net/api/v1/events')
       )
-    ).resolves.toMatchObject({ sessionId: expect.any(String) })
+    ).resolves.toMatchObject({
+      principalId: expect.any(String),
+      isCurrent: expect.any(Function)
+    })
     expect(manager.trustedViews()).toHaveLength(0)
     expect(changed).toHaveBeenCalled()
   })
@@ -199,7 +202,8 @@ describe('RemoteSessionPairingManager', () => {
     )
     const pendingCookie = cookiePair(firstResponse.headers.get('set-cookie') as string)
     await manager.approve(manager.pendingViews()[0].id, 'always')
-    expect((await repository.load()).trustedBrowsers).toHaveLength(1)
+    const [trustedBrowser] = (await repository.load()).trustedBrowsers
+    if (!trustedBrowser) throw new Error('Expected a persisted trusted browser.')
 
     const statusResponse = response()
     await manager.webAccess.authorizeHttp(
@@ -218,13 +222,27 @@ describe('RemoteSessionPairingManager', () => {
       isEnabled: () => true,
       onChanged: vi.fn()
     })
+    const httpAuthorization = await restartedManager.webAccess.authorizeHttp(
+      request('/', { cookie: sessionCookie }),
+      response().response,
+      new URL('https://home.example.ts.net/')
+    )
+    expect(httpAuthorization).toMatchObject({
+      kind: 'authorized-pairing-manager',
+      principalId: trustedBrowser.id
+    })
     await expect(
-      restartedManager.webAccess.authorizeHttp(
-        request('/', { cookie: sessionCookie }),
-        response().response,
-        new URL('https://home.example.ts.net/')
+      restartedManager.webAccess.authorizeWebSocket(
+        request('/events', {
+          cookie: sessionCookie,
+          origin: 'https://home.example.ts.net'
+        }),
+        new URL('https://home.example.ts.net/events')
       )
-    ).resolves.toMatchObject({ kind: 'authorized-pairing-manager' })
+    ).resolves.toMatchObject({
+      principalId: trustedBrowser.id,
+      isCurrent: expect.any(Function)
+    })
     expect(restartedManager.pendingViews()).toHaveLength(0)
 
     await expect(
@@ -793,6 +811,74 @@ describe('RemoteSessionPairingManager', () => {
         expect((await repository.load()).trustedBrowsers).toHaveLength(0)
       })
       expect(onChanged).toHaveBeenCalledOnce()
+    } finally {
+      manager?.dispose()
+      vi.useRealTimers()
+    }
+  })
+
+  it('reports each naturally expired authorization by stable principal ID', async () => {
+    vi.useFakeTimers()
+    let manager: RemoteSessionPairingManager | undefined
+    try {
+      vi.setSystemTime(0)
+      const root = await mkdtemp(join(tmpdir(), 'open-science-remote-pairing-'))
+      roots.push(root)
+      const onAuthorizationExpired = vi.fn()
+      const options = {
+        repository: new RemoteAccessRepository(root),
+        isAllowedRemoteHost: (hostname: string) => hostname === 'home.example.ts.net',
+        isEnabled: () => true,
+        onChanged: vi.fn(),
+        onAuthorizationExpired
+      }
+      manager = await RemoteSessionPairingManager.create(options)
+
+      const grant = async (
+        decision: RemotePairingDecision
+      ): Promise<{ principalId: string; isCurrent: () => boolean }> => {
+        const pairingResponse = response()
+        await manager!.webAccess.authorizeHttp(
+          request('/'),
+          pairingResponse.response,
+          new URL('https://home.example.ts.net/')
+        )
+        const pendingCookie = cookiePair(pairingResponse.headers.get('set-cookie') as string)
+        await manager!.approve(manager!.pendingViews()[0].id, decision)
+        const statusResponse = response()
+        await manager!.webAccess.authorizeHttp(
+          request('/__open_science_remote/pair/status', { cookie: pendingCookie }),
+          statusResponse.response,
+          new URL('https://home.example.ts.net/__open_science_remote/pair/status')
+        )
+        const sessionCookie = cookiePair((statusResponse.headers.get('set-cookie') as string[])[0])
+        const authorization = await manager!.webAccess.authorizeWebSocket(
+          request('/api/v1/events', {
+            cookie: sessionCookie,
+            origin: 'https://home.example.ts.net'
+          }),
+          new URL('https://home.example.ts.net/api/v1/events')
+        )
+        return authorization!
+      }
+
+      const oneTimeAuthorization = await grant('once')
+      const trustedAuthorization = await grant('always')
+      expect(oneTimeAuthorization.isCurrent()).toBe(true)
+      expect(trustedAuthorization.isCurrent()).toBe(true)
+      onAuthorizationExpired.mockClear()
+
+      const oneTimeTtlMs = 12 * 60 * 60 * 1_000
+      await vi.advanceTimersByTimeAsync(oneTimeTtlMs + 1)
+      expect(onAuthorizationExpired).toHaveBeenCalledOnce()
+      expect(onAuthorizationExpired).toHaveBeenLastCalledWith(oneTimeAuthorization.principalId)
+      expect(oneTimeAuthorization.isCurrent()).toBe(false)
+      expect(trustedAuthorization.isCurrent()).toBe(true)
+
+      await vi.advanceTimersByTimeAsync(TRUSTED_BROWSER_TTL_MS - oneTimeTtlMs)
+      expect(onAuthorizationExpired).toHaveBeenCalledTimes(2)
+      expect(onAuthorizationExpired).toHaveBeenLastCalledWith(trustedAuthorization.principalId)
+      expect(trustedAuthorization.isCurrent()).toBe(false)
     } finally {
       manager?.dispose()
       vi.useRealTimers()

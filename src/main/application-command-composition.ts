@@ -128,6 +128,9 @@ type ApplicationCommandComposition = Readonly<{
 }>
 
 const ELECTRON_NATIVE_COMMAND_NAMES = Object.freeze([
+  'remote-access:detect',
+  'remote-access:disable',
+  'remote-access:set-mode',
   'sessions:export-conversation',
   'uploads:stage-local-file'
 ])
@@ -241,6 +244,7 @@ const createRemoteAccessSlot = (): Readonly<{
   }
   const owner: RemoteAccessOwner = Object.freeze({
     snapshot: (...args) => current().snapshot(...args),
+    probe: (...args) => current().probe(...args),
     detect: (...args) => current().detect(...args),
     setMode: (...args) => current().setMode(...args),
     disable: (...args) => current().disable(...args),

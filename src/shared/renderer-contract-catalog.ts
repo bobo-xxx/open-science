@@ -240,6 +240,7 @@ import type {
   UpdateSessionArchiveRequest
 } from './session-persistence'
 import type {
+  SessionPersistenceFlushAbortedEvent,
   SessionPersistenceFlushRequest,
   SessionPersistenceFlushResponse
 } from './session-persistence-flush'
@@ -1285,10 +1286,16 @@ export const RENDERER_API_CONTRACT = Object.freeze({
     (request: ApproveRemotePairingRequest) => Promise<RemoteAccessSnapshot>
   >()('remote-access', ['remote-access:approve']),
   'remoteAccess.detect': callable<() => Promise<RemoteAccessSnapshot>>()('remote-access', [
-    'remote-access:detect'
+    'remote-access:detect',
+    ELECTRON
+  ]),
+  'remoteAccess.probe': callable<() => Promise<RemoteAccessSnapshot>>()('remote-access', [
+    'remote-access:probe',
+    LOCAL
   ]),
   'remoteAccess.disable': callable<() => Promise<RemoteAccessSnapshot>>()('remote-access', [
-    'remote-access:disable'
+    'remote-access:disable',
+    ELECTRON
   ]),
   'remoteAccess.getSnapshot': callable<() => Promise<RemoteAccessSnapshot>>()('remote-access', [
     'remote-access:get-snapshot'
@@ -1305,7 +1312,7 @@ export const RENDERER_API_CONTRACT = Object.freeze({
   >()('remote-access', ['remote-access:revoke-browser']),
   'remoteAccess.setMode': callable<
     (request: SetRemoteAccessModeRequest) => Promise<RemoteAccessSnapshot>
-  >()('remote-access', ['remote-access:set-mode']),
+  >()('remote-access', ['remote-access:set-mode', ELECTRON]),
   'reviewer.abortFixLoop': callable<(request: ReviewSessionRequest) => Promise<void>>()(
     'reviewer',
     ['reviewer:abort-fix-loop']
@@ -1416,11 +1423,9 @@ export const RENDERER_API_CONTRACT = Object.freeze({
     'sessions',
     ['session:deleted', EVENT]
   ),
-  'sessions.onFlushAborted': callable<(listener: () => void) => RemoveListener>()(
-    'sessions',
-    ['sessions:flush-aborted', EVENT],
-    { optionalMember: true }
-  ),
+  'sessions.onFlushAborted': callable<
+    (listener: AcpListener<SessionPersistenceFlushAbortedEvent | undefined>) => RemoveListener
+  >()('sessions', ['sessions:flush-aborted', EVENT], { optionalMember: true }),
   'sessions.onFlushRequest': callable<
     (listener: AcpListener<SessionPersistenceFlushRequest>) => RemoveListener
   >()('sessions', ['sessions:flush-request', EVENT], { optionalMember: true }),

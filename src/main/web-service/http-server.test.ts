@@ -1,5 +1,5 @@
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { request as httpRequest, ServerResponse } from 'node:http'
+import { request as httpRequest, type IncomingMessage, ServerResponse } from 'node:http'
 import { connect } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -76,18 +76,25 @@ const startTestWebHttpServer = (
     applicationEvents
   })
 }
-const authorizedExternalAccess = (): ExternalWebAccessAuthorization => ({
+const authorizedExternalAccess = (
+  principalId = 'trusted-browser'
+): ExternalWebAccessAuthorization => ({
   kind: 'authorized-pairing-manager' as const,
+  principalId,
   isCurrent: () => true
 })
-const accessOnlyExternalAccess = (): ExternalWebAccessAuthorization => ({
+const accessOnlyExternalAccess = (
+  principalId = 'one-time-session'
+): ExternalWebAccessAuthorization => ({
   kind: 'authorized' as const,
+  principalId,
   isCurrent: () => true
 })
 const startBudgetTestServer = async (
   requestBodyBudgets: NonNullable<Parameters<typeof startWebHttpServer>[0]['requestBodyBudgets']>,
   onExternalAuthorization?: () => void,
-  invoke: TestWebServerOptions['rpc']['invoke'] = vi.fn().mockResolvedValue([])
+  invoke: TestWebServerOptions['rpc']['invoke'] = vi.fn().mockResolvedValue([]),
+  principalIdForRequest: (request: IncomingMessage) => string = () => 'one-time-session'
 ): ReturnType<typeof startWebHttpServer> => {
   const staticRoot = await mkdtemp(join(tmpdir(), 'open-science-web-static-'))
   roots.push(staticRoot)
@@ -105,9 +112,9 @@ const startBudgetTestServer = async (
       dispose: vi.fn()
     },
     externalAccess: {
-      authorizeHttp: async () => {
+      authorizeHttp: async (request) => {
         onExternalAuthorization?.()
-        return accessOnlyExternalAccess()
+        return accessOnlyExternalAccess(principalIdForRequest(request))
       },
       authorizeWebSocket: async () => undefined
     },
@@ -143,6 +150,201 @@ afterEach(async () => {
 })
 
 describe('startWebHttpServer', () => {
+  it('closes stale external event sockets before an application event can leak', async () => {
+    let authorizationCurrent = true
+    const server = await startTestWebHttpServer({
+      host: '127.0.0.1',
+      port: 0,
+      token: 'test-token',
+      staticRoot: '/unused',
+      rpc: { channels: () => [], invoke: vi.fn() },
+      externalAccess: {
+        authorizeHttp: vi.fn().mockResolvedValue('denied'),
+        authorizeWebSocket: vi.fn().mockResolvedValue({
+          principalId: 'remote-principal-1',
+          isCurrent: () => authorizationCurrent
+        })
+      },
+      bootstrap: {
+        appName: 'Open Science',
+        appVersion: '0.0.0',
+        configRoot: '/fake/root',
+        platform: 'test',
+        versions: { electron: '1', chrome: '1', node: '1' }
+      }
+    })
+    servers.push(server)
+    const socket = new WebSocket(`ws://127.0.0.1:${server.port}/events`)
+    await new Promise<void>((resolve) => socket.once('open', resolve))
+    authorizationCurrent = false
+
+    const outcome = new Promise<'closed' | 'leaked'>((resolve) => {
+      socket.once('close', () => resolve('closed'))
+      socket.once('message', () => resolve('leaked'))
+    })
+    applicationEvents.publish('project:created', {
+      id: 'private-project',
+      name: 'Private project',
+      description: '',
+      isExample: false,
+      createdAt: 1,
+      updatedAt: 1
+    })
+
+    await expect(
+      Promise.race([
+        outcome,
+        new Promise<'timed-out'>((resolve) => setTimeout(() => resolve('timed-out'), 250))
+      ])
+    ).resolves.toBe('closed')
+  })
+
+  it('closes stale idle external sockets before heartbeat traffic is sent', async () => {
+    let authorizationCurrent = true
+    const server = await startTestWebHttpServer({
+      host: '127.0.0.1',
+      port: 0,
+      token: 'test-token',
+      staticRoot: '/unused',
+      eventHeartbeatIntervalMs: 10,
+      rpc: { channels: () => [], invoke: vi.fn() },
+      externalAccess: {
+        authorizeHttp: vi.fn().mockResolvedValue('denied'),
+        authorizeWebSocket: vi.fn().mockResolvedValue({
+          principalId: 'remote-principal-1',
+          isCurrent: () => authorizationCurrent
+        })
+      },
+      bootstrap: {
+        appName: 'Open Science',
+        appVersion: '0.0.0',
+        configRoot: '/fake/root',
+        platform: 'test',
+        versions: { electron: '1', chrome: '1', node: '1' }
+      }
+    })
+    servers.push(server)
+    const socket = new WebSocket(`ws://127.0.0.1:${server.port}/events?liveness=1`)
+    await new Promise<void>((resolve) => socket.once('open', resolve))
+    authorizationCurrent = false
+
+    const outcome = new Promise<'closed' | 'heartbeat'>((resolve) => {
+      socket.once('close', () => resolve('closed'))
+      socket.once('message', () => resolve('heartbeat'))
+    })
+    await expect(
+      Promise.race([
+        outcome,
+        new Promise<'timed-out'>((resolve) => setTimeout(() => resolve('timed-out'), 250))
+      ])
+    ).resolves.toBe('closed')
+  })
+
+  it('rejects stale external sockets before replay frames are sent', async () => {
+    const server = await startTestWebHttpServer({
+      host: '127.0.0.1',
+      port: 0,
+      token: 'test-token',
+      staticRoot: '/unused',
+      rpc: { channels: () => [], invoke: vi.fn() },
+      externalAccess: {
+        authorizeHttp: vi.fn().mockResolvedValue('denied'),
+        authorizeWebSocket: vi.fn().mockResolvedValue({
+          principalId: 'remote-principal-1',
+          isCurrent: () => false
+        })
+      },
+      bootstrap: {
+        appName: 'Open Science',
+        appVersion: '0.0.0',
+        configRoot: '/fake/root',
+        platform: 'test',
+        versions: { electron: '1', chrome: '1', node: '1' }
+      }
+    })
+    servers.push(server)
+    const url = new URL(`ws://127.0.0.1:${server.port}/events`)
+    url.searchParams.set('eventProtocol', String(WEB_EVENT_STREAM_PROTOCOL_VERSION))
+    url.searchParams.set('stream', 'stale-stream')
+    url.searchParams.set('after', '0')
+    const socket = new WebSocket(url)
+    const outcome = new Promise<'rejected' | 'replayed'>((resolve) => {
+      socket.once('unexpected-response', (_request, response) => {
+        response.resume()
+        resolve('rejected')
+      })
+      socket.once('error', () => resolve('rejected'))
+      socket.once('message', () => resolve('replayed'))
+    })
+
+    await expect(
+      Promise.race([
+        outcome,
+        new Promise<'timed-out'>((resolve) => setTimeout(() => resolve('timed-out'), 250))
+      ])
+    ).resolves.toBe('rejected')
+  })
+
+  it('closes stale external sockets before Task progress is sent', async () => {
+    let authorizationCurrent = true
+    let publishProgress:
+      ((event: import('../../shared/task-api').TaskRunProgressEvent) => void) | undefined
+    const server = await startTestWebHttpServer({
+      host: '127.0.0.1',
+      port: 0,
+      token: 'test-token',
+      staticRoot: '/unused',
+      rpc: { channels: () => [], invoke: vi.fn() },
+      tasks: {
+        subscribeProgress: (listener) => {
+          publishProgress = listener
+          return () => {
+            publishProgress = undefined
+          }
+        }
+      } as never,
+      externalAccess: {
+        authorizeHttp: vi.fn().mockResolvedValue('denied'),
+        authorizeWebSocket: vi.fn().mockResolvedValue({
+          principalId: 'remote-principal-1',
+          isCurrent: () => authorizationCurrent
+        })
+      },
+      bootstrap: {
+        appName: 'Open Science',
+        appVersion: '0.0.0',
+        configRoot: '/fake/root',
+        platform: 'test',
+        versions: { electron: '1', chrome: '1', node: '1' }
+      }
+    })
+    servers.push(server)
+    const socket = new WebSocket(`ws://127.0.0.1:${server.port}/api/v1/events`)
+    await new Promise<void>((resolve) => socket.once('open', resolve))
+    authorizationCurrent = false
+
+    const outcome = new Promise<'closed' | 'leaked'>((resolve) => {
+      socket.once('close', () => resolve('closed'))
+      socket.once('message', () => resolve('leaked'))
+    })
+    publishProgress?.({
+      runId: 'run-1',
+      sessionId: 'session-1',
+      projectId: 'project-1',
+      phase: 'provider-accepted',
+      timestamp: 250,
+      elapsedMs: 249,
+      heartbeat: false
+    })
+
+    await expect(
+      Promise.race([
+        outcome,
+        new Promise<'timed-out'>((resolve) => setTimeout(() => resolve('timed-out'), 250))
+      ])
+    ).resolves.toBe('closed')
+  })
+
   it('rejects malformed URL encoding at the public HTTP boundary', async () => {
     const server = await startTestWebHttpServer({
       host: '127.0.0.1',
@@ -276,22 +478,30 @@ describe('startWebHttpServer', () => {
         perClientInFlightBytes: 64,
         serverInFlightBytes: 128
       },
-      firstClientId: 'shared-client',
-      secondClientId: 'shared-client',
+      firstClientId: 'first-connection',
+      secondClientId: 'second-connection',
       expectedStatus: 429
     }
   ])(
     'rejects a declared body before reading when concurrent requests exhaust the $dimension byte budget',
-    async ({ budgets, firstClientId, secondClientId, expectedStatus }) => {
+    async ({ dimension, budgets, firstClientId, secondClientId, expectedStatus }) => {
       let authorizeCount = 0
       let markFirstAuthorized: () => void = () => undefined
       const firstAuthorized = new Promise<void>((resolve) => {
         markFirstAuthorized = resolve
       })
-      const server = await startBudgetTestServer(budgets, () => {
-        authorizeCount += 1
-        if (authorizeCount === 1) markFirstAuthorized()
-      })
+      const server = await startBudgetTestServer(
+        budgets,
+        () => {
+          authorizeCount += 1
+          if (authorizeCount === 1) markFirstAuthorized()
+        },
+        undefined,
+        ({ headers }) =>
+          dimension === 'server'
+            ? `principal:${String(headers['x-open-science-client'])}`
+            : 'shared-principal'
+      )
 
       const firstRequest = httpRequest({
         host: '127.0.0.1',
@@ -1673,7 +1883,10 @@ describe('startWebHttpServer', () => {
       rpc,
       externalAccess: {
         authorizeHttp,
-        authorizeWebSocket: vi.fn().mockResolvedValue({})
+        authorizeWebSocket: vi.fn().mockResolvedValue({
+          principalId: 'trusted-browser',
+          isCurrent: () => true
+        })
       },
       bootstrap: {
         appName: 'Open Science',
@@ -1701,7 +1914,7 @@ describe('startWebHttpServer', () => {
     expect(rpc.invoke).toHaveBeenCalledWith(
       'remote-access:get-snapshot',
       expect.objectContaining({
-        clientId: 'trusted-phone',
+        clientId: 'trusted-browser:trusted-phone',
         location: 'remote',
         authorities: ['manage-remote-pairing']
       }),
@@ -1725,12 +1938,66 @@ describe('startWebHttpServer', () => {
     expect(rpc.invoke).toHaveBeenLastCalledWith(
       'remote-access:get-snapshot',
       expect.objectContaining({
-        clientId: 'one-time-phone',
+        clientId: 'one-time-session:one-time-phone',
         location: 'remote',
         authorities: []
       }),
       []
     )
+  })
+
+  it('rejects a remote HTTP request when authorization expires while authorization is pending', async () => {
+    const staticRoot = await mkdtemp(join(tmpdir(), 'open-science-web-static-'))
+    roots.push(staticRoot)
+    await writeFile(join(staticRoot, 'index.html'), '<!doctype html>')
+    let markAuthorizationStarted: () => void = () => undefined
+    const authorizationStarted = new Promise<void>((resolve) => {
+      markAuthorizationStarted = resolve
+    })
+    let resolveAuthorization: (authorization: ExternalWebAccessAuthorization) => void = () =>
+      undefined
+    const authorization = new Promise<ExternalWebAccessAuthorization>((resolve) => {
+      resolveAuthorization = resolve
+    })
+    let current = true
+    const server = await startTestWebHttpServer({
+      host: '127.0.0.1',
+      port: 0,
+      token: 'local-token',
+      staticRoot,
+      rpc: {
+        channels: () => [],
+        invoke: vi.fn(),
+        releaseClient: vi.fn(),
+        dispose: vi.fn()
+      },
+      externalAccess: {
+        authorizeHttp: vi.fn(() => {
+          markAuthorizationStarted()
+          return authorization
+        }),
+        authorizeWebSocket: vi.fn().mockResolvedValue(undefined)
+      },
+      bootstrap: {
+        appName: 'Open Science',
+        appVersion: '0.0.0',
+        configRoot: '/fake/root',
+        platform: 'test',
+        versions: { electron: '1', chrome: '1', node: '1' }
+      }
+    })
+    servers.push(server)
+
+    const response = fetch(`http://127.0.0.1:${server.port}/api/bootstrap`)
+    await authorizationStarted
+    current = false
+    resolveAuthorization({
+      kind: 'authorized-pairing-manager',
+      principalId: 'trusted-browser',
+      isCurrent: () => current
+    })
+
+    expect((await response).status).toBe(401)
   })
 
   it('does not execute remote RPC or Task API requests after their authorization expires', async () => {
@@ -1742,6 +2009,7 @@ describe('startWebHttpServer', () => {
       const authorizedGeneration = authorizationGeneration
       return {
         kind: 'authorized-pairing-manager' as const,
+        principalId: 'trusted-browser',
         isCurrent: () => authorizedGeneration === authorizationGeneration
       }
     })
@@ -1792,7 +2060,10 @@ describe('startWebHttpServer', () => {
       tasks,
       externalAccess: {
         authorizeHttp,
-        authorizeWebSocket: vi.fn().mockResolvedValue({})
+        authorizeWebSocket: vi.fn().mockResolvedValue({
+          principalId: 'trusted-browser',
+          isCurrent: () => true
+        })
       },
       bootstrap: {
         appName: 'Open Science',
@@ -1897,7 +2168,10 @@ describe('startWebHttpServer', () => {
       },
       externalAccess: {
         authorizeHttp,
-        authorizeWebSocket: vi.fn().mockResolvedValue({})
+        authorizeWebSocket: vi.fn().mockResolvedValue({
+          principalId: 'trusted-browser',
+          isCurrent: () => true
+        })
       },
       bootstrap: {
         appName: 'Open Science',
@@ -2116,7 +2390,10 @@ describe('startWebHttpServer', () => {
       rpc,
       externalAccess: {
         authorizeHttp: vi.fn().mockResolvedValue(createAuthorization()),
-        authorizeWebSocket: vi.fn().mockResolvedValue({})
+        authorizeWebSocket: vi.fn().mockResolvedValue({
+          principalId: 'trusted-browser',
+          isCurrent: () => true
+        })
       },
       bootstrap: {
         appName: 'Open Science',
@@ -2197,7 +2474,10 @@ describe('startWebHttpServer', () => {
       },
       externalAccess: {
         authorizeHttp: vi.fn().mockResolvedValue(authorizedExternalAccess()),
-        authorizeWebSocket: vi.fn().mockResolvedValue({ sessionId: 'trusted-browser' })
+        authorizeWebSocket: vi.fn().mockResolvedValue({
+          principalId: 'trusted-browser',
+          isCurrent: () => true
+        })
       },
       bootstrap: {
         appName: 'Open Science',
@@ -2237,6 +2517,114 @@ describe('startWebHttpServer', () => {
     await nextRemoteClosed
     expect(localSocket.readyState).toBe(WebSocket.OPEN)
     localSocket.close()
+  })
+
+  it('rejects an external WebSocket when authorization expires while the upgrade waits', async () => {
+    const staticRoot = await mkdtemp(join(tmpdir(), 'open-science-web-static-'))
+    roots.push(staticRoot)
+    await writeFile(join(staticRoot, 'index.html'), '<!doctype html>')
+    let authorizationCurrent = true
+    let resolveAuthorization:
+      ((authorization: { principalId: string; isCurrent: () => boolean }) => void) | undefined
+    let markAuthorizationStarted: (() => void) | undefined
+    const authorizationStarted = new Promise<void>((resolve) => {
+      markAuthorizationStarted = resolve
+    })
+    const server = await startTestWebHttpServer({
+      host: '127.0.0.1',
+      port: 0,
+      token: 'local-token',
+      staticRoot,
+      rpc: {
+        channels: () => [],
+        invoke: vi.fn(),
+        releaseClient: vi.fn(),
+        dispose: vi.fn()
+      },
+      externalAccess: {
+        authorizeHttp: vi.fn().mockResolvedValue(authorizedExternalAccess()),
+        authorizeWebSocket: vi.fn(
+          () =>
+            new Promise<{ principalId: string; isCurrent: () => boolean }>((resolve) => {
+              resolveAuthorization = resolve
+              markAuthorizationStarted?.()
+            })
+        )
+      },
+      bootstrap: {
+        appName: 'Open Science',
+        appVersion: '0.0.0',
+        configRoot: '/fake/root',
+        platform: 'test',
+        versions: { electron: '1', chrome: '1', node: '1' }
+      }
+    })
+    servers.push(server)
+    const socket = new WebSocket(`ws://127.0.0.1:${server.port}/events`, {
+      headers: { origin: `http://127.0.0.1:${server.port}` }
+    })
+    const outcome = new Promise<'opened' | 'rejected'>((resolve) => {
+      socket.once('open', () => resolve('opened'))
+      socket.once('unexpected-response', (_request, response) => {
+        response.resume()
+        resolve('rejected')
+      })
+      socket.once('error', () => resolve('rejected'))
+    })
+
+    await authorizationStarted
+    authorizationCurrent = false
+    resolveAuthorization?.({
+      principalId: 'temporary-browser',
+      isCurrent: () => authorizationCurrent
+    })
+
+    await expect(outcome).resolves.toBe('rejected')
+    socket.terminate()
+  })
+
+  it('closes an expired external WebSocket before replaying retained task events', async () => {
+    const staticRoot = await mkdtemp(join(tmpdir(), 'open-science-web-static-'))
+    roots.push(staticRoot)
+    await writeFile(join(staticRoot, 'index.html'), '<!doctype html>')
+    const isCurrent = vi.fn().mockReturnValueOnce(true).mockReturnValue(false)
+    const server = await startTestWebHttpServer({
+      host: '127.0.0.1',
+      port: 0,
+      token: 'local-token',
+      staticRoot,
+      rpc: {
+        channels: () => [],
+        invoke: vi.fn(),
+        releaseClient: vi.fn(),
+        dispose: vi.fn()
+      },
+      externalAccess: {
+        authorizeHttp: vi.fn().mockResolvedValue(authorizedExternalAccess()),
+        authorizeWebSocket: vi.fn().mockResolvedValue({
+          principalId: 'temporary-browser',
+          isCurrent
+        })
+      },
+      bootstrap: {
+        appName: 'Open Science',
+        appVersion: '0.0.0',
+        configRoot: '/fake/root',
+        platform: 'test',
+        versions: { electron: '1', chrome: '1', node: '1' }
+      }
+    })
+    servers.push(server)
+    const socket = new WebSocket(`ws://127.0.0.1:${server.port}/api/v1/events?eventProtocol=1`, {
+      headers: { origin: `http://127.0.0.1:${server.port}` }
+    })
+    const outcome = new Promise<'closed' | 'event-leaked'>((resolve) => {
+      socket.once('close', () => resolve('closed'))
+      socket.once('message', () => resolve('event-leaked'))
+    })
+
+    await expect(outcome).resolves.toBe('closed')
+    expect(isCurrent).toHaveBeenCalledTimes(2)
   })
 
   it('authenticates shutdown requests before invoking the callback', async () => {
@@ -2352,7 +2740,10 @@ describe('startWebHttpServer', () => {
       },
       externalAccess: {
         authorizeHttp: vi.fn().mockResolvedValue(authorizedExternalAccess()),
-        authorizeWebSocket: vi.fn().mockResolvedValue({})
+        authorizeWebSocket: vi.fn().mockResolvedValue({
+          principalId: 'trusted-browser',
+          isCurrent: () => true
+        })
       },
       onShutdownRequest,
       bootstrap: {
@@ -2475,6 +2866,66 @@ describe('startWebHttpServer', () => {
     })
     expect(runResponses[1]).toEqual(runResponses[0])
     expect([createProject.mock.calls.length, startRun.mock.calls.length]).toEqual([1, 1])
+  })
+
+  it('keeps remote browser idempotency keys in separate authorized caller scopes', async () => {
+    const createProject = vi
+      .fn()
+      .mockImplementation(async (request: { name: string }) => ({ id: request.name }))
+    const server = await startTestWebHttpServer({
+      host: '127.0.0.1',
+      port: 0,
+      token: 'local-token',
+      staticRoot: '/unused',
+      rpc: { channels: () => [], invoke: vi.fn() },
+      tasks: {
+        runWithCallerContext,
+        subscribeProgress: vi.fn(() => vi.fn()),
+        listProjects: vi.fn(),
+        createProject,
+        updateProject: vi.fn(),
+        listSessions: vi.fn(),
+        getSession: vi.fn(),
+        startRun: vi.fn(),
+        getRun: vi.fn(),
+        cancelRun: vi.fn(),
+        listArtifacts: vi.fn(),
+        acquireArtifact: vi.fn(),
+        releaseArtifact: vi.fn()
+      },
+      externalAccess: {
+        authorizeHttp: vi.fn().mockResolvedValue(accessOnlyExternalAccess()),
+        authorizeWebSocket: vi.fn().mockResolvedValue({
+          principalId: 'trusted-browser',
+          isCurrent: () => true
+        })
+      },
+      bootstrap: {
+        appName: 'Open Science',
+        appVersion: '0.0.0',
+        configRoot: '/fake/root',
+        platform: 'test',
+        versions: { electron: '1', chrome: '1', node: '1' }
+      }
+    })
+    servers.push(server)
+
+    const createFromBrowser = (clientId: string, name: string): Promise<Response> =>
+      fetch(`http://127.0.0.1:${server.port}/api/v1/projects`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'idempotency-key': 'create-project',
+          'x-open-science-client': clientId
+        },
+        body: JSON.stringify({ name })
+      })
+
+    const first = await createFromBrowser('browser-a', 'First project')
+    const second = await createFromBrowser('browser-b', 'Second project')
+
+    expect([first.status, second.status]).toEqual([201, 201])
+    expect(createProject).toHaveBeenCalledTimes(2)
   })
 
   it('serves the versioned task API without exposing internal RPC channels', async () => {
