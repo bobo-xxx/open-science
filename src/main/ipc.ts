@@ -75,6 +75,7 @@ import { AgentComputeService } from './compute/agent-compute-service'
 import { createSessionCatalogHydration } from './compute/session-catalog-hydration'
 import { SessionEnabledComputeHostsOwner } from './compute/session-enabled-hosts-owner'
 import { createComputeJobRuntime } from './compute/job-runtime'
+import { LiteratureFullTextIndex } from './literature/full-text-index'
 import { waitForInitialConnectorRefresh } from './connector-reload'
 import { createConnectorApplicationModule } from './connectors/application'
 import { isCustomMcpServerRouteSafe } from './connectors/custom-mcp-bootstrap'
@@ -114,7 +115,9 @@ import {
   buildSkillImportApprovalBroadcast,
   buildConnectorApprovalBroadcast,
   buildConnectorCredentialRequestBroadcast,
-  buildTaskNotificationShow
+  buildTaskNotificationShow,
+  getTaskNotificationAvailability,
+  showTestTaskNotification
 } from './notifications/electron-wiring'
 import { createLogger, diagnosticErrorFields, errorLogFields } from './logger'
 import { startDiagnosticOperation, type DiagnosticOperation } from './diagnostics/operation'
@@ -162,7 +165,7 @@ import { HostSessionsService } from './notebook/host-sessions-service'
 import { HostModelService } from './notebook/host-model-service'
 import { HostViewImageService } from './notebook/host-view-image-service'
 import { parseArtifactVersionLocator } from '../shared/artifact-provenance'
-import { parseUploadVersionReference } from '../shared/uploads'
+import { PENDING_UPLOAD_SESSION_ID, parseUploadVersionReference } from '../shared/uploads'
 import { DEFAULT_ARTIFACT_PROJECT_ID } from '../shared/artifacts'
 import type { NotebookLanguage } from '../shared/notebook'
 import { MAIN_ENABLED_COMPUTE_HOSTS_LIFECYCLE_CLIENT_ID } from '../shared/lifecycle-events'
@@ -224,6 +227,9 @@ import {
   SessionAuxiliaryTurnUsageRecorder,
   type SessionAuxiliaryTurnUsageRecord
 } from './session-persistence/auxiliary-turn-usage'
+import { SessionPdfContextOwner } from './session-persistence/pdf-context-owner'
+import { linkPdfContextWithCapability } from './session-persistence/pdf-context-link-workflow'
+import { LiteratureDocumentReader } from './literature/document-reader'
 import { SessionDeletionOwner } from './session-deletion/owner'
 import { buildSessionDetailsUserPrompt, createSessionDetailsOwner } from './session-details/owner'
 import { tryDecryptKey } from './settings/crypto'
@@ -847,6 +853,37 @@ const createApplicationModules = async (
       })
     }
   )
+  const sessionPdfContextOwner = new SessionPdfContextOwner({
+    inputs: immutableInputAuthority,
+    pendingUploads: {
+      resolveContent: ({ projectId, path }) =>
+        uploadRepository.resolveManagedUploadPath(
+          { path },
+          { projectId, sessionId: PENDING_UPLOAD_SESSION_ID }
+        )
+    },
+    sessions: sessionPersistenceCoordinator
+  })
+  const literatureContextLog = createLogger('literature-reading-context')
+  let stopLiteratureIndexRetention: (() => Promise<void>) | undefined
+  await modules.add(undefined, () => ({
+    name: 'literature-index-retention',
+    capability: undefined,
+    start: () => {
+      stopLiteratureIndexRetention = LiteratureFullTextIndex.startRetentionSweep(
+        resolveDataRoot(),
+        (error) => {
+          literatureContextLog.error('Literature index maintenance failed', errorLogFields(error))
+        }
+      )
+    },
+    dispose: () => stopLiteratureIndexRetention?.()
+  }))
+  const literatureDocumentReader = new LiteratureDocumentReader({
+    storageRoot: resolveDataRoot(),
+    inputs: immutableInputAuthority,
+    sessions: sessionPersistenceCoordinator
+  })
   const sideChatRelay = new SideChatRelayOwner({
     targetState: (parentSessionId) => {
       const runtime = runtimeRef.current
@@ -978,7 +1015,9 @@ const createApplicationModules = async (
         visionEvidenceRepository.deleteSessions(sessionIds)
       ])
     },
-    onSessionsReconciled: (sessionIds) => visionEvidenceRepository.reconcileSessions(sessionIds)
+    onSessionsReconciled: async (sessionIds) => {
+      await visionEvidenceRepository.reconcileSessions(sessionIds)
+    }
   })
   const projectHandlers = createProjectHandlers(projectRepository, projectDeletionCoordinator, {
     updateArchive: (request) => archiveCoordinator.updateProjectArchive(request),
@@ -1439,16 +1478,19 @@ const createApplicationModules = async (
   // regression on either of those contracts would not be caught by TaskNotificationService tests.
   const notificationsLog = createLogger('notifications')
   const liveNotifications = new Set<Notification>()
+  const taskNotificationDeliveryDeps = {
+    notificationCtor: Notification,
+    liveNotifications,
+    log: notificationsLog,
+    headless,
+    translate
+  }
   const taskNotifications = new TaskNotificationService({
     isEnabled: () => settingsService.getNotificationsEnabled(),
+    showContent: () => settingsService.getShowNotificationContent(),
     isAppFocused: () => BrowserWindow.getAllWindows().some((window) => window.isFocused()),
     translate,
-    show: buildTaskNotificationShow({
-      notificationCtor: Notification,
-      liveNotifications,
-      log: notificationsLog,
-      headless
-    }),
+    show: buildTaskNotificationShow(taskNotificationDeliveryDeps),
     onDeliveryError: (error) =>
       notificationsLog.warn('task notification delivery failed', errorLogFields(error)),
     onAttentionError: (error) =>
@@ -1467,6 +1509,12 @@ const createApplicationModules = async (
   // for retry, without an older IPC round trip clearing a newer click target.
   declareElectronAdapter('task-notifications', () => {
     registerNotificationInboxIpcAdapter(notificationInbox)
+    ipcMainHandle('notifications:get-desktop-availability', () =>
+      getTaskNotificationAvailability(taskNotificationDeliveryDeps)
+    )
+    ipcMainHandle('notifications:send-test', () =>
+      showTestTaskNotification(taskNotificationDeliveryDeps)
+    )
     ipcMainHandle('notifications:peek-pending-open-session', () =>
       taskNotifications.peekPendingOpenSession()
     )
@@ -2339,6 +2387,7 @@ const createApplicationModules = async (
       initializationBarrier: initialConnectorSkillsReady,
       specialistService,
       sessionPersistenceCoordinator,
+      literatureReader: literatureDocumentReader,
       delegatedWork: delegatedWork.root,
       sideChatRelays: mainPromptSideChatRelay,
       imageInputCompatibility,
@@ -3542,6 +3591,47 @@ const createApplicationModules = async (
       projects: projectHandlers,
       sessions: {
         ...sessionPersistenceHandlers,
+        filterPdfContextCandidates: (request) => sessionPdfContextOwner.filterCandidates(request),
+        linkPdfContext: (request) =>
+          linkPdfContextWithCapability({
+            read: () =>
+              sessionPersistenceCoordinator.readSessionRuntimeContext(
+                request.projectId,
+                request.sessionId
+              ),
+            link: () => sessionPdfContextOwner.linkWithResult(request),
+            enable: () =>
+              runtimeRef.current?.enableLiteratureContext(request.sessionId) ?? Promise.resolve(),
+            rollback: (linked, previous) =>
+              sessionPersistenceCoordinator
+                .patchSessionRuntimeContext({
+                  projectId: request.projectId,
+                  sessionId: request.sessionId,
+                  expectedRevision: linked.revision,
+                  patch: { pdfContext: previous.pdfContext }
+                })
+                .then(() => undefined),
+            onRollbackError: (error) => {
+              literatureContextLog.error('PDF context link rollback failed', {
+                sessionId: request.sessionId,
+                ...errorLogFields(error)
+              })
+            }
+          }),
+        unlinkPdfContext: async (request) => {
+          const context = await sessionPdfContextOwner.unlink(request)
+          if ((context.pdfContext?.bindings.length ?? 0) === 0) {
+            try {
+              await runtimeRef.current?.disableLiteratureContext(request.sessionId)
+            } catch (error) {
+              literatureContextLog.warn('Literature capability disable failed after PDF unlink', {
+                sessionId: request.sessionId,
+                ...errorLogFields(error)
+              })
+            }
+          }
+          return context
+        },
         editDetails: (request) => sessionDetailsOwner.edit(request),
         saveSession: async (session, options) => {
           const result = await sessionPersistenceHandlers.saveSession(session, options)
