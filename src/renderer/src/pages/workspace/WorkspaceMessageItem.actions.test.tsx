@@ -79,7 +79,7 @@ const renderItem = async (
       onPrevious?: () => void
       onNext?: () => void
     }
-    reviewerCorrectionActive?: boolean
+    reviewerCorrectionState?: 'waiting' | 'responding' | 'completed' | 'failed'
     activeTextAnnotations?: TextAnnotation[]
     onAddTextAnnotation?: (annotation: TextAnnotation) => undefined
   } = {}
@@ -101,7 +101,7 @@ const renderItem = async (
         onBranchInNewSession={options.onBranchInNewSession}
         subsequentTurns={options.subsequentTurns ?? 0}
         revisionNavigation={options.revisionNavigation}
-        reviewerCorrectionActive={options.reviewerCorrectionActive}
+        reviewerCorrectionState={options.reviewerCorrectionState}
         annotationPort={
           options.onAddTextAnnotation
             ? {
@@ -154,6 +154,15 @@ const click = async (element: HTMLElement): Promise<void> => {
   await act(async () => {
     element.dispatchEvent(new MouseEvent('click', { bubbles: true }))
   })
+}
+
+const expectComputeCompletionEvent = (): void => {
+  expect(container.querySelector('[data-testid="compute-job-completion-event"]')).not.toBeNull()
+  expect(container.textContent).toContain('Remote job completed')
+  expect(container.textContent).toContain('Analysis started automatically')
+  expect(container.textContent).not.toContain('A remote job has finished')
+  expect(container.querySelector('[data-slot="user-message-bubble"]')).toBeNull()
+  expect(container.querySelector('[aria-label="Edit message"]')).toBeNull()
 }
 
 // Replaces the inline editor's text and lets the editor emit the updated doc, mimicking a typing pass.
@@ -554,13 +563,14 @@ describe('WorkspaceMessageItem user message actions', () => {
       }),
       {
         canEditMessage: true,
-        revisionNavigation: { index: 0, total: 2, onNext: noop }
+        revisionNavigation: { index: 0, total: 2, onNext: noop },
+        reviewerCorrectionState: 'completed'
       }
     )
 
     expect(container.querySelector('[data-testid="reviewer-correction-message"]')).not.toBeNull()
     expect(container.textContent).toContain('Corrections requested')
-    expect(container.textContent).toContain('Handed off to the Agent · response started')
+    expect(container.textContent).toContain('Response completed.')
     expect(container.textContent).not.toContain('[Auditor] Correct the unsupported claim.')
     expect(container.querySelector('[data-slot="user-message-bubble"]')).toBeNull()
     expect(container.querySelector('[aria-label="Edit message"]')).toBeNull()
@@ -583,7 +593,7 @@ describe('WorkspaceMessageItem user message actions', () => {
           causeReviewId: 'review-1'
         }
       }),
-      { reviewerCorrectionActive: true }
+      { reviewerCorrectionState: 'waiting' }
     )
 
     expect(container.textContent).toContain('Reviewer requested corrections')
@@ -602,6 +612,36 @@ describe('WorkspaceMessageItem user message actions', () => {
 
     expect(container.querySelector('[data-slot="user-message-bubble"]')).not.toBeNull()
     expect(container.querySelector('[aria-label="Edit message"]')).not.toBeNull()
+  })
+
+  it('presents a Compute completion prompt as an automatic system event instead of a user bubble', async () => {
+    await renderItem(
+      createMessage({
+        content: 'A remote job has finished. Please analyze the results.',
+        attribution: {
+          kind: 'application',
+          feature: 'compute',
+          purpose: 'job-completion-analysis',
+          deliveryKey: 'compute_done:session-1:job-1',
+          jobIds: ['job-1']
+        }
+      }),
+      { canEditMessage: true }
+    )
+
+    expectComputeCompletionEvent()
+  })
+
+  it('keeps a reloaded Compute completion presentation out of the user bubble', async () => {
+    await renderItem(
+      createMessage({
+        content: 'A remote job has finished. Please analyze the results.',
+        presentation: { kind: 'compute-job-completion' }
+      }),
+      { canEditMessage: true }
+    )
+
+    expectComputeCompletionEvent()
   })
   it('keeps the normal Session transcript gutter by default', async () => {
     await renderItem(createMessage())

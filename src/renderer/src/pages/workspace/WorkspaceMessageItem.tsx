@@ -19,6 +19,7 @@ import {
   ChevronLeft,
   ChevronRight,
   ChevronUp,
+  CircleAlert,
   CircleGauge,
   Copy,
   FileText,
@@ -46,6 +47,8 @@ import type { AcpTurnTokenUsage } from '../../../../shared/acp'
 import type { PersistedRuntimeSegment } from '../../../../shared/conversation-graph'
 import type { MessagePart } from '../../../../shared/session-persistence'
 import {
+  isComputeJobCompletionAttribution,
+  isComputeJobCompletionPresentation,
   isHumanUserMessage,
   isReviewerCorrectionAttribution
 } from '../../../../shared/session-persistence'
@@ -109,6 +112,7 @@ type WorkspaceAssistantTurnCompletionProps = {
   canBranchInNewSession?: boolean
   onBranchInNewSession?: (messageId: string) => void
 }
+type ReviewerCorrectionState = 'waiting' | 'responding' | 'completed' | 'failed'
 type WorkspaceMessageItemProps = {
   message: ChatMessage
   projectId?: string
@@ -159,9 +163,9 @@ type WorkspaceMessageItemProps = {
   // A trailing buffered reply can reserve the loading-row geometry it replaces. When another
   // live row remains below it, the message keeps only its natural text-line height.
   reserveLoadingRowHeight?: boolean
-  // True only while this application-authored correction is the current live Agent prompt and no
-  // Agent response has appeared. Historical/reloaded rows stay settled and motionless.
-  reviewerCorrectionActive?: boolean
+  // Durable lifecycle of an application-authored correction request. Keeping the response state
+  // explicit prevents a missing historical response from looking like a successfully started one.
+  reviewerCorrectionState?: ReviewerCorrectionState
 }
 
 const ARTIFACT_GALLERY_VISIBLE_COUNT = 5
@@ -1243,12 +1247,17 @@ const WorkspaceMessageItemImpl = ({
   presentationSourceOpen,
   presentationAnimateOnMount = true,
   reserveLoadingRowHeight = true,
-  reviewerCorrectionActive = false
+  reviewerCorrectionState = 'failed'
 }: WorkspaceMessageItemProps): React.JSX.Element => {
   const { t } = useTranslation()
   const isUserMessage = message.role === 'user'
   const isHumanUser = isHumanUserMessage(message)
+  const reviewerCorrectionActive =
+    reviewerCorrectionState === 'waiting' || reviewerCorrectionState === 'responding'
   const isReviewerCorrection = isReviewerCorrectionAttribution(message.attribution)
+  const isComputeJobCompletion =
+    isComputeJobCompletionAttribution(message.attribution) ||
+    isComputeJobCompletionPresentation(message)
   const isSideChatAdvisory =
     message.relayedFrom?.kind === 'side-chat' && message.relayedFrom.direction === 'to-main'
   const presentsAssistantMessage = !isUserMessage && !isSideChatAdvisory
@@ -1437,7 +1446,19 @@ const WorkspaceMessageItemImpl = ({
     >
       <div className={cn('px-4 pb-1 pt-5 md:px-6', contentPaddingClassName)}>
         {/* User prompts stay compact; assistant responses remain a readable transcript surface. */}
-        {isReviewerCorrection ? (
+        {isComputeJobCompletion ? (
+          <div
+            data-testid="compute-job-completion-event"
+            className="flex max-w-[56rem] items-start gap-2 rounded-lg bg-bg-200 px-3 py-2 text-xs text-text-300"
+            role="status"
+          >
+            <Bot className="mt-0.5 size-3.5 shrink-0 text-text-300" aria-hidden="true" />
+            <div className="flex min-w-0 flex-col gap-0.5 sm:flex-row sm:items-baseline sm:gap-2">
+              <span className="font-medium text-text-200">{t('Remote job completed')}</span>
+              <span className="text-text-300">{t('Analysis started automatically')}</span>
+            </div>
+          </div>
+        ) : isReviewerCorrection ? (
           <div
             data-testid="reviewer-correction-message"
             data-active={reviewerCorrectionActive || undefined}
@@ -1451,26 +1472,38 @@ const WorkspaceMessageItemImpl = ({
                 className="mt-0.5 size-3.5 shrink-0 animate-spin text-text-300 motion-reduce:animate-none"
                 aria-hidden="true"
               />
-            ) : (
+            ) : reviewerCorrectionState === 'completed' ? (
               <Check
                 data-testid="reviewer-correction-settled-icon"
                 className="mt-0.5 size-3.5 shrink-0 text-text-300"
                 aria-hidden="true"
               />
+            ) : (
+              <CircleAlert
+                data-testid="reviewer-correction-failed-icon"
+                className="mt-0.5 size-3.5 shrink-0 text-status-warning-foreground dark:text-status-warning-dark-foreground"
+                aria-hidden="true"
+              />
             )}
             <div className="flex min-w-0 flex-col gap-0.5 sm:flex-row sm:items-baseline sm:gap-2">
               <span className="font-medium text-text-200">
-                {reviewerCorrectionActive
+                {reviewerCorrectionState === 'waiting'
                   ? t('Reviewer requested corrections')
                   : t('Corrections requested')}
               </span>
-              {reviewerCorrectionActive && (
+              {reviewerCorrectionState === 'waiting' && (
                 <span className="text-text-300">{t('Agent is addressing the feedback')}</span>
               )}
-              {!reviewerCorrectionActive && (
+              {reviewerCorrectionState === 'responding' && (
                 <span className="text-text-300">
                   {t('Handed off to the Agent · response started')}
                 </span>
+              )}
+              {reviewerCorrectionState === 'completed' && (
+                <span className="text-text-300">{t('Response completed.')}</span>
+              )}
+              {reviewerCorrectionState === 'failed' && (
+                <span className="text-text-300">{t('Response failed.')}</span>
               )}
             </div>
           </div>
