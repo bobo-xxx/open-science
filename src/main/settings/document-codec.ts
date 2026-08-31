@@ -18,6 +18,7 @@ import {
 import { isPermissionProfileId } from '../../shared/permission-profiles'
 import { isLanguagePreference } from '../../shared/locale'
 import { normalizeNetworkProxySettings } from '../../shared/network-proxy'
+import { normalizeNotebookNetworkSettings } from '../../shared/notebook-network'
 import type { GrantedLocalRoot } from '../../shared/local-fs'
 import type { NotebookLanguage } from '../../shared/notebook'
 import type { RuntimeEnablement, RuntimeSelection } from '../../shared/notebook-runtime'
@@ -300,6 +301,9 @@ const sanitizeSettings = (value: unknown): StoredSettings => {
   if (packageMirror) settings.packageMirror = packageMirror
   const networkProxy = normalizeNetworkProxySettings(value.networkProxy)
   if (networkProxy && networkProxy.mode !== 'system') settings.networkProxy = networkProxy
+  if (value.notebookNetwork !== undefined) {
+    settings.notebookNetwork = normalizeNotebookNetworkSettings(value.notebookNetwork)
+  }
 
   const pathsNormalizedAt = asNumber(value.pathsNormalizedAt)
   if (pathsNormalizedAt !== undefined) settings.pathsNormalizedAt = pathsNormalizedAt
@@ -374,6 +378,15 @@ const sanitizeSettings = (value: unknown): StoredSettings => {
   if (notebookRuntimeEnablement) settings.notebookRuntimeEnablement = notebookRuntimeEnablement
   const notebookManualInterpreters = sanitizeManualInterpreters(value.notebookManualInterpreters)
   if (notebookManualInterpreters) settings.notebookManualInterpreters = notebookManualInterpreters
+
+  if (isRecord(value.computeBookmarks)) {
+    const computeBookmarks: Record<string, string[]> = Object.fromEntries(
+      Object.entries(value.computeBookmarks).flatMap(([providerId, folders]) =>
+        Array.isArray(folders) ? [[providerId, asStringArray(folders)]] : []
+      )
+    )
+    if (Object.keys(computeBookmarks).length > 0) settings.computeBookmarks = computeBookmarks
+  }
 
   const computeGrants = Array.isArray(value.computeGrants)
     ? value.computeGrants

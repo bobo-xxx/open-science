@@ -273,6 +273,7 @@ import type {
   SetActiveProviderRequest,
   SetPackageMirrorRequest,
   SetNetworkProxyRequest,
+  SetNotebookNetworkRequest,
   SetAgentFrameworkRequest,
   SetConversationSkillImportEnabledRequest,
   SetNotificationsEnabledRequest,
@@ -352,7 +353,8 @@ import type {
 } from './settings'
 import type { PackageMirror } from './mirror'
 import type { NetworkProxySettings } from './network-proxy'
-import type { NetworkInfo } from './network'
+import type { NotebookNetworkSettings, NotebookNetworkStatus } from './notebook-network'
+import { NETWORK_SYSTEM_RESUMED_CHANNEL, type NetworkInfo } from './network'
 import type {
   ActiveSessionInfo,
   DataRootInspection,
@@ -1074,6 +1076,10 @@ export const RENDERER_API_CONTRACT = Object.freeze({
   'network.getInfo': callable<() => Promise<NetworkInfo>>()('network', [
     'network:get-info',
     ELECTRON
+  ]),
+  'network.onSystemResume': callable<(listener: () => void) => RemoveListener>()('network', [
+    NETWORK_SYSTEM_RESUMED_CHANNEL,
+    ELECTRON_EVENT
   ]),
   'notebook.appendCodeCell': callable<
     (request: AppendNotebookCodeCellRequest) => Promise<{
@@ -1821,6 +1827,21 @@ export const RENDERER_API_CONTRACT = Object.freeze({
   'settings.setNetworkProxy': callable<
     (request: SetNetworkProxyRequest) => Promise<NetworkProxySettings>
   >()('settings', ['settings:set-network-proxy', LOCAL]),
+  'settings.setNotebookNetwork': callable<
+    (request: SetNotebookNetworkRequest) => Promise<NotebookNetworkSettings>
+  >()('settings', ['settings:set-notebook-network', LOCAL]),
+  'settings.getNotebookNetworkStatus': callable<() => Promise<NotebookNetworkStatus>>()(
+    'settings',
+    ['settings:get-notebook-network-status', LOCAL]
+  ),
+  'settings.installNotebookNetwork': callable<() => Promise<NotebookNetworkStatus>>()('settings', [
+    'settings:install-notebook-network',
+    LOCAL
+  ]),
+  'settings.removeNotebookNetwork': callable<() => Promise<NotebookNetworkStatus>>()('settings', [
+    'settings:remove-notebook-network',
+    LOCAL
+  ]),
   'settings.setNotificationsEnabled': callable<
     (request: SetNotificationsEnabledRequest) => Promise<SettingsSnapshot>
   >()('settings', ['settings:set-notifications-enabled', LOCAL]),

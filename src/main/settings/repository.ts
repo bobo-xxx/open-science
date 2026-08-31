@@ -10,12 +10,17 @@ import type {
 import {
   CLAUDE_ISOLATED_PROVIDER_ID,
   CLAUDE_SHARED_PROVIDER_ID,
+  CODEX_SUBSCRIPTION_PROVIDER_ID,
   claudeIsolatedProviderIdentity,
   isClaudeSubscriptionProvider,
   isClaudeSubscriptionProviderId
 } from '../../shared/settings'
 import type { PermissionProfileId } from '../../shared/permission-profiles'
 import type { PackageMirror } from '../../shared/mirror'
+import {
+  normalizeNotebookNetworkSettings,
+  type NotebookNetworkSettings
+} from '../../shared/notebook-network'
 import {
   networkProxyValidationMessage,
   normalizeNetworkProxySettings,
@@ -116,6 +121,55 @@ class SettingsRepository {
 
       const providers = [...settings.providers]
       providers[index] = { ...currentProvider, fetchedModels }
+      applied = true
+      return { ...settings, providers }
+    })
+
+    return applied
+  }
+
+  async clearCodexIsolatedValidationIfExists(): Promise<boolean> {
+    let applied = false
+
+    await this.mutate((settings) => {
+      const index = settings.providers.findIndex(
+        (provider) => provider.id === CODEX_SUBSCRIPTION_PROVIDER_ID
+      )
+      const current = settings.providers[index]
+      if (current?.type !== 'codex-isolated' || current.codexAuthMode !== 'isolated') {
+        return settings
+      }
+
+      const provider = { ...current }
+      delete provider.lastValidatedAt
+      delete provider.lastValidationFailure
+      const providers = [...settings.providers]
+      providers[index] = provider
+      applied = true
+      return { ...settings, providers }
+    })
+
+    return applied
+  }
+
+  async updateCodexIsolatedValidationIfIdentityMatches(
+    expectedProvider: Pick<StoredProvider, 'id' | 'type' | 'codexAuthMode'>,
+    patch: Pick<StoredProvider, 'lastValidatedAt' | 'lastValidationFailure'>
+  ): Promise<boolean> {
+    let applied = false
+
+    await this.mutate((settings) => {
+      const index = settings.providers.findIndex((provider) => provider.id === expectedProvider.id)
+      const current = settings.providers[index]
+      if (
+        current?.type !== expectedProvider.type ||
+        current.codexAuthMode !== expectedProvider.codexAuthMode
+      ) {
+        return settings
+      }
+
+      const providers = [...settings.providers]
+      providers[index] = { ...current, ...patch }
       applied = true
       return { ...settings, providers }
     })
@@ -316,6 +370,11 @@ class SettingsRepository {
       delete next.networkProxy
       return next
     })
+  }
+
+  async setNotebookNetwork(value: NotebookNetworkSettings): Promise<StoredSettings> {
+    const notebookNetwork = normalizeNotebookNetworkSettings(value)
+    return this.mutate((settings) => ({ ...settings, notebookNetwork }))
   }
 
   async setAgentFramework(id: AgentFrameworkId): Promise<StoredSettings> {

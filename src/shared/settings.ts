@@ -12,6 +12,7 @@ import type {
 } from './reasoning-effort'
 import type { PackageMirror } from './mirror'
 import type { NetworkProxySettings } from './network-proxy'
+import type { NotebookNetworkSettings } from './notebook-network'
 import type { CloseActionPreference } from './window-controls'
 
 // Settings file schema version; bumped when the on-disk shape changes. v2 adds official-vendor
@@ -479,6 +480,9 @@ export type AgentFrameworkView = {
 
 // Full renderer snapshot of settings state.
 export type SettingsSnapshot = {
+  // Volatile Main-authority projection order. It is not persisted; older peers may omit it.
+  // Renderer stores use it to reject an RPC response that arrives after a newer settings event.
+  revision?: number
   claude: ClaudeInfo
   // Detected opencode executable, for the framework-aware detection card.
   opencode: OpencodeInfo
@@ -509,6 +513,8 @@ export type SettingsSnapshot = {
   packageMirror?: PackageMirror
   // Application-wide proxy preference. Older documents without this field resolve to System.
   networkProxy?: NetworkProxySettings
+  // Global Notebook REPL/Bash egress policy. Historical settings resolve to the safe defaults.
+  notebookNetwork?: NotebookNetworkSettings
   // The user's reasoning-effort preference for agent requests. 'default' leaves the agent's own
   // default untouched; concrete levels apply to subsequent requests when the agent supports them.
   reasoningEffort: ReasoningEffort
@@ -545,6 +551,12 @@ export type ProjectFilesFilterPreference = {
 
 // Request to set (or clear, via omitted fields) the package-mirror configuration.
 export type SetNetworkProxyRequest = NetworkProxySettings
+
+export type SetNotebookNetworkRequest = NotebookNetworkSettings & {
+  // The renderer's allowed-domain baseline. The owner applies the draft's add/remove delta to the
+  // latest stored policy so a concurrent conversation approval cannot be overwritten by a stale form.
+  baseAllowedDomains?: readonly string[]
+}
 
 export type SetPackageMirrorRequest = PackageMirror
 
@@ -967,12 +979,52 @@ export type EnvironmentCheckId =
 
 export type EnvironmentCheckStatus = 'passed' | 'warning' | 'failed'
 
+export type EnvironmentCheckPresentation =
+  | {
+      kind: 'system-supported'
+      platform: string
+      architecture: string
+    }
+  | {
+      kind: 'system-baseline-supported'
+      platform: string
+      architecture: string
+    }
+  | {
+      kind: 'system-detected-runtime'
+      platform: string
+      architecture: string
+      runtime: string
+    }
+  | {
+      kind: 'system-no-installer'
+      platform: string
+      architecture: string
+    }
+  | { kind: 'storage-writable' }
+  | { kind: 'storage-unwritable' }
+  | { kind: 'secure-storage-available' }
+  | { kind: 'secure-storage-unavailable' }
+  | {
+      kind: 'install-network-runtime-present'
+      runtime: string
+    }
+  | {
+      kind: 'install-network-registry-available'
+      registry: ManagedClaudeRegistry
+      latencyMs: number
+    }
+  | { kind: 'install-network-unreachable' }
+
 export type EnvironmentCheckItem = {
   id: EnvironmentCheckId
   label: string
   status: EnvironmentCheckStatus
   summary: string
   detail?: string
+  // Stable renderer-owned copy projection. The English strings above remain as a compatibility
+  // fallback and for technical diagnostics that must be shown verbatim.
+  presentation?: EnvironmentCheckPresentation
 }
 
 export type EnvironmentCheckResult = {
@@ -1417,6 +1469,7 @@ export type DeviceCredentialView = {
   displayName: string
   kind: DeviceCredentialKind
   status: 'stored' | 'connected' | 'disconnected'
+  needsSecret: boolean
   resourceUri?: string
   transport?: DeviceOAuthTransport
   oauth?: DeviceOAuthRegistration

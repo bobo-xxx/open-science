@@ -521,13 +521,13 @@ describe('settings repository', () => {
     const repository = new SettingsRepository(root)
 
     expect(sanitizeSettings({}).localePreference).toBeUndefined()
-    expect(sanitizeSettings({ localePreference: 'de' }).localePreference).toBeUndefined()
+    expect(sanitizeSettings({ localePreference: 'de' }).localePreference).toBe('de')
     expect(sanitizeSettings({ localePreference: 'es' }).localePreference).toBe('es')
     expect(sanitizeSettings({ localePreference: 'ko' }).localePreference).toBe('ko')
     expect(sanitizeSettings({ localePreference: 'system' }).localePreference).toBe('system')
 
-    await repository.setLocalePreference('es')
-    expect((await new SettingsRepository(root).getSettings()).localePreference).toBe('es')
+    await repository.setLocalePreference('de')
+    expect((await new SettingsRepository(root).getSettings()).localePreference).toBe('de')
   })
 
   it('serializes startup locale and runtime settings writes through one document store', async () => {
@@ -995,6 +995,27 @@ describe('settings repository', () => {
 
     const reloaded = await new SettingsRepository(root).getSettings()
     expect(reloaded.onboardingCompletedAt).toBe(1234)
+  })
+
+  it('preserves compute bookmarks across a reload', async () => {
+    const root = await createStorageRoot()
+    const repository = new SettingsRepository(root)
+
+    await repository.setComputeBookmarks('ssh:cluster', ['/scratch/project', '/data/results'])
+    expect(JSON.parse(await readFile(join(root, 'settings.json'), 'utf8'))).toMatchObject({
+      computeBookmarks: { 'ssh:cluster': ['/scratch/project', '/data/results'] }
+    })
+
+    const reloaded = await new SettingsRepository(root).getSettings()
+    expect(reloaded.computeBookmarks).toEqual({
+      'ssh:cluster': ['/scratch/project', '/data/results']
+    })
+
+    await new SettingsRepository(root).setNotificationsEnabled(false)
+    await expect(new SettingsRepository(root).getSettings()).resolves.toMatchObject({
+      computeBookmarks: { 'ssh:cluster': ['/scratch/project', '/data/results'] },
+      notificationsEnabled: false
+    })
   })
 
   it('stamps pathsNormalizedAt once, is idempotent, and survives a reload', async () => {
