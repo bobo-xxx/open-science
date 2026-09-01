@@ -1,19 +1,30 @@
-import type { AcpRuntimeEvent, AcpRuntimeEventInput, AcpStateSnapshot } from '../../shared/acp'
+import type {
+  AcpRuntimeEvent,
+  AcpRuntimeEventInput,
+  AcpRuntimeState,
+  AcpStateSnapshot
+} from '../../shared/acp'
 import {
   getAcpRuntimeEventImage,
   MAX_ACP_RUNTIME_EVENTS,
   MAX_ACP_SESSION_IMAGE_BYTES
 } from '../../shared/acp'
-import { capToolDetailText, sanitizeToolContent } from '../../shared/tool-detail-sanitizer'
+import {
+  sanitizeRawToolPayload,
+  sanitizeToolContent,
+  sanitizeToolDetailText
+} from '../../shared/tool-detail-sanitizer'
 
 const ACP_RUNTIME_EVENT_RETENTION_LIMIT = MAX_ACP_RUNTIME_EVENTS
+const MAX_RUNTIME_RAW_PAYLOAD_CHARS = 8_000
 // Amortized eviction: trim only after a full cap of slack accumulates, so steady-state appends are
 // a plain push instead of an O(n) array rebuild per event. Reads always go through the last
 // ACP_RUNTIME_EVENT_RETENTION_LIMIT window, keeping the observable retention bound exact.
 const EVENT_TRIM_THRESHOLD = ACP_RUNTIME_EVENT_RETENTION_LIMIT * 2
 
-type RuntimeSnapshotFields = Pick<AcpStateSnapshot, 'status' | 'cwd' | 'error' | 'events'>
-type RuntimeSnapshotProjection = Omit<AcpStateSnapshot, keyof RuntimeSnapshotFields>
+type RuntimeStateFields = Pick<AcpRuntimeState, 'status' | 'cwd' | 'error'>
+type RuntimeSnapshotFields = RuntimeStateFields & Pick<AcpStateSnapshot, 'events'>
+type RuntimeSnapshotProjection = Omit<AcpRuntimeState, keyof RuntimeStateFields>
 type RuntimeEventInput = AcpRuntimeEventInput
 
 const cloneEvent = (event: AcpRuntimeEvent): AcpRuntimeEvent => structuredClone(event)
@@ -64,10 +75,13 @@ class AcpRuntimeSnapshotOwner {
     let image = event.image
     let raw = event.raw
     let text = event.text
+    const title = typeof event.title === 'string' ? sanitizeToolDetailText(event.title) : undefined
+    const rawInput = sanitizeRawToolPayload(event.rawInput, MAX_RUNTIME_RAW_PAYLOAD_CHARS)
+    const rawOutput = sanitizeRawToolPayload(event.rawOutput, MAX_RUNTIME_RAW_PAYLOAD_CHARS)
     const toolContent = sanitizeToolContent(event.toolContent) as
       AcpRuntimeEvent['toolContent'] | undefined
     const terminalOutput = event.terminalOutput
-      ? capToolDetailText(event.terminalOutput)
+      ? sanitizeToolDetailText(event.terminalOutput)
       : undefined
     if (image && event.sessionId) {
       const retainedBytes = this.retainedWindow()
@@ -91,8 +105,11 @@ class AcpRuntimeSnapshotOwner {
       id: event.id ?? this.nextEventId(),
       timestamp: event.timestamp ?? Date.now(),
       level: event.level ?? 'info',
+      title,
       text,
       image,
+      rawInput,
+      rawOutput,
       toolContent,
       terminalOutput,
       promptMessageId: event.promptMessageId,
@@ -119,14 +136,25 @@ class AcpRuntimeSnapshotOwner {
 
   snapshot(projection: RuntimeSnapshotProjection): AcpStateSnapshot {
     return structuredClone({
+      ...this.state(projection),
+      events: this.retainedWindow()
+    })
+  }
+
+  state(projection: RuntimeSnapshotProjection): AcpRuntimeState {
+    return structuredClone({
       status: this.connectionStatus,
       cwd: this.workingDirectory,
       error: this.currentError,
-      events: this.retainedWindow(),
       ...projection
     })
   }
 }
 
 export { ACP_RUNTIME_EVENT_RETENTION_LIMIT, AcpRuntimeSnapshotOwner }
-export type { RuntimeEventInput, RuntimeSnapshotFields, RuntimeSnapshotProjection }
+export type {
+  RuntimeEventInput,
+  RuntimeSnapshotFields,
+  RuntimeSnapshotProjection,
+  RuntimeStateFields
+}

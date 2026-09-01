@@ -1,4 +1,11 @@
-import type { AcpPermissionRequest, AcpRuntimeEvent, AcpStateSnapshot } from '../../shared/acp'
+import type {
+  AcpPermissionRequest,
+  AcpRuntimeEvent,
+  AcpRuntimeState,
+  AcpStateSnapshot,
+  AcpStateUpdate
+} from '../../shared/acp'
+import { sanitizeRawToolPayload, sanitizeToolDetailText } from '../../shared/tool-detail-sanitizer'
 import { createLogger } from '../logger'
 import type { AcpSessionInteractionOwner } from './session-interaction-owner'
 import {
@@ -15,7 +22,7 @@ let acpStateBroadcastsSent = 0
 let acpStateBroadcastsSuppressed = 0
 const acpRuntimeEventsPublished = new Map<AcpRuntimeEvent['kind'], number>()
 
-const recordAcpStateBroadcastSent = (snapshot: AcpStateSnapshot): void => {
+const recordAcpStateBroadcastSent = (state: AcpStateUpdate): void => {
   acpStateBroadcastsSent += 1
   // Streaming still emits ~one broadcast per renderer presentation tick, so summarize periodically.
   if (acpStateBroadcastsSent % 100 === 0) {
@@ -24,7 +31,7 @@ const recordAcpStateBroadcastSent = (snapshot: AcpStateSnapshot): void => {
       suppressed: acpStateBroadcastsSuppressed,
       eventKinds: Object.fromEntries(acpRuntimeEventsPublished),
       ...(process.env.NODE_ENV === 'development'
-        ? { snapshotChars: JSON.stringify(snapshot).length }
+        ? { snapshotChars: JSON.stringify(state).length }
         : {})
     })
   }
@@ -33,11 +40,11 @@ const recordAcpStateBroadcastSent = (snapshot: AcpStateSnapshot): void => {
 type AcpRuntimePublicationCallbacks = Readonly<{
   onEvent?: (event: AcpRuntimeEvent) => void
   onPermissionRequest?: (request: AcpPermissionRequest) => void
-  onStateChanged?: (snapshot: AcpStateSnapshot) => void
+  onStateChanged?: (state: AcpStateUpdate) => void
 }>
 
 type AcpRuntimePublicationOwnerOptions = Readonly<{
-  snapshotOwner: Pick<AcpRuntimeSnapshotOwner, 'appendEvent' | 'nextEventId' | 'snapshot'>
+  snapshotOwner: Pick<AcpRuntimeSnapshotOwner, 'appendEvent' | 'nextEventId' | 'snapshot' | 'state'>
   interactions: Pick<AcpSessionInteractionOwner, 'current'>
   snapshotProjection: () => RuntimeSnapshotProjection
   callbacks: AcpRuntimePublicationCallbacks
@@ -45,10 +52,27 @@ type AcpRuntimePublicationOwnerOptions = Readonly<{
 }>
 
 const STATE_PUBLICATION_INTERVAL_MS = 33
+const MAX_PERMISSION_RAW_INPUT_CHARS = 8_000
 // A fast provider can emit more than one retained window before the 33 ms timer runs. Publish
 // midway through that window so every prefix chunk reaches subscribers before bounded history can
 // evict it, while ordinary streams still receive the same frame-level coalescing.
 const MAX_COALESCED_EVENTS = Math.floor(ACP_RUNTIME_EVENT_RETENTION_LIMIT / 2)
+
+const projectPermissionRequest = (request: AcpPermissionRequest): AcpPermissionRequest => {
+  const { rawInput, ...requestProjection } = request
+  const sanitizedProjection = {
+    ...requestProjection,
+    title: sanitizeToolDetailText(request.title)
+  }
+  const sanitizedRawInput =
+    rawInput === null ? null : sanitizeRawToolPayload(rawInput, MAX_PERMISSION_RAW_INPUT_CHARS)
+
+  return rawInput === undefined
+    ? sanitizedProjection
+    : sanitizedRawInput === undefined
+      ? sanitizedProjection
+      : { ...sanitizedProjection, rawInput: sanitizedRawInput }
+}
 
 const scheduleStatePublication = (publish: () => void): (() => void) => {
   const timer = setTimeout(publish, STATE_PUBLICATION_INTERVAL_MS)
@@ -78,7 +102,11 @@ class AcpRuntimePublicationOwner {
   constructor(private readonly options: AcpRuntimePublicationOwnerOptions) {}
 
   getSnapshot(): AcpStateSnapshot {
-    return this.options.snapshotOwner.snapshot(this.options.snapshotProjection())
+    return this.options.snapshotOwner.snapshot(this.snapshotProjection())
+  }
+
+  getState(): AcpRuntimeState {
+    return this.options.snapshotOwner.state(this.snapshotProjection())
   }
 
   nextEventId(): string {
@@ -152,18 +180,28 @@ class AcpRuntimePublicationOwner {
   }
 
   publishPermissionRequest(request: AcpPermissionRequest): void {
+    const publishedRequest = projectPermissionRequest(request)
+
     this.pushEvent({
       kind: 'permission',
       level: 'warning',
-      sessionId: request.sessionId,
-      permissionRequestId: request.requestId,
-      toolCallId: request.toolCallId,
+      sessionId: publishedRequest.sessionId,
+      permissionRequestId: publishedRequest.requestId,
+      toolCallId: publishedRequest.toolCallId,
       title: 'Permission requested',
-      text: request.title,
-      raw: request
+      text: publishedRequest.title,
+      raw: publishedRequest
     })
-    this.options.callbacks.onPermissionRequest?.(request)
+    this.options.callbacks.onPermissionRequest?.(publishedRequest)
     this.emitState()
+  }
+
+  private snapshotProjection(): RuntimeSnapshotProjection {
+    const projection = this.options.snapshotProjection()
+    return {
+      ...projection,
+      pendingPermissions: projection.pendingPermissions.map(projectPermissionRequest)
+    }
   }
 
   emitState(): void {
@@ -176,9 +214,11 @@ class AcpRuntimePublicationOwner {
     const onStateChanged = this.options.callbacks.onStateChanged
     if (!onStateChanged) return
 
-    const snapshot = this.getSnapshot()
-    recordAcpStateBroadcastSent(snapshot)
-    onStateChanged(snapshot)
+    // Snapshot-only consumers still need the retained event window. Incremental consumers already
+    // receive every event through onEvent, so routine state publications carry state only.
+    const state = this.options.callbacks.onEvent ? this.getState() : this.getSnapshot()
+    recordAcpStateBroadcastSent(state)
+    onStateChanged(state)
   }
 
   cancelPendingStatePublication(): void {
@@ -205,5 +245,5 @@ class AcpRuntimePublicationOwner {
   }
 }
 
-export { AcpRuntimePublicationOwner }
+export { AcpRuntimePublicationOwner, projectPermissionRequest }
 export type { AcpRuntimePublicationCallbacks, AcpRuntimePublicationOwnerOptions }

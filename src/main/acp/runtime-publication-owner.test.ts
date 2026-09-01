@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import type { AcpPermissionRequest } from '../../shared/acp'
+import type { AcpPermissionRequest, AcpRuntimeEvent } from '../../shared/acp'
 import { AcpRuntimePublicationOwner } from './runtime-publication-owner'
 import { AcpRuntimeSnapshotOwner, type RuntimeSnapshotProjection } from './runtime-snapshot-owner'
 import { AcpSessionInteractionOwner } from './session-interaction-owner'
@@ -68,7 +68,7 @@ describe('AcpRuntimePublicationOwner', () => {
       snapshotProjection: createProjection,
       callbacks: {
         onEvent: (event) => order.push(`event:${event.text}`),
-        onStateChanged: (snapshot) => order.push(`state:${snapshot.events.length}`)
+        onStateChanged: (snapshot) => order.push(`state:${snapshot.events?.length ?? 0}`)
       },
       scheduleStatePublication: (publish) => {
         releaseScheduledState = publish
@@ -112,7 +112,7 @@ describe('AcpRuntimePublicationOwner', () => {
 
     owner.emitState()
     expect(onStateChanged).toHaveBeenCalledOnce()
-    expect(onStateChanged.mock.calls[0]?.[0].events).toHaveLength(6)
+    expect(onStateChanged.mock.calls[0]?.[0]).not.toHaveProperty('events')
   })
 
   it('coalesces streamed assistant thought state', () => {
@@ -146,7 +146,7 @@ describe('AcpRuntimePublicationOwner', () => {
       snapshotProjection: createProjection,
       callbacks: {
         onStateChanged: (snapshot) => {
-          for (const event of snapshot.events) {
+          for (const event of snapshot.events ?? []) {
             if (event.kind === 'message' && event.role === 'assistant' && event.text) {
               visibleChunks.set(event.id, event.text)
             }
@@ -178,7 +178,7 @@ describe('AcpRuntimePublicationOwner', () => {
       snapshotProjection: createProjection,
       callbacks: {
         onEvent: (event) => order.push(`event:${event.kind}`),
-        onStateChanged: (snapshot) => order.push(`state:${snapshot.events.length}`)
+        onStateChanged: (snapshot) => order.push(`state:${snapshot.events?.length ?? 0}`)
       },
       scheduleStatePublication: () => () => undefined
     })
@@ -197,7 +197,7 @@ describe('AcpRuntimePublicationOwner', () => {
       snapshotProjection: createProjection,
       callbacks: {
         onStateChanged: (snapshot) =>
-          snapshots.push(snapshot.events.map((event) => event.status ?? 'updating'))
+          snapshots.push((snapshot.events ?? []).map((event) => event.status ?? 'updating'))
       },
       scheduleStatePublication: () => () => undefined
     })
@@ -237,7 +237,7 @@ describe('AcpRuntimePublicationOwner', () => {
       snapshotOwner: new AcpRuntimeSnapshotOwner('/workspace'),
       interactions: new AcpSessionInteractionOwner(),
       snapshotProjection: createProjection,
-      callbacks: { onStateChanged: (snapshot) => snapshots.push(snapshot.events.length) },
+      callbacks: { onStateChanged: (snapshot) => snapshots.push(snapshot.events?.length ?? 0) },
       scheduleStatePublication: () => () => undefined
     })
 
@@ -374,6 +374,77 @@ describe('AcpRuntimePublicationOwner', () => {
       toolCallId: 'tool-1',
       raw: request
     })
+  })
+
+  it('publishes a sanitized permission projection without mutating the broker request', () => {
+    const publishedRequests: AcpPermissionRequest[] = []
+    const publishedStates: unknown[] = []
+    const request: AcpPermissionRequest = {
+      requestId: 'request-secret',
+      sessionId: 'session-1',
+      toolCallId: 'tool-secret',
+      title: 'curl https://example.test/data?token=test-permission-title-secret',
+      rawInput: {
+        command: 'curl "https://example.test/data?token=test-permission-secret"'
+      },
+      options: []
+    }
+    const owner = new AcpRuntimePublicationOwner({
+      snapshotOwner: new AcpRuntimeSnapshotOwner('/workspace'),
+      interactions: new AcpSessionInteractionOwner(),
+      snapshotProjection: () => ({ ...createProjection(), pendingPermissions: [request] }),
+      callbacks: {
+        onEvent: () => undefined,
+        onPermissionRequest: (published) => publishedRequests.push(published),
+        onStateChanged: (state) => publishedStates.push(state)
+      }
+    })
+
+    owner.publishPermissionRequest(request)
+
+    expect(JSON.stringify(publishedRequests)).not.toContain('test-permission-secret')
+    expect(JSON.stringify(publishedStates)).not.toContain('test-permission-secret')
+    expect(JSON.stringify(owner.getSnapshot())).not.toContain('test-permission-secret')
+    expect(JSON.stringify(publishedRequests)).not.toContain('test-permission-title-secret')
+    expect(JSON.stringify(publishedStates)).not.toContain('test-permission-title-secret')
+    expect(JSON.stringify(owner.getSnapshot())).not.toContain('test-permission-title-secret')
+    expect(JSON.stringify(request)).toContain('test-permission-secret')
+    expect(request.title).toContain('test-permission-title-secret')
+  })
+
+  it('publishes sanitized synthesized tool events without mutating the source event', () => {
+    const publishedEvents: AcpRuntimeEvent[] = []
+    const event = {
+      kind: 'tool' as const,
+      level: 'info' as const,
+      sessionId: 'session-1',
+      toolCallId: 'tool-synthesized',
+      title: 'Permission declined',
+      rawInput: {
+        command:
+          'curl "https://example.test/data?token=test-synthesized-secret" --access-key test-runtime-access-key-secret',
+        accessKey: 'test-runtime-structured-access-key-secret'
+      }
+    }
+    const owner = new AcpRuntimePublicationOwner({
+      snapshotOwner: new AcpRuntimeSnapshotOwner('/workspace'),
+      interactions: new AcpSessionInteractionOwner(),
+      snapshotProjection: createProjection,
+      callbacks: {
+        onEvent: (published) => publishedEvents.push(published)
+      }
+    })
+
+    owner.pushEvent(event)
+
+    expect(JSON.stringify(publishedEvents)).not.toContain('test-synthesized-secret')
+    expect(JSON.stringify(owner.getSnapshot().events)).not.toContain('test-synthesized-secret')
+    expect(JSON.stringify(publishedEvents)).not.toContain('test-runtime-access-key-secret')
+    expect(JSON.stringify(owner.getSnapshot().events)).not.toContain(
+      'test-runtime-structured-access-key-secret'
+    )
+    expect(JSON.stringify(event)).toContain('test-synthesized-secret')
+    expect(JSON.stringify(event)).toContain('test-runtime-access-key-secret')
   })
 
   it('attaches only the active prompt id and preserves an explicit event id', () => {
