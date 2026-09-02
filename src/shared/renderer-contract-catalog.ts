@@ -168,6 +168,7 @@ import type {
   NotebookLanguage,
   NotebookNamespaceRequest,
   NotebookNamespaceSnapshot,
+  NotebookRestartRequest,
   NotebookRunSummary,
   NotebookSessionReference,
   NotebookSessionRequest,
@@ -1163,7 +1164,7 @@ export const RENDERER_API_CONTRACT = Object.freeze({
     (request: ReadArtifactPreviewRequest) => Promise<ArtifactPreviewResult>
   >()('notebook', ['notebook:read-input-preview']),
   'notebook.restart': callable<
-    (request: NotebookSessionRequest) => Promise<NotebookSessionState>
+    (request: NotebookRestartRequest) => Promise<NotebookSessionState>
   >()('notebook', ['notebook:restart']),
   'notebook.runCell': callable<(request: RunNotebookCellRequest) => Promise<NotebookRunSummary>>()(
     'notebook',
@@ -1188,10 +1189,9 @@ export const RENDERER_API_CONTRACT = Object.freeze({
   'notebookEnv.provision': callable<
     (lang: NotebookLanguage, operationId?: string) => Promise<void>
   >()('notebook-environment', ['notebook-env:provision', LOCAL]),
-  'notebookEnv.repair': callable<(lang: NotebookLanguage, operationId?: string) => Promise<void>>()(
-    'notebook-environment',
-    ['notebook-env:repair', LOCAL]
-  ),
+  'notebookEnv.repair': callable<
+    (lang: NotebookLanguage, runtimeIdentity: string, operationId?: string) => Promise<void>
+  >()('notebook-environment', ['notebook-env:repair', LOCAL]),
   'notifications.getSnapshot': callable<() => Promise<NotificationInboxSnapshot>>()(
     'notifications',
     ['notifications:get-snapshot']
@@ -1437,6 +1437,10 @@ export const RENDERER_API_CONTRACT = Object.freeze({
   'runtime.describeUsage': callable<
     (language: NotebookLanguage, envId: string) => Promise<RuntimeUsage>
   >()('runtime', ['runtime:describe-usage', WEB, RUNTIME_LANGUAGE_ENV]),
+  'runtime.getAgentEnvironmentCreationEnabled': callable<() => Promise<boolean>>()('runtime', [
+    'runtime:get-agent-environment-creation-enabled',
+    WEB
+  ]),
   'runtime.getEnablement': callable<(language: NotebookLanguage) => Promise<RuntimeEnablement>>()(
     'runtime',
     ['runtime:get-enablement', WEB, RUNTIME_LANGUAGE]
@@ -1457,6 +1461,9 @@ export const RENDERER_API_CONTRACT = Object.freeze({
   'runtime.registerInterpreter': callable<
     (language: NotebookLanguage, path: string) => Promise<string[]>
   >()('runtime', ['runtime:register-interpreter', LOCAL, RUNTIME_INTERPRETER]),
+  'runtime.setAgentEnvironmentCreationEnabled': callable<
+    (request: { enabled: boolean }) => Promise<boolean>
+  >()('runtime', ['runtime:set-agent-environment-creation-enabled', LOCAL]),
   'runtime.setEnvironmentEnabled': callable<
     (
       language: NotebookLanguage,
