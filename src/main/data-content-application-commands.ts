@@ -201,7 +201,6 @@ const dataContentApplicationCommands = Object.freeze({
     'getVersionProvenance'
   ),
   artifactGetVersionReview: artifactCommand('artifacts:get-version-review', 'getVersionReview'),
-  artifactListProjectFiles: artifactCommand('artifacts:list-project-files', 'listProjectFiles'),
   artifactOpenFile: artifactCommand('artifacts:open-file', 'openFile'),
   artifactReadPreview: artifactCommand('artifacts:read-preview', 'readPreview'),
   artifactReconcilePending: artifactCommand(
@@ -312,8 +311,16 @@ const dataContentApplicationCommands = Object.freeze({
   sessionLoadAll: sessionCommand('sessions:load-all', 'loadAll'),
   sessionLoadOne: sessionCommand('sessions:load-one', 'loadOne'),
   sessionLoadUsage: sessionCommand('sessions:load-usage', 'loadUsage'),
-  sessionSaveManifest: sessionCommand('sessions:save-manifest', 'saveManifest'),
-  sessionUpdateArchive: sessionCommand('sessions:update-archive', 'updateArchive'),
+  sessionSaveManifest: sessionCommand(
+    'sessions:save-manifest',
+    'saveManifest',
+    SessionPersistence.sessionApplicationCommandContracts.saveManifest
+  ),
+  sessionUpdateArchive: sessionCommand(
+    'sessions:update-archive',
+    'updateArchive',
+    SessionPersistence.sessionApplicationCommandContracts.updateArchive
+  ),
   sessionUnlinkPdfContext: sessionCommand(
     'sessions:unlink-pdf-context',
     'unlinkPdfContext',
@@ -326,7 +333,7 @@ const dataContentApplicationCommands = Object.freeze({
       options?: SessionPersistence.SaveSessionOptions
     ],
     SessionPersistence.PersistedChatSession
-  >('sessions:save-session'),
+  >('sessions:save-session', SessionPersistence.sessionApplicationCommandContracts.save),
   sessionSetDelegationPolicy: defineApplicationCommand<
     'sessions:set-delegation-policy',
     readonly [projectId: string, sessionId: string, policy: SessionPersistence.DelegationPolicy],
@@ -362,7 +369,6 @@ const dataContentApplicationCommandGroups = Object.freeze([
     dataContentApplicationCommands.artifactGetVersionMessages,
     dataContentApplicationCommands.artifactGetVersionProvenance,
     dataContentApplicationCommands.artifactGetVersionReview,
-    dataContentApplicationCommands.artifactListProjectFiles,
     dataContentApplicationCommands.artifactOpenFile,
     dataContentApplicationCommands.artifactReadPreview,
     dataContentApplicationCommands.artifactReconcilePending,
@@ -517,8 +523,6 @@ const registerDataContentApplicationCommands = (
         dependencies.artifacts.getVersionProvenance(args[0]),
       'artifacts:get-version-review': ({ args }) =>
         dependencies.artifacts.getVersionReview(args[0]),
-      'artifacts:list-project-files': ({ args }) =>
-        dependencies.artifacts.listProjectFiles(args[0]),
       'artifacts:open-file': (invocation) => {
         assertLocalCaller(invocation, dataContentApplicationCommands.artifactOpenFile.name)
         return dependencies.artifacts.openFile(invocation.args[0])
