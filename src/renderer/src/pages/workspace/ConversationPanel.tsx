@@ -752,11 +752,13 @@ const ConversationPanel = ({
       : undefined
   const effectiveSpecialistSkills = resolveEffectiveSpecialistSkills(
     activeSpecialist?.kind === 'custom' ? activeSpecialist : undefined,
-    catalogSkills.map((skill) => ({
-      id: skill.id,
-      frameworkName: skill.source === 'featured' ? skill.id : skill.name,
-      displayName: skill.name
-    }))
+    catalogSkills
+      .filter((skill) => skill.available !== false)
+      .map((skill) => ({
+        id: skill.id,
+        frameworkName: skill.source === 'featured' ? skill.id : skill.name,
+        displayName: skill.name
+      }))
   )
   const allowedSkillIds =
     effectiveSpecialistSkills.kind === 'specialist'
@@ -1550,6 +1552,7 @@ const ConversationPanel = ({
                                 ? [
                                     {
                                       sourceKind: binding.sourceKind,
+                                      sourceFileId: binding.sourceFileId,
                                       sourceVersionId: binding.sourceVersionId
                                     }
                                   ]

@@ -2,6 +2,7 @@
 
 [![Download](https://img.shields.io/badge/Download-Latest%20Release-2f9e44?style=for-the-badge&logo=github)](https://github.com/aipoch/open-science/releases/latest)
 [![Version](https://img.shields.io/github/v/release/aipoch/open-science?label=Version&style=for-the-badge&color=4dabf7)](https://github.com/aipoch/open-science/releases/latest)
+[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.22252246-4dabf7?style=for-the-badge)](https://doi.org/10.5281/zenodo.22252246)
 [![🏆 #1 BiomniBench-DA Public 50](https://img.shields.io/badge/%F0%9F%8F%86%20%231-BiomniBench--DA%20Public%2050-F9B000?style=for-the-badge)](https://huggingface.co/datasets/phylobio/BiomniBench-DA)
 [![Platforms macOS Windows Linux](https://img.shields.io/badge/Platforms-macOS%20%7C%20Windows%20%7C%20Linux-4dabf7?style=for-the-badge)](https://github.com/aipoch/open-science/releases/latest)
 [![License](https://img.shields.io/badge/License-Apache--2.0-4dabf7?style=for-the-badge)](LICENSE)
@@ -24,7 +25,7 @@ Open Science is an open-source, local-first, model-agnostic AI research workbenc
 
 Open Science supports computational and data-intensive research across disciplines, including machine learning, statistics, life sciences, chemistry, materials science, physics and environmental science. It supports the research process from literature review and hypothesis development to code execution, data analysis, simulation, visualization, and the production of traceable research outputs.
 
-> 💡 **[Open Science v0.25.0 released](https://github.com/aipoch/open-science/releases/latest)** _(last updated September 2026)_. Open Science v0.25.0 turns research outputs into living documents: text artifacts and uploads become editable, with every save published as a new, comparable version — alongside a curated NVIDIA Build provider, per-session delegation controls, fuzzy search in the project quick switcher, safe runtime reinstall with control over agent-created environments, faster multi-version upgrades, and a broad set of runtime, persistence, and security fixes. See the [latest release notes](https://github.com/aipoch/open-science/releases/latest) for full details.
+> 💡 **[Open Science v0.25.1 released](https://github.com/aipoch/open-science/releases/latest)** _(last updated September 2026)_. Open Science v0.25.1 is a maintenance release: protected notebook kernels now launch directly on Windows, file exports publish atomically with time-zone-safe package timestamps, generated image previews are restored, and a broad set of session, artifact, specialist, and provider fixes land throughout. See the [latest release notes](https://github.com/aipoch/open-science/releases/latest) for full details.
 
 <p align="center">
  <img width="1920" height="1140" alt="Open Science open-source AI research workbench desktop app workspace showing an agent session with generated artifacts" src="https://github.com/user-attachments/assets/df59db19-98d7-4071-81f2-c682fbecdf86" />

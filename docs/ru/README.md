@@ -2,6 +2,7 @@
 
 [![Скачать](https://img.shields.io/badge/Скачать-последний%20выпуск-2f9e44?style=for-the-badge&logo=github)](https://github.com/aipoch/open-science/releases/latest)
 [![Версия](https://img.shields.io/github/v/release/aipoch/open-science?label=Версия&style=for-the-badge&color=4dabf7)](https://github.com/aipoch/open-science/releases/latest)
+[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.22252246-4dabf7?style=for-the-badge)](https://doi.org/10.5281/zenodo.22252246)
 [![🏆 № 1 в BiomniBench-DA Public 50](https://img.shields.io/badge/%F0%9F%8F%86%20%231-BiomniBench--DA%20Public%2050-F9B000?style=for-the-badge)](https://huggingface.co/datasets/phylobio/BiomniBench-DA)
 [![Платформы macOS Windows Linux](https://img.shields.io/badge/Platforms-macOS%20%7C%20Windows%20%7C%20Linux-4dabf7?style=for-the-badge)](https://github.com/aipoch/open-science/releases/latest)
 [![Лицензия](https://img.shields.io/badge/Лицензия-Apache--2.0-4dabf7?style=for-the-badge)](../../LICENSE)
@@ -26,7 +27,7 @@ Open Science — это разработанная [AIPOCH](https://aipoch.com/o
 
 Open Science подходит для вычислительных исследований и анализа больших объёмов данных в машинном обучении, статистике, науках о жизни, химии, материаловедении, физике, науках об окружающей среде и других областях. Приложение поддерживает весь исследовательский процесс: от обзора литературы и формулирования гипотез до выполнения кода, анализа данных, моделирования, визуализации и подготовки проверяемых результатов.
 
-> 💡 **[Вышла Open Science v0.25.0](https://github.com/aipoch/open-science/releases/latest)** _(последнее обновление: сентябрь 2026 г.)_. Open Science v0.25.0 превращает результаты исследования в живые документы: текстовые артефакты и загруженные файлы становятся редактируемыми, а каждое сохранение публикуется как новая версия, доступная для сравнения, — вместе с курируемым поставщиком NVIDIA Build, управлением делегированием для каждой сессии, нечётким поиском в быстром переключателе проектов, безопасной переустановкой среды выполнения с управлением средами, создаваемыми агентом, ускоренными обновлениями сразу на несколько версий и широким набором исправлений среды выполнения, хранилища и безопасности. Полный список изменений приведён в [примечаниях к последнему выпуску](https://github.com/aipoch/open-science/releases/latest).
+> 💡 **[Вышла Open Science v0.25.1](https://github.com/aipoch/open-science/releases/latest)** _(последнее обновление: сентябрь 2026 г.)_. Open Science v0.25.1 — технический выпуск: защищённые ядра Notebook теперь запускаются напрямую в Windows, экспорт файлов публикуется атомарно с метками времени пакетов, корректными в любом часовом поясе, предпросмотры созданных изображений восстановлены, а по всему приложению внесён широкий набор исправлений сессий, артефактов, специалистов и поставщиков. Полный список изменений приведён в [примечаниях к последнему выпуску](https://github.com/aipoch/open-science/releases/latest).
 
 <p align="center">
  <img width="1920" height="1140" alt="Рабочее пространство настольного приложения Open Science с открытым исходным кодом: сессия агента и созданные артефакты" src="https://github.com/user-attachments/assets/df59db19-98d7-4071-81f2-c682fbecdf86" />
