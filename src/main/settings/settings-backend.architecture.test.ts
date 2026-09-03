@@ -387,7 +387,6 @@ describe('Settings backend ownership architecture', () => {
       'setReasoningEffort',
       'setReviewerModel',
       'setRuntimeEnablement',
-      'setRuntimeSelection',
       'setSessionDetailsModel',
       'setShowNotificationContent',
       'setSkillEnabled',
@@ -480,7 +479,7 @@ describe('Settings backend ownership architecture', () => {
         codexSkillDescriptorsForIds createDeviceCredential createSkill deleteProvider deleteSkill detectClaude detectCodeBuddy detectCodex
         detectOpencode deviceCredentialConsumerIds deviceCredentialIdForServer disconnectCustomServer disconnectDeviceCredential dismissLegacyDataMovePrompt getAgentEnvironmentCreationEnabled getAppIconVariant getClosePreference
         getComputeBookmarks getConnectorDetail getConnectors getConversationSkillImportEnabled getGitHubTokenStatus getGrantedLocalRoots getManualInterpreters getNotebookNetwork getNotebookNetworkStatus getNotificationsEnabled getPackageMirror
-        getPreflight getRuntimeEnablement getRuntimeSelection getSettingsView getShowNotificationContent getSkillDetail
+        getPreflight getRuntimeEnablement getSettingsView getShowNotificationContent getSkillDetail
         getStoredSettings importAgentHomeSkills importSkill importSkillArchiveBatch importSkillZip
         importSkillZipBatch installClaude installCodeBuddy installCodex installNotebookNetwork installOpencode isEncryptionAvailable
         isNpmAvailable listAgentHomeSkills listConnectors listDeviceCredentials listHostSkills listSkills listSpecialistSkillCatalog listUserSkills
@@ -496,7 +495,7 @@ describe('Settings backend ownership architecture', () => {
         setConversationSkillImportEnabled setCustomServerAuthenticator setCustomServerEnabled
         setDataRoot setDefaultPermissionProfile setDeviceCredentialAuthenticator setEnvironmentEnabled setInstallAuthorized
         setCustomServerRuntimeProjectionProvider setNcbiCredentials setNetworkProxy setNotebookNetwork setNotificationsEnabled
-        setOpenAlexCredential setPackageMirror setProjectFilesFilter setReasoningEffort setReviewerModel setRuntimeSelection setSessionDetailsModel setShowNotificationContent setSkillDeletionGuard setSkillEnabled setSkillsEnabled setSubagentModel setVisionModel
+        setOpenAlexCredential setPackageMirror setProjectFilesFilter setReasoningEffort setReviewerModel setSessionDetailsModel setShowNotificationContent setSkillDeletionGuard setSkillEnabled setSkillsEnabled setSubagentModel setVisionModel
         setToolPermission skillNudgeNamesForIds skillsNeedingForceLoad uninstallClaude uninstallCodeBuddy uninstallCodex
         uninstallOpencode updateCustomServer updateDeviceCredential updateSkill upsertProvider validateOpenAlexCredential validateProvider waitXaiOAuthLogin withHostSkillRead
       `
@@ -689,7 +688,6 @@ describe('Settings backend ownership architecture', () => {
       'notebookManualInterpreters',
       'notebookNetwork',
       'notebookRuntimeEnablement',
-      'notebookRuntimes',
       'notificationsEnabled',
       'onboardingCompletedAt',
       'opencodePath',
@@ -764,6 +762,9 @@ describe('Settings backend ownership architecture', () => {
     )
     expect(mainIpc).toContain('settingsStore ?? resolveStorageRoot()')
     expect(mainIpc).toContain('await settingsService.migrateAgentHomeSkillIdentities()')
+    expect(mainIpc.indexOf('specialistPackageRecovery.current =')).toBeLessThan(
+      mainIpc.indexOf('await settingsService.migrateAgentHomeSkillIdentities()')
+    )
     expect(mainIpc).toContain(
       'capability: new SettingsService({\n      repository: settingsRepository,\n      skillRuntimeMcpEntryPath: mainEntryPath,\n      openAlexFetch: netFetchStandard,\n      applyNetworkProxy:'
     )

@@ -365,6 +365,96 @@ const createProjectReconciliationSnapshot = (): ArtifactProjectReconciliationSna
   ({}) as ArtifactProjectReconciliationSnapshot
 
 describe('SessionPersistenceCoordinator', () => {
+  it('rejects a retry when any requested native Artifact run remains unresolved', async () => {
+    const session = createSession()
+    const repository = createSessionRepository({
+      loadSessionWithDiagnostics: vi.fn().mockResolvedValue({ status: 'found', session })
+    })
+    const artifactStorage = {
+      prepareProjectReconciliation: vi
+        .fn()
+        .mockResolvedValue(createProjectReconciliationSnapshot()),
+      reconcileSession: vi.fn().mockResolvedValue({
+        recoveredMessageArtifacts: [
+          { messageId: 'message-1', artifacts: [createRecoveredArtifact()] }
+        ],
+        nativeFinalizationRunIds: ['run-1', 'run-2'],
+        unresolvedNativeFinalizationRunIds: ['run-2']
+      })
+    }
+    const coordinator = new SessionPersistenceCoordinator(
+      repository,
+      createFileIndex(),
+      undefined,
+      undefined,
+      undefined,
+      artifactStorage
+    )
+
+    await expect(
+      coordinator.retryArtifactFinalization({
+        projectId: session.projectId,
+        sessionId: session.id,
+        messageId: 'message-1',
+        pendingPaths: [
+          '/artifacts/storage-session/.pending/run-1/a.txt',
+          '/artifacts/storage-session/.pending/run-2/b.txt'
+        ]
+      })
+    ).rejects.toThrow(/remains unresolved/u)
+  })
+
+  it('scopes an explicit Artifact retry so an unrelated native run cannot block it', async () => {
+    const session = createSession()
+    const repository = createSessionRepository({
+      loadSessionWithDiagnostics: vi.fn().mockResolvedValue({ status: 'found', session })
+    })
+    const reconcileSession = vi.fn(
+      async (
+        _projectId: string,
+        _sessionId: string,
+        _session: PersistedChatSession,
+        options?: { artifactRunIds?: string[] }
+      ) => {
+        if (!options?.artifactRunIds?.includes('run-legacy')) {
+          throw new Error('unrelated native recovery failed')
+        }
+        return {
+          recoveredMessageArtifacts: [],
+          nativeFinalizationRunIds: [],
+          unresolvedNativeFinalizationRunIds: []
+        }
+      }
+    )
+    const artifactStorage = {
+      prepareProjectReconciliation: vi
+        .fn()
+        .mockResolvedValue(createProjectReconciliationSnapshot()),
+      reconcileSession
+    }
+    const coordinator = new SessionPersistenceCoordinator(
+      repository,
+      createFileIndex(),
+      undefined,
+      undefined,
+      undefined,
+      artifactStorage
+    )
+    const request = {
+      projectId: session.projectId,
+      sessionId: session.id,
+      messageId: 'message-1',
+      pendingPaths: ['/artifacts/storage-session/.pending/run-legacy/result.txt']
+    }
+
+    await expect(coordinator.retryArtifactFinalization(request)).resolves.toBeUndefined()
+    expect(reconcileSession).toHaveBeenCalledWith(session.projectId, session.id, session, {
+      removeOrphanStaging: false,
+      artifactRunIds: ['run-legacy']
+    })
+    expect(artifactStorage.prepareProjectReconciliation).not.toHaveBeenCalled()
+  })
+
   it('resolves Message membership from the durable active Branch', async () => {
     const prompt = (id: string, createdAt: number): PersistedChatMessage => ({
       id,
@@ -1792,6 +1882,52 @@ describe('SessionPersistenceCoordinator', () => {
       )
     ).resolves.toMatchObject({ title: 'Renderer rename', delegationPolicy: 'deny' })
     expect(durable.delegationPolicy).toBe('deny')
+  })
+
+  it('persists Compute concurrency through its dedicated Session owner', async () => {
+    const previousUpdatedAt = Date.now() + 10_000
+    let durable = createSession({ updatedAt: previousUpdatedAt })
+    const repository = createSessionRepository({
+      loadSessionWithDiagnostics: vi.fn(async () => ({
+        status: 'found' as const,
+        session: durable
+      })),
+      saveSession: vi.fn(async (session, expectedRevision) => {
+        durable = structuredClone({
+          ...session,
+          revision: (expectedRevision ?? session.revision ?? 0) + 1
+        })
+        return durable
+      })
+    })
+    const coordinator = new SessionPersistenceCoordinator(repository, createFileIndex())
+
+    await expect(
+      coordinator.setSessionComputeConcurrencyLimit('project-1', 'session-1', 2)
+    ).resolves.toMatchObject({ computeConcurrencyLimit: 2 })
+
+    expect(durable.computeConcurrencyLimit).toBe(2)
+    expect(durable.updatedAt).toBeGreaterThan(previousUpdatedAt)
+  })
+
+  it('preserves Main-owned Compute concurrency on an ordinary existing-Session save', async () => {
+    let durable = createSession({ computeConcurrencyLimit: 2 })
+    const repository = createSessionRepository({
+      loadSessionWithDiagnostics: vi.fn(async () => ({
+        status: 'found' as const,
+        session: durable
+      })),
+      saveSession: vi.fn(async (session) => {
+        durable = structuredClone(session)
+      })
+    })
+    const coordinator = new SessionPersistenceCoordinator(repository, createFileIndex())
+
+    await coordinator.saveSession(
+      createSession({ title: 'Renderer rename', computeConcurrencyLimit: 9 })
+    )
+
+    expect(durable).toMatchObject({ title: 'Renderer rename', computeConcurrencyLimit: 2 })
   })
 
   it('updates enabled Compute Hosts through the durable Session owner', async () => {

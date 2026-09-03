@@ -686,12 +686,18 @@ export type PersistedSessionDetailsGeneration =
         | (SessionDetailsAdmission & SessionDetailsOptionalUsage)
       ))
 
-export type EditSessionDetailsRequest = Readonly<{
+type EditSessionDetailsRequestBase = Readonly<{
   projectId: string
   sessionId: string
   title: string
   description: string
 }>
+
+export type EditSessionDetailsRequest = EditSessionDetailsRequestBase &
+  (
+    | Readonly<{ expectedTitle: string; expectedDescription: string }>
+    | Readonly<{ expectedTitle?: never; expectedDescription?: never }>
+  )
 
 export type PersistedChatSession = {
   id: string
@@ -749,6 +755,9 @@ export type PersistedChatSession = {
   // enabled hosts. An explicit empty array distinguishes the new Available-only state from legacy
   // Session files where a missing field means every enabled host was selected.
   selectedComputeHosts?: string[]
+  // Durable Session-level Compute concurrency limit. Historical Sessions omit it and continue to
+  // use only their Compute Host ceilings.
+  computeConcurrencyLimit?: number
   // Pins the conversation to a dedicated section at the top of the sidebar. Absent (older files) or
   // non-true restores as unpinned; only an explicit true keeps it pinned across restarts.
   pinned?: boolean
@@ -856,6 +865,25 @@ export type SaveSessionOptions = {
 }
 
 export const SESSION_REVISION_CONFLICT_ERROR_CODE = 'session-revision-conflict' as const
+export const SESSION_DETAILS_CONFLICT_ERROR_CODE = 'session-details-conflict' as const
+
+export class SessionDetailsConflictError extends Error {
+  readonly code = SESSION_DETAILS_CONFLICT_ERROR_CODE
+
+  constructor() {
+    super('Session details changed elsewhere. Reopen the editor and try again.')
+    this.name = 'SessionDetailsConflictError'
+  }
+}
+
+export const isSessionDetailsConflictError = (
+  error: unknown
+): error is Readonly<{ code: typeof SESSION_DETAILS_CONFLICT_ERROR_CODE }> =>
+  error instanceof SessionDetailsConflictError ||
+  (typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    error.code === SESSION_DETAILS_CONFLICT_ERROR_CODE)
 
 export class SessionRevisionConflictError extends Error {
   readonly code = SESSION_REVISION_CONFLICT_ERROR_CODE
@@ -4117,6 +4145,15 @@ const sanitizeSession = (
   const selectedComputeHosts = selectedComputeHostCandidates.filter((providerId) =>
     enabledComputeHostSet.has(providerId)
   )
+  const computeConcurrencyLimit = asNumber(session.computeConcurrencyLimit)
+  if (
+    session.computeConcurrencyLimit !== undefined &&
+    (!Number.isInteger(computeConcurrencyLimit) ||
+      (computeConcurrencyLimit ?? 0) < 1 ||
+      (computeConcurrencyLimit ?? 0) > 500)
+  ) {
+    return undefined
+  }
 
   if (activeRun) sanitized.activeRun = activeRun
   if (resumeRecovery) sanitized.resumeRecovery = resumeRecovery
@@ -4153,6 +4190,9 @@ const sanitizeSession = (
   if (enabledComputeHosts.length > 0) sanitized.enabledComputeHosts = enabledComputeHosts
   if (hasSelectedComputeHosts || enabledComputeHosts.length > 0) {
     sanitized.selectedComputeHosts = selectedComputeHosts
+  }
+  if (computeConcurrencyLimit !== undefined) {
+    sanitized.computeConcurrencyLimit = computeConcurrencyLimit
   }
   // Specialist ID: accept any non-empty string. The main process validates it against SpecialistService
   // at send time; the sanitizer only ensures the value is safe to re-persist.
@@ -4580,14 +4620,29 @@ export const deleteSessionRequestSchema = z
 // Manual details edits mutate only authority-owned display fields server-side, so they carry no
 // whole-Session revision: concurrent unrelated writes advance that revision constantly and must
 // not fence the edit.
-export const editSessionDetailsRequestSchema = z
-  .object({
-    projectId: z.string().min(1),
-    sessionId: z.string().min(1),
-    title: z.string(),
-    description: z.string()
-  })
-  .strict()
+const editSessionDetailsRequestFields = {
+  projectId: z.string().min(1),
+  sessionId: z.string().min(1),
+  title: z.string(),
+  description: z.string()
+} as const
+
+// Web RPC v1 originally exposed this command without optimistic edit baselines. Accept that exact
+// legacy shape alongside the protected shape; a partial baseline is neither valid nor useful.
+export const editSessionDetailsRequestSchema = z.union([
+  z
+    .object({
+      ...editSessionDetailsRequestFields,
+      expectedTitle: z.string(),
+      expectedDescription: z.string()
+    })
+    .strict(),
+  z
+    .object({
+      ...editSessionDetailsRequestFields
+    })
+    .strict()
+])
 
 export type DeleteSessionRequest = z.infer<typeof deleteSessionRequestSchema>
 

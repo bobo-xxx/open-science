@@ -9,7 +9,10 @@ import {
   useWorkspaceElicitation
 } from '@/lib/acp/useWorkspaceElicitation'
 import { usePreviewPersistence } from '@/lib/preview-persistence/preview-persistence'
-import { deleteSession } from '@/lib/session-persistence/session-persistence'
+import {
+  deleteSession,
+  retryPendingArtifactFinalization
+} from '@/lib/session-persistence/session-persistence'
 import { useMemoryStore } from '@/stores/memory-store'
 import { useNavigationStore } from '@/stores/navigation-store'
 import { useProjectStore } from '@/stores/project-store'
@@ -218,6 +221,8 @@ const WorkspacePage = ({
   // disabled as the first defense.
   const [isDownloadingProjectArtifacts, setIsDownloadingProjectArtifacts] = useState(false)
   const [isProjectDownloadOpen, setIsProjectDownloadOpen] = useState(false)
+  const [artifactFinalizationRetrySessionId, setArtifactFinalizationRetrySessionId] =
+    useState<string>()
   const [manualReviewRequests, setManualReviewRequests] = useState<
     Record<string, ManualReviewRequestState>
   >({})
@@ -1028,6 +1033,19 @@ const WorkspacePage = ({
     })()
   }
 
+  const requestArtifactFinalizationRetry = (): void => {
+    if (!activeSession || artifactFinalizationRetrySessionId) return
+    const sessionId = activeSession.id
+    setArtifactFinalizationRetrySessionId(sessionId)
+    void retryPendingArtifactFinalization(sessionId)
+      .catch(() => undefined)
+      .finally(() => {
+        setArtifactFinalizationRetrySessionId((current) =>
+          current === sessionId ? undefined : current
+        )
+      })
+  }
+
   const requestSaveAsSkill = (): void => {
     if (!activeSession || !saveAsSkillAvailability.enabled) return
     const graph = activeSession.conversationGraph
@@ -1306,6 +1324,10 @@ const WorkspacePage = ({
               compact: compactActiveContext
             }}
             workflows={{
+              artifactFinalization: {
+                running: artifactFinalizationRetrySessionId !== undefined,
+                request: requestArtifactFinalizationRetry
+              },
               review: {
                 disabled: isRequestReviewDisabled,
                 running: isReviewBusy,
@@ -1343,6 +1365,7 @@ const WorkspacePage = ({
         titleDraft={sessionController.view.dialogs.edit?.titleDraft ?? ''}
         descriptionDraft={sessionController.view.dialogs.edit?.descriptionDraft ?? ''}
         isSaving={sessionController.view.dialogs.edit?.isSaving}
+        error={sessionController.view.dialogs.edit?.error}
         onTitleDraftChange={sessionController.actions.changeEditTitleDraft}
         onDescriptionDraftChange={sessionController.actions.changeEditDescriptionDraft}
         onCancel={sessionController.actions.closeEdit}
