@@ -1340,7 +1340,7 @@ describe('notebook runtime service', () => {
               {
                 path: join(root, 'notebooks', 'default-project', 'session-1', 'data', 'result.csv'),
                 relativePath: 'data/result.csv',
-                kind: 'processed-data',
+                kind: 'other',
                 size: 12,
                 mtimeMs: 200
               }
@@ -1406,7 +1406,7 @@ describe('notebook runtime service', () => {
       workingFiles: [
         {
           relativePath: 'data/result.csv',
-          kind: 'processed-data'
+          kind: 'other'
         }
       ],
       environmentCapture: {
@@ -2903,7 +2903,7 @@ describe('notebook runtime service', () => {
     const writtenFile = {
       path: join(root, 'notebooks', 'default-project', 'session-1', 'handoff', 'data.json'),
       relativePath: 'handoff/data.json',
-      kind: 'raw-data' as const
+      kind: 'other' as const
     }
     const fileEvidence = {
       schemaVersion: 1 as const,
@@ -3678,13 +3678,14 @@ describe('notebook runtime service', () => {
           )} ${quoteForShell(marker)} & descendant_pid=$!; printf '%s' "$descendant_pid" > ${quoteForShell(
             descendantPidPath
           )}; wait "$descendant_pid" # ${marker}`,
-          timeoutMs: 2_000
+          timeoutMs: 5_000
         })
 
         // Start the execution first, then require the descendant to be observable well before the
         // timeout. This prevents a loaded runner from taking the process-tree snapshot before the
-        // fixture has spawned the process that the cleanup contract is meant to cover.
-        const readinessDeadline = Date.now() + 1_500
+        // fixture has spawned the process that the cleanup contract is meant to cover. Coverage
+        // shards on Ubuntu can spend more than 1.5s before the descendant writes its pid.
+        const readinessDeadline = Date.now() + 4_000
         let descendantPid: number | undefined
         while (descendantPid === undefined && Date.now() < readinessDeadline) {
           try {

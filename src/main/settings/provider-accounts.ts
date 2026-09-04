@@ -1,6 +1,7 @@
 import type {
   ChatApiEndpoint,
   ProviderDraft,
+  ProviderDeletionScenarioModelHandling,
   ProviderView,
   RefreshProviderModelsRequest,
   RefreshProviderModelsResult,
@@ -277,7 +278,10 @@ class ProviderAccountsModule {
     await this.repository.upsertProvider(provider, editId)
   }
 
-  async deleteProvider(id: string): Promise<void> {
+  async deleteProvider(
+    id: string,
+    scenarioModelHandling?: ProviderDeletionScenarioModelHandling
+  ): Promise<void> {
     const settings = await this.repository.getSettings()
     if (settings.providers.some((provider) => provider.id === id && isXaiRecord(provider))) {
       await this.xai.logout()
@@ -285,7 +289,7 @@ class ProviderAccountsModule {
 
     await this.auth.serializeAccountMutation(async () => {
       await this.auth.cleanupProviderBeforeDelete(id)
-      await this.repository.deleteProvider(id)
+      await this.repository.deleteProvider(id, scenarioModelHandling)
     })
   }
 
@@ -503,7 +507,7 @@ class ProviderAccountsModule {
   }
 
   // Produces an ephemeral backend input without mutating selection or entering authentication;
-  // configured fallback rules remain, while an explicit required model must match exactly.
+  // a persisted or explicitly required model must still exist in the current catalog.
   resolveRuntimeTarget(
     storedProvider: StoredProvider,
     selection: RuntimeProviderModelSelection,
