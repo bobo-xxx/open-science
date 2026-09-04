@@ -54,6 +54,37 @@ afterEach(async () => {
 })
 
 describe('settings repository', () => {
+  it('commits framework, Reviewer, and Subagent routing as one validated mutation', async () => {
+    const repository = new SettingsRepository(await createStorageRoot())
+    const fixed = {
+      mode: 'fixed' as const,
+      providerId: 'provider-a',
+      model: 'model-a',
+      reasoningEffort: 'high' as const
+    }
+
+    await repository.setAgentRouting(
+      { framework: 'opencode', reviewer: fixed, subagent: fixed },
+      (candidate) => candidate
+    )
+    await expect(repository.getSettings()).resolves.toMatchObject({
+      agentFrameworkId: 'opencode',
+      reviewerModel: fixed,
+      subagentModel: fixed
+    })
+
+    await expect(
+      repository.setAgentRouting({ framework: 'codex', reviewer: { mode: 'inherit' } }, () => {
+        throw new Error('routing is unavailable')
+      })
+    ).rejects.toThrow('routing is unavailable')
+    await expect(repository.getSettings()).resolves.toMatchObject({
+      agentFrameworkId: 'opencode',
+      reviewerModel: fixed,
+      subagentModel: fixed
+    })
+  })
+
   it('defaults legacy and malformed Subagent model settings to dynamic inheritance', () => {
     expect(sanitizeSettings({ providers: [] }).subagentModel).toEqual({ mode: 'inherit' })
     expect(
@@ -941,21 +972,29 @@ describe('settings repository', () => {
 
     await repository.upsertProvider(
       provider({
+        lastValidatedAt: 1716999999999,
+        lastValidatedTarget: { model: 'model-a', endpoint: 'anthropic' },
         lastValidationFailure: {
           at: 1717000000000,
-          category: 'auth',
-          status: 401,
-          message: 'nope'
+          category: 'model-not-found',
+          status: 404,
+          message: 'nope',
+          target: { model: 'model-b', endpoint: 'anthropic' }
         }
       })
     )
 
     const reloaded = await new SettingsRepository(root).getSettings()
+    expect(reloaded.providers[0].lastValidatedTarget).toEqual({
+      model: 'model-a',
+      endpoint: 'anthropic'
+    })
     expect(reloaded.providers[0].lastValidationFailure).toEqual({
       at: 1717000000000,
-      category: 'auth',
-      status: 401,
-      message: 'nope'
+      category: 'model-not-found',
+      status: 404,
+      message: 'nope',
+      target: { model: 'model-b', endpoint: 'anthropic' }
     })
   })
 

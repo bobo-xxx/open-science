@@ -6,7 +6,8 @@ import type {
   ClaudeInfo,
   ProjectFilesFilterPreference,
   ProviderDeletionScenarioModelHandling,
-  ReasoningEffort
+  ReasoningEffort,
+  SetAgentRoutingRequest
 } from '../../shared/settings'
 import {
   CLAUDE_ISOLATED_PROVIDER_ID,
@@ -161,6 +162,7 @@ class SettingsRepository {
 
       const provider = { ...current }
       delete provider.lastValidatedAt
+      delete provider.lastValidatedTarget
       delete provider.lastValidationFailure
       const providers = [...settings.providers]
       providers[index] = provider
@@ -173,7 +175,8 @@ class SettingsRepository {
 
   async updateCodexIsolatedValidationIfIdentityMatches(
     expectedProvider: Pick<StoredProvider, 'id' | 'type' | 'codexAuthMode'>,
-    patch: Pick<StoredProvider, 'lastValidatedAt' | 'lastValidationFailure'>
+    patch: Pick<StoredProvider, 'lastValidatedAt' | 'lastValidationFailure'> &
+      Partial<Pick<StoredProvider, 'lastValidatedTarget'>>
   ): Promise<boolean> {
     let applied = false
 
@@ -221,7 +224,10 @@ class SettingsRepository {
   // first paste) it is created with the fixed id/name, mirroring codex's single subscription record.
   async upsertClaudeIsolatedProvider(
     patch: Partial<
-      Pick<StoredProvider, 'keyRef' | 'keyMask' | 'lastValidatedAt' | 'lastValidationFailure'>
+      Pick<
+        StoredProvider,
+        'keyRef' | 'keyMask' | 'lastValidatedAt' | 'lastValidatedTarget' | 'lastValidationFailure'
+      >
     >
   ): Promise<StoredSettings> {
     const identity = claudeIsolatedProviderIdentity()
@@ -275,7 +281,8 @@ class SettingsRepository {
   // replacement token as verified.
   async updateClaudeIsolatedValidationIfKeyMatches(
     expectedKeyRef: string | undefined,
-    patch: Pick<StoredProvider, 'expiresAt' | 'lastValidatedAt' | 'lastValidationFailure'>
+    patch: Pick<StoredProvider, 'expiresAt' | 'lastValidatedAt' | 'lastValidationFailure'> &
+      Partial<Pick<StoredProvider, 'lastValidatedTarget'>>
   ): Promise<boolean> {
     let applied = false
 
@@ -299,7 +306,8 @@ class SettingsRepository {
     expectedProvider: StoredProvider,
     expectedPreferredMode: ClaudeSubscriptionProviderId | undefined,
     expectedResolvedModel: string | undefined,
-    patch: Pick<StoredProvider, 'disconnectedAt' | 'lastValidatedAt' | 'lastValidationFailure'>
+    patch: Pick<StoredProvider, 'disconnectedAt' | 'lastValidatedAt' | 'lastValidationFailure'> &
+      Partial<Pick<StoredProvider, 'lastValidatedTarget'>>
   ): Promise<boolean> {
     let applied = false
 
@@ -442,6 +450,24 @@ class SettingsRepository {
 
   async setAgentFramework(id: AgentFrameworkId): Promise<StoredSettings> {
     return this.mutate((settings) => ({ ...settings, agentFrameworkId: id }))
+  }
+
+  async setAgentRouting(
+    request: SetAgentRoutingRequest,
+    validate: (candidate: StoredSettings) => StoredSettings
+  ): Promise<StoredSettings> {
+    return this.mutate((settings) =>
+      validate({
+        ...settings,
+        ...(request.framework !== undefined ? { agentFrameworkId: request.framework } : {}),
+        ...(request.reviewer !== undefined
+          ? { reviewerModel: structuredClone(request.reviewer) }
+          : {}),
+        ...(request.subagent !== undefined
+          ? { subagentModel: structuredClone(request.subagent) }
+          : {})
+      })
+    )
   }
 
   async setReasoningEffort(effort: ReasoningEffort): Promise<StoredSettings> {

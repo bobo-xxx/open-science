@@ -802,6 +802,9 @@ export type PersistedChatSession = {
   // unknown ACP-layer failure. Resolved once when the run fails and persisted so the "Report error"
   // gate survives a reload. Absent on older files — treated as reportable (the prior behavior).
   errorReportable?: boolean
+  // Identifies the artifact runtime event that owns the current finalization error. Historical
+  // Sessions omit it and retain the conservative replay-clearing behavior.
+  artifactErrorEventIds?: string[]
   artifacts?: PersistedArtifact[]
   // Incremented only when finalized file metadata changes; text streaming leaves it untouched.
   filesRevision?: number
@@ -941,6 +944,26 @@ export const isSessionRevisionConflictError = (
     'code' in error &&
     error.code === SESSION_REVISION_CONFLICT_ERROR_CODE) ||
   (error instanceof Error && error.message.includes('Session revision conflict:'))
+
+export class SessionConfigurationBusyError extends Error {
+  readonly code = 'session-configuration-busy' as const
+
+  constructor(readonly sessionId: string) {
+    super(`Session has active work: ${sessionId}`)
+    this.name = 'SessionConfigurationBusyError'
+  }
+}
+
+export const isSessionConfigurationBusyError = (
+  error: unknown
+): error is Readonly<{ code: SessionConfigurationBusyError['code']; message: string }> =>
+  error instanceof SessionConfigurationBusyError ||
+  (typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    error.code === 'session-configuration-busy' &&
+    'message' in error &&
+    typeof error.message === 'string')
 
 // Restored interrupted sessions carry this error verbatim; the renderer keys its resume banner off it.
 export const INTERRUPTED_SESSION_ERROR = 'Session was interrupted before the app closed.'
@@ -4194,6 +4217,10 @@ const sanitizeSession = (
   if (error) sanitized.error = error
   // Only meaningful alongside an error; persisted only when explicitly false (absent = reportable).
   if (error && session.errorReportable === false) sanitized.errorReportable = false
+  const artifactErrorEventIds = [...new Set(asStringArray(session.artifactErrorEventIds))]
+  if (error?.startsWith('Generated file finalization') && artifactErrorEventIds.length > 0) {
+    sanitized.artifactErrorEventIds = artifactErrorEventIds
+  }
   if (agentFrameworkId && AGENT_FRAMEWORK_IDS.has(agentFrameworkId)) {
     sanitized.agentFrameworkId = agentFrameworkId
   }
@@ -4734,6 +4761,20 @@ const saveSessionArgsCodec: RuntimeCodec<
   }
 })
 
+const updateSessionConfigurationArgsCodec: RuntimeCodec<
+  readonly [session: PersistedChatSession, expectedRevision: number]
+> = Object.freeze({
+  parse: (value) => {
+    if (!Array.isArray(value) || value.length !== 2) {
+      throw new Error('Invalid Session configuration update arguments.')
+    }
+    return [
+      persistedChatSessionCodec.parse(value[0]),
+      z.number().int().nonnegative().parse(value[1])
+    ]
+  }
+})
+
 // Runtime-validated contracts for Electron-facing Session commands. Request schemas double as wire
 // types, while Session-bearing commands share the recursive persistence codec above.
 export const sessionApplicationCommandContracts = Object.freeze({
@@ -4766,6 +4807,10 @@ export const sessionApplicationCommandContracts = Object.freeze({
     persistedChatSessionCodec
   ),
   save: defineApplicationCommandContract(saveSessionArgsCodec, persistedChatSessionCodec),
+  updateConfiguration: defineApplicationCommandContract(
+    updateSessionConfigurationArgsCodec,
+    persistedChatSessionCodec
+  ),
   editDetails: defineApplicationCommandContract(
     validationCodec(z.tuple([editSessionDetailsRequestSchema])),
     persistedChatSessionCodec
