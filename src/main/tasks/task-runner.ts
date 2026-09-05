@@ -780,7 +780,13 @@ class TaskRunner {
   }
 
   initialize(): Promise<void> {
-    if (!this.initialization) this.initialization = this.restoreRuns()
+    if (!this.initialization) {
+      const attempt = this.restoreRuns().catch((error) => {
+        if (this.initialization === attempt) this.initialization = undefined
+        throw error
+      })
+      this.initialization = attempt
+    }
     return this.initialization
   }
 
@@ -938,6 +944,29 @@ class TaskRunner {
 
   async getSession(sessionId: string): Promise<TaskSessionSummary> {
     return summarizeSession(await this.findSession(sessionId))
+  }
+
+  async ensureSessionAttached(sessionId: string): Promise<PersistedChatSession> {
+    const session = await this.findSession(sessionId)
+    const attachedSessionIds = await this.dependencies.agent.listAttachedSessionIds()
+    if (attachedSessionIds.includes(session.id)) return session
+
+    await this.dependencies.agent.resumeSession({
+      sessionId: session.id,
+      cwd: session.cwd,
+      projectId: session.projectId,
+      permissionProfile: session.permissionProfile ?? DEFAULT_PERMISSION_PROFILE,
+      previousFrameworkId: session.agentFrameworkId,
+      previousBackendId: session.agentBackendId,
+      previousModel: session.agentModel,
+      providerSessionId: session.providerSessionId,
+      providerContinuityToken: session.providerContinuityToken,
+      memoryEnabled: session.memoryEnabled !== false,
+      ...(session.specialistId ? { specialistId: session.specialistId } : {}),
+      ...(session.specialistBindingPending === true ? { specialistBindingPending: true } : {}),
+      ...(session.agentConfiguration ? { agentConfiguration: session.agentConfiguration } : {})
+    })
+    return session
   }
 
   async getSessionConfiguration(sessionId: string): Promise<TaskSessionConfiguration> {
@@ -2408,6 +2437,11 @@ class TaskRunner {
   private async restoreRuns(): Promise<void> {
     const journal = this.dependencies.runJournal
     if (!journal) return
+    // A failed restoration may already have projected part of the journal into memory. Task API
+    // requests remain behind initialize(), so a retry can rebuild that projection atomically from
+    // the durable journal without exposing stale entries.
+    this.runs.clear()
+    this.activeRunBySession.clear()
     const loadedRuns = await journal.load()
     const storedRuns = loadedRuns.slice(-MAX_RETAINED_RUNS)
     const sessions = storedRuns.some(
