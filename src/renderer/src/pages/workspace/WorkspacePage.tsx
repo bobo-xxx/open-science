@@ -87,6 +87,8 @@ import { annotationRequiresImageInput } from '../../../../shared/annotations'
 type WorkspacePageProps = {
   isSessionPersistenceHydrated: boolean
   isSessionPersistenceReady: boolean
+  persistenceBlockedSessionIds?: readonly string[]
+  onSessionSizeLimit?: (sessionId: string) => void
   canDeleteConversations: boolean
   isPreviewPresentationActive?: boolean
 }
@@ -114,6 +116,8 @@ const planProjectionRecoveryPorts = {
 const WorkspacePage = ({
   isSessionPersistenceHydrated,
   isSessionPersistenceReady,
+  persistenceBlockedSessionIds = [],
+  onSessionSizeLimit = () => undefined,
   canDeleteConversations,
   isPreviewPresentationActive = true
 }: WorkspacePageProps): React.JSX.Element => {
@@ -249,7 +253,10 @@ const WorkspacePage = ({
     setPermissionProfile,
     revokePermissionGrant
   } = runtime
-  const { respondToElicitation } = useWorkspaceElicitation(runtime.resolveSessionRuntimeSelection)
+  const { respondToElicitation } = useWorkspaceElicitation(
+    runtime.resolveSessionRuntimeSelection,
+    onSessionSizeLimit
+  )
 
   const [newConversationPermissionProfile, setNewConversationPermissionProfile] =
     useState<PermissionProfileId>(defaultPermissionProfile)
@@ -281,7 +288,8 @@ const WorkspacePage = ({
 
   // The selected session is the only conversation rendered in the center panel. Selecting it by
   // id (instead of deriving it from the full list) keeps chunk commits for other sessions from
-  // re-rendering the page; the active session's own per-chunk identity changes still do.
+  // re-rendering the page. In-flight streaming text lives in the store's streaming slice, so pure
+  // text-growth ticks keep even the active session's identity stable and this selector bails out.
   const storedActiveSession = useSessionStore((state) => {
     if (activeProject?.archivedAt !== undefined) return undefined
     const selected = state.sessions.find((session) => session.id === selectedSessionId)
@@ -367,7 +375,8 @@ const WorkspacePage = ({
     beginSessionDeletion: (sessionId) => composer.lifecycle.beginSessionDeletion(sessionId),
     settleSessionDeletion: (sessionId, deleted) =>
       composer.lifecycle.settleSessionDeletion(sessionId, deleted),
-    deleteSession
+    deleteSession,
+    onSessionSizeLimit
   })
   const exportConversationSessionId = sessionController.view.dialogs.exportConversation?.id
   const currentExportConversationSession = useSessionStore((state) =>
@@ -458,7 +467,8 @@ const WorkspacePage = ({
     historyPolicy: composerHistoryPolicy,
     canStageAttachments: canEditDraft,
     supportsImageInput,
-    uploads: window.api.uploads
+    uploads: window.api.uploads,
+    onSessionSizeLimit
   })
   const { doc: draftDoc, error: attachmentError } = composer.view
   const { changeDoc: changeComposerDraftDoc, setError: setAttachmentError } = composer.actions
@@ -467,7 +477,8 @@ const WorkspacePage = ({
     selectedSessionId,
     selectedFrameworkId: selectedAgentFrameworkId,
     frameworks: agentFrameworks,
-    setError: setAttachmentError
+    setError: setAttachmentError,
+    onSessionSizeLimit
   })
   const previewAnnotations = {
     activeAnnotations: composer.view.annotations,
@@ -574,7 +585,10 @@ const WorkspacePage = ({
     activeSession,
     projectId: scopedProjectId,
     currentDraftKey,
-    isPersistenceReady: isSessionPersistenceReady,
+    persistenceBlockedSessionIds,
+    isPersistenceReady:
+      isSessionPersistenceReady &&
+      (!activeSession || !persistenceBlockedSessionIds.includes(activeSession.id)),
     supportsImageInput,
     agentConfiguration: activeAgentConfiguration,
     agentConfigurationReady: !agentConfigurationUnavailable,
@@ -610,6 +624,7 @@ const WorkspacePage = ({
     getSession: (sessionId) =>
       useSessionStore.getState().sessions.find((candidate) => candidate.id === sessionId),
     subscribeSessionChanges: useSessionStore.subscribe,
+    onSessionSizeLimit,
     planProjectionRecovery:
       typeof window.api.acp?.getPlanProjection === 'function'
         ? planProjectionRecoveryPorts
@@ -1108,14 +1123,14 @@ const WorkspacePage = ({
         hasPreviewItems={previewItems.length > 0}
         isPreviewPresentationActive={isPreviewPresentationActive}
         onPdfContextError={setAttachmentError}
-        restoredPlanResponder={
-          activeSession
-            ? {
-                sessionId: activeSession.id,
-                respond: conversation.actions.submit.restoredPlan
-              }
-            : undefined
-        }
+        restoredPlanResponder={{
+          sessionId: activeSession?.id,
+          enabled: activeSession !== undefined && conversation.availability.planResponse,
+          respond: conversation.actions.submit.restoredPlan,
+          canRespondToSession: (sessionId) =>
+            isSessionPersistenceReady && !persistenceBlockedSessionIds.includes(sessionId),
+          onSessionSizeLimit: conversation.actions.reportSessionSizeLimit
+        }}
         preview={{
           state: previewPanelState,
           openRequestVersion: previewOpenRequestVersion,

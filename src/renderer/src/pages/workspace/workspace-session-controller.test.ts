@@ -7,9 +7,10 @@ import type {
   CompletionHandoffLifecycleEvent,
   SpecialistListItem
 } from '../../../../shared/specialist'
-import type {
-  PersistedChatSession,
-  SessionDeletionResult
+import {
+  SessionSizeLimitError,
+  type PersistedChatSession,
+  type SessionDeletionResult
 } from '../../../../shared/session-persistence'
 import { createLinearConversationGraph } from '../../../../shared/conversation-graph'
 import { useArchiveUndoStore } from '@/stores/archive-undo-store'
@@ -317,6 +318,25 @@ describe('workspace session controller', () => {
       revision: 3
     })
     expect(hook.result.current.view.dialogs.edit).toBeNull()
+  })
+
+  it('reports Edit session size failures through the Session recovery owner', async () => {
+    const active = session()
+    const onSessionSizeLimit = vi.fn()
+    window.api = {
+      sessions: { editDetails: vi.fn().mockRejectedValue(new SessionSizeLimitError()) }
+    } as unknown as Window['api']
+    const hook = renderController({ activeSession: active, onSessionSizeLimit })
+    mounted.push(hook)
+
+    act(() => hook.result.current.actions.openEdit(active))
+    act(() => hook.result.current.actions.confirmEdit({ preventDefault: vi.fn() } as never))
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(onSessionSizeLimit).toHaveBeenCalledWith(active.id)
   })
 
   it('does not close a newly opened Edit dialog when the previous save succeeds', async () => {
@@ -738,6 +758,26 @@ describe('workspace session controller', () => {
 
     expect(order).toEqual(['archive', 'undo', 'clear'])
     expect(hook.result.current.lifecycle.canArchive(active)).toBe(true)
+  })
+
+  it('reports archive size failures through the Session recovery owner', async () => {
+    const active = session()
+    const onSessionSizeLimit = vi.fn()
+    useSessionStore.setState({
+      sessions: [active],
+      selectedSessionId: active.id,
+      updateSessionArchive: vi.fn().mockRejectedValue(new SessionSizeLimitError())
+    })
+    const hook = renderController({ activeSession: active, onSessionSizeLimit })
+    mounted.push(hook)
+
+    await act(async () => {
+      hook.result.current.actions.archive(active)
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(onSessionSizeLimit).toHaveBeenCalledWith(active.id)
   })
 
   it('does not archive while context compaction owns the Session', () => {
@@ -1272,6 +1312,29 @@ describe('workspace session controller', () => {
     expect(settleSessionDeletion).toHaveBeenCalledWith(active.id, true)
     expect(hook.result.current.view.deletingIds.has(active.id)).toBe(false)
     expect(hook.result.current.view.dialogs.delete).toBeNull()
+  })
+
+  it('settles committed deletion and reports unfinished cleanup without offering a live Session retry', async () => {
+    const active = session()
+    const settleSessionDeletion = vi.fn()
+    const hook = renderController({
+      activeSession: active,
+      settleSessionDeletion,
+      deleteSession: vi.fn().mockResolvedValue({
+        status: 'deleted',
+        runtimeDetached: true,
+        cleanupPending: true
+      })
+    })
+    mounted.push(hook)
+    act(() => hook.result.current.actions.openDelete(active))
+    await act(async () => hook.result.current.actions.confirmDelete())
+
+    expect(settleSessionDeletion).toHaveBeenCalledWith(active.id, true)
+    expect(hook.result.current.view.dialogs.delete).toBeNull()
+    expect(hook.result.current.view.exportError).toBe(
+      'The Session was deleted, but some cleanup could not be completed.'
+    )
   })
 
   it('keeps a background Session dialog open with a retryable persistence error', async () => {

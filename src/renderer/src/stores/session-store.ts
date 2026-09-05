@@ -16,6 +16,8 @@ import {
   createInitialSessionState,
   createSessionPersistenceOwner,
   hydrateSession,
+  materializeStreamingMessageContent,
+  removeStreamingMessageContentForSession,
   type ChatSession,
   type SessionPersistenceActions,
   type SessionStoreData
@@ -33,6 +35,8 @@ export {
   type ChatSession,
   type SessionHydrationSelection,
   type SessionStatus,
+  type StreamingMessageContent,
+  type StreamingMessageContentByMessageId,
   type ToolActivity,
   type ToolActivityStatus
 } from './session-store-persistence-owner'
@@ -92,6 +96,18 @@ type SessionStore = SessionStoreData &
     removeSessionsForProject: (projectId: string) => void
   }
 
+// Navigation and deletion use the same visible, project-scoped fallback, regardless of list order.
+export const findMostRecentSessionId = (
+  sessions: ChatSession[],
+  projectId: string
+): string | undefined =>
+  sessions
+    .filter(
+      (session) =>
+        session.projectId === projectId && !session.isPending && session.archivedAt === undefined
+    )
+    .sort((left, right) => right.updatedAt - left.updatedAt)[0]?.id
+
 // Stores all transient workspace conversation state for the renderer process.
 const createSessionStoreInitializer = (): StateCreator<SessionStore> => (set, get) => ({
   ...createInitialSessionState(),
@@ -125,9 +141,14 @@ const createSessionStoreInitializer = (): StateCreator<SessionStore> => (set, ge
     set((state) => ({
       sessions: state.sessions.map((session) =>
         session.id === sessionId
-          ? projectInterruptedRun(session, 'connection-lost', error)
+          ? projectInterruptedRun(
+              materializeStreamingMessageContent(session, state.streamingMessages),
+              'connection-lost',
+              error
+            )
           : session
-      )
+      ),
+      streamingMessages: removeStreamingMessageContentForSession(state.streamingMessages, sessionId)
     }))
   },
 
@@ -270,29 +291,13 @@ const createSessionStoreInitializer = (): StateCreator<SessionStore> => (set, ge
   },
 
   updateSessionArchive: async (request) => {
+    const source = get().sessions.find((session) => session.id === request.sessionId)
     const persisted = await window.api.sessions.updateArchive(request)
-    let updated: ChatSession | undefined
-
-    set((state) => {
-      const existing = state.sessions.find((session) => session.id === persisted.id)
-      if (existing) {
-        const withoutPreviousArchive = { ...existing }
-        delete withoutPreviousArchive.archivedAt
-        updated =
-          persisted.archivedAt === undefined
-            ? withoutPreviousArchive
-            : { ...withoutPreviousArchive, archivedAt: persisted.archivedAt }
-      } else {
-        updated = hydrateSession(persisted)
-      }
-      return {
-        sessions: state.sessions.map((session) =>
-          session.id === persisted.id ? updated! : session
-        )
-      }
-    })
-
-    return updated ?? hydrateSession(persisted)
+    if (source)
+      get().applyDurableSessionProjection({ source, session: persisted, mode: 'archive-authority' })
+    return (
+      get().sessions.find((session) => session.id === persisted.id) ?? hydrateSession(persisted)
+    )
   },
 
   // Sets or clears the per-session fix loop active flag. The flag is transient (never persisted)
@@ -340,24 +345,23 @@ const createSessionStoreInitializer = (): StateCreator<SessionStore> => (set, ge
       if (!deletedSession) return state
 
       const sessions = state.sessions.filter((session) => session.id !== sessionId)
+      const streamingMessages = removeStreamingMessageContentForSession(
+        state.streamingMessages,
+        sessionId
+      )
 
       if (state.selectedSessionId !== sessionId) {
         return {
           sessions,
+          streamingMessages,
           selectedSessionId: state.selectedSessionId
         }
       }
 
-      // Fall back within the deleted session's own project. `sessions` is newest-first, so this picks the
-      // most recent sibling. Using the global sessions[0] could select another project's conversation,
-      // which the project-scoped workspace then filters out — leaving a blank center panel.
-      const fallbackSession = deletedSession
-        ? sessions.find((session) => session.projectId === deletedSession.projectId)
-        : undefined
-
       return {
         sessions,
-        selectedSessionId: fallbackSession?.id
+        streamingMessages,
+        selectedSessionId: findMostRecentSessionId(sessions, deletedSession.projectId)
       }
     })
   },
@@ -365,13 +369,21 @@ const createSessionStoreInitializer = (): StateCreator<SessionStore> => (set, ge
   // Drops every session belonging to a deleted project; the persistence bridge removes their files.
   removeSessionsForProject: (projectId) => {
     set((state) => {
+      const removedSessionIds = new Set(
+        state.sessions.flatMap((session) => (session.projectId === projectId ? [session.id] : []))
+      )
       const sessions = state.sessions.filter((session) => session.projectId !== projectId)
       if (sessions.length === state.sessions.length) return state
 
       const selectedRemoved = !sessions.some((session) => session.id === state.selectedSessionId)
+      let streamingMessages = state.streamingMessages
+      for (const sessionId of removedSessionIds) {
+        streamingMessages = removeStreamingMessageContentForSession(streamingMessages, sessionId)
+      }
 
       return {
         sessions,
+        streamingMessages,
         selectedSessionId: selectedRemoved ? sessions[0]?.id : state.selectedSessionId
       }
     })

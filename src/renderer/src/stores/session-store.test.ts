@@ -17,6 +17,7 @@ import {
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ArtifactFile } from '../../../shared/artifacts'
+import { MAX_ACP_RUNTIME_EVENTS } from '../../../shared/acp'
 import { DEFAULT_PERMISSION_PROFILE } from '../../../shared/permission-profiles'
 import {
   INTERRUPTED_SESSION_ERROR,
@@ -539,9 +540,141 @@ describe('session store', () => {
     unsubscribe()
 
     expect(commits).toBe(1)
+    // The first delta creates the Message; later same-batch deltas accumulate in the streaming
+    // slice until the turn ends.
+    const state = useSessionStore.getState()
+    const message = state.sessions[0].messages.at(-1)!
+    expect(message).toMatchObject({ content: 'Hello', eventIds: ['event-1'] })
+    expect(state.streamingMessages[message.id]).toMatchObject({
+      content: 'Hello world',
+      eventIds: ['event-1', 'event-2']
+    })
+
+    useSessionStore.getState().finishRun('transport-session-1')
     expect(useSessionStore.getState().sessions[0].messages.at(-1)).toMatchObject({
       content: 'Hello world',
       eventIds: ['event-1', 'event-2']
+    })
+    expect(useSessionStore.getState().streamingMessages[message.id]).toBeUndefined()
+  })
+
+  it('keeps Session and messages references stable across pure text-growth ticks', () => {
+    useSessionStore.getState().appendUserMessage({
+      sessionId: 'transport-session-1',
+      content: 'Stream a response'
+    })
+    useSessionStore.getState().appendAgentMessageChunk({
+      sessionId: 'transport-session-1',
+      streamId: 'assistant-message-1',
+      eventId: 'event-1',
+      content: 'Hello'
+    })
+    const before = useSessionStore.getState()
+
+    useSessionStore.getState().appendAgentMessageChunks([
+      {
+        sessionId: 'transport-session-1',
+        streamId: 'assistant-message-1',
+        eventId: 'event-2',
+        content: ' world'
+      }
+    ])
+    const after = useSessionStore.getState()
+
+    expect(after.sessions).toBe(before.sessions)
+    expect(after.sessions[0]).toBe(before.sessions[0])
+    expect(after.sessions[0].messages).toBe(before.sessions[0].messages)
+    expect(after.sessions[0].messages.at(-1)).toBe(before.sessions[0].messages.at(-1))
+    const messageId = before.sessions[0].messages.at(-1)!.id
+    expect(after.streamingMessages[messageId]).toMatchObject({
+      content: 'Hello world',
+      eventIds: ['event-1', 'event-2']
+    })
+
+    // A duplicate in-flight event is still dropped without touching Session identity.
+    useSessionStore.getState().appendAgentMessageChunks([
+      {
+        sessionId: 'transport-session-1',
+        streamId: 'assistant-message-1',
+        eventId: 'event-2',
+        content: ' world'
+      }
+    ])
+    const deduped = useSessionStore.getState()
+    expect(deduped.sessions).toBe(after.sessions)
+    expect(deduped.streamingMessages[messageId]?.content).toBe('Hello world')
+  })
+
+  it('clears the first-output wait with one identity change, then stabilizes', () => {
+    useSessionStore.getState().appendUserMessage({
+      sessionId: 'transport-session-1',
+      content: 'Stream a response'
+    })
+    useSessionStore.getState().appendAgentMessageChunk({
+      sessionId: 'transport-session-1',
+      streamId: 'assistant-message-1',
+      eventId: 'event-1',
+      content: ' '
+    })
+    useSessionStore.setState((state) => ({
+      sessions: state.sessions.map((session) => ({ ...session, awaitingFirstAgentOutput: true }))
+    }))
+
+    // The first visible chunk clears the wait flag, which legitimately changes Session identity.
+    useSessionStore.getState().appendAgentMessageChunk({
+      sessionId: 'transport-session-1',
+      streamId: 'assistant-message-1',
+      eventId: 'event-2',
+      content: 'Visible'
+    })
+    const cleared = useSessionStore.getState()
+    expect(cleared.sessions[0].awaitingFirstAgentOutput).toBeUndefined()
+
+    // Later text-growth ticks keep the Session stable again.
+    useSessionStore.getState().appendAgentMessageChunk({
+      sessionId: 'transport-session-1',
+      streamId: 'assistant-message-1',
+      eventId: 'event-3',
+      content: ' output'
+    })
+    const after = useSessionStore.getState()
+    expect(after.sessions[0]).toBe(cleared.sessions[0])
+    expect(after.sessions[0].messages).toBe(cleared.sessions[0].messages)
+  })
+
+  it('materializes the streaming slice into the same terminal Message state as direct commits', () => {
+    useSessionStore.getState().appendUserMessage({
+      sessionId: 'transport-session-1',
+      content: 'Stream a response'
+    })
+    for (const [index, content] of ['Hello', ' world', ' again'].entries()) {
+      useSessionStore.getState().appendAgentMessageChunk({
+        sessionId: 'transport-session-1',
+        streamId: 'assistant-message-1',
+        eventId: `event-${index + 1}`,
+        content
+      })
+    }
+
+    useSessionStore.getState().finishRun('transport-session-1')
+
+    const state = useSessionStore.getState()
+    const session = state.sessions[0]
+    const message = session.messages.at(-1)!
+    expect(message).toMatchObject({
+      content: 'Hello world again',
+      status: 'complete',
+      eventIds: ['event-1', 'event-2', 'event-3']
+    })
+    expect(Object.keys(state.streamingMessages)).toEqual([])
+    // The conversation graph and the durable projection observe the complete turn as well.
+    expect(
+      session.conversationGraph?.messages.find((candidate) => candidate.id === message.id)
+    ).toMatchObject({ content: 'Hello world again' })
+    const persisted = toPersistedSession(session, state.streamingMessages)
+    expect(persisted.messages.at(-1)).toMatchObject({
+      content: 'Hello world again',
+      eventIds: ['event-1', 'event-2', 'event-3']
     })
   })
 
@@ -602,7 +735,10 @@ describe('session store', () => {
     const batchedChunkReads = measureHistoricalReads(8)
 
     expect(batchedChunkReads).toBeLessThanOrEqual(singleChunkReads * 2)
-    expect(useSessionStore.getState().sessions[0].messages.at(-1)).toMatchObject({
+    const state = useSessionStore.getState()
+    const message = state.sessions[0].messages.at(-1)!
+    expect(message).toMatchObject({ content: 'x', eventIds: ['event-0'] })
+    expect(state.streamingMessages[message.id]).toMatchObject({
       content: 'xxxxxxxx',
       eventIds: Array.from({ length: 8 }, (_, index) => `event-${index}`)
     })
@@ -1392,6 +1528,72 @@ describe('session store', () => {
 
     expect(useSessionStore.getState().sessions[0].activePlanProjection).toBe(projection)
   })
+
+  it.each(['none', 'title', 'pin'] as const)(
+    'adopts newer durable metadata when a summary has only %s locally edited',
+    (editedField) => {
+      useSessionStore.getState().hydrateSessionSummaries(
+        [
+          {
+            number: 1,
+            id: 'session-1',
+            projectId: 'project-1',
+            title: 'Old summary title',
+            status: 'idle',
+            presentedStatus: 'idle',
+            pinned: false,
+            revision: 1,
+            activeMessageCount: 1,
+            artifactCount: 0,
+            filesRevision: 0,
+            createdAt: 1,
+            updatedAt: 2,
+            needsStartupRecovery: false
+          }
+        ],
+        undefined
+      )
+      expect(useSessionStore.getState().sessions[0].unsavedTitle).toBeUndefined()
+      if (editedField === 'title')
+        useSessionStore.getState().renameSession('session-1', 'Local title')
+      if (editedField === 'pin') useSessionStore.getState().togglePinned('session-1')
+
+      useSessionStore.getState().upsertPersistedSession({
+        id: 'session-1',
+        projectId: 'project-1',
+        title: 'New durable title',
+        cwd: '/workspace',
+        status: 'idle',
+        pinned: editedField !== 'pin',
+        archivedAt: 3,
+        revision: 2,
+        messages: [
+          {
+            id: 'message-1',
+            role: 'user',
+            content: 'New durable body',
+            status: 'complete',
+            eventIds: [],
+            createdAt: 1,
+            updatedAt: 1
+          }
+        ],
+        createdAt: 1,
+        updatedAt: 3
+      })
+
+      const current = useSessionStore.getState().sessions[0]
+      expect(current.contentLoaded).not.toBe(false)
+      expect(current.revision).toBe(2)
+      expect(current.messages[0].content).toBe('New durable body')
+      expect(current).toMatchObject({
+        title: editedField === 'title' ? 'Local title' : 'New durable title',
+        pinned: editedField !== 'pin',
+        archivedAt: 3
+      })
+      expect(current.unsavedTitle).toBe(editedField === 'title' ? true : undefined)
+    }
+  )
 
   it('preserves pending summary metadata edits when lazy hydration finishes', () => {
     useSessionStore.getState().hydrateSessionSummaries(
@@ -2474,8 +2676,13 @@ describe('session store', () => {
     })
 
     const current = useSessionStore.getState().sessions[0]
-    expect(current.messages.at(-1)?.content).toBe('Delegation complete')
-    const persisted = toPersistedSession(current)
+    // Mid-stream text growth lives in the streamingMessages slice; the message object keeps the
+    // creation-time content until the turn materializes.
+    expect(current.messages.at(-1)?.content).toBe('De')
+    expect(useSessionStore.getState().streamingMessages[current.messages.at(-1)!.id]?.content).toBe(
+      'Delegation complete'
+    )
+    const persisted = toPersistedSession(current, useSessionStore.getState().streamingMessages)
     useSessionStore.getState().hydrateSessions([persisted])
 
     expect(persisted.messages.at(-1)?.content).toBe('Delegation complete')
@@ -3356,11 +3563,19 @@ describe('session store', () => {
         'which appears to violate our Usage Policy (https://www.anthropic.com/legal/aup). Try rephrasing.'
     })
 
-    const session = useSessionStore.getState().sessions[0]
-    expect(session.messages[1]?.content).toBe(
+    const state = useSessionStore.getState()
+    const session = state.sessions[0]
+    const messageId = session.messages[1]!.id
+    // The merged, normalized text accumulates in the streaming slice until the turn ends.
+    expect(state.streamingMessages[messageId]?.content).toBe(
       'The selected model declined to complete this response under its safety policy. Try rephrasing.'
     )
-    expect(toPersistedSession(session).messages[1]?.content).toBe(
+    expect(toPersistedSession(session, state.streamingMessages).messages[1]?.content).toBe(
+      'The selected model declined to complete this response under its safety policy. Try rephrasing.'
+    )
+
+    useSessionStore.getState().finishRun('transport-session-1')
+    expect(useSessionStore.getState().sessions[0].messages[1]?.content).toBe(
       'The selected model declined to complete this response under its safety policy. Try rephrasing.'
     )
   })
@@ -3573,6 +3788,19 @@ describe('session store', () => {
     })
 
     expect(textChunk?.messageId).toBe(imageChunk?.messageId)
+    // The image delta owns the Message object; the following pure text delta accumulates in the
+    // streaming slice and folds back into the same Message when the turn ends.
+    expect(useSessionStore.getState().sessions[0].messages[1]).toMatchObject({
+      content: '',
+      eventIds: ['event-image'],
+      images: [{ id: 'event-image', mimeType: 'image/png', data: 'AQID', byteLength: 3 }]
+    })
+    expect(useSessionStore.getState().streamingMessages[imageChunk!.messageId]).toMatchObject({
+      content: 'Generated chart',
+      eventIds: ['event-image', 'event-text']
+    })
+
+    useSessionStore.getState().finishRun('transport-session-1')
     expect(useSessionStore.getState().sessions[0].messages[1]).toMatchObject({
       content: 'Generated chart',
       eventIds: ['event-image', 'event-text'],
@@ -3648,6 +3876,27 @@ describe('session store', () => {
     })
 
     expect(useSessionStore.getState().sessions[0]).toEqual(finishedSession)
+  })
+
+  it('keeps only the replayable event id window after a run finishes', () => {
+    useSessionStore.getState().appendUserMessage({
+      sessionId: 'transport-session-1',
+      content: 'Stream a long response'
+    })
+    useSessionStore.getState().appendAgentMessageChunks(
+      Array.from({ length: MAX_ACP_RUNTIME_EVENTS + 1 }, (_, index) => ({
+        sessionId: 'transport-session-1',
+        streamId: 'assistant-message-1',
+        eventId: `event-${index}`,
+        content: 'x'
+      }))
+    )
+
+    useSessionStore.getState().finishRun('transport-session-1')
+
+    expect(useSessionStore.getState().sessions[0].messages.at(-1)?.eventIds).toEqual(
+      Array.from({ length: MAX_ACP_RUNTIME_EVENTS }, (_, index) => `event-${index + 1}`)
+    )
   })
 
   it('marks the active run and streaming agent message as failed', () => {
@@ -5734,8 +5983,16 @@ describe('session store public contract', () => {
     const first = createInitialSessionState()
     const second = createInitialSessionState()
 
-    expect(first).toEqual({ sessions: [], selectedSessionId: undefined })
-    expect(Object.keys(first).sort()).toEqual(['selectedSessionId', 'sessions'])
+    expect(first).toEqual({
+      sessions: [],
+      selectedSessionId: undefined,
+      streamingMessages: {}
+    })
+    expect(Object.keys(first).sort()).toEqual([
+      'selectedSessionId',
+      'sessions',
+      'streamingMessages'
+    ])
     expect(first.sessions).not.toBe(second.sessions)
   })
 

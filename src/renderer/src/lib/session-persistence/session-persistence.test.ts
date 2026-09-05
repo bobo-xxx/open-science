@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { SessionPersistenceStateOwner } from '../../../../main/session-persistence/state-owner'
 import { ARTIFACT_FINALIZATION_INVALID_PROOF } from '../../../../shared/artifacts'
 import {
   activateConversationBranch,
@@ -133,6 +134,25 @@ describe('deriveSessionCatalogRecovery', () => {
         { projectId: 'project-a', fileName: 'session-1.json' },
         { projectId: 'project-b', fileName: 'session-2.json' }
       ]
+    })
+  })
+
+  it('preserves oversized Session files as distinct recovery authority', () => {
+    expect(
+      deriveSessionCatalogRecovery({
+        isComplete: false,
+        warnings: [
+          {
+            kind: 'too-large',
+            projectId: 'project-a',
+            fileName: 'session-1.json',
+            recovered: false
+          }
+        ]
+      })
+    ).toEqual({
+      kind: 'oversized-authority',
+      affectedFiles: [{ projectId: 'project-a', fileName: 'session-1.json' }]
     })
   })
 })
@@ -977,6 +997,75 @@ describe('renderer session persistence bridge', () => {
     expect(observedSelections).toEqual([undefined])
   })
 
+  it('keeps a newer durable pin through lazy hydration and an unrelated title save', async () => {
+    const authority = createPersistedSession({
+      title: 'Remote title',
+      pinned: true,
+      archivedAt: 3,
+      revision: 2,
+      createdAt: 1,
+      updatedAt: 3
+    })
+    const write = vi.fn(async (candidate: PersistedChatSession, expectedRevision?: number) => ({
+      ...candidate,
+      revision: (expectedRevision ?? 0) + 1
+    }))
+    const main = new SessionPersistenceStateOwner({
+      repository: {
+        loadSessionWithDiagnostics: async () => ({ status: 'found', session: authority }),
+        saveSession: write
+      },
+      fileIndex: { syncSession: async () => [] },
+      assertMutable: () => undefined,
+      notifyFilesChanged: () => undefined,
+      notifyRuntimeContextSessionUpdated: () => undefined,
+      log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+    })
+    const saveSession = vi.fn<SessionPersistenceApi['saveSession']>((session, options) =>
+      main.saveSession(session, options)
+    )
+    useSessionStore.getState().hydrateSessionSummaries(
+      [
+        {
+          number: 1,
+          id: authority.id,
+          projectId: authority.projectId,
+          title: 'Old summary title',
+          status: 'idle',
+          presentedStatus: 'idle',
+          pinned: false,
+          revision: 1,
+          activeMessageCount: 0,
+          artifactCount: 0,
+          filesRevision: 0,
+          createdAt: authority.createdAt,
+          updatedAt: 2,
+          needsStartupRecovery: false
+        }
+      ],
+      undefined
+    )
+    const save = createStoreSaver(createApi({ saveSession }), useSessionStore.getState())
+
+    // This is the full-snapshot boundary used by another window's Session update event.
+    useSessionStore.getState().upsertPersistedSession(authority)
+    await save(useSessionStore.getState())
+    expect(saveSession).not.toHaveBeenCalled()
+    useSessionStore.getState().renameSession(authority.id, 'Local title edit')
+    await save(useSessionStore.getState())
+
+    expect(saveSession).toHaveBeenCalledOnce()
+    expect(saveSession.mock.calls[0][0].revision).toBe(2)
+    expect(write).toHaveBeenCalledOnce()
+    expect(write.mock.calls[0][1]).toBe(2)
+    const durable = await saveSession.mock.results[0].value
+    expect(durable.archivedAt).toBe(3)
+    expect(durable.title).toBe('Local title edit')
+    expect(durable.pinned, 'An unrelated title save must not undo the newer durable pin.').toBe(
+      true
+    )
+  })
+
   it('does not echo an externally hydrated session back to persistence', async () => {
     const api = createApi()
     const save = createStoreSaver(api)
@@ -1004,6 +1093,52 @@ describe('renderer session persistence bridge', () => {
     expect(api.saveSession).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'session-1', projectId: 'project-a' })
     )
+  })
+
+  it('persists in-flight streaming text that Session identity stability keeps out of Messages', async () => {
+    useSessionStore.getState().appendUserMessage({
+      sessionId: 'session-1',
+      content: 'Stream a response',
+      cwd: '/workspace/project',
+      projectId: 'project-a'
+    })
+    useSessionStore.getState().appendAgentMessageChunk({
+      sessionId: 'session-1',
+      streamId: 'assistant-1',
+      eventId: 'event-1',
+      content: 'Hello'
+    })
+    const api = createApi()
+    const save = createStoreSaver(api, useSessionStore.getState())
+
+    // Pure text-growth ticks hold the new text in the streaming slice only; the Session object,
+    // its messages array, and the saver's identity diff all stay unchanged.
+    useSessionStore.getState().appendAgentMessageChunk({
+      sessionId: 'session-1',
+      streamId: 'assistant-1',
+      eventId: 'event-2',
+      content: ' world'
+    })
+    const state = useSessionStore.getState()
+    expect(state.sessions[0].messages.at(-1)?.content).toBe('Hello')
+    await save(state)
+
+    expect(api.saveSession).toHaveBeenCalledTimes(1)
+    const persisted = vi.mocked(api.saveSession).mock.calls[0][0]
+    expect(persisted.messages.find((message) => message.role === 'agent')).toMatchObject({
+      content: 'Hello world',
+      eventIds: ['event-1', 'event-2']
+    })
+
+    // A crash after the turn ends must still find the complete terminal Message on disk.
+    useSessionStore.getState().finishRun('session-1')
+    await save(useSessionStore.getState())
+    const terminal = vi.mocked(api.saveSession).mock.calls.at(-1)![0]
+    expect(terminal.messages.find((message) => message.role === 'agent')).toMatchObject({
+      content: 'Hello world',
+      status: 'complete',
+      eventIds: ['event-1', 'event-2']
+    })
   })
 
   it('reports only changed safe fields for stale-graph conflict rebasing', async () => {
@@ -1696,6 +1831,54 @@ describe('renderer session persistence bridge', () => {
     } finally {
       await vi.runAllTimersAsync()
       await flushing
+      vi.useRealTimers()
+    }
+  })
+
+  it('relaxes the flush cadence while streaming and flushes the terminal commit promptly', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    try {
+      const api = createApi()
+      const save = createStoreSaver(api)
+      useSessionStore.getState().appendUserMessage({
+        sessionId: 'session-1',
+        content: 'Hi',
+        cwd: '/workspace/project',
+        projectId: 'project-a'
+      })
+      await save(useSessionStore.getState())
+      expect(api.saveSession).toHaveBeenCalledTimes(1)
+
+      const baseState = useSessionStore.getState()
+      const streamingState = (content: string, updatedAt: number): Parameters<typeof save>[0] => ({
+        sessions: baseState.sessions,
+        selectedSessionId: baseState.selectedSessionId,
+        streamingMessages: {
+          'message-1': { sessionId: 'session-1', content, eventIds: [], updatedAt }
+        }
+      })
+
+      void save(streamingState('chunk-1', 1))
+      await vi.advanceTimersByTimeAsync(300)
+      void save(streamingState('chunk-2', 2))
+      await vi.advanceTimersByTimeAsync(300)
+
+      // The relaxed streaming cadence (2s) has not elapsed; the normal 500ms cadence would have
+      // flushed by now.
+      expect(api.saveSession).toHaveBeenCalledTimes(1)
+
+      const terminalSave = save({
+        sessions: baseState.sessions,
+        selectedSessionId: baseState.selectedSessionId,
+        streamingMessages: {}
+      })
+      await vi.advanceTimersByTimeAsync(0)
+      await terminalSave
+
+      expect(api.saveSession).toHaveBeenCalledTimes(2)
+    } finally {
+      await vi.runAllTimersAsync()
       vi.useRealTimers()
     }
   })

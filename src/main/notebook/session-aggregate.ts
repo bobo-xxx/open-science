@@ -228,6 +228,8 @@ export class NotebookSessionAggregate<
 
   private cwdValue: string
   private readonly cells = new Map<string, NotebookCell>()
+  private writeCancellationCleanup: (() => void) | undefined
+  private readonly cellExecutions = new Map<string, number>()
   private activeWriteValue: NotebookWriteLock | undefined
   private readonly activeRunIds = new Set<string>()
   private activeRunIdValue: string | undefined
@@ -302,7 +304,14 @@ export class NotebookSessionAggregate<
     }
   }
 
-  beginCellWrite(input: BeginCellWrite): Readonly<NotebookCell> {
+  beginCellWrite(
+    input: BeginCellWrite,
+    cancellation?: { signal: AbortSignal; onAbort: () => void }
+  ): Readonly<NotebookCell> {
+    cancellation?.signal.throwIfAborted()
+    if (this.cellExecutions.has(input.cellId)) {
+      throw new Error(`Notebook cell is queued or running: ${input.cellId}`)
+    }
     if (this.activeWriteValue) {
       throw new Error(`Notebook cell is already receiving code: ${this.activeWriteValue.cellId}`)
     }
@@ -324,6 +333,14 @@ export class NotebookSessionAggregate<
       source: input.source,
       startedAt: input.startedAt
     }
+    if (cancellation) {
+      const abort = (): void => {
+        this.abortCellWrite(input.cellId, input.writeId)
+        cancellation.onAbort()
+      }
+      cancellation.signal.addEventListener('abort', abort, { once: true })
+      this.writeCancellationCleanup = () => cancellation.signal.removeEventListener('abort', abort)
+    }
     return cloneCell(cell)
   }
 
@@ -337,6 +354,8 @@ export class NotebookSessionAggregate<
   abortCellWrite(cellId: string, writeId: string): Readonly<NotebookCell> {
     const cell = this.requireCell(cellId)
     this.assertActiveWrite(writeId, cellId)
+    this.writeCancellationCleanup?.()
+    this.writeCancellationCleanup = undefined
     this.activeWriteValue = undefined
     cell.writeId = undefined
     cell.code = ''
@@ -347,6 +366,8 @@ export class NotebookSessionAggregate<
   finishCellWrite(cellId: string, writeId: string): Readonly<NotebookCell> {
     const cell = this.requireCell(cellId)
     this.assertActiveWrite(writeId, cellId)
+    this.writeCancellationCleanup?.()
+    this.writeCancellationCleanup = undefined
     this.activeWriteValue = undefined
     cell.writeId = undefined
     cell.status = 'idle'
@@ -354,7 +375,27 @@ export class NotebookSessionAggregate<
   }
 
   cellView(cellId: string): Readonly<NotebookCell> {
-    return this.requireCell(cellId)
+    return cloneCell(this.requireCell(cellId))
+  }
+
+  // Hold editing from admission through queueing and settlement. Count submissions so repeated
+  // runs of the same cell retain the write restriction until the last one settles or is cancelled.
+  async withCellExecution<T>(
+    cellId: string,
+    execute: (cell: Readonly<NotebookCell>) => Promise<T>
+  ): Promise<T> {
+    const cell = this.cellView(cellId)
+    if (this.isCellReceiving(cellId)) {
+      throw new Error(`Notebook cell is still receiving code: ${cellId}`)
+    }
+    this.cellExecutions.set(cellId, (this.cellExecutions.get(cellId) ?? 0) + 1)
+    try {
+      return await execute(cell)
+    } finally {
+      const remaining = this.cellExecutions.get(cellId)! - 1
+      if (remaining === 0) this.cellExecutions.delete(cellId)
+      else this.cellExecutions.set(cellId, remaining)
+    }
   }
 
   isCellReceiving(cellId: string): boolean {
@@ -649,6 +690,9 @@ export class NotebookSessionAggregate<
   }
 
   shutdownExecutor(): Promise<{ reaped: boolean }> {
+    if (this.activeWriteValue) {
+      this.abortCellWrite(this.activeWriteValue.cellId, this.activeWriteValue.writeId)
+    }
     const executor = this.executorValue
     this.executorGenerationActive = false
     const lifecycleDrain = this.executorLifecycleQueue
