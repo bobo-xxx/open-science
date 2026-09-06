@@ -127,13 +127,20 @@ const WorkspacePage = ({
   // matches no session and triggers the redirect below.
   const activeProjectId = useNavigationStore((state) => state.activeProjectId)
   const pendingCustomizePrefill = useNavigationStore((state) => state.pendingCustomizePrefill)
+  const pendingLiteratureReviewPrefill = useNavigationStore(
+    (state) => state.pendingLiteratureReviewPrefill
+  )
   const pendingArtifactMention = useNavigationStore((state) => state.pendingArtifactMention)
   const consumeCustomizePrefill = useNavigationStore((state) => state.consumeCustomizePrefill)
+  const consumeLiteratureReviewPrefill = useNavigationStore(
+    (state) => state.consumeLiteratureReviewPrefill
+  )
   const consumeArtifactMention = useNavigationStore((state) => state.consumeArtifactMention)
   const setArtifactMentionAvailability = useNavigationStore(
     (state) => state.setArtifactMentionAvailability
   )
   const goHome = useNavigationStore((state) => state.goHome)
+  const openProjectLiterature = useNavigationStore((state) => state.openProjectLiterature)
   const openSettings = useSettingsStore((state) => state.openSettings)
   const activeProviderId = useSettingsStore((state) => state.activeProviderId)
   const activeProviderType = useSettingsStore(
@@ -378,6 +385,12 @@ const WorkspacePage = ({
     deleteSession,
     onSessionSizeLimit
   })
+  const deleteSessionProjectName = useProjectStore(
+    (state) =>
+      state.projects.find(
+        (project) => project.id === sessionController.view.dialogs.delete?.session.projectId
+      )?.name
+  )
   const exportConversationSessionId = sessionController.view.dialogs.exportConversation?.id
   const currentExportConversationSession = useSessionStore((state) =>
     state.sessions.find((session) => session.id === exportConversationSessionId)
@@ -699,6 +712,33 @@ const WorkspacePage = ({
     consumeArtifactMention,
     draftDoc,
     pendingArtifactMention
+  ])
+
+  useEffect(() => {
+    if (
+      !pendingLiteratureReviewPrefill ||
+      pendingLiteratureReviewPrefill.projectId !== activeProjectId ||
+      currentDraftKey !== newConversationDraftKey ||
+      !canEditDraft
+    ) {
+      return
+    }
+
+    changeComposerDraftDoc({
+      nodes: [
+        pendingLiteratureReviewPrefill.scope,
+        { type: 'text', text: ` ${pendingLiteratureReviewPrefill.prompt}` }
+      ]
+    })
+    consumeLiteratureReviewPrefill()
+  }, [
+    activeProjectId,
+    canEditDraft,
+    changeComposerDraftDoc,
+    consumeLiteratureReviewPrefill,
+    currentDraftKey,
+    newConversationDraftKey,
+    pendingLiteratureReviewPrefill
   ])
   const canEditMessage = conversation.availability.revise
   useWorkspaceBranchSwitchGuard(
@@ -1147,6 +1187,7 @@ const WorkspacePage = ({
             onNewConversation={openNewConversation}
             isFilesOpen={activePreviewItemId === PROJECT_FILES_PREVIEW_ID}
             onOpenFiles={openFilesPreview}
+            onOpenLiterature={() => openProjectLiterature(scopedProjectId, 'user')}
             onOpenSession={openSessionWithoutExportError}
             onRenameSession={sessionController.actions.openEdit}
             onRenameSessionTitle={sessionController.actions.renameTitle}
@@ -1200,6 +1241,9 @@ const WorkspacePage = ({
             onOpenFiles={() => {
               close()
               openFilesPreview()
+            }}
+            onOpenLiterature={() => {
+              if (openProjectLiterature(scopedProjectId, 'user')) close()
             }}
             onOpenSession={(sessionId) => {
               close()
@@ -1388,6 +1432,7 @@ const WorkspacePage = ({
       />
       <DeleteSessionDialog
         session={sessionController.view.dialogs.delete?.session}
+        projectName={deleteSessionProjectName}
         canDelete={canDeleteConversations}
         isDeleting={sessionController.view.dialogs.delete?.isDeleting}
         error={sessionController.view.dialogs.delete?.error ?? undefined}

@@ -99,6 +99,7 @@ const createDependencies = () => {
     readPreview: vi.fn(async () => ({ content: '', encoding: 'utf8', size: 0, truncated: false })),
     getLineage: vi.fn(async () => undefined),
     getVersionProvenance: vi.fn(),
+    getVersionLiterature: vi.fn(),
     getVersionExecution: vi.fn(),
     getVersionMessages: vi.fn(),
     getVersionReview: vi.fn(),
@@ -293,7 +294,7 @@ const dispatchCommand = (
 }
 
 describe('Data and content application commands', () => {
-  it('owns exactly the 58 current data and content invoke channels', () => {
+  it('owns exactly the current data and content invoke channels', () => {
     expect(registeredCommands()).toEqual(
       [
         'artifacts:finalize-run',
@@ -301,6 +302,7 @@ describe('Data and content application commands', () => {
         'artifacts:get-code-reconstruction',
         'artifacts:get-lineage',
         'artifacts:get-version-execution',
+        'artifacts:get-version-literature',
         'artifacts:get-version-messages',
         'artifacts:get-version-provenance',
         'artifacts:get-version-review',
@@ -420,6 +422,11 @@ describe('Data and content application commands', () => {
         owner: deps.artifacts.getVersionProvenance
       },
       {
+        key: 'artifactGetVersionLiterature',
+        args: [request('version-literature')],
+        owner: deps.artifacts.getVersionLiterature
+      },
+      {
         key: 'artifactGetVersionReview',
         args: [request('version-review')],
         owner: deps.artifacts.getVersionReview
@@ -504,7 +511,7 @@ describe('Data and content application commands', () => {
       },
       {
         key: 'projectUpdateArchive',
-        args: [{ id: 'project-1', archived: true, expectedArchivedAt: null }],
+        args: [{ id: 'project-1', archived: true, expectedArchiveRevision: 0 }],
         owner: deps.projects.updateArchive
       },
       {
@@ -514,7 +521,7 @@ describe('Data and content application commands', () => {
             projectId: 'project-1',
             sessionId: 'session-1',
             archived: true,
-            expectedArchivedAt: null
+            expectedRevision: 0
           }
         ],
         owner: deps.sessions.updateArchive
@@ -875,7 +882,7 @@ describe('Data and content application commands', () => {
       },
       {
         command: 'projectUpdateArchive' as const,
-        args: [{ id: 'project-1', archived: true, expectedArchivedAt: null }]
+        args: [{ id: 'project-1', archived: true, expectedArchiveRevision: 0 }]
       },
       {
         command: 'projectUpdate' as const,
@@ -1033,7 +1040,7 @@ describe('Data and content application commands', () => {
             projectId: 'project-1',
             sessionId: 'session-1',
             archived: true,
-            expectedArchivedAt: null
+            expectedRevision: 0
           }
         ]
       },
@@ -1386,7 +1393,7 @@ describe('Data and content application commands', () => {
             projectId: 'project-1',
             sessionId: 'session-1',
             archived: true,
-            expectedArchivedAt: null
+            expectedRevision: 0
           }
         ] as const)
       )
@@ -1459,7 +1466,7 @@ describe('Data and content application commands', () => {
           projectId: 'project-1',
           sessionId: 'session-1',
           archived: true,
-          expectedArchivedAt: null
+          expectedRevision: 0
         }
       ] as const)
     )
@@ -1534,7 +1541,7 @@ describe('Data and content application commands', () => {
           projectId: 'project-1',
           sessionId: 'session-1',
           archived: true,
-          expectedArchivedAt: null
+          expectedRevision: 0
         }
       ] as const)
     )
@@ -1692,7 +1699,7 @@ describe('Data and content application commands', () => {
         projectId: 'project-1',
         sessionId: 'session-1',
         archived: true,
-        expectedArchivedAt: null,
+        expectedRevision: 0,
         force: true
       },
       owner: 'updateArchive' as const
@@ -1704,7 +1711,7 @@ describe('Data and content application commands', () => {
         projectId: 'project-1',
         sessionId: 'session-1',
         archived: false,
-        expectedArchivedAt: Number.NaN
+        expectedRevision: Number.NaN
       },
       owner: 'updateArchive' as const
     },
