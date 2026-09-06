@@ -100,11 +100,13 @@
     "Could not open the update installer: {{error}}": "Das Update-Installationsprogramm konnte nicht geöffnet werden: {{error}}"
   },
   "renderer": {
+    "An installer is not available for this platform. Download manually to check other installation options.": "Für diese Plattform ist kein Installationsprogramm verfügbar. Laden Sie es manuell herunter, um andere Installationsmöglichkeiten zu prüfen.",
     "Latest saved version": "Zuletzt gespeicherte Version",
     "Unable to discard the Plan.": "Der Plan kann nicht verworfen werden.",
     "Discard unavailable Plan": "Nicht verfügbaren Plan verwerfen",
     "Discard unavailable Plan?": "Nicht verfügbaren Plan verwerfen?",
     "This removes the active Plan and its approval and progress from this conversation. Messages and Artifacts are kept. This cannot be undone.": "Dadurch werden der aktive Plan sowie seine Freigabe und sein Fortschritt aus dieser Konversation entfernt. Nachrichten und Artefakte bleiben erhalten. Dies kann nicht rückgängig gemacht werden.",
+    "Marketplace data needs repair. The original {{fileName}} file has been preserved.": "Die Marktplatzdaten müssen repariert werden. Die ursprüngliche Datei {{fileName}} wurde beibehalten.",
     "Receiving code. Cancelling discards the unfinished code.": "Code wird empfangen. Beim Abbrechen wird der unvollständige Code verworfen.",
     "Cancel code reception": "Codeempfang abbrechen",
     "Checking version…": "Version wird geprüft…",
@@ -3559,6 +3561,17 @@
     "Not yet verified": "Noch nicht verifiziert",
     "Authentication method": "Authentifizierungsmethode",
     "Configuration": "Konfiguration",
+    "Execution mode": "Ausführungsmodus",
+    "Direct SSH": "Direktes SSH",
+    "Run jobs and command calls directly on the SSH login host.": "Aufträge und Befehlsaufrufe direkt auf dem SSH-Anmeldehost ausführen.",
+    "Slurm": "Slurm",
+    "Submit and manage jobs through Slurm; command calls still run on the SSH login host.": "Aufträge über Slurm übermitteln und verwalten; Befehlsaufrufe werden weiterhin auf dem SSH-Anmeldehost ausgeführt.",
+    "Configured mode": "Konfigurierter Modus",
+    "Detected scheduler": "Erkannter Scheduler",
+    "None detected": "Keiner erkannt",
+    "Failed to set execution mode.": "Ausführungsmodus konnte nicht festgelegt werden.",
+    "Login host resources": "Ressourcen des Anmeldehosts",
+    "Reported by the SSH login host; Slurm job capacity depends on each allocation.": "Vom SSH-Anmeldehost gemeldet; die Kapazität eines Slurm-Auftrags hängt von der jeweiligen Zuweisung ab.",
     "Edit configuration": "Konfiguration bearbeiten",
     "Saved password": "Passwort gespeichert",
     "(unchanged)": "(unverändert)",
@@ -4263,6 +4276,9 @@
     "Loading the latest version discards your draft. Overwriting replaces the editable content and removes reference files absent from your draft.": "Beim Laden der neuesten Version wird Ihr Entwurf verworfen. Beim Überschreiben werden die bearbeitbaren Inhalte ersetzt und Referenzdateien gelöscht, die in Ihrem Entwurf fehlen.",
     "Keep editing": "Weiter bearbeiten",
     "Load latest version": "Neueste Version laden",
-    "Overwrite with my draft": "Mit meinem Entwurf überschreiben"
+    "Overwrite with my draft": "Mit meinem Entwurf überschreiben",
+    "Could not refresh environment readiness. Saved settings are unchanged.": "Der Bereitschaftsstatus der Umgebung konnte nicht aktualisiert werden. Gespeicherte Einstellungen bleiben unverändert.",
+    "Retry preflight": "Vorprüfung wiederholen",
+    "The provider changed while loading models. Try again.": "Der Anbieter wurde während des Ladens der Modelle geändert. Versuchen Sie es erneut."
   }
 }

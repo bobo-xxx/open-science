@@ -99,11 +99,13 @@
     "Import Connector configuration": "コネクタ構成のインポート"
   },
   "renderer": {
+    "An installer is not available for this platform. Download manually to check other installation options.": "このプラットフォーム用のインストーラーはありません。手動ダウンロードのページで他のインストール方法を確認してください。",
     "Latest saved version": "最後に保存されたバージョン",
     "Unable to discard the Plan.": "プランを破棄できません。",
     "Discard unavailable Plan": "利用できないプランを破棄",
     "Discard unavailable Plan?": "利用できないプランを破棄しますか？",
     "This removes the active Plan and its approval and progress from this conversation. Messages and Artifacts are kept. This cannot be undone.": "この会話から現在のプランとその承認および進捗を削除します。メッセージと成果物は保持されます。この操作は取り消せません。",
+    "Marketplace data needs repair. The original {{fileName}} file has been preserved.": "マーケットプレイスのデータを修復する必要があります。元の {{fileName}} ファイルは保持されています。",
     "Receiving code. Cancelling discards the unfinished code.": "コードを受信しています。キャンセルすると未完成のコードは破棄されます。",
     "Cancel code reception": "コードの受信をキャンセル",
     "Checking version…": "バージョンを確認中…",
@@ -3604,6 +3606,17 @@
     "Not yet verified": "未確認",
     "Authentication method": "認証方法",
     "Configuration": "設定",
+    "Execution mode": "実行モード",
+    "Direct SSH": "直接 SSH",
+    "Run jobs and command calls directly on the SSH login host.": "SSH ログインホストでジョブとコマンド呼び出しを直接実行します。",
+    "Slurm": "Slurm",
+    "Submit and manage jobs through Slurm; command calls still run on the SSH login host.": "Slurm を通じてジョブを投入・管理します。コマンド呼び出しは引き続き SSH ログインホストで実行されます。",
+    "Configured mode": "設定済みのモード",
+    "Detected scheduler": "検出されたスケジューラー",
+    "None detected": "検出なし",
+    "Failed to set execution mode.": "実行モードを設定できませんでした。",
+    "Login host resources": "ログインホストのリソース",
+    "Reported by the SSH login host; Slurm job capacity depends on each allocation.": "SSH ログインホストから報告された情報です。Slurm ジョブの容量は各割り当てによって異なります。",
     "Edit configuration": "設定を編集",
     "Saved password": "保存済みパスワード",
     "(unchanged)": "(変更なし)",
@@ -4108,6 +4121,9 @@
     "Loading the latest version discards your draft. Overwriting replaces the editable content and removes reference files absent from your draft.": "最新バージョンを読み込むと下書きは破棄されます。上書きすると編集可能な内容が置き換わり、下書きにない参照ファイルは削除されます。",
     "Keep editing": "編集を続ける",
     "Load latest version": "最新バージョンを読み込む",
-    "Overwrite with my draft": "下書きで上書き"
+    "Overwrite with my draft": "下書きで上書き",
+    "Could not refresh environment readiness. Saved settings are unchanged.": "環境の準備状態を更新できませんでした。保存済みの設定に変更はありません。",
+    "Retry preflight": "事前チェックを再試行",
+    "The provider changed while loading models. Try again.": "モデルの読み込み中にプロバイダーが変更されました。もう一度お試しください。"
   }
 }

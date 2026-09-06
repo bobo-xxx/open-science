@@ -99,11 +99,13 @@
     "Import Connector configuration": "匯入連接器設定"
   },
   "renderer": {
+    "An installer is not available for this platform. Download manually to check other installation options.": "此平台暫無可用的安裝套件。請前往手動下載頁面查看其他安裝選項。",
     "Latest saved version": "最新儲存的版本",
     "Unable to discard the Plan.": "無法捨棄計畫。",
     "Discard unavailable Plan": "捨棄無法使用的計畫",
     "Discard unavailable Plan?": "要捨棄無法使用的計畫嗎？",
     "This removes the active Plan and its approval and progress from this conversation. Messages and Artifacts are kept. This cannot be undone.": "這會從此對話中移除目前的計畫及其核准和進度。訊息和產物會保留。此操作無法復原。",
+    "Marketplace data needs repair. The original {{fileName}} file has been preserved.": "市集資料需要修復。原始 {{fileName}} 檔案已保留。",
     "Receiving code. Cancelling discards the unfinished code.": "正在接收程式碼。取消將捨棄未完成的程式碼。",
     "Cancel code reception": "取消程式碼接收",
     "Checking version…": "正在檢查版本…",
@@ -3604,6 +3606,17 @@
     "Not yet verified": "尚未驗證",
     "Authentication method": "認證方式",
     "Configuration": "設定",
+    "Execution mode": "執行模式",
+    "Direct SSH": "直接 SSH",
+    "Run jobs and command calls directly on the SSH login host.": "直接在 SSH 登入主機上執行作業及命令呼叫。",
+    "Slurm": "Slurm",
+    "Submit and manage jobs through Slurm; command calls still run on the SSH login host.": "透過 Slurm 提交及管理作業；命令呼叫仍在 SSH 登入主機上執行。",
+    "Configured mode": "已設定的模式",
+    "Detected scheduler": "偵測到的排程器",
+    "None detected": "未偵測到",
+    "Failed to set execution mode.": "無法設定執行模式。",
+    "Login host resources": "登入主機資源",
+    "Reported by the SSH login host; Slurm job capacity depends on each allocation.": "由 SSH 登入主機回報；Slurm 作業容量取決於每次資源分配。",
     "Edit configuration": "編輯設定",
     "Saved password": "已儲存的密碼",
     "(unchanged)": "（不變）",
@@ -4108,6 +4121,9 @@
     "Loading the latest version discards your draft. Overwriting replaces the editable content and removes reference files absent from your draft.": "載入最新版本將捨棄您的草稿。覆寫將取代可編輯內容，並刪除草稿中沒有的參考檔案。",
     "Keep editing": "繼續編輯",
     "Load latest version": "載入最新版本",
-    "Overwrite with my draft": "以我的草稿覆寫"
+    "Overwrite with my draft": "以我的草稿覆寫",
+    "Could not refresh environment readiness. Saved settings are unchanged.": "無法重新整理環境就緒狀態。已儲存的設定不受影響。",
+    "Retry preflight": "重試預先檢查",
+    "The provider changed while loading models. Try again.": "載入模型期間供應商已變更。請重試。"
   }
 }

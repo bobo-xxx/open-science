@@ -866,6 +866,9 @@ export const RENDERER_API_CONTRACT = Object.freeze({
     'compute',
     ['compute:concurrency:set']
   ),
+  'compute.executionModeSet': callable<
+    (providerId: string, executionMode: import('./compute').ComputeExecutionMode) => Promise<void>
+  >()('compute', ['compute:execution-mode:set']),
   'compute.create': callable<(request: CreateComputeHostRequest) => Promise<ComputeHost>>()(
     'compute',
     ['compute:create']
@@ -2133,7 +2136,10 @@ export const RENDERER_API_CONTRACT = Object.freeze({
     (request: { id: string }) => Promise<SpecialistDeletePreview>
   >()('specialist', ['specialist:delete-preview', ELECTRON]),
   'specialist.previewExport': callable<
-    (request: { specialistId: string }) => Promise<SpecialistExportPreview>
+    (request: {
+      specialistId: string
+      includedSkillIds?: readonly string[]
+    }) => Promise<SpecialistExportPreview>
   >()('specialist', ['specialist:export-preview', ELECTRON]),
   'specialist.removeMarketplaceSource': callable<
     (request: RemoveMarketplaceSourceRequest) => Promise<void>

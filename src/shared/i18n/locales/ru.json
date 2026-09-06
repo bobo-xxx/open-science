@@ -102,11 +102,13 @@
     "Import Connector configuration": "Импорт конфигурации коннектора"
   },
   "renderer": {
+    "An installer is not available for this platform. Download manually to check other installation options.": "Установщик для этой платформы недоступен. Перейдите к ручной загрузке, чтобы узнать о других вариантах установки.",
     "Latest saved version": "Последняя сохранённая версия",
     "Unable to discard the Plan.": "Не удалось удалить план.",
     "Discard unavailable Plan": "Удалить недоступный план",
     "Discard unavailable Plan?": "Удалить недоступный план?",
     "This removes the active Plan and its approval and progress from this conversation. Messages and Artifacts are kept. This cannot be undone.": "Активный план, его утверждение и прогресс будут удалены из этого диалога. Сообщения и артефакты сохранятся. Это действие нельзя отменить.",
+    "Marketplace data needs repair. The original {{fileName}} file has been preserved.": "Данные Маркетплейса требуют исправления. Исходный файл {{fileName}} сохранён.",
     "Receiving code. Cancelling discards the unfinished code.": "Получение кода. При отмене незавершённый код будет удалён.",
     "Cancel code reception": "Отменить получение кода",
     "Checking version…": "Проверка версии…",
@@ -3995,6 +3997,17 @@
     "Not yet verified": "Еще не проверено",
     "Authentication method": "Способ аутентификации",
     "Configuration": "Настройки",
+    "Execution mode": "Режим выполнения",
+    "Direct SSH": "Прямое SSH-подключение",
+    "Run jobs and command calls directly on the SSH login host.": "Выполнять задания и вызовы команд непосредственно на хосте входа по SSH.",
+    "Slurm": "Slurm",
+    "Submit and manage jobs through Slurm; command calls still run on the SSH login host.": "Отправлять задания и управлять ими через Slurm; вызовы команд по-прежнему выполняются на хосте входа по SSH.",
+    "Configured mode": "Настроенный режим",
+    "Detected scheduler": "Обнаруженный планировщик",
+    "None detected": "Не обнаружен",
+    "Failed to set execution mode.": "Не удалось задать режим выполнения.",
+    "Login host resources": "Ресурсы хоста входа",
+    "Reported by the SSH login host; Slurm job capacity depends on each allocation.": "Данные хоста входа по SSH; доступные ресурсы задания Slurm зависят от конкретного выделения.",
     "Edit configuration": "Редактировать настройки",
     "Saved password": "Сохранённый пароль",
     "(unchanged)": "(без изменений)",
@@ -4548,6 +4561,9 @@
     "Loading the latest version discards your draft. Overwriting replaces the editable content and removes reference files absent from your draft.": "Загрузка последней версии удалит ваш черновик. Перезапись заменит редактируемое содержимое и удалит справочные файлы, которых нет в вашем черновике.",
     "Keep editing": "Продолжить редактирование",
     "Load latest version": "Загрузить последнюю версию",
-    "Overwrite with my draft": "Перезаписать моим черновиком"
+    "Overwrite with my draft": "Перезаписать моим черновиком",
+    "Could not refresh environment readiness. Saved settings are unchanged.": "Не удалось обновить состояние готовности окружения. Сохранённые настройки не изменены.",
+    "Retry preflight": "Повторить предварительную проверку",
+    "The provider changed while loading models. Try again.": "Поставщик изменился во время загрузки моделей. Попробуйте ещё раз."
   }
 }

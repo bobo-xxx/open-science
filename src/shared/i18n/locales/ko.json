@@ -99,11 +99,13 @@
     "Import Connector configuration": "커넥터 구성 가져오기"
   },
   "renderer": {
+    "An installer is not available for this platform. Download manually to check other installation options.": "이 플랫폼에서 사용할 수 있는 설치 프로그램이 없습니다. 수동 다운로드 페이지에서 다른 설치 방법을 확인하세요.",
     "Latest saved version": "최근 저장된 버전",
     "Unable to discard the Plan.": "계획을 삭제할 수 없습니다.",
     "Discard unavailable Plan": "사용할 수 없는 계획 삭제",
     "Discard unavailable Plan?": "사용할 수 없는 계획을 삭제하시겠습니까?",
     "This removes the active Plan and its approval and progress from this conversation. Messages and Artifacts are kept. This cannot be undone.": "이 대화에서 현재 계획과 해당 승인 및 진행 상황을 제거합니다. 메시지와 아티팩트는 유지됩니다. 이 작업은 되돌릴 수 없습니다.",
+    "Marketplace data needs repair. The original {{fileName}} file has been preserved.": "마켓플레이스 데이터를 복구해야 합니다. 원본 {{fileName}} 파일은 보존되어 있습니다.",
     "Receiving code. Cancelling discards the unfinished code.": "코드를 수신 중입니다. 취소하면 미완성 코드가 삭제됩니다.",
     "Cancel code reception": "코드 수신 취소",
     "Checking version…": "버전 확인 중…",
@@ -3604,6 +3606,17 @@
     "Not yet verified": "아직 확인되지 않음",
     "Authentication method": "인증방법",
     "Configuration": "구성",
+    "Execution mode": "실행 모드",
+    "Direct SSH": "직접 SSH",
+    "Run jobs and command calls directly on the SSH login host.": "SSH 로그인 호스트에서 작업과 명령 호출을 직접 실행합니다.",
+    "Slurm": "Slurm",
+    "Submit and manage jobs through Slurm; command calls still run on the SSH login host.": "Slurm을 통해 작업을 제출하고 관리합니다. 명령 호출은 계속 SSH 로그인 호스트에서 실행됩니다.",
+    "Configured mode": "구성된 모드",
+    "Detected scheduler": "감지된 스케줄러",
+    "None detected": "감지되지 않음",
+    "Failed to set execution mode.": "실행 모드를 설정하지 못했습니다.",
+    "Login host resources": "로그인 호스트 리소스",
+    "Reported by the SSH login host; Slurm job capacity depends on each allocation.": "SSH 로그인 호스트에서 보고한 정보입니다. Slurm 작업 용량은 각 할당에 따라 달라집니다.",
     "Edit configuration": "구성 수정",
     "Saved password": "저장된 비밀번호",
     "(unchanged)": "(변경되지 않음)",
@@ -4106,6 +4119,9 @@
     "Loading the latest version discards your draft. Overwriting replaces the editable content and removes reference files absent from your draft.": "최신 버전을 불러오면 초안이 삭제됩니다. 덮어쓰면 편집 가능한 내용이 교체되고 초안에 없는 참조 파일이 삭제됩니다.",
     "Keep editing": "계속 편집",
     "Load latest version": "최신 버전 불러오기",
-    "Overwrite with my draft": "내 초안으로 덮어쓰기"
+    "Overwrite with my draft": "내 초안으로 덮어쓰기",
+    "Could not refresh environment readiness. Saved settings are unchanged.": "환경 준비 상태를 새로 고치지 못했습니다. 저장된 설정은 그대로 유지됩니다.",
+    "Retry preflight": "사전 점검 다시 시도",
+    "The provider changed while loading models. Try again.": "모델을 불러오는 동안 모델 제공업체가 변경되었습니다. 다시 시도하세요."
   }
 }

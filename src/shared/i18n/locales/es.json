@@ -101,11 +101,13 @@
     "Import Connector configuration": "Importar configuración del conector"
   },
   "renderer": {
+    "An installer is not available for this platform. Download manually to check other installation options.": "No hay un instalador disponible para esta plataforma. Descargue manualmente para consultar otras opciones de instalación.",
     "Latest saved version": "Última versión guardada",
     "Unable to discard the Plan.": "No se puede descartar el plan.",
     "Discard unavailable Plan": "Descartar el plan no disponible",
     "Discard unavailable Plan?": "¿Descartar el plan no disponible?",
     "This removes the active Plan and its approval and progress from this conversation. Messages and Artifacts are kept. This cannot be undone.": "Se eliminarán de esta conversación el plan activo, su aprobación y su progreso. Se conservarán los mensajes y los artefactos. Esta acción no se puede deshacer.",
+    "Marketplace data needs repair. The original {{fileName}} file has been preserved.": "Es necesario reparar los datos del Mercado. Se ha conservado el archivo original {{fileName}}.",
     "Receiving code. Cancelling discards the unfinished code.": "Se está recibiendo código. Al cancelar, se descarta el código incompleto.",
     "Cancel code reception": "Cancelar recepción de código",
     "Checking version…": "Comprobando la versión…",
@@ -3884,6 +3886,17 @@
     "Not yet verified": "Aún no verificado",
     "Authentication method": "Método de autenticación",
     "Configuration": "Configuración",
+    "Execution mode": "Modo de ejecución",
+    "Direct SSH": "SSH directo",
+    "Run jobs and command calls directly on the SSH login host.": "Ejecutar trabajos y llamadas de comandos directamente en el host de inicio de sesión SSH.",
+    "Slurm": "Slurm",
+    "Submit and manage jobs through Slurm; command calls still run on the SSH login host.": "Enviar y gestionar trabajos mediante Slurm; las llamadas de comandos se siguen ejecutando en el host de inicio de sesión SSH.",
+    "Configured mode": "Modo configurado",
+    "Detected scheduler": "Planificador detectado",
+    "None detected": "No se detectó ninguno",
+    "Failed to set execution mode.": "No se pudo establecer el modo de ejecución.",
+    "Login host resources": "Recursos del host de inicio de sesión",
+    "Reported by the SSH login host; Slurm job capacity depends on each allocation.": "Información del host de inicio de sesión SSH; la capacidad de los trabajos de Slurm depende de cada asignación.",
     "Edit configuration": "Editar configuración",
     "Saved password": "Contraseña guardada",
     "(unchanged)": "(sin cambios)",
@@ -4418,6 +4431,9 @@
     "Loading the latest version discards your draft. Overwriting replaces the editable content and removes reference files absent from your draft.": "Cargar la última versión descarta su borrador. Sobrescribir reemplaza el contenido editable y elimina los archivos de referencia que no estén en su borrador.",
     "Keep editing": "Continuar editando",
     "Load latest version": "Cargar la última versión",
-    "Overwrite with my draft": "Sobrescribir con mi borrador"
+    "Overwrite with my draft": "Sobrescribir con mi borrador",
+    "Could not refresh environment readiness. Saved settings are unchanged.": "No se pudo actualizar el estado de preparación del entorno. La configuración guardada permanece sin cambios.",
+    "Retry preflight": "Reintentar comprobación previa",
+    "The provider changed while loading models. Try again.": "El proveedor cambió durante la carga de modelos. Inténtelo de nuevo."
   }
 }
