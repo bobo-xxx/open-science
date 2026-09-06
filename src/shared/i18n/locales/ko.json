@@ -99,6 +99,11 @@
     "Import Connector configuration": "커넥터 구성 가져오기"
   },
   "renderer": {
+    "Latest saved version": "최근 저장된 버전",
+    "Unable to discard the Plan.": "계획을 삭제할 수 없습니다.",
+    "Discard unavailable Plan": "사용할 수 없는 계획 삭제",
+    "Discard unavailable Plan?": "사용할 수 없는 계획을 삭제하시겠습니까?",
+    "This removes the active Plan and its approval and progress from this conversation. Messages and Artifacts are kept. This cannot be undone.": "이 대화에서 현재 계획과 해당 승인 및 진행 상황을 제거합니다. 메시지와 아티팩트는 유지됩니다. 이 작업은 되돌릴 수 없습니다.",
     "Receiving code. Cancelling discards the unfinished code.": "코드를 수신 중입니다. 취소하면 미완성 코드가 삭제됩니다.",
     "Cancel code reception": "코드 수신 취소",
     "Checking version…": "버전 확인 중…",
@@ -1585,7 +1590,6 @@
     "On this machine": "이 컴퓨터에서",
     "Once": "한 번",
     "Once installed, run <code>open-science start</code> to launch the backend and open the authenticated URL, then <code>open-science stop</code> to shut it down. <code>status</code> and <code>url</code> are also available.": "설치가 완료되면 <code>open-science start</code>를 실행하여 백엔드를 시작하고 인증된 URL을 연 다음 <code>open-science stop</code>를 실행하여 종료하세요. <code>status</code> 및 <code>url</code>도 사용할 수 있습니다.",
-    "One argument per line.": "한 줄에 인수가 하나씩 있습니다.",
     "One moment.": "잠시만요.",
     "One or more agent runtimes could not be detected.": "하나 이상의 에이전트 런타임을 감지할 수 없습니다.",
     "One sentence — what does this skill teach the agent, and when does it apply?": "한 문장으로 작성하세요. 이 스킬이 에이전트에게 무엇을 가르치며 언제 적용되는지 설명하세요.",
@@ -2158,7 +2162,6 @@
     "Send message options": "메시지 전송 옵션",
     "Sending this edited prompt starts a new branch from here. The {{count}} turns that currently follow remain available from the message revision controls._other": "이 편집된 프롬프트를 보내면 여기에서 새 브랜치가 시작됩니다. 현재 뒤따르는 {{count}}개 턴은 메시지 수정 컨트롤에서 계속 사용할 수 있습니다.",
     "Sent": "보냄",
-    "Separated by spaces or newlines.": "공백이나 줄 바꿈으로 구분됩니다.",
     "Server URL": "서버 URL",
     "Servers, clusters or job submission nodes from your SSH host lists": "SSH 호스트 목록의 서버, 클러스터 또는 작업 제출 노드",
     "Session": "세션",
@@ -2902,7 +2905,6 @@
     "First message": "첫 번째 메시지",
     "Response completed.": "응답이 완료되었습니다.",
     "Response failed.": "응답에 실패했습니다.",
-    "-y @modelcontextprotocol/server-memory": "-y @modelcontextprotocol/server-memory",
     "https://mirrors.example.com/conda-forge/": "https://mirrors.example.com/conda-forge/",
     "https://mirrors.example.com/pypi/simple": "https://mirrors.example.com/pypi/simple",
     "/path/to/corp-ca-bundle.pem": "/path/to/corp-ca-bundle.pem",
@@ -4091,6 +4093,19 @@
     "Runtime source": "런타임 출처",
     "File content omitted": "파일 내용 생략됨",
     "Switch notebook runtime": "Notebook 런타임 전환",
-    "Clears memory in the selected language kernel. Other kernels are unaffected.": "선택한 언어 커널의 메모리를 지웁니다. 다른 커널에는 영향을 주지 않습니다."
+    "Clears memory in the selected language kernel. Other kernels are unaffected.": "선택한 언어 커널의 메모리를 지웁니다. 다른 커널에는 영향을 주지 않습니다.",
+    "Credential changes were saved, but Connectors could not refresh. Retry from Settings > Connectors.": "자격 증명 변경 사항은 저장되었지만 커넥터를 새로 고치지 못했습니다. 설정 > 커넥터에서 다시 시도하세요.",
+    "One argument per line. Spaces and blank lines are preserved. Clear the field to remove all arguments.": "한 줄에 인수 하나를 입력합니다. 공백과 빈 줄은 유지됩니다. 입력란을 비우면 모든 인수가 제거됩니다.",
+    "The saved arguments contain embedded line breaks. Editing this field replaces the list using one argument per line.": "저장된 인수 내부에 줄 바꿈이 포함되어 있습니다. 이 입력란을 편집하면 한 줄에 인수 하나씩 전체 목록이 교체됩니다.",
+    "Use a safe filename without path separators or reserved characters.": "경로 구분자나 예약 문자가 없는 안전한 파일 이름을 사용하세요.",
+    "Review Skill changes": "스킬 변경 사항 검토",
+    "This Skill changed while you were editing. Your draft is preserved.": "편집하는 동안 이 스킬이 변경되었습니다. 초안은 유지됩니다.",
+    "Your draft": "내 초안",
+    "Latest version": "최신 버전",
+    "No reference files": "참조 파일 없음",
+    "Loading the latest version discards your draft. Overwriting replaces the editable content and removes reference files absent from your draft.": "최신 버전을 불러오면 초안이 삭제됩니다. 덮어쓰면 편집 가능한 내용이 교체되고 초안에 없는 참조 파일이 삭제됩니다.",
+    "Keep editing": "계속 편집",
+    "Load latest version": "최신 버전 불러오기",
+    "Overwrite with my draft": "내 초안으로 덮어쓰기"
   }
 }

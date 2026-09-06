@@ -100,6 +100,11 @@
     "Could not open the update installer: {{error}}": "Das Update-Installationsprogramm konnte nicht geöffnet werden: {{error}}"
   },
   "renderer": {
+    "Latest saved version": "Zuletzt gespeicherte Version",
+    "Unable to discard the Plan.": "Der Plan kann nicht verworfen werden.",
+    "Discard unavailable Plan": "Nicht verfügbaren Plan verwerfen",
+    "Discard unavailable Plan?": "Nicht verfügbaren Plan verwerfen?",
+    "This removes the active Plan and its approval and progress from this conversation. Messages and Artifacts are kept. This cannot be undone.": "Dadurch werden der aktive Plan sowie seine Freigabe und sein Fortschritt aus dieser Konversation entfernt. Nachrichten und Artefakte bleiben erhalten. Dies kann nicht rückgängig gemacht werden.",
     "Receiving code. Cancelling discards the unfinished code.": "Code wird empfangen. Beim Abbrechen wird der unvollständige Code verworfen.",
     "Cancel code reception": "Codeempfang abbrechen",
     "Checking version…": "Version wird geprüft…",
@@ -1534,7 +1539,6 @@
     "On this machine": "Auf dieser Maschine",
     "Once": "Einmal",
     "Once installed, run <code>open-science start</code> to launch the backend and open the authenticated URL, then <code>open-science stop</code> to shut it down. <code>status</code> and <code>url</code> are also available.": "Führen Sie nach der Installation <code>open-science start</code> aus, um das Backend zu starten und die authentifizierte URL zu öffnen. Mit <code>open-science stop</code> beenden Sie es wieder. Die Befehle <code>status</code> und <code>url</code> sind ebenfalls verfügbar.",
-    "One argument per line.": "Ein Argument pro Zeile.",
     "One moment.": "Einen Moment.",
     "One or more agent runtimes could not be detected.": "Eine oder mehrere Agentenlaufzeiten konnten nicht erkannt werden.",
     "One sentence — what does this skill teach the agent, and when does it apply?": "Ein Satz: Was lehrt diese Fähigkeit den Agenten und wann kommt sie zur Anwendung?",
@@ -2050,7 +2054,6 @@
     "Sending this edited prompt starts a new branch from here. The {{count}} turns that currently follow remain available from the message revision controls._one": "Durch das Senden dieses bearbeiteten Prompts wird ab hier ein neuer Branch erstellt. Die folgende {{count}} Interaktion bleibt über die Versionssteuerung der Nachricht verfügbar.",
     "Sending this edited prompt starts a new branch from here. The {{count}} turns that currently follow remain available from the message revision controls._other": "Durch das Senden dieses bearbeiteten Prompts wird ab hier ein neuer Branch erstellt. Die folgenden {{count}} Interaktionen bleiben über die Versionssteuerung der Nachricht verfügbar.",
     "Sent": "Gesendet",
-    "Separated by spaces or newlines.": "Durch Leerzeichen oder Zeilenumbrüche getrennt.",
     "Server URL": "Server-URL",
     "Servers, clusters or job submission nodes from your SSH host lists": "Server, Cluster oder Jobübermittlungsknoten aus Ihren SSH-Hostlisten",
     "Session": "Sitzung",
@@ -2845,7 +2848,6 @@
     "First message": "Erste Nachricht",
     "Response completed.": "Antwort abgeschlossen.",
     "Response failed.": "Antwort fehlgeschlagen.",
-    "-y @modelcontextprotocol/server-memory": "-y @modelcontextprotocol/server-memory",
     "https://mirrors.example.com/conda-forge/": "https://mirrors.example.com/conda-forge/",
     "https://mirrors.example.com/pypi/simple": "https://mirrors.example.com/pypi/simple",
     "/path/to/corp-ca-bundle.pem": "/path/to/corp-ca-bundle.pem",
@@ -4248,6 +4250,19 @@
     "Runtime source": "Laufzeitquelle",
     "File content omitted": "Dateiinhalt ausgelassen",
     "Switch notebook runtime": "Notebook-Laufzeit wechseln",
-    "Clears memory in the selected language kernel. Other kernels are unaffected.": "Löscht den Speicher des Kernels der ausgewählten Sprache. Andere Kernel bleiben unverändert."
+    "Clears memory in the selected language kernel. Other kernels are unaffected.": "Löscht den Speicher des Kernels der ausgewählten Sprache. Andere Kernel bleiben unverändert.",
+    "Credential changes were saved, but Connectors could not refresh. Retry from Settings > Connectors.": "Die Änderungen an den Zugangsdaten wurden gespeichert, aber die Konnektoren konnten nicht aktualisiert werden. Versuchen Sie es unter Einstellungen > Konnektoren erneut.",
+    "One argument per line. Spaces and blank lines are preserved. Clear the field to remove all arguments.": "Ein Argument pro Zeile. Leerzeichen und Leerzeilen bleiben erhalten. Leeren Sie das Feld, um alle Argumente zu entfernen.",
+    "The saved arguments contain embedded line breaks. Editing this field replaces the list using one argument per line.": "Die gespeicherten Argumente enthalten interne Zeilenumbrüche. Beim Bearbeiten dieses Felds wird die Liste mit einem Argument pro Zeile ersetzt.",
+    "Use a safe filename without path separators or reserved characters.": "Verwenden Sie einen sicheren Dateinamen ohne Pfadtrennzeichen oder reservierte Zeichen.",
+    "Review Skill changes": "Änderungen an der Fähigkeit prüfen",
+    "This Skill changed while you were editing. Your draft is preserved.": "Diese Fähigkeit wurde während Ihrer Bearbeitung geändert. Ihr Entwurf bleibt erhalten.",
+    "Your draft": "Ihr Entwurf",
+    "Latest version": "Neueste Version",
+    "No reference files": "Keine Referenzdateien",
+    "Loading the latest version discards your draft. Overwriting replaces the editable content and removes reference files absent from your draft.": "Beim Laden der neuesten Version wird Ihr Entwurf verworfen. Beim Überschreiben werden die bearbeitbaren Inhalte ersetzt und Referenzdateien gelöscht, die in Ihrem Entwurf fehlen.",
+    "Keep editing": "Weiter bearbeiten",
+    "Load latest version": "Neueste Version laden",
+    "Overwrite with my draft": "Mit meinem Entwurf überschreiben"
   }
 }

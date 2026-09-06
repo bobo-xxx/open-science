@@ -99,6 +99,11 @@
     "Import Connector configuration": "匯入連接器設定"
   },
   "renderer": {
+    "Latest saved version": "最新儲存的版本",
+    "Unable to discard the Plan.": "無法捨棄計畫。",
+    "Discard unavailable Plan": "捨棄無法使用的計畫",
+    "Discard unavailable Plan?": "要捨棄無法使用的計畫嗎？",
+    "This removes the active Plan and its approval and progress from this conversation. Messages and Artifacts are kept. This cannot be undone.": "這會從此對話中移除目前的計畫及其核准和進度。訊息和產物會保留。此操作無法復原。",
     "Receiving code. Cancelling discards the unfinished code.": "正在接收程式碼。取消將捨棄未完成的程式碼。",
     "Cancel code reception": "取消程式碼接收",
     "Checking version…": "正在檢查版本…",
@@ -1654,7 +1659,6 @@
     "On this machine": "在這台機器上",
     "Once": "僅此一次",
     "Once installed, run <code>open-science start</code> to launch the backend and open the authenticated URL, then <code>open-science stop</code> to shut it down. <code>status</code> and <code>url</code> are also available.": "安裝完成後，執行 <code>open-science start</code> 啟動後端並開啟帶驗證的網址，再用 <code>open-science stop</code> 關閉。此外還提供 <code>status</code> 和 <code>url</code> 兩個命令。",
-    "One argument per line.": "每行一個參數。",
     "One moment.": "請稍候。",
     "One or more agent runtimes could not be detected.": "有一個或多個智能體執行環境無法偵測到。",
     "One sentence — what does this skill teach the agent, and when does it apply?": "一句話 —— 這個技能教給智能體什麼，什麼時候適用？",
@@ -2233,7 +2237,6 @@
     "Send message options": "傳送訊息選項",
     "Sending this edited prompt starts a new branch from here. The {{count}} turns that currently follow remain available from the message revision controls._other": "傳送此編輯後的提示會從這裡開始一個新分支。目前緊接其後的 {{count}} 個輪次仍可透過訊息版本控制項存取。",
     "Sent": "已傳送",
-    "Separated by spaces or newlines.": "以空格或換行分隔。",
     "Server URL": "伺服器 URL",
     "Servers, clusters or job submission nodes from your SSH host lists": "來自你 SSH 主機清單的伺服器、叢集或工作提交節點",
     "Session": "會話",
@@ -2977,7 +2980,6 @@
     "First message": "首則訊息",
     "Response completed.": "回應已完成。",
     "Response failed.": "回應失敗。",
-    "-y @modelcontextprotocol/server-memory": "-y @modelcontextprotocol/server-memory",
     "https://mirrors.example.com/conda-forge/": "https://mirrors.example.com/conda-forge/",
     "https://mirrors.example.com/pypi/simple": "https://mirrors.example.com/pypi/simple",
     "/path/to/corp-ca-bundle.pem": "/path/to/corp-ca-bundle.pem",
@@ -4093,6 +4095,19 @@
     "Runtime source": "執行環境來源",
     "File content omitted": "已省略檔案內容",
     "Switch notebook runtime": "切換 Notebook 執行環境",
-    "Clears memory in the selected language kernel. Other kernels are unaffected.": "清空所選語言核心的記憶體，不影響其他核心。"
+    "Clears memory in the selected language kernel. Other kernels are unaffected.": "清空所選語言核心的記憶體，不影響其他核心。",
+    "Credential changes were saved, but Connectors could not refresh. Retry from Settings > Connectors.": "憑證變更已儲存，但連接器重新整理失敗。請前往設定 > 連接器重試。",
+    "One argument per line. Spaces and blank lines are preserved. Clear the field to remove all arguments.": "每行一個參數。空格和空行會保留。清空輸入框可移除所有參數。",
+    "The saved arguments contain embedded line breaks. Editing this field replaces the list using one argument per line.": "已儲存的參數內部含有換行。編輯此輸入框將按每行一個參數取代整個清單。",
+    "Use a safe filename without path separators or reserved characters.": "請使用不含路徑分隔符號或保留字元的安全檔案名稱。",
+    "Review Skill changes": "檢視技能變更",
+    "This Skill changed while you were editing. Your draft is preserved.": "此技能在您編輯時發生了變更。您的草稿已保留。",
+    "Your draft": "您的草稿",
+    "Latest version": "最新版本",
+    "No reference files": "沒有參考檔案",
+    "Loading the latest version discards your draft. Overwriting replaces the editable content and removes reference files absent from your draft.": "載入最新版本將捨棄您的草稿。覆寫將取代可編輯內容，並刪除草稿中沒有的參考檔案。",
+    "Keep editing": "繼續編輯",
+    "Load latest version": "載入最新版本",
+    "Overwrite with my draft": "以我的草稿覆寫"
   }
 }
