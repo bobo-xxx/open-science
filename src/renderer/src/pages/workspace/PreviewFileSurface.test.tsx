@@ -87,6 +87,7 @@ vi.mock('./ManagedVersionDiffContent', () => ({
 }))
 
 import { PreviewFileSurface } from './PreviewFileSurface'
+import { createPreviewFileItemFromPdfContext } from './preview-file-item'
 import { FOCUS_COMPOSER_EVENT } from './composer-focus-events'
 
 ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
@@ -375,7 +376,15 @@ describe('PreviewFileSurface managed text versions', () => {
     expect(alert?.textContent).toContain(
       failure === 'result' ? error.message : 'Version transport disconnected.'
     )
-    if (failure === 'result') expect(alert?.textContent).toContain(error.code)
+    const notice = alert!.closest('section')!
+    const diagnostics = notice.querySelector('details')
+    if (failure === 'result') {
+      expect(diagnostics!.open).toBe(false)
+      expect(diagnostics!.closest('[role="alert"]')).toBeNull()
+      expect(diagnostics!.textContent).toContain(error.code)
+    } else {
+      expect(diagnostics).toBeNull()
+    }
     expect(container.querySelector('[aria-label="Edit README.md"]')).toBeNull()
     const failedRequest = inspect.mock.calls.at(-1)![0]
     let finish!: (result: Result) => void
@@ -385,7 +394,7 @@ describe('PreviewFileSurface managed text versions', () => {
           finish = resolve
         })
     )
-    await click(alert!.querySelector('button'))
+    await click(notice.querySelector('button'))
     expect(inspect).toHaveBeenLastCalledWith(failedRequest)
     expect(
       [...container.querySelectorAll('[role="status"]')].some((status) =>
@@ -3205,6 +3214,45 @@ describe('PreviewFileSurface PDF context action matrix', () => {
     // Linking is "Read with agent": the composer takes focus so the user can ask immediately.
     expect(focusListener).toHaveBeenCalled()
     window.removeEventListener(FOCUS_COMPOSER_EVENT, focusListener)
+  })
+
+  it('opens a Reading Literature PDF without an Artifact version error', async () => {
+    selectPdfContextSession()
+    installPdfContextApi()
+    window.api.managedFileVersions.inspect = vi.fn().mockResolvedValue({
+      ok: false,
+      error: { code: 'FILE_NOT_FOUND', message: 'Managed Artifact was not found.' }
+    })
+    const readingItem = createPreviewFileItemFromPdfContext(
+      {
+        version: 1,
+        bindingId: 'literature-binding',
+        sourceKind: 'literature-attachment-version',
+        sourceFileId: 'attachment-1',
+        sourceVersionId: 'attachment-version-1',
+        name: 'paper.pdf',
+        mimeType: 'application/pdf',
+        sizeBytes: 4096,
+        checksum: 'pdf-checksum',
+        linkedAt: 1
+      },
+      'project-1'
+    )
+    await act(async () => {
+      root.render(<PreviewFileSurface item={readingItem} onClose={vi.fn()} />)
+    })
+
+    expect(container.querySelector('[data-testid="preview-content"]')).not.toBeNull()
+    const download = container.querySelector<HTMLButtonElement>('[aria-label="Download paper.pdf"]')
+    expect.soft(download?.disabled).toBe(false)
+    expect.soft(container.textContent).not.toContain('Managed Artifact was not found.')
+    expect.soft(window.api.managedFileVersions.inspect).not.toHaveBeenCalled()
+    await click(download)
+    expect(window.api.saveManagedFile).toHaveBeenCalledWith({
+      source: 'literature',
+      path: readingItem.path,
+      suggestedName: 'paper.pdf'
+    })
   })
 
   it('adds an immutable Literature PDF Version to the active Session context', async () => {

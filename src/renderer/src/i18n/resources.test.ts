@@ -1587,7 +1587,6 @@ describe('mandatory product glossary', () => {
   it('keeps high-risk German storage, exit, credential, and theme actions unambiguous', () => {
     expect({
       about: de.renderer.About,
-      alwaysLight: de.renderer['Always light'],
       credential: de.renderer.Credential,
       custom: de.renderer.Custom,
       duplicate: de.renderer.Duplicate,
@@ -1615,7 +1614,6 @@ describe('mandatory product glossary', () => {
       volumes: de.renderer.Volumes
     }).toEqual({
       about: 'Über',
-      alwaysLight: 'Immer hell',
       credential: 'Anmeldeinformation',
       custom: 'Benutzerdefiniert',
       duplicate: 'Duplizieren',
@@ -2814,8 +2812,8 @@ describe('Russian catalog quality', () => {
       'Сохраняет файл как артефакт этого диалога.'
     ],
     [
-      'Remote access is off on the home computer. Re-enable a remote access mode in Open Science, then try again.',
-      'Удалённый доступ отключён на домашнем компьютере. Снова включите режим удалённого доступа в Open Science и повторите попытку.'
+      'Access authorization has expired. Reopen the Web link from Open Science on the host computer, or return to the remote access entry page to pair again.',
+      'Срок действия разрешения на доступ истёк. Снова откройте веб-ссылку из Open Science на главном компьютере или вернитесь на страницу удалённого доступа для повторного сопряжения.'
     ],
     [
       'That folder already contains Open Science data. Pick an empty folder, or use the default location.',

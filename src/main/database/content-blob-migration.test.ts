@@ -69,7 +69,12 @@ describe('Content blob migration', () => {
     )
 
     await expect(migrateApplicationDatabase(client)).resolves.toMatchObject({
-      applied: ['0030_literature_foundation', '0031_project_archive_revision']
+      applied: [
+        '0030_literature_foundation',
+        '0031_project_archive_revision',
+        '0032_permission_approval_summary',
+        '0033_compute_job_harvest_retry'
+      ]
     })
     await expect(
       client.literatureIdentifier.findMany({ orderBy: { id: 'asc' }, select: { itemId: true } })
@@ -141,9 +146,14 @@ describe('Content blob migration', () => {
         applied:
           schema === 'pre-ledger'
             ? MIGRATION_MANIFEST.map(({ id }) => id)
-            : ['0030_literature_foundation', '0031_project_archive_revision'],
+            : [
+                '0030_literature_foundation',
+                '0031_project_archive_revision',
+                '0032_permission_approval_summary',
+                '0033_compute_job_harvest_retry'
+              ],
         from: schema === 'pre-ledger' ? null : '0029_compute_host_execution_mode',
-        to: '0031_project_archive_revision'
+        to: '0033_compute_job_harvest_retry'
       })
 
       await expect(

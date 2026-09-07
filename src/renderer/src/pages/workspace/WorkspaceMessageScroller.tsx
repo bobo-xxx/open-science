@@ -52,6 +52,7 @@ import { JobDetailModal } from '@/components/JobDetailModal'
 import { extractJobIdFromActivity } from '@/components/job-binding-utils'
 import { MessageScrollerItem } from '@/components/ui/message-scroller'
 import { Button } from '@/components/ui/button'
+import { TooltipProvider } from '@/components/ui/tooltip'
 import { ReviewerCard } from '@/components/ReviewerCard'
 import { WorkspaceActivityGroup } from './WorkspaceActivityGroup'
 import { WorkspaceContextCompactionActivityRow } from './WorkspaceContextCompactionActivityRow'
@@ -733,10 +734,26 @@ const WorkspaceMessageScrollerImpl = ({
     undefined
   )
   const showWindowFind = useCallback((): void => {
+    const acknowledgedScope = windowFindAcknowledgedScopeRef.current
+    if (
+      acknowledgedScope &&
+      acknowledgedScope.scopeId === currentPresentationScopeId &&
+      presentationBarrierIndex < 0 &&
+      transcriptWindow.entries.length === conversationItems.length
+    ) {
+      window.api?.window?.announceWindowFindContentReady?.()
+      return
+    }
     windowFindAcknowledgedScopeRef.current = undefined
     setWindowFindOpen(true)
     revealFullTranscript()
-  }, [revealFullTranscript])
+  }, [
+    conversationItems.length,
+    currentPresentationScopeId,
+    presentationBarrierIndex,
+    revealFullTranscript,
+    transcriptWindow.entries.length
+  ])
   useEffect(() => {
     return window.api?.window?.onShowWindowFind?.(showWindowFind)
   }, [showWindowFind])
@@ -1268,7 +1285,11 @@ const WorkspaceMessageScrollerImpl = ({
   }
 
   return (
-    <>
+    <TooltipProvider
+      key={activeSession?.id ?? 'empty-conversation'}
+      delayDuration={200}
+      skipDelayDuration={300}
+    >
       <MessageScrollerProvider
         key={activeSession?.id ?? 'empty-conversation'}
         autoScroll
@@ -1846,7 +1867,7 @@ const WorkspaceMessageScrollerImpl = ({
           onClose={handleCloseModal}
         />
       )}
-    </>
+    </TooltipProvider>
   )
 }
 
