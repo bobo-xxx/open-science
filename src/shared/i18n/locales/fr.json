@@ -1,5 +1,6 @@
 {
   "common": {
+    "The conversation changed. Close and reopen export to review it.": "La conversation a changé. Fermez puis rouvrez l’exportation pour la vérifier.",
     "Approval needed": "Approbation nécessaire",
     "Cancel": "Annuler",
     "Stay": "Rester dans l’application",
@@ -1317,7 +1318,6 @@
     "No response yet": "Pas encore de réponse",
     "Attachments: {{total}}": "Pièces jointes : {{total}}",
     "Wait for the conversation to finish before exporting it.": "Attendez la fin de la conversation avant de l’exporter.",
-    "The conversation changed. Close and reopen export to review it.": "La conversation a changé. Fermez puis rouvrez l’exportation pour la vérifier.",
     "Select content to export.": "Sélectionnez le contenu à exporter.",
     "The entire conversation will be exported.": "La conversation entière sera exportée.",
     "Only selected content will be exported.": "Seul le contenu sélectionné sera exporté.",
@@ -2052,6 +2052,7 @@
     "Preview {{title}}": "Aperçu {{title}}",
     "Preview — matches the list and picker.": "Aperçu : correspond à la liste et au sélecteur.",
     "Previous Artifact version": "Version précédente de l'artefact",
+    "Message revisions are unavailable while this session is busy or blocked.": "Les versions des messages ne sont pas disponibles lorsque cette session est occupée ou bloquée.",
     "Previous message revision": "Révision du message précédent",
     "Previous page": "Page précédente",
     "Previous preview page": "Page d'aperçu précédente",
@@ -4930,6 +4931,12 @@
     "Loading skills…": "Chargement des compétences…",
     "Could not load skills": "Impossible de charger les compétences",
     "No skills available": "Aucune compétence disponible",
-    "No matching sessions": "Aucune session correspondante"
+    "No matching sessions": "Aucune session correspondante",
+    "Current evidence could not be verified": "Les éléments actuels n’ont pas pu être vérifiés",
+    "Historical results are retained. Retry to verify the current evidence.": "Les résultats précédents sont conservés. Réessayez pour vérifier les éléments actuels.",
+    "Automatic correction stopped because the active conversation changed.": "La correction automatique a été arrêtée, car la conversation active a changé.",
+    "Review did not start. Please try again.": "L’examen n’a pas démarré. Veuillez réessayer.",
+    "Review failed. You can try again.": "L’examen a échoué. Vous pouvez réessayer.",
+    "No checkable claims": "Aucune affirmation vérifiable"
   }
 }

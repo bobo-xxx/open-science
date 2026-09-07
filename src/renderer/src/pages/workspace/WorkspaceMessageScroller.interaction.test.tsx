@@ -1629,6 +1629,68 @@ describe('WorkspaceMessageScroller artifact click behavior', () => {
     )
   })
 
+  it('reruns a failed historical card with its original scope branch', async () => {
+    const { WorkspaceMessageScroller } = await import('./WorkspaceMessageScroller')
+    const run = vi.fn().mockResolvedValue({ started: true })
+    window.api.reviewer.run = run
+    const messages = [
+      createMessage({ id: 'original-user', sortIndex: 1 }),
+      createMessage({
+        id: 'original-answer',
+        role: 'agent',
+        responseToMessageId: 'original-user',
+        sortIndex: 2
+      }),
+      createMessage({ id: 'newer-user', sortIndex: 3 })
+    ]
+    useReviewStore.getState().handleReviewUpdate({
+      review: {
+        id: 'historical-error',
+        projectId: 'default',
+        sessionId: 'session-1',
+        turnMessageId: 'original-answer',
+        scope: {
+          turnMessageId: 'original-answer',
+          messageBranchId: 'original-branch',
+          blocks: [],
+          artifactVersionIds: []
+        },
+        lifecycle: 'error',
+        outcome: null,
+        errorMessage: 'Temporary failure',
+        model: 'test',
+        reviewerLog: [],
+        checks: [],
+        createdAt: 1000,
+        updatedAt: 1000
+      }
+    })
+    root = createRoot(container)
+    await act(async () => {
+      root.render(
+        <WorkspaceMessageScroller
+          activeSession={createSession({ status: 'idle', messages })}
+          onSendEditedMessage={vi.fn()}
+        />
+      )
+    })
+    const retry = Array.from(container.querySelectorAll('button')).find(
+      (button) => button.textContent === 'Re-run review'
+    )
+    expect(retry).toBeDefined()
+    await act(async () => {
+      retry!.click()
+    })
+    expect(run).toHaveBeenCalledWith(
+      expect.objectContaining({
+        turnMessageId: 'original-answer',
+        scopeTurnMessageId: 'original-answer',
+        scopeMessageBranchId: 'original-branch',
+        origin: 'manual'
+      })
+    )
+  })
+
   it('renders one initial and three fix-loop Review Runs at their four distinct scope anchors', async () => {
     const { WorkspaceMessageScroller } = await import('./WorkspaceMessageScroller')
     const answerIds = ['answer-initial', 'answer-fix-1', 'answer-fix-2', 'answer-fix-3']
@@ -4219,6 +4281,89 @@ describe('WorkspaceMessageScroller artifact click behavior', () => {
     })
 
     expect(rawOutputReads).toBeLessThanOrEqual(itemCount * 8)
+  })
+
+  it.each([
+    { status: 'running' as const },
+    { status: 'idle' as const, compacting: true },
+    { status: 'idle' as const, fixLoopActive: true },
+    { status: 'idle' as const, branchSwitchBlocked: true },
+    { status: 'idle' as const, conversationGraphSyncBlocked: true },
+    { status: 'waiting-for-user' as const },
+    { status: 'waiting-permission' as const },
+    { status: 'waiting-plan-approval' as const }
+  ])('disables revision navigation while editing remains available: %j', async (blocked) => {
+    const { WorkspaceMessageScroller } = await import('./WorkspaceMessageScroller')
+    const { WorkspaceMessageEditStateProvider } = await import('./workspace-message-edit-state')
+    useSessionStore.setState({
+      sessions: [
+        createSession({
+          status: 'idle',
+          messages: [createMessage({ id: 'original', content: 'Original prompt' })]
+        })
+      ],
+      selectedSessionId: 'session-1'
+    })
+    useSessionStore.getState().truncateSessionFromMessage('session-1', 'original')
+    useSessionStore
+      .getState()
+      .appendUserMessage({ sessionId: 'session-1', content: 'Edited prompt' })
+    const running = useSessionStore.getState().sessions[0]
+    expect(running.status).toBe('running')
+    const branchId = running.conversationGraph!.frames[0].activeBranchId
+    useSessionStore.setState({ sessions: [{ ...running, activeRun: undefined, ...blocked }] })
+    const onSendEditedMessage = vi.fn()
+    const Parent = (): React.JSX.Element => {
+      const activeSession = useSessionStore((state) => state.sessions[0])
+      return (
+        <WorkspaceMessageEditStateProvider canEditMessage={true}>
+          <WorkspaceMessageScroller
+            activeSession={activeSession}
+            onSendEditedMessage={onSendEditedMessage}
+          />
+        </WorkspaceMessageEditStateProvider>
+      )
+    }
+    root = createRoot(container)
+    await act(async () => root.render(<Parent />))
+    const previous = (): HTMLButtonElement => {
+      const button = container.querySelector<HTMLButtonElement>(
+        '[aria-label="Previous message revision"]'
+      )
+      if (!button) throw new Error('Previous revision button missing')
+      return button
+    }
+    expect(
+      container.querySelector<HTMLButtonElement>('[aria-label="Edit message"]')?.disabled
+    ).toBe(false)
+    expect.soft(previous().disabled).toBe(true)
+    await act(async () => previous().click())
+    expect(useSessionStore.getState().sessions[0].conversationGraph!.frames[0].activeBranchId).toBe(
+      branchId
+    )
+
+    await act(async () => {
+      useSessionStore.getState().finishRun('session-1')
+      useSessionStore.setState((state) => ({
+        sessions: state.sessions.map((session) => ({
+          ...session,
+          compacting: false,
+          fixLoopActive: false,
+          branchSwitchBlocked: false,
+          conversationGraphSyncBlocked: false
+        }))
+      }))
+    })
+    expect(previous().disabled).toBe(false)
+    await act(async () => useSessionStore.getState().setBranchSwitchBlocked('session-1', true))
+    expect(previous().disabled).toBe(true)
+    expect(
+      container.querySelector<HTMLButtonElement>('[aria-label="Edit message"]')?.disabled
+    ).toBe(false)
+    await act(async () => useSessionStore.getState().setBranchSwitchBlocked('session-1', false))
+    expect(previous().disabled).toBe(false)
+    await act(async () => previous().click())
+    expect(useSessionStore.getState().sessions[0].messages[0].content).toBe('Original prompt')
   })
 
   it('renders a long conversation graph without rescanning it for every visible revision', async () => {

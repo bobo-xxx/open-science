@@ -1,5 +1,6 @@
 {
   "common": {
+    "The conversation changed. Close and reopen export to review it.": "会話が変更されました。内容を確認するには、エクスポートを閉じて再度開いてください。",
     "Approval needed": "承認が必要です",
     "Cancel": "キャンセル",
     "Stay": "アプリに留まる",
@@ -1262,7 +1263,6 @@
     "No response yet": "まだ応答はありません",
     "Attachments: {{total}}": "添付ファイル：{{total}}",
     "Wait for the conversation to finish before exporting it.": "会話が終了してからエクスポートしてください。",
-    "The conversation changed. Close and reopen export to review it.": "会話が変更されました。内容を確認するには、エクスポートを閉じて再度開いてください。",
     "Select content to export.": "エクスポートするコンテンツを選択してください。",
     "The entire conversation will be exported.": "会話全体をエクスポートします。",
     "Only selected content will be exported.": "選択したコンテンツのみをエクスポートします。",
@@ -1983,6 +1983,7 @@
     "Preview {{title}}": "{{title}} をプレビュー",
     "Preview — matches the list and picker.": "プレビュー — リストとピッカーの表示と一致します。",
     "Previous Artifact version": "以前のアーティファクトのバージョン",
+    "Message revisions are unavailable while this session is busy or blocked.": "このセッションが処理中またはブロックされている間は、メッセージのバージョンを切り替えられません。",
     "Previous message revision": "以前のメッセージのリビジョン",
     "Previous page": "前のページ",
     "Previous preview page": "前のプレビューページ",
@@ -4614,6 +4615,12 @@
     "Loading skills…": "スキルを読み込み中…",
     "Could not load skills": "スキルを読み込めませんでした",
     "No skills available": "利用可能なスキルはありません",
-    "No matching sessions": "一致するセッションはありません"
+    "No matching sessions": "一致するセッションはありません",
+    "Current evidence could not be verified": "現在の証拠を検証できませんでした",
+    "Historical results are retained. Retry to verify the current evidence.": "過去の結果は保持されています。再試行して現在の証拠を検証してください。",
+    "Automatic correction stopped because the active conversation changed.": "アクティブな会話が変更されたため、自動修正を停止しました。",
+    "Review did not start. Please try again.": "レビューを開始できませんでした。もう一度お試しください。",
+    "Review failed. You can try again.": "レビューに失敗しました。再試行できます。",
+    "No checkable claims": "検証可能な主張はありません"
   }
 }

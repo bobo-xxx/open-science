@@ -121,6 +121,48 @@ const clickPermissionDecision = async (page: Page, decision: 'allow' | 'deny'): 
   })
 }
 
+test('explains disabled revision navigation while a turn is running', async ({ app }, testInfo) => {
+  await app.completeOnboarding()
+  const page = await app.configureFakeAgent()
+  await createProject(page)
+
+  await page.getByRole('textbox', { name: 'Ask anything' }).fill(USER_MESSAGE)
+  await expect(page.getByRole('button', { name: 'Send message' })).toBeEnabled()
+  await page.getByRole('button', { name: 'Send message' }).click()
+
+  const conversation = page.getByRole('region', { name: 'Conversation' })
+  await expect(conversation.getByText(USER_MESSAGE, { exact: true })).toBeVisible()
+  await expect(conversation.getByText(AGENT_REPLY, { exact: true })).toBeVisible()
+  // Reply text can arrive before the Agent turn ends. Wait for Main to observe completion
+  // before editing history and restarting, which otherwise can open a native quit dialog.
+  await expect.poll(() => page.evaluate(() => window.api.storage.detectActive())).toEqual([])
+
+  await conversation.getByText(USER_MESSAGE, { exact: true }).hover()
+  await conversation.getByRole('button', { name: 'Edit message' }).click()
+  await conversation.getByRole('textbox', { name: 'Edit message' }).fill(EDITED_USER_MESSAGE)
+  await conversation.getByRole('button', { name: 'Send', exact: true }).click()
+
+  const previous = conversation.getByRole('button', { name: 'Previous message revision' })
+  await expect(previous).toBeEnabled()
+  await page
+    .getByRole('textbox', { name: 'Ask anything' })
+    .fill('Run the ordered slow tool journey.')
+  await page.getByRole('button', { name: 'Send message' }).click()
+  await expect(page.getByTestId('composer-queue-submit')).toBeVisible()
+  await expect(previous).toBeDisabled()
+  const explanation = 'Message revisions are unavailable while this session is busy or blocked.'
+  const trigger = previous.locator('..')
+  await trigger.focus()
+  await expect(page.getByRole('tooltip', { name: explanation })).toBeVisible()
+  await page.screenshot({ path: testInfo.outputPath('revision-navigation-running.png') })
+  await expect(conversation.getByLabel('Message revision', { exact: true })).toHaveText('2/2')
+  await expect(previous).toBeEnabled()
+  await previous.click()
+  await expect(conversation.getByText(USER_MESSAGE, { exact: true })).toBeVisible()
+  await expect(conversation.getByLabel('Message revision', { exact: true })).toHaveText('1/2')
+  await page.screenshot({ path: testInfo.outputPath('revision-navigation-idle.png') })
+})
+
 test('edits and navigates message revisions that persist after relaunch', async ({ app }) => {
   await app.completeOnboarding()
   let page = await app.configureFakeAgent()
@@ -678,7 +720,7 @@ test('shows the Electron failure reason when a source request fails', async ({ a
   await expect(sourceError).toContainText('ERR_CONNECTION_REFUSED (-102)')
 })
 
-test('archives a completed session from its mobile sidebar actions', async ({ app }) => {
+test('archives a completed session from its mobile sidebar actions', async ({ app }, testInfo) => {
   await app.completeOnboarding()
   const page = await app.configureFakeAgent()
   await createProject(page)
@@ -753,6 +795,10 @@ test('archives a completed session from its mobile sidebar actions', async ({ ap
     }
   }
   await expect(page.getByRole('button', { name: `Open actions for ${USER_MESSAGE}` })).toBeHidden()
+  await page.screenshot({
+    path: testInfo.outputPath('mobile-session-archived.png'),
+    animations: 'disabled'
+  })
 })
 
 test('identifies the Project before deleting a workspace Session', async ({ app }, testInfo) => {

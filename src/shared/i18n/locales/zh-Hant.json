@@ -1,5 +1,6 @@
 {
   "common": {
+    "The conversation changed. Close and reopen export to review it.": "對話已發生變更。請關閉並重新開啟匯出以檢查內容。",
     "Approval needed": "需要批准",
     "Cancel": "取消",
     "Stay": "留在應用程式中",
@@ -1347,7 +1348,6 @@
     "No response yet": "尚無回覆",
     "Attachments: {{total}}": "附件：{{total}}",
     "Wait for the conversation to finish before exporting it.": "請等待對話結束後再匯出。",
-    "The conversation changed. Close and reopen export to review it.": "對話已發生變更。請關閉並重新開啟匯出以檢查內容。",
     "Select content to export.": "請選擇要匯出的內容。",
     "The entire conversation will be exported.": "將匯出完整對話。",
     "Only selected content will be exported.": "僅匯出已選內容。",
@@ -2067,6 +2067,7 @@
     "Preview {{title}}": "預覽 {{title}}",
     "Preview — matches the list and picker.": "預覽 — 與清單和選擇器一致。",
     "Previous Artifact version": "上一個 Artifact 版本",
+    "Message revisions are unavailable while this session is busy or blocked.": "此工作階段忙碌或受阻時，無法切換訊息版本。",
     "Previous message revision": "上一個訊息版本",
     "Previous page": "上一頁",
     "Previous preview page": "上一預覽頁",
@@ -4614,6 +4615,12 @@
     "Loading skills…": "正在載入技能…",
     "Could not load skills": "無法載入技能",
     "No skills available": "沒有可用技能",
-    "No matching sessions": "沒有符合的會話"
+    "No matching sessions": "沒有符合的會話",
+    "Current evidence could not be verified": "目前證據無法驗證",
+    "Historical results are retained. Retry to verify the current evidence.": "已保留歷史結果。請重試以驗證目前證據。",
+    "Automatic correction stopped because the active conversation changed.": "作用中的對話已變更，自動修正已停止。",
+    "Review did not start. Please try again.": "審查未啟動，請重試。",
+    "Review failed. You can try again.": "審查失敗，可以重試。",
+    "No checkable claims": "沒有可檢查的主張"
   }
 }

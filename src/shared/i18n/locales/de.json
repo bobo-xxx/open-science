@@ -1,5 +1,6 @@
 {
   "common": {
+    "The conversation changed. Close and reopen export to review it.": "Die Konversation wurde geändert. Schließen Sie den Export und öffnen Sie ihn erneut, um die aktuelle Fassung zu prüfen.",
     "Cancel": "Abbrechen",
     "Stay": "In der App bleiben",
     "Retry saving": "Speichern erneut versuchen",
@@ -1209,7 +1210,6 @@
     "No response yet": "Noch keine Antwort",
     "Attachments: {{total}}": "Anhänge: {{total}}",
     "Wait for the conversation to finish before exporting it.": "Warten Sie, bis die Konversation beendet ist, bevor Sie sie exportieren.",
-    "The conversation changed. Close and reopen export to review it.": "Die Konversation wurde geändert. Schließen Sie den Export und öffnen Sie ihn erneut, um die aktuelle Fassung zu prüfen.",
     "Select content to export.": "Wählen Sie den zu exportierenden Inhalt aus.",
     "The entire conversation will be exported.": "Die gesamte Konversation wird exportiert.",
     "Only selected content will be exported.": "Es werden nur ausgewählte Inhalte exportiert.",
@@ -1867,6 +1867,7 @@
     "Preview {{title}}": "Vorschau {{title}}",
     "Preview — matches the list and picker.": "Vorschau – entspricht der Liste und Auswahl.",
     "Previous Artifact version": "Vorherige Artefaktversion",
+    "Message revisions are unavailable while this session is busy or blocked.": "Nachrichtenversionen sind nicht verfügbar, solange diese Sitzung beschäftigt oder blockiert ist.",
     "Previous message revision": "Vorherige Nachrichtenüberarbeitung",
     "Previous page": "Vorherige Seite",
     "Previous preview page": "Vorherige Vorschauseite",
@@ -4768,6 +4769,12 @@
     "Loading skills…": "Fähigkeiten werden geladen…",
     "Could not load skills": "Fähigkeiten konnten nicht geladen werden",
     "No skills available": "Keine Fähigkeiten verfügbar",
-    "No matching sessions": "Keine passenden Sitzungen"
+    "No matching sessions": "Keine passenden Sitzungen",
+    "Current evidence could not be verified": "Die aktuellen Belege konnten nicht überprüft werden",
+    "Historical results are retained. Retry to verify the current evidence.": "Bisherige Ergebnisse bleiben erhalten. Versuchen Sie es erneut, um die aktuellen Belege zu überprüfen.",
+    "Automatic correction stopped because the active conversation changed.": "Die automatische Korrektur wurde gestoppt, weil sich die aktive Konversation geändert hat.",
+    "Review did not start. Please try again.": "Die Prüfung wurde nicht gestartet. Bitte versuchen Sie es erneut.",
+    "Review failed. You can try again.": "Die Prüfung ist fehlgeschlagen. Sie können es erneut versuchen.",
+    "No checkable claims": "Keine überprüfbaren Aussagen"
   }
 }
