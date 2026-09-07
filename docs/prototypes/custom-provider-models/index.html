@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Open Science · Custom Provider prototype</title>
+<style>
+:root{--background:#faf9f6;--card:#fff;--foreground:#292d29;--muted:#f2f2ed;--muted-foreground:#6d726b;--primary:#216452;--accent:#edf5ef;--border:#dedfd6;--destructive:#a43832;--ring:#216452;--warning:#805e21}
+*{box-sizing:border-box}body{margin:0;background:var(--background);color:var(--foreground);font:15px/1.5 "Segoe UI",Arial,sans-serif}button,input,select{font:inherit}button{border:1px solid var(--border);background:var(--card);color:var(--foreground);padding:8px 13px;border-radius:8px;cursor:pointer;font-weight:550}button:hover{background:var(--muted)}button:disabled{opacity:.45;cursor:not-allowed}.primary{background:var(--primary);border-color:var(--primary);color:white}.primary:hover{background:#174d3f}.danger{color:var(--destructive)}:focus-visible{outline:3px solid #94baa7;outline-offset:2px}input:not([type=checkbox]),select{width:100%;border:1px solid var(--border);border-radius:7px;padding:9px 11px;color:var(--foreground);background:var(--card)}input[readonly]{background:var(--muted);color:var(--muted-foreground)}input[type=checkbox]{accent-color:var(--primary);width:17px;height:17px;vertical-align:middle}label{display:block;font-weight:550}small,.muted{color:var(--muted-foreground)}small{font-size:12px}h1,h2,h3,p{margin:0}h1{font-size:28px;font-weight:630;letter-spacing:-.7px}h2{font-size:19px;letter-spacing:-.3px}h3{font-size:15px}p{margin-top:6px}code{font-family:Consolas,monospace;font-size:13px}.top{padding:13px 30px;background:#efefe8;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:20px}.brand{font-weight:650}.tag{display:inline-flex;align-items:center;font-size:11px;font-weight:650;letter-spacing:.5px;padding:3px 8px;border-radius:5px;background:var(--accent);color:var(--primary)}.top .tag{margin-left:14px}.layout{max-width:1320px;margin:auto;padding:30px;display:grid;grid-template-columns:190px minmax(0,1fr);gap:30px}.sidebar{padding-top:8px}.sidebar div{padding:10px 12px;color:var(--muted-foreground);border-radius:8px}.sidebar .selected{background:var(--accent);color:var(--primary);font-weight:600}.sidebar small{display:block;margin:20px 12px}.intro{margin-bottom:22px}.intro p{max-width:780px}.card{background:var(--card);border:1px solid var(--border);border-radius:12px;margin-bottom:18px;overflow:hidden}.pad{padding:23px}.row{display:flex;align-items:center;justify-content:space-between;gap:16px}.actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.fields{display:grid;grid-template-columns:1fr 1fr;gap:17px;margin-top:19px}.field label{margin-bottom:6px}.field small{display:block;margin-top:5px}.full{grid-column:1/-1}.section-head{padding:21px 23px;border-bottom:1px solid var(--border)}.models{padding:0 23px}.model{padding:19px 0;display:flex;gap:16px;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border)}.model:last-child{border:0}.model-id{font-size:15px;font-weight:600;margin-right:8px;overflow-wrap:anywhere}.model-meta{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:7px;font-size:12px;color:var(--muted-foreground)}.subtle{background:var(--muted);color:var(--muted-foreground);letter-spacing:0;font-weight:500}.model .actions button{font-size:12px;padding:6px 10px}.foot{padding:15px 23px;background:#fbfbf8;border-top:1px solid var(--border)}.notice{background:var(--accent);color:var(--primary);border:1px solid #d1e3d6;border-radius:8px;padding:11px 14px;font-size:13px}.notice.warning{background:#fcf7ec;border-color:#eadcbb;color:var(--warning)}.notice.error{background:#fcf1ef;border-color:#ebcbc7;color:var(--destructive)}#status{margin-bottom:17px}.status-title{font-weight:600}.scenarios{display:flex;gap:8px;margin:14px 0;flex-wrap:wrap}.scenarios button[aria-selected=true]{border-color:var(--primary);background:var(--accent);color:var(--primary)}.steps{display:flex;gap:8px;flex-wrap:wrap;margin-top:13px}.steps button{font-size:13px}.summary{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:15px}.summary small{display:block}.summary strong{display:block;font-size:14px;margin-top:4px}.save-row{margin:20px 0}.demo-controls{display:flex;align-items:center;gap:10px;margin-top:17px}.demo-controls select{width:auto;max-width:260px;font-size:13px}.demo-controls label{font-size:12px;color:var(--muted-foreground)}dialog{border:1px solid var(--border);border-radius:14px;padding:0;width:670px;max-width:calc(100vw - 30px);max-height:90vh;color:var(--foreground);box-shadow:0 24px 100px #17241e33}dialog::backdrop{background:#17211c60}.dialog-head{padding:23px 25px;border-bottom:1px solid var(--border)}.dialog-body{padding:22px 25px;overflow:auto}.dialog-footer{display:flex;justify-content:flex-end;gap:9px;padding:17px 25px;border-top:1px solid var(--border);background:#fafaf7}dialog .fields{margin-top:0}.close{padding:4px 10px;font-size:20px;font-weight:400}.discovery-item{display:flex;align-items:flex-start;gap:12px;padding:15px 0;border-bottom:1px solid var(--border);font-weight:400}.discovery-item input{margin-top:5px}.discovery-item span{flex:1}.discovery-item small{display:block;margin-top:4px}.empty{padding:28px;text-align:center;color:var(--muted-foreground)}.gap{margin-top:16px}.hidden{display:none!important}.source{font-size:12px;color:var(--muted-foreground);margin-top:22px}a{color:var(--primary)}@media(max-width:900px){.layout{grid-template-columns:1fr;padding:18px}.sidebar{display:none}.model{align-items:flex-start;flex-direction:column}.top{padding:12px 18px}.top small{display:none}}@media(max-width:560px){.fields,.summary{grid-template-columns:1fr}.full{grid-column:auto}.row{flex-wrap:wrap}.pad,.section-head{padding:18px}.models{padding:0 18px}}
+</style>
+<style>
+.test-toolbar{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:13px 23px;background:var(--muted);border-bottom:1px solid var(--border);flex-wrap:wrap}.test-toolbar label{font-size:13px;font-weight:400}.test-select{flex:0 0 auto}.model-content{flex:1;min-width:0}.test-result{margin-top:9px;font-size:12px;color:var(--muted-foreground)}.test-result[data-status="passed"]{color:var(--primary)}.test-result[data-status="failed"]{color:var(--destructive)}.test-result[data-status="testing"],.test-result[data-status="queued"]{color:var(--warning)}#test-summary{padding:12px 23px;border-top:1px solid var(--border);font-size:13px}.test-toolbar .actions button{font-size:12px}#test-progress{font-size:12px;color:var(--muted-foreground)}
+</style>
+</head>
+<body>
+<header class="top"><div><span class="brand">Open Science</span><span class="tag">INTERACTIVE PROTOTYPE</span></div><small>Simulated data · No API calls · Changes stay in this page</small></header>
+<div class="layout">
+<aside class="sidebar" aria-label="Settings context"><small>SETTINGS PREVIEW</small><div>General</div><div>Agent framework</div><div class="selected">Providers</div><div>Connectors</div><div>Skills</div><small>Navigation is illustrative.<br>The Provider editor is interactive.</small></aside>
+<main>
+<div class="intro"><small>Settings / Providers / Custom provider</small><h1>One provider. Multiple models.</h1><p class="muted">Explore how shared connection settings and independent model capabilities work together, including discovery, defaults, and models already used by a session.</p></div>
+<section class="card pad" aria-label="Guided walkthroughs">
+<div class="row"><h3>Try a scenario</h3><button id="reset">Reset demo</button></div>
+<div class="scenarios" role="tablist" aria-label="Scenarios">
+<button role="tab" data-scenario="existing" aria-selected="true">Existing provider</button>
+<button role="tab" data-scenario="discovery" aria-selected="false">Discover models</button>
+<button role="tab" data-scenario="failure" aria-selected="false">Discovery unavailable</button>
+<button role="tab" data-scenario="references" aria-selected="false">Session protection</button>
+<button role="tab" data-scenario="testing" aria-selected="false">Test individual models</button>
+</div>
+<p id="scenario-description" class="muted"></p><div id="steps" class="steps"></div>
+</section>
+<div id="status" class="notice" role="status" aria-live="polite"></div>
+<section class="card pad" aria-label="Provider connection">
+<div class="row"><div><h2 id="provider-heading">Research gateway</h2><p class="muted">One connection and credential, shared by every model below.</p></div><span class="tag">CUSTOM PROVIDER</span></div>
+<div class="fields">
+<div class="field"><label for="provider-name">Provider name</label><input id="provider-name" value="Research gateway"></div>
+<div class="field"><label for="protocol">API protocol</label><select id="protocol"><option>OpenAI Chat Completions</option><option>OpenAI Responses</option><option>Anthropic Messages</option></select><small>All models use the selected protocol.</small></div>
+<div class="field"><label for="base-url">Base URL</label><input id="base-url" value="https://gateway.example.invalid/v1"><small>Example address. This prototype never sends requests.</small></div>
+<div class="field"><label for="api-key">API key</label><input id="api-key" type="password" value="prototype-placeholder" readonly><small>Shared credential placeholder. No real key is stored.</small></div>
+</div>
+</section>
+<section class="card" aria-label="Models">
+<div class="section-head"><div class="row"><div><h2>Models <span id="model-count" class="tag subtle"></span></h2><p class="muted">Add model IDs manually or choose from the service catalog.</p></div><div class="actions"><button id="discover">Fetch models</button><button id="add" class="primary">+ Add model</button></div></div>
+<div class="demo-controls"><label for="discovery-mode">Simulated discovery response</label><select id="discovery-mode"><option value="success">Success: three model IDs</option><option value="unsupported">Discovery not supported</option><option value="error">Connection failed</option></select></div></div>
+<div class="test-toolbar"><label><input type="checkbox" id="select-all"> Select all <span id="selected-count"></span></label><div class="actions"><span id="test-progress"></span><button id="test-selected" disabled>Test selected</button><button id="test-all">Test all</button><button id="stop-tests" class="hidden">Stop testing</button></div></div>
+<div id="models" class="models"></div><div id="test-summary" role="status" aria-live="polite">No models tested yet. Each model gets its own result.</div><div class="foot"><small>Default applies when no model is explicitly selected. Existing sessions keep their model selection.</small><div class="demo-controls"><label for="test-mode">Simulated test response</label><select id="test-mode"><option value="mixed">Mixed model outcomes</option><option value="success">Every model responds</option></select></div><small>Tests check a short text response using each model's configuration. They do not verify vision, maximum context, or every reasoning level.</small></div>
+</section>
+<section class="card pad" aria-label="Current configuration"><h3>Current configuration</h3><div class="summary"><div><small>Default model</small><strong id="state-default"></strong></div><div><small>Saved in this demo</small><strong id="state-saved"></strong></div><div><small>Existing session: Analysis A</small><strong id="state-session"></strong></div></div><p class="muted gap" style="font-size:13px">Saved models would be available to the Main, Reviewer, and Subagent model selectors. Each role still keeps its own selection.</p></section>
+<div class="row save-row"><small id="dirty-state"></small><button id="save-provider" class="primary">Save provider</button></div>
+<p class="source">Design proposal for Open Science v0.26.0 · Not a production feature. Reloading resets this demo. Model IDs and capabilities are fictional examples.</p>
+</main></div>
+<dialog id="editor" aria-labelledby="editor-title"><form id="model-form">
+<div class="dialog-head row"><div><h2 id="editor-title">Add model</h2><p class="muted">Capabilities belong to this model only.</p></div><button type="button" class="close" data-close="editor" aria-label="Close model editor">×</button></div>
+<div class="dialog-body"><div id="editor-error" class="notice error hidden" role="alert"></div><div class="fields gap">
+<div class="field full"><label for="model-id">Model ID</label><input id="model-id" required placeholder="e.g. analysis-pro"><small id="model-id-help">Use the exact model ID accepted by your service.</small></div>
+<div class="field"><label for="context">Context window (tokens)</label><input id="context" type="number" min="1" step="1" placeholder="Not configured"></div>
+<div class="field"><label for="vision">Image input</label><select id="vision"><option value="unknown">Not configured</option><option value="yes">Supported</option><option value="no">Not supported</option></select></div>
+<div class="field"><label for="max-input">Maximum input tokens</label><input id="max-input" type="number" min="1" step="1" placeholder="Not configured"></div>
+<div class="field"><label for="max-output">Maximum output tokens</label><input id="max-output" type="number" min="1" step="1" placeholder="Not configured"></div>
+<div class="field"><label for="effort">Reasoning effort support</label><select id="effort"><option value="unknown">Not configured</option><option value="none">Not supported</option><option value="standard">Low / Medium / High</option><option value="extended">Low / Medium / High / XHigh / Max</option></select><small>Declare supported levels; each run selects its effort.</small></div>
+<div class="field"><label for="format">Reasoning request format</label><select id="format"><option value="unknown">Not configured</option><option value="reasoning_effort">GPT / OpenAI — reasoning_effort</option><option value="deepseek">DeepSeek — thinking + reasoning_effort</option><option value="minimax">MiniMax — adaptive thinking</option><option value="xiaomimimo">MiMo — thinking on / off</option><option value="openrouter">OpenRouter — reasoning object</option></select><small id="format-help">Chat Completions request format; follow the service documentation.</small></div>
+</div><div class="notice gap">Model discovery does not verify capabilities. Confirm these values from the service documentation.</div></div>
+<div class="dialog-footer"><button type="button" data-close="editor">Cancel</button><button type="submit" class="primary">Save model</button></div>
+</form></dialog>
+<dialog id="discovery" aria-labelledby="discovery-title"><div class="dialog-head row"><div><h2 id="discovery-title">Discover models</h2><p class="muted">Research gateway · Simulated catalog response</p></div><button class="close" data-close="discovery" aria-label="Close model discovery">×</button></div><div class="dialog-body"><div id="discovery-content"></div></div><div class="dialog-footer"><button data-close="discovery">Cancel</button><button id="import" class="primary">Import selected</button></div></dialog>
+<dialog id="remove" aria-labelledby="remove-title"><div class="dialog-head"><h2 id="remove-title">Remove model</h2></div><div class="dialog-body"><p id="remove-description"></p><div id="remove-warning" class="notice warning gap"></div><div class="field gap hidden" id="replacement-field"><label for="replacement">Replacement default model</label><select id="replacement"></select></div></div><div class="dialog-footer"><button data-close="remove">Cancel</button><button id="confirm-remove" class="danger">Remove model</button></div></dialog>
+<script>
+// Throwaway state exploration; no backend, storage, credentials, or network access.
+const Demo = (() => {
+  const empty = id => ({id,context:null,maxInput:null,maxOutput:null,vision:'unknown',effort:'unknown',format:'unknown'});
+  const seed = () => ({name:'Research gateway',url:'https://gateway.example.invalid/v1',protocol:'OpenAI Chat Completions',models:[{...empty('analysis-pro'),context:200000,maxInput:180000,maxOutput:16000,vision:'yes',effort:'standard',format:'reasoning_effort'}],defaultId:'analysis-pro',session:'analysis-pro',savedCount:1,dirty:false});
+  function change(s, action) {
+    const n=structuredClone(s);
+    if(action.type==='upsert') {
+      if(!action.original && n.models.some(m=>m.id===action.model.id)) return {error:'This model ID is already configured. Edit the existing model instead.'};
+      if(action.original) n.models[n.models.findIndex(m=>m.id===action.original)]=action.model;
+      else n.models.push(action.model);
+      if(!n.defaultId)n.defaultId=action.model.id;
+    } else if(action.type==='import') {
+      action.ids.forEach(id=>{if(!n.models.some(m=>m.id===id))n.models.push(empty(id));});
+      if(!n.defaultId)n.defaultId=n.models[0]?.id;
+    } else if(action.type==='default') n.defaultId=action.id;
+    else if(action.type==='remove') {
+      if(n.session===action.id)return {error:'Analysis A still uses this model. Reconfigure that session before removing it.'};
+      if(n.models.length===1)return {error:'Keep at least one model in this provider.'};
+      if(n.defaultId===action.id){if(!n.models.some(m=>m.id===action.replacement && m.id!==action.id))return {error:'Choose a replacement default first.'};n.defaultId=action.replacement;}
+      n.models=n.models.filter(m=>m.id!==action.id);
+    } else if(action.type==='provider')Object.assign(n,action.fields);
+    else if(action.type==='save') {if(!n.models.length)return {error:'Add at least one model before saving.'};n.savedCount=n.models.length;n.dirty=false;return {state:n};}
+    n.dirty=true;return {state:n};
+  }
+  return {seed,empty,change};
+})();
+const $=id=>document.getElementById(id), escapeHTML=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let state=Demo.seed(),editing=null,removing=null,discoveryTimer=null,scenario='existing';
+let selected=new Set(),testResults={},testRun=0,testing=false,activeTestIds=[];
+const tokenText=n=>n?Number(n).toLocaleString('en-US'):'Not configured';
+const visionText={unknown:'Not configured',yes:'Supported',no:'Not supported'};
+const effortText={unknown:'Not configured',none:'Not supported',standard:'Low / Medium / High',extended:'Low / Medium / High / XHigh / Max'};
+function status(message,tone=''){ $('status').className='notice '+tone;$('status').textContent=message; }
+function render(){
+  $('provider-heading').textContent=state.name||'Custom provider';
+  $('model-count').textContent=state.models.length;
+  $('models').innerHTML=state.models.map(m=>`<article class="model" data-id="${escapeHTML(m.id)}"><div><span class="model-id">${escapeHTML(m.id)}</span>${m.id===state.defaultId?'<span class="tag">DEFAULT</span>':''}${m.id===state.session?' <span class="tag subtle">Used by Analysis A</span>':''}<div class="model-meta"><span>Context: ${tokenText(m.context)}</span><span>Images: ${visionText[m.vision]}</span><span>Effort: ${effortText[m.effort]}</span></div><div class="model-meta"><span>Input cap: ${tokenText(m.maxInput)}</span><span>Output cap: ${tokenText(m.maxOutput)}</span><span>Request format: ${escapeHTML(m.format==='unknown'?'Not configured':m.format)}</span></div></div><div class="actions">${m.id!==state.defaultId?'<button data-action="default">Set default</button>':''}<button data-action="edit">Edit</button><button data-action="remove" class="danger">Remove</button></div></article>`).join('')||'<div class="empty">Add your first model.</div>';
+  $('state-default').textContent=state.defaultId||'None';$('state-session').textContent=state.session;
+  $('state-saved').textContent=`${state.savedCount} model${state.savedCount===1?'':'s'}${state.dirty?' · Pending changes':''}`;
+  $('dirty-state').textContent=state.dirty?'Unsaved changes in this prototype.':'No pending changes. Nothing is written to Open Science.';
+  renderTests();
+}
+function dispatch(a,message){const result=Demo.change(state,a);if(result.error){status(result.error,'warning');return false;}state=result.state;if(a.type==='provider')testResults={};if(a.type==='remove'){delete testResults[a.id];selected.delete(a.id);}render();if(message)status(message);return true;}
+function renderTests(){
+  selected=new Set([...selected].filter(id=>state.models.some(m=>m.id===id)));
+  document.querySelectorAll('.model').forEach(row=>{
+    const id=row.dataset.id,content=row.firstElementChild;content.classList.add('model-content');
+    const box=document.createElement('input');box.type='checkbox';box.className='test-select';box.checked=selected.has(id);box.disabled=testing;box.setAttribute('aria-label',`Select ${id}`);box.onchange=()=>{box.checked?selected.add(id):selected.delete(id);render();};row.prepend(box);
+    const test=document.createElement('button');test.textContent='Test model';test.dataset.action='test';row.querySelector('.actions').prepend(test);
+    const result=testResults[id],line=document.createElement('div');line.className='test-result';line.dataset.status=result?.status||'untested';line.textContent=result?`${result.label}${result.detail?' · '+result.detail:''}`:'Not tested';content.append(line);
+    row.querySelectorAll('button').forEach(b=>b.disabled=testing);
+  });
+  $('select-all').checked=!!state.models.length&&selected.size===state.models.length;$('select-all').indeterminate=selected.size>0&&selected.size<state.models.length;$('select-all').disabled=testing;
+  $('selected-count').textContent=`(${selected.size} selected)`;$('test-selected').disabled=testing||!selected.size;$('test-selected').textContent=selected.size?`Test selected (${selected.size})`:'Test selected';$('test-all').disabled=testing||!state.models.length;
+  $('stop-tests').classList.toggle('hidden',!testing);$('test-mode').disabled=testing;
+  ['add','discover','save-provider','provider-name','base-url','protocol'].forEach(id=>$(id).disabled=testing);
+  $('steps').querySelectorAll('button').forEach(b=>b.disabled=testing);
+  const totals=Object.values(testResults).reduce((a,r)=>(a[r.status]=(a[r.status]||0)+1,a),{});
+  $('test-summary').textContent=Object.keys(testResults).length?`${totals.passed||0} passed · ${totals.failed||0} failed · ${totals.testing||0} testing · ${totals.queued||0} queued · ${totals.cancelled||0} cancelled. Results are simulated; they do not validate the real service.`:'No models tested yet. Each model gets its own result.';
+  const done=activeTestIds.filter(id=>['passed','failed'].includes(testResults[id]?.status)).length;
+  $('test-progress').textContent=testing?`${done} / ${activeTestIds.length} finished`:'';
+}
+async function testModels(ids){
+  if(testing||!ids.length)return;
+  const epoch=++testRun,mode=$('test-mode').value;testing=true;activeTestIds=[...ids];
+  ids.forEach(id=>testResults[id]={status:'queued',label:'Queued'});render();status(`Testing ${ids.length} model${ids.length===1?'':'s'} individually. Results will appear beside each model.`);
+  for(const id of ids){
+    if(epoch!==testRun)return;
+    testResults[id]={status:'testing',label:'Testing…'};render();
+    await new Promise(resolve=>setTimeout(resolve,650));if(epoch!==testRun)return;
+    testResults[id]=mode==='mixed'&&id==='analysis-fast'?{status:'failed',label:'Failed',detail:'Simulated: model access denied (403). Check access to this model.'}:mode==='mixed'&&id==='vision-lab'?{status:'failed',label:'Failed',detail:'Simulated: model request timed out. Retry this model.'}:{status:'passed',label:'Passed',detail:'Simulated: a short text response was received.'};render();
+  }
+  testing=false;render();const failed=ids.filter(id=>testResults[id].status==='failed').length;
+  status(`Model tests finished: ${ids.length-failed} passed, ${failed} failed. Each result belongs to its model; defaults and sessions are unchanged.`,failed?'warning':'');
+}
+function stopTests(){
+  ++testRun;testing=false;Object.values(testResults).forEach(r=>{if(['testing','queued'].includes(r.status)){r.status='cancelled';r.label='Cancelled';delete r.detail;}});render();status('Testing stopped. Completed results are kept; unfinished models are marked cancelled.');
+}
+function openEditor(id=null){
+  editing=id;const m=id?state.models.find(x=>x.id===id):Demo.empty('');
+  $('editor-title').textContent=id?'Edit model':'Add model';$('model-id').value=m.id;$('model-id').readOnly=!!id;
+  $('model-id-help').textContent=id?'Model IDs are kept stable. Add a new entry to use a different ID.':'Use the exact model ID accepted by your service.';
+  ['context','vision','effort','format'].forEach(k=>$(k).value=m[k]??'');$('max-input').value=m.maxInput??'';$('max-output').value=m.maxOutput??'';
+  $('format').disabled=state.protocol!=='OpenAI Chat Completions';$('format-help').textContent=$('format').disabled?'Request format follows the selected provider protocol.':'Chat Completions request format; follow the service documentation.';
+  $('editor-error').classList.add('hidden');$('editor').showModal();
+}
+function openDiscovery(){
+  clearTimeout(discoveryTimer);$('discovery-content').innerHTML='<div class="notice">Fetching the simulated model catalog…</div>';$('import').disabled=true;$('import').textContent='Import selected';$('discovery').showModal();
+  const mode=$('discovery-mode').value;
+  discoveryTimer=setTimeout(()=>{
+    if(!$('discovery').open)return;
+    if(mode!=='success'){
+      $('discovery-content').innerHTML=`<div class="notice warning">${mode==='unsupported'?'This service does not expose a supported model-list endpoint.':'Could not fetch models. Check the service URL, credential, or connection.'}</div><p class="muted gap">Your existing models and their settings have not changed. You can still add model IDs manually.</p><button id="manual-after-failure" class="gap">Add a model manually</button>`;
+      $('manual-after-failure').onclick=()=>{$('discovery').close();openEditor();};return;
+    }
+    $('discovery-content').innerHTML='<div class="notice">3 model IDs returned. Existing entries are preserved; new entries need capability configuration.</div>'+['analysis-pro','analysis-fast','vision-lab'].map(id=>{const exists=state.models.some(m=>m.id===id);return `<label class="discovery-item"><input type="checkbox" value="${id}" ${exists?'disabled':''}><span><code>${id}</code><small>${exists?'Already added · Existing capability settings will be kept.':'Capabilities not supplied by the service.'}</small></span>${exists?'<span class="tag subtle" style="flex:0 0 auto">ALREADY ADDED</span>':''}</label>`;}).join('');
+    $('discovery-content').querySelectorAll('input').forEach(i=>i.onchange=updateImport);
+  },450);
+}
+function updateImport(){const count=$('discovery-content').querySelectorAll('input:checked').length;$('import').disabled=!count;$('import').textContent=count?`Import ${count} model${count===1?'':'s'}`:'Import selected';}
+function openRemove(id){
+  removing=id;const m=state.models.find(m=>m.id===id),used=state.session===id,last=state.models.length===1,isDefault=id===state.defaultId;
+  $('remove-description').textContent=`Remove ${m.id} from ${state.name}?`;
+  $('remove-warning').textContent=used?'Analysis A references this model. Removal is blocked until that session is explicitly reconfigured. Changing the provider default does not change Analysis A.':last?'At least one model must remain. Add another model before removing this entry.':isDefault?'Choose a replacement default. Existing sessions will keep their own model selections.':'This removes the model entry only. The shared provider connection and credential stay in place.';
+  $('replacement-field').classList.toggle('hidden',!isDefault||used||last);
+  $('replacement').innerHTML='<option value="">Select a replacement</option>'+state.models.filter(m=>m.id!==id).map(m=>`<option value="${escapeHTML(m.id)}">${escapeHTML(m.id)}</option>`).join('');
+  $('confirm-remove').disabled=used||last||isDefault;$('remove').showModal();
+}
+const descriptions={existing:'Start with an existing single-model provider. Add a second model, give it its own capabilities, and save both under the same connection.',discovery:'Import selected IDs from a simulated catalog. The existing model is recognized, and its configured capabilities are preserved.',failure:'Explore a service without model discovery. The saved catalog stays usable, and manual entry remains available.',references:'Changing the default must not redirect an existing session. Try removing its model, then remove an unused default with a replacement.',testing:'A shared credential can work for one model and fail for another. Test one, selected, or all models. Switch the simulated response to retry failures successfully.'};
+function reset(which='existing'){
+  clearTimeout(discoveryTimer);++testRun;testing=false;selected=new Set();testResults={};activeTestIds=[];document.querySelectorAll('dialog[open]').forEach(d=>d.close());state=Demo.seed();scenario=which;$('test-mode').value='mixed';
+  $('provider-name').value=state.name;$('base-url').value=state.url;$('protocol').value=state.protocol;$('discovery-mode').value=which==='failure'?'unsupported':'success';
+  if(which==='references'){state.models.push({...Demo.empty('analysis-fast'),context:128000,vision:'no',effort:'none'});state.savedCount=2;}
+  if(which==='testing'){state.models.push({...Demo.empty('analysis-fast'),context:128000,vision:'no',effort:'none'},{...Demo.empty('vision-lab'),context:128000,vision:'yes',effort:'standard',format:'reasoning_effort'});state.savedCount=3;}
+  document.querySelectorAll('[data-scenario]').forEach(b=>b.setAttribute('aria-selected',String(b.dataset.scenario===which)));
+  $('scenario-description').textContent=descriptions[which];
+  const steps={existing:[['1. Add a model',()=>openEditor()],['2. Save provider',saveProvider]],discovery:[['1. Fetch model catalog',openDiscovery],['2. Inspect imported capabilities',()=>{const m=state.models.find(m=>m.id!=='analysis-pro');m?openEditor(m.id):status('First fetch the catalog and import a new model.','warning');}]],failure:[['1. Try discovery',openDiscovery],['2. Add manually',()=>openEditor()]],references:[['1. Change the default',()=>dispatch({type:'default',id:'analysis-fast'},'Default changed to analysis-fast. Analysis A still uses analysis-pro.')],['2. Remove the session’s model',()=>openRemove('analysis-pro')],['3. Remove the unused default',()=>openRemove('analysis-fast')]]};
+  steps.testing=[['1. Test all three models',()=>testModels(state.models.map(m=>m.id))],['2. Select the failed models',()=>{selected=new Set(state.models.filter(m=>testResults[m.id]?.status==='failed').map(m=>m.id));render();status('Failed models selected. Choose “Every model responds” below to simulate a successful retry.');}],['3. Test selected models',()=>testModels([...selected])]];
+  $('steps').replaceChildren();steps[which].forEach(([text,fn])=>{const b=document.createElement('button');b.textContent=text;b.onclick=fn;$('steps').append(b);});
+  render();status('Demo reset. The existing provider and its session keep their original model.');
+}
+function saveProvider(){if(!$('provider-name').value.trim()||!$('base-url').value.trim()){status('Enter a provider name and Base URL before saving.','warning');return;}dispatch({type:'save'},'Provider saved in this demo only. Existing session and role selections are unchanged.');}
+$('model-form').onsubmit=e=>{
+  e.preventDefault();const id=$('model-id').value.trim();if(!id){$('model-id').focus();return;}
+  const model={id,context:$('context').value?Number($('context').value):null,maxInput:$('max-input').value?Number($('max-input').value):null,maxOutput:$('max-output').value?Number($('max-output').value):null,vision:$('vision').value,effort:$('effort').value,format:$('format').value};
+  const result=Demo.change(state,{type:'upsert',original:editing,model});if(result.error){$('editor-error').textContent=result.error;$('editor-error').classList.remove('hidden');return;}
+  state=result.state;delete testResults[id];render();$('editor').close();status(`${id} ${editing?'updated':'added'}. Other models and the shared credential are unchanged. Test this model to check its new configuration.`);
+};
+$('models').onclick=e=>{const b=e.target.closest('button[data-action]');if(!b||testing)return;const id=b.closest('[data-id]').dataset.id;if(b.dataset.action==='edit')openEditor(id);else if(b.dataset.action==='test')testModels([id]);else if(b.dataset.action==='remove')openRemove(id);else dispatch({type:'default',id},`Default changed to ${id}. Analysis A still uses ${state.session}.`);};
+$('import').onclick=()=>{const ids=[...$('discovery-content').querySelectorAll('input:checked')].map(i=>i.value);if(!ids.length)return;dispatch({type:'import',ids},`${ids.length} new model${ids.length===1?'':'s'} imported. Existing settings preserved. Configure capabilities before relying on them.`);$('discovery').close();};
+$('replacement').onchange=()=>{$('confirm-remove').disabled=!$('replacement').value;};
+$('confirm-remove').onclick=()=>{if(dispatch({type:'remove',id:removing,replacement:$('replacement').value},`${removing} removed. Analysis A still uses ${state.session}.`))$('remove').close();};
+document.querySelectorAll('[data-close]').forEach(b=>b.onclick=()=>$(b.dataset.close).close());
+document.querySelectorAll('[data-scenario]').forEach(b=>b.onclick=()=>reset(b.dataset.scenario));
+$('provider-name').oninput=()=>dispatch({type:'provider',fields:{name:$('provider-name').value}});
+$('base-url').oninput=()=>dispatch({type:'provider',fields:{url:$('base-url').value}});
+$('protocol').onchange=()=>dispatch({type:'provider',fields:{protocol:$('protocol').value}},'Protocol changed for the whole provider. Confirm that every configured model supports it.');
+$('select-all').onchange=()=>{selected=$('select-all').checked?new Set(state.models.map(m=>m.id)):new Set();render();};$('test-selected').onclick=()=>testModels([...selected]);$('test-all').onclick=()=>testModels(state.models.map(m=>m.id));$('stop-tests').onclick=stopTests;
+$('add').onclick=()=>openEditor();$('discover').onclick=openDiscovery;$('reset').onclick=()=>reset(scenario);$('save-provider').onclick=saveProvider;reset();
+</script>
+</body>
+</html>

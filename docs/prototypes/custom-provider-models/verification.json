@@ -1,0 +1,30 @@
+{
+  "result": "PASS",
+  "checks": [
+    "manual addition and in-memory save",
+    "duplicate model ID rejected",
+    "selective discovery import",
+    "repeat import deduplicated",
+    "existing capabilities preserved",
+    "new capabilities remain unconfigured",
+    "independent capability editing",
+    "unsupported discovery preserves catalog and offers manual entry",
+    "connection failure preserves catalog",
+    "default switch preserves session selection",
+    "referenced model removal blocked",
+    "default removal requires replacement",
+    "last model protected",
+    "single-model test leaves other models untested",
+    "all-model test retains separate mixed results",
+    "testing preserves default and session selections",
+    "select failed models and retry only the selection",
+    "stop retains completed results and cancels remaining models",
+    "model edit clears only its own result",
+    "connection edit clears all model results",
+    "reset prevents late test results from reappearing",
+    "reload clears prototype changes",
+    "390px viewport has no horizontal overflow",
+    "no browser script errors"
+  ],
+  "screenshots": 6
+}
