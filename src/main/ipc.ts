@@ -1523,10 +1523,10 @@ const createApplicationModules = async (
   })
   const projectHandlers = createProjectHandlers(projectRepository, projectDeletionCoordinator, {
     updateArchive: (request) => archiveCoordinator.updateProjectArchive(request),
-    onAgentContextChanged: () => {
+    onAgentContextChanged: (projectId) => {
       // Runtime generations capture Project Agent Context during Session setup. Retiring them marks
       // idle Sessions for resume immediately; an in-flight turn drains before its next prompt.
-      void runtimeRef.current?.requestProjectAgentContextReload()
+      void runtimeRef.current?.requestProjectAgentContextReload(projectId)
     }
   })
   const projectFilesHandlers = createProjectFilesHandlers(
@@ -4620,8 +4620,14 @@ const createApplicationModules = async (
       get: (itemId) => literatureCatalog.get(itemId),
       importPdf: (request) => literaturePdfImporter.import(request),
       importRecords: async (request) => {
-        const parsed = await literatureCitationFormatter.parseReferences(request.content)
-        const entries = await literatureCatalog.inspectImportItems(parsed.items, parsed.errors)
+        const { warnings, ...parsed } = await literatureCitationFormatter.parseReferences(
+          request.content
+        )
+        const entries = await literatureCatalog.inspectImportItems(
+          parsed.items,
+          parsed.errors,
+          warnings
+        )
         if (request.mode === 'preview') return { ...parsed, entries }
         if (parsed.items.length === 0) throw new Error('No valid references were found.')
         return {
