@@ -765,10 +765,15 @@ class LiteratureCatalog {
     private readonly getClient: LiteratureCatalogClientProvider,
     private readonly onTagAssignmentsChanged?: () => Promise<void>,
     private readonly content?: Pick<ContentRepository, 'verify' | 'sweep'>,
-    private readonly withAttachmentRemoval?: (
-      attachmentId: string,
-      remove: () => Promise<LiteratureCatalogReceipt>
-    ) => Promise<LiteratureCatalogReceipt>
+    private readonly withAttachmentRemoval: (
+      remove: (
+        assertUnreferenced: (attachmentIds: readonly string[]) => void
+      ) => Promise<LiteratureCatalogReceipt>
+    ) => Promise<LiteratureCatalogReceipt> = async (remove) =>
+      remove((attachmentIds) => {
+        // Metadata-only clients may delete metadata, but cannot bypass attachment authority.
+        if (attachmentIds.length) throw new Error('Literature attachment removal is unavailable.')
+      })
   ) {}
 
   private async publishTagAssignmentsChanged(): Promise<void> {
@@ -923,6 +928,13 @@ class LiteratureCatalog {
         ? Prisma.sql`i."deletedAt" IS NOT NULL`
         : Prisma.sql`i."deletedAt" IS NULL`
     ]
+    if (request.itemIds !== undefined) {
+      predicates.push(
+        request.itemIds.length
+          ? Prisma.sql`selected.id IN (${Prisma.join(request.itemIds)})`
+          : Prisma.sql`0 = 1`
+      )
+    }
     const contains = (column: Prisma.Sql, text: string): Prisma.Sql =>
       Prisma.sql`instr(${column}, ${normalizeSearchText(text)}) > 0`
     const creatorMatches = (text: string): Prisma.Sql => Prisma.sql`EXISTS (
@@ -995,14 +1007,26 @@ class LiteratureCatalog {
             : request.sortBy === 'created'
               ? Prisma.sql`i."createdAt" ${direction}, i.id ASC`
               : Prisma.sql`i."updatedAt" ${direction}, i.id ASC`
+    // Selected IDs follow getMany's alias contract: filter survivor metadata, return requested IDs.
+    const from =
+      request.itemIds === undefined
+        ? Prisma.sql`"LiteratureItem" i`
+        : Prisma.sql`"LiteratureItem" selected JOIN "LiteratureItem" i
+          ON i.id = COALESCE(selected."mergedIntoItemId", selected.id)`
+    const requestedId = request.itemIds === undefined ? Prisma.sql`i.id` : Prisma.sql`selected.id`
     const ids = await client.$queryRaw<
-      { id: string }[]
-    >(Prisma.sql`SELECT i.id FROM "LiteratureItem" i WHERE ${where} ORDER BY ${orderBy}
+      { id: string; requestedId: string }[]
+    >(Prisma.sql`SELECT i.id, ${requestedId} AS "requestedId" FROM ${from} WHERE ${where} ORDER BY ${orderBy}, ${requestedId} ASC
       ${request.allItemIds ? Prisma.empty : Prisma.sql`LIMIT ${limit} OFFSET ${offset}`}`)
     const itemIds = ids.map(({ id }) => id)
-    if (request.allItemIds) return { entries: [], itemIds, totalCount: itemIds.length }
+    if (request.allItemIds)
+      return {
+        entries: [],
+        itemIds: ids.map(({ requestedId }) => requestedId),
+        totalCount: ids.length
+      }
     const [count] = await client.$queryRaw<{ total: bigint }[]>(
-      Prisma.sql`SELECT COUNT(*) AS total FROM "LiteratureItem" i WHERE ${where}`
+      Prisma.sql`SELECT COUNT(*) AS total FROM ${from} WHERE ${where}`
     )
     const totalCount = Number(count!.total)
     const rows = itemIds.length
@@ -1013,7 +1037,10 @@ class LiteratureCatalog {
       : []
     const byId = new Map(rows.map((row) => [row.id, row]))
     return {
-      entries: itemIds.map((id) => toItemView(byId.get(id)!)),
+      entries: ids.map(({ id, requestedId }) => ({
+        ...toItemView(byId.get(id)!),
+        id: requestedId
+      })),
       totalCount,
       nextOffset: offset + limit < totalCount ? offset + limit : undefined
     }
@@ -1227,15 +1254,14 @@ class LiteratureCatalog {
   private deleteAttachment(
     command: Extract<LiteratureCatalogCommand, { kind: 'delete-attachment' }>
   ): Promise<LiteratureCatalogReceipt> {
-    if (!this.withAttachmentRemoval)
-      throw new Error('Literature attachment removal is unavailable.')
-    return this.withAttachmentRemoval(command.attachmentId, () =>
-      this.deleteUnreferencedAttachment(command)
+    return this.withAttachmentRemoval((assertUnreferenced) =>
+      this.deleteUnreferencedAttachment(command, assertUnreferenced)
     )
   }
 
   private async deleteUnreferencedAttachment(
-    command: Extract<LiteratureCatalogCommand, { kind: 'delete-attachment' }>
+    command: Extract<LiteratureCatalogCommand, { kind: 'delete-attachment' }>,
+    assertUnreferenced: (attachmentIds: readonly string[]) => void
   ): Promise<LiteratureCatalogReceipt> {
     if (!this.content) throw new Error('Literature content operations are unavailable.')
     const client = await this.getClient()
@@ -1249,6 +1275,7 @@ class LiteratureCatalog {
         select: { versions: { select: { contentBlobId: true } } }
       })
       if (!attachment) throw new Error('Literature Attachment is unavailable.')
+      assertUnreferenced([command.attachmentId])
       await transaction.literatureAttachment.delete({ where: { id: command.attachmentId } })
       return attachment.versions.map(({ contentBlobId }) => contentBlobId)
     })
@@ -1901,49 +1928,56 @@ class LiteratureCatalog {
     const itemIds = [...new Set(command.itemIds)]
     const client = await this.getClient()
     let tagsChanged = false
-    const receipt = await client.$transaction<LiteratureCatalogReceipt>(async (transaction) => {
-      const requestedItems = await transaction.literatureItem.findMany({
-        where: { id: { in: itemIds } },
-        select: { id: true, deletedAt: true }
-      })
-      if (
-        requestedItems.length !== itemIds.length ||
-        requestedItems.some(({ deletedAt }) => deletedAt === null)
-      ) {
-        throw new Error('Only Literature Items in Trash can be permanently deleted.')
-      }
-
-      const mergedItems = await transaction.literatureItem.findMany({
-        where: { mergedIntoItemId: { in: itemIds } },
-        select: { id: true }
-      })
-      const deletionIds = [...new Set([...itemIds, ...mergedItems.map(({ id }) => id)])]
-      const creatorLinks = await transaction.literatureItemCreator.findMany({
-        where: { itemId: { in: deletionIds } },
-        select: { creatorId: true }
-      })
-
-      await transaction.literatureInboxCandidate.deleteMany({
-        where: { acceptedItemId: { in: deletionIds } }
-      })
-      const removedTags = await transaction.tagAssignment.deleteMany({
-        where: { resourceType: 'literature.item', resourceId: { in: deletionIds } }
-      })
-      tagsChanged = removedTags.count > 0
-      await transaction.literatureItem.updateMany({
-        where: { id: { in: deletionIds } },
-        data: { mergedIntoItemId: null }
-      })
-      await transaction.literatureItem.deleteMany({ where: { id: { in: deletionIds } } })
-
-      const creatorIds = [...new Set(creatorLinks.map(({ creatorId }) => creatorId))]
-      if (creatorIds.length > 0) {
-        await transaction.literatureCreator.deleteMany({
-          where: { id: { in: creatorIds }, items: { none: {} } }
+    const receipt = await this.withAttachmentRemoval((assertUnreferenced) =>
+      client.$transaction<LiteratureCatalogReceipt>(async (transaction) => {
+        const requestedItems = await transaction.literatureItem.findMany({
+          where: { id: { in: itemIds } },
+          select: { id: true, deletedAt: true }
         })
-      }
-      return { kind: 'item', id: itemIds[0]!, state: 'deleted-permanently' }
-    })
+        if (
+          requestedItems.length !== itemIds.length ||
+          requestedItems.some(({ deletedAt }) => deletedAt === null)
+        ) {
+          throw new Error('Only Literature Items in Trash can be permanently deleted.')
+        }
+
+        const mergedItems = await transaction.literatureItem.findMany({
+          where: { mergedIntoItemId: { in: itemIds } },
+          select: { id: true }
+        })
+        const deletionIds = [...new Set([...itemIds, ...mergedItems.map(({ id }) => id)])]
+        const attachments = await transaction.literatureAttachment.findMany({
+          where: { itemId: { in: deletionIds } },
+          select: { id: true }
+        })
+        assertUnreferenced(attachments.map(({ id }) => id))
+        const creatorLinks = await transaction.literatureItemCreator.findMany({
+          where: { itemId: { in: deletionIds } },
+          select: { creatorId: true }
+        })
+
+        await transaction.literatureInboxCandidate.deleteMany({
+          where: { acceptedItemId: { in: deletionIds } }
+        })
+        const removedTags = await transaction.tagAssignment.deleteMany({
+          where: { resourceType: 'literature.item', resourceId: { in: deletionIds } }
+        })
+        tagsChanged = removedTags.count > 0
+        await transaction.literatureItem.updateMany({
+          where: { id: { in: deletionIds } },
+          data: { mergedIntoItemId: null }
+        })
+        await transaction.literatureItem.deleteMany({ where: { id: { in: deletionIds } } })
+
+        const creatorIds = [...new Set(creatorLinks.map(({ creatorId }) => creatorId))]
+        if (creatorIds.length > 0) {
+          await transaction.literatureCreator.deleteMany({
+            where: { id: { in: creatorIds }, items: { none: {} } }
+          })
+        }
+        return { kind: 'item', id: itemIds[0]!, state: 'deleted-permanently' }
+      })
+    )
     if (tagsChanged) await this.publishTagAssignmentsChanged()
     return receipt
   }
