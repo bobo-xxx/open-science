@@ -249,10 +249,24 @@ const literatureCandidateInputSchema = z
   })
   .strict()
 
+// A source-reported snapshot for these exact bytes, independent of bibliographic metadata.
+export const literaturePdfProvenanceSchema = z
+  .object({
+    provider: nonEmptyTextSchema,
+    source: nonEmptyTextSchema,
+    sourceUrl: z.string().url(),
+    acquiredAt: z.number().int().nonnegative(),
+    version: z.enum(['published', 'accepted', 'submitted']).optional(),
+    license: nonEmptyTextSchema.optional()
+  })
+  .strict()
+export type LiteraturePdfProvenance = z.infer<typeof literaturePdfProvenanceSchema>
+
 const literatureAttachmentVersionViewSchema = z
   .object({
     id: nonEmptyTextSchema,
     versionNumber: z.number().int().positive(),
+    provenance: literaturePdfProvenanceSchema.optional(),
     filename: nonEmptyTextSchema,
     contentType: nonEmptyTextSchema,
     sizeBytes: z.number().int().nonnegative(),
@@ -347,6 +361,7 @@ const literatureCatalogSearchRequestSchema = z
   .object({
     scope: z.enum(['library', 'inbox', 'collections', 'project-counts', 'duplicates']),
     refreshDuplicates: z.boolean().optional(),
+    allItemIds: z.boolean().optional(),
     query: optionalTextSchema,
     projectId: optionalTextSchema,
     collectionId: optionalTextSchema,
@@ -361,6 +376,9 @@ const literatureCatalogSearchRequestSchema = z
     limit: z.number().int().positive().max(100).optional()
   })
   .strict()
+  .refine((request) => !request.allItemIds || request.scope === 'library', {
+    message: 'Complete item membership is only available for the library.'
+  })
 
 const literatureCatalogSearchPageSchema = z
   .object({
@@ -373,6 +391,7 @@ const literatureCatalogSearchPageSchema = z
         literatureDuplicateGroupSchema
       ])
     ),
+    itemIds: z.array(nonEmptyTextSchema).optional(),
     totalCount: z.number().int().nonnegative().optional(),
     nextOffset: z.number().int().nonnegative().optional()
   })
@@ -841,7 +860,28 @@ const literatureFullTextProgressSchema = z
   .strict()
 export type LiteratureFullTextProgress = z.infer<typeof literatureFullTextProgressSchema>
 
+const literatureFullTextTransferSchema = z
+  .object({
+    id: nonEmptyTextSchema,
+    itemId: nonEmptyTextSchema,
+    candidate: literatureFullTextCandidateSchema,
+    status: z.enum(['running', 'succeeded', 'failed']),
+    progress: literatureFullTextProgressSchema,
+    attachmentId: nonEmptyTextSchema.optional(),
+    versionId: nonEmptyTextSchema.optional(),
+    retryAt: z.number().finite().nonnegative().optional()
+  })
+  .strict()
+export type LiteratureFullTextTransfer = z.infer<typeof literatureFullTextTransferSchema>
+
 const literatureFullTextRequestSchema = z.discriminatedUnion('mode', [
+  z
+    .object({
+      mode: z.literal('transfer'),
+      itemId: nonEmptyTextSchema,
+      acknowledgeId: nonEmptyTextSchema.optional()
+    })
+    .strict(),
   z
     .object({
       mode: z.literal('progress'),
@@ -859,6 +899,13 @@ const literatureFullTextRequestSchema = z.discriminatedUnion('mode', [
     .strict()
 ])
 const literatureFullTextResultSchema = z.discriminatedUnion('mode', [
+  z
+    .object({
+      mode: z.literal('transfer'),
+      transfer: literatureFullTextTransferSchema.optional(),
+      item: literatureItemViewSchema.optional()
+    })
+    .strict(),
   z
     .object({
       mode: z.literal('attach-error'),
@@ -887,7 +934,13 @@ const literatureFullTextResultSchema = z.discriminatedUnion('mode', [
       )
     })
     .strict(),
-  z.object({ mode: z.literal('attach'), item: literatureItemViewSchema }).strict()
+  z
+    .object({
+      mode: z.literal('attach'),
+      item: literatureItemViewSchema,
+      transferId: nonEmptyTextSchema.optional()
+    })
+    .strict()
 ])
 type LiteratureFullTextCandidate = z.infer<typeof literatureFullTextCandidateSchema>
 type LiteratureFullTextRequest = z.infer<typeof literatureFullTextRequestSchema>

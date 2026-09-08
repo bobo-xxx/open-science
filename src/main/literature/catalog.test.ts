@@ -17,6 +17,9 @@ import { migrateApplicationDatabase } from '../database/migration-service'
 import { createProjectDbClient } from '../projects/prisma-client'
 import { LiteratureCatalog, normalizeIdentifier } from './catalog'
 import { LiteratureCitationFormatter } from './citation-formatter'
+import { TagRepository } from '../tags/repository'
+import { TagResourceCatalog } from '../tags/resource-catalog'
+import { TagService } from '../tags/service'
 
 describe('Literature identifier normalization', () => {
   it('removes text joined to the end of a DOI before provider lookup', () => {
@@ -80,6 +83,147 @@ describe('LiteratureCatalog', () => {
     await client.project.create({ data: { id: 'project-1', name: 'Research' } })
     return new LiteratureCatalog(async () => client!)
   }
+
+  it.each(['merge', 'delete', 'batch', 'rollback', 'preview'] as const)(
+    'publishes tag assignments only after committed catalog changes: %s',
+    async (operation) => {
+      await setup()
+      const catalog = new LiteratureCatalog(
+        async () => client!,
+        () => tags.notifyAssignmentsChanged()
+      )
+      const survivor = await catalog.transact({ kind: 'create-item', item: candidate().item })
+      const duplicate = await catalog.transact({
+        kind: 'create-item',
+        item: candidate().item,
+        duplicatePolicy: 'separate'
+      })
+      const publish = vi.fn()
+      const tags = new TagService(
+        new TagRepository(async () => client!),
+        new TagResourceCatalog({
+          listSkills: async () => [],
+          listConnectors: async () => ({ connectors: [], customServers: [] }),
+          listSpecialists: async () => [],
+          listLiteratureItems: async () => client!.literatureItem.findMany({ select: { id: true } })
+        }),
+        { publish }
+      )
+      await tags.snapshot()
+      const before = await tags.setAssignment({
+        tagId: 'tag-favorite',
+        resourceType: 'literature.item',
+        resourceId: duplicate.id,
+        assigned: true
+      })
+      publish.mockClear()
+      const reviewed = (
+        await Promise.all([catalog.get(survivor.id), catalog.get(duplicate.id)])
+      ).map((item) => item!)
+      if (operation === 'delete') {
+        await catalog.transact({
+          kind: 'set-item-lifecycle',
+          itemIds: [duplicate.id],
+          state: 'deleted'
+        })
+        await catalog.transact({ kind: 'delete-items-permanently', itemIds: [duplicate.id] })
+      } else if (operation === 'batch' || operation === 'preview') {
+        await catalog.transact({
+          kind: 'merge-duplicates',
+          mode: operation === 'preview' ? 'preview' : 'commit',
+          groups: [
+            [survivor.id, duplicate.id],
+            ['missing-a', 'missing-b']
+          ],
+          strategy: 'oldest',
+          expectedItems: reviewed.map(({ id, metadataRevision, updatedAt }) => ({
+            id,
+            metadataRevision,
+            updatedAt
+          }))
+        })
+      } else {
+        const merging = catalog.transact({
+          kind: 'merge-items',
+          survivorId: survivor.id,
+          duplicateIds: [duplicate.id],
+          expectedMetadataRevision: operation === 'rollback' ? 999 : reviewed[0].metadataRevision,
+          expectedItems: reviewed.map(({ id, metadataRevision, updatedAt }) => ({
+            id,
+            metadataRevision,
+            updatedAt
+          })),
+          item: reviewed[0].item
+        })
+        if (operation === 'rollback') await expect(merging).rejects.toThrow()
+        else await merging
+      }
+      const assignments = await client!.tagAssignment.findMany({
+        where: { resourceType: 'literature.item' }
+      })
+      const expectedIds =
+        operation === 'delete'
+          ? []
+          : [operation === 'rollback' || operation === 'preview' ? duplicate.id : survivor.id]
+      expect(assignments.map(({ resourceId }) => resourceId)).toEqual(expectedIds)
+      const after = await tags.snapshot()
+      expect(after.assignments.map(({ resourceId }) => resourceId)).toEqual(expectedIds)
+      if (operation === 'rollback' || operation === 'preview') {
+        expect(after.revision).toBe(before.revision)
+        expect(publish).not.toHaveBeenCalled()
+        return
+      }
+      expect.soft(after.revision).toBe(before.revision + 1)
+      expect.soft(publish).toHaveBeenCalledTimes(1)
+      expect.soft(publish).toHaveBeenCalledWith('tags:changed', { revision: after.revision })
+    }
+  )
+
+  it('reads all matching member IDs independently of page limits and later title changes', async () => {
+    const catalog = await setup()
+    const { itemIds } = await catalog.importItems(
+      Array.from({ length: 101 }, (_, index) =>
+        literatureItemInputSchema.parse({
+          itemType: 'book',
+          title: `Paper ${String(index).padStart(3, '0')}`
+        })
+      )
+    )
+    await catalog.transact({
+      kind: 'set-project-items',
+      projectId: 'project-1',
+      itemIds,
+      included: true,
+      source: 'library'
+    })
+    const page = await catalog.search({
+      scope: 'library',
+      projectId: 'project-1',
+      sortBy: 'title',
+      allItemIds: true,
+      limit: 1,
+      offset: 100
+    })
+    expect(page).toEqual({ entries: [], itemIds, totalCount: 101 })
+    const view = (await catalog.get(itemIds[100]!))!
+    await catalog.transact({
+      kind: 'update-item',
+      itemId: view.id,
+      expectedMetadataRevision: view.metadataRevision,
+      item: { ...view.item, title: 'A moved reference' }
+    })
+    expect(page.itemIds).toEqual(itemIds)
+    const filtered = await catalog.search({
+      scope: 'library',
+      projectId: 'project-1',
+      filter: { query: 'A moved' },
+      allItemIds: true
+    })
+    expect(filtered.itemIds).toEqual([view.id])
+    expect(
+      (await catalog.search({ scope: 'library', projectId: 'missing', allItemIds: true })).itemIds
+    ).toEqual([])
+  })
 
   it.each([
     ['deleted', 'missing'],
@@ -898,7 +1042,15 @@ describe('LiteratureCatalog', () => {
       contentType: 'application/pdf',
       filename: 'paper.pdf',
       pageCount: 8,
-      sourceUrl: 'https://pmc.ncbi.nlm.nih.gov/articles/PMC1/'
+      sourceUrl: 'https://pmc.ncbi.nlm.nih.gov/articles/PMC1/',
+      provenance: {
+        provider: 'pmc',
+        source: 'PMC',
+        sourceUrl: 'https://pmc.ncbi.nlm.nih.gov/articles/PMC1/',
+        acquiredAt: 123,
+        version: 'accepted' as const,
+        license: 'cc-by'
+      }
     }
     const staged = await catalog.stageAcquiredPdf(candidate(), pdf)
     expect(staged).toMatchObject({ kind: 'candidate', state: 'pending' })
@@ -907,13 +1059,50 @@ describe('LiteratureCatalog', () => {
     expect((await catalog.search({ scope: 'inbox' })).entries[0]).toMatchObject({
       pdfs: [{ filename: 'paper.pdf', pageCount: 8 }]
     })
+    expect(
+      JSON.parse((await client!.literatureInboxPdf.findFirstOrThrow()).provenanceJson!)
+    ).toEqual(pdf.provenance)
     const accepted = await catalog.transact({ kind: 'accept-candidate', candidateId: staged.id })
     expect(accepted.id).toBe(existing.id)
+    expect((await catalog.get(existing.id))!.attachments[0].versions[0].provenance).toEqual(
+      pdf.provenance
+    )
     expect((await catalog.get(existing.id))!.attachments).toHaveLength(1)
     expect((await catalog.get(existing.id))!.projectIds).toEqual(['project-1'])
     expect(await client!.literatureInboxPdf.count()).toBe(0)
     await catalog.transact({ kind: 'accept-candidate', candidateId: staged.id })
     expect((await catalog.get(existing.id))!.attachments).toHaveLength(1)
+  })
+
+  it('rejects a cancelled acquisition while waiting for the database client before any Inbox write', async () => {
+    await setup()
+    let release!: () => void
+    const waiting = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const catalog = new LiteratureCatalog(async () => {
+      await waiting
+      return client!
+    })
+    const controller = new AbortController()
+    const pending = catalog.stageAcquiredPdf(
+      candidate(),
+      {
+        contentBlobId: 'unused',
+        checksum: 'c'.repeat(64),
+        sizeBytes: 128,
+        contentType: 'application/pdf',
+        filename: 'paper.pdf',
+        pageCount: 8,
+        sourceUrl: 'https://example.test/paper'
+      },
+      controller.signal
+    )
+    controller.abort(new Error('cancelled before transaction'))
+    release()
+    await expect(pending).rejects.toThrow('cancelled before transaction')
+    expect(await client!.literatureInboxCandidate.count()).toBe(0)
+    expect(await client!.literatureInboxPdf.count()).toBe(0)
   })
 
   it('rolls back Inbox metadata if its acquired PDF cannot be retained', async () => {
@@ -1038,6 +1227,40 @@ describe('LiteratureCatalog', () => {
     await expect(catalog.search({ scope: 'inbox' })).resolves.toMatchObject({
       entries: [expect.objectContaining({ id: staged.id, state: 'pending' })]
     })
+  })
+
+  it('rolls back a stale restore batch and allows its still-dismissed subset', async () => {
+    const catalog = await setup()
+    const first = await catalog.transact({ kind: 'stage-candidate', candidate: candidate() })
+    const second = await catalog.transact({
+      kind: 'stage-candidate',
+      candidate: candidate({ doi: '10.1234/second', externalId: 'second' })
+    })
+    await catalog.transact({
+      kind: 'settle-candidates',
+      candidateIds: [first.id, second.id],
+      state: 'dismissed'
+    })
+    // A second caller uses the same public transaction boundary before the stale Undo arrives.
+    await catalog.transact({ kind: 'restore-candidates', candidateIds: [first.id] })
+    await expect(
+      catalog.transact({ kind: 'restore-candidates', candidateIds: [first.id, second.id] })
+    ).rejects.toThrow('One or more Literature Inbox candidates are not dismissed.')
+    await expect(
+      catalog.search({ scope: 'inbox', inboxState: 'dismissed' })
+    ).resolves.toMatchObject({
+      entries: [expect.objectContaining({ id: second.id, state: 'dismissed' })]
+    })
+    await catalog.transact({ kind: 'accept-candidate', candidateId: first.id })
+    await catalog.transact({ kind: 'restore-candidates', candidateIds: [second.id] })
+    await expect(catalog.search({ scope: 'inbox', inboxState: 'pending' })).resolves.toMatchObject({
+      entries: [expect.objectContaining({ id: second.id, state: 'pending' })]
+    })
+    await expect(catalog.search({ scope: 'inbox', inboxState: 'accepted' })).resolves.toMatchObject(
+      {
+        entries: [expect.objectContaining({ id: first.id, state: 'accepted' })]
+      }
+    )
   })
 
   it('updates citation metadata atomically with optimistic revision checks', async () => {
@@ -1501,6 +1724,142 @@ describe('LiteratureCatalog', () => {
         }
       ]
     })
+  })
+
+  it.each(['collection', 'project', 'project batch'] as const)(
+    'rejects stale merged identities when linking a single reference to a %s',
+    async (destination) => {
+      const catalog = await setup()
+      const survivor = await catalog.transact({ kind: 'create-item', item: candidate().item })
+      const alias = await catalog.transact({
+        kind: 'create-item',
+        item: candidate({ doi: '10.1234/alias', title: 'Alias' }).item
+      })
+      const reviewed = (await Promise.all([catalog.get(survivor.id), catalog.get(alias.id)])).map(
+        (view) => view!
+      )
+      await catalog.transact({
+        kind: 'merge-items',
+        survivorId: survivor.id,
+        duplicateIds: [alias.id],
+        expectedMetadataRevision: reviewed[0].metadataRevision,
+        expectedItems: reviewed.map(({ id, metadataRevision, updatedAt }) => ({
+          id,
+          metadataRevision,
+          updatedAt
+        })),
+        item: reviewed[0].item
+      })
+      const collection = await catalog.transact({ kind: 'create-collection', name: 'Target' })
+      await expect(catalog.get(alias.id)).resolves.toMatchObject({ id: survivor.id })
+      await expect(
+        catalog.transact(
+          destination === 'collection'
+            ? {
+                kind: 'set-collection-item',
+                collectionId: collection.id,
+                itemId: alias.id,
+                included: true
+              }
+            : destination === 'project batch'
+              ? {
+                  kind: 'set-project-items',
+                  projectId: 'project-1',
+                  itemIds: [alias.id],
+                  included: true,
+                  source: 'library'
+                }
+              : {
+                  kind: 'set-project-item',
+                  projectId: 'project-1',
+                  itemId: alias.id,
+                  included: true,
+                  source: 'library'
+                }
+        )
+      ).rejects.toThrow(/unavailable/i)
+      expect(await client!.literatureCollectionItem.count({ where: { itemId: alias.id } })).toBe(0)
+      expect(await client!.projectLiterature.count({ where: { itemId: alias.id } })).toBe(0)
+    }
+  )
+
+  it.each(['collection', 'project', 'project batch'] as const)(
+    'rejects deleted identities when linking a single reference to a %s',
+    async (destination) => {
+      const catalog = await setup()
+      const item = await catalog.transact({ kind: 'create-item', item: candidate().item })
+      const collection = await catalog.transact({ kind: 'create-collection', name: 'Target' })
+      await catalog.transact({ kind: 'set-item-lifecycle', itemIds: [item.id], state: 'deleted' })
+      await expect(
+        catalog.transact(
+          destination === 'collection'
+            ? {
+                kind: 'set-collection-item',
+                collectionId: collection.id,
+                itemId: item.id,
+                included: true
+              }
+            : destination === 'project batch'
+              ? {
+                  kind: 'set-project-items',
+                  projectId: 'project-1',
+                  itemIds: [item.id],
+                  included: true,
+                  source: 'library'
+                }
+              : {
+                  kind: 'set-project-item',
+                  projectId: 'project-1',
+                  itemId: item.id,
+                  included: true,
+                  source: 'library'
+                }
+        )
+      ).rejects.toThrow(/unavailable/i)
+      expect(await client!.literatureCollectionItem.count({ where: { itemId: item.id } })).toBe(0)
+      expect(await client!.projectLiterature.count({ where: { itemId: item.id } })).toBe(0)
+    }
+  )
+
+  it('preserves an earlier committed collection batch when a later command rejects', async () => {
+    const catalog = await setup()
+    const source = await catalog.transact({ kind: 'create-collection', name: 'Source' })
+    const target = await catalog.transact({ kind: 'create-collection', name: 'Target' })
+    const ids: string[] = []
+    for (let index = 0; index < 201; index++) {
+      const item = await catalog.transact({
+        kind: 'create-item',
+        item: candidate({ doi: `10.1234/batch-${index}`, title: `Reference ${index}` }).item
+      })
+      ids.push(item.id)
+      await catalog.transact({
+        kind: 'set-collection-item',
+        collectionId: source.id,
+        itemId: item.id,
+        included: true
+      })
+    }
+    await catalog.transact({
+      kind: 'move-collection-items',
+      sourceCollectionId: source.id,
+      targetCollectionId: target.id,
+      itemIds: ids.slice(0, 200)
+    })
+    await catalog.transact({ kind: 'set-item-lifecycle', itemIds: [ids[200]], state: 'deleted' })
+    await expect(
+      catalog.transact({
+        kind: 'move-collection-items',
+        sourceCollectionId: source.id,
+        targetCollectionId: target.id,
+        itemIds: [ids[200]]
+      })
+    ).rejects.toThrow(/unavailable/i)
+    await expect(
+      catalog.search({ scope: 'library', collectionId: target.id })
+    ).resolves.toMatchObject({ totalCount: 200 })
+    expect(
+      await client!.literatureCollectionItem.count({ where: { collectionId: source.id } })
+    ).toBe(1)
   })
 
   it('moves Items between Collections', async () => {
