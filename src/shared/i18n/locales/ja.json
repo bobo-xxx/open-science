@@ -103,6 +103,9 @@
     "Your unsaved changes will be lost.": "保存されていない変更は失われます。"
   },
   "renderer": {
+    "Cancellation request failed": "キャンセル要求に失敗しました",
+    "Skills are loading. Paste again shortly.": "スキルを読み込んでいます。少し待ってから再度貼り付けてください。",
+    "Could not load Skills. Try pasting again.": "スキルを読み込めませんでした。もう一度貼り付けてください。",
     "This TIFF exceeds the {{limit}} MiB preview limit. Download it or open it externally.": "このTIFFはプレビューの上限（{{limit}} MiB）を超えています。ダウンロードするか、外部アプリで開いてください。",
     "Shared content": "共有コンテンツ",
     "Literature settings and tasks": "文献の設定とタスク",
@@ -4872,6 +4875,8 @@
     "You can import unfinished files or close this window.": "未完了のファイルをインポートするか、このウィンドウを閉じることができます。",
     "New Compute jobs may remain queued because saved concurrency limits could not be verified. Preserve the affected files, recover a valid copy, then recheck to resume dispatch.": "保存された同時実行数の制限を検証できないため、新しい Compute ジョブがキューに残る場合があります。対象ファイルを保持し、有効なコピーを復元してから再確認すると、ジョブの送信を再開できます。",
     "Recheck saved conversations": "保存済みの会話を再確認",
-    "Some changes have not been saved.": "一部の変更が保存されていません。"
+    "Some changes have not been saved.": "一部の変更が保存されていません。",
+    "Allow once applies to the next execution in this runtime, even if the code changes. It allows multiple connections to this domain during that execution.": "1回のみ許可は、コードが変更されても、このランタイムでの次の実行に適用されます。その実行中は、このドメインへの複数の接続が許可されます。",
+    "Next execution in this runtime": "このランタイムでの次の実行"
   }
 }
