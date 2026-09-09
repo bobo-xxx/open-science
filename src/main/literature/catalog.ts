@@ -1,3 +1,10 @@
+import { ApplicationCommandError } from '../../shared/application-command-contract'
+import {
+  LITERATURE_OVERSIZED_REFERENCE,
+  type LiteratureExportRecordRequest,
+  type LiteratureExportRecordResult
+} from '../../shared/literature-export'
+import { boundedLiteraturePage } from './response-page'
 import type { ContentRepository } from '../storage/content-repository'
 import { createHash, randomUUID } from 'node:crypto'
 
@@ -35,6 +42,7 @@ import {
   type LiteratureRecordImportReceipt,
   type LiteratureRecordImportEntry,
   type LiteratureRecordImportError,
+  type LiteratureSourceRecordView,
   type LiteratureSourceInput
 } from '../../shared/literature'
 
@@ -765,11 +773,9 @@ class LiteratureCatalog {
     private readonly getClient: LiteratureCatalogClientProvider,
     private readonly onTagAssignmentsChanged?: () => Promise<void>,
     private readonly content?: Pick<ContentRepository, 'verify' | 'sweep'>,
-    private readonly withAttachmentRemoval: (
-      remove: (
-        assertUnreferenced: (attachmentIds: readonly string[]) => void
-      ) => Promise<LiteratureCatalogReceipt>
-    ) => Promise<LiteratureCatalogReceipt> = async (remove) =>
+    private readonly withAttachmentRemoval: <Result>(
+      remove: (assertUnreferenced: (attachmentIds: readonly string[]) => void) => Promise<Result>
+    ) => Promise<Result> = async (remove) =>
       remove((attachmentIds) => {
         // Metadata-only clients may delete metadata, but cannot bypass attachment authority.
         if (attachmentIds.length) throw new Error('Literature attachment removal is unavailable.')
@@ -916,9 +922,21 @@ class LiteratureCatalog {
     })
   }
 
+  // The main-process agent adapter applies the existing MCP projection and output budget.
+  // This entry point is not exposed by the renderer/Web search command.
+  async searchForAgent(
+    request: LiteratureCatalogSearchRequest & { scope: 'library' }
+  ): Promise<LiteratureCatalogSearchPage> {
+    const client = await this.getClient()
+    return client.$transaction((transaction) => this.searchLibrary(request, transaction, false), {
+      timeout: 30_000
+    })
+  }
+
   private async searchLibrary(
     request: LiteratureCatalogSearchRequest,
-    client: Pick<LiteratureCatalogClient, 'literatureItem' | '$queryRaw'>
+    client: Pick<LiteratureCatalogClient, 'literatureItem' | '$queryRaw'>,
+    boundResponse = true
   ): Promise<LiteratureCatalogSearchPage> {
     const offset = Math.max(0, request.offset ?? 0)
     const limit = Math.min(100, Math.max(1, request.limit ?? 50))
@@ -1014,6 +1032,12 @@ class LiteratureCatalog {
         : Prisma.sql`"LiteratureItem" selected JOIN "LiteratureItem" i
           ON i.id = COALESCE(selected."mergedIntoItemId", selected.id)`
     const requestedId = request.itemIds === undefined ? Prisma.sql`i.id` : Prisma.sql`selected.id`
+    if (request.countOnly) {
+      const [count] = await client.$queryRaw<{ total: bigint }[]>(
+        Prisma.sql`SELECT COUNT(*) AS total FROM ${from} WHERE ${where}`
+      )
+      return { entries: [], totalCount: Number(count!.total) }
+    }
     const ids = await client.$queryRaw<
       { id: string; requestedId: string }[]
     >(Prisma.sql`SELECT i.id, ${requestedId} AS "requestedId" FROM ${from} WHERE ${where} ORDER BY ${orderBy}, ${requestedId} ASC
@@ -1036,13 +1060,51 @@ class LiteratureCatalog {
         })
       : []
     const byId = new Map(rows.map((row) => [row.id, row]))
+    const entries = ids.map(({ id, requestedId }) => ({
+      ...toItemView(byId.get(id)!),
+      id: requestedId
+    }))
+    const page = boundResponse
+      ? boundedLiteraturePage(
+          entries,
+          0,
+          limit,
+          (row) =>
+            new ApplicationCommandError('command-failed', LITERATURE_OVERSIZED_REFERENCE + row.id)
+        )
+      : { entries }
     return {
-      entries: ids.map(({ id, requestedId }) => ({
-        ...toItemView(byId.get(id)!),
-        id: requestedId
-      })),
+      entries: page.entries,
       totalCount,
-      nextOffset: offset + limit < totalCount ? offset + limit : undefined
+      nextOffset:
+        offset + page.entries.length < totalCount ? offset + page.entries.length : undefined
+    }
+  }
+
+  async exportRecord(
+    request: LiteratureExportRecordRequest
+  ): Promise<LiteratureExportRecordResult> {
+    const client = await this.getClient()
+    // Export the retained record itself, including Trash metadata and merge provenance.
+    // Normal get() deliberately hides deleted records and follows active aliases.
+    const row = await client.literatureItem.findUnique({
+      where: { id: request.itemId },
+      include: itemInclude
+    })
+    if (!row) throw new Error('Reference unavailable')
+    const content = JSON.stringify(toItemView(row))
+    const digest = createHash('sha256').update(content).digest('hex')
+    const offset = request.offset ?? 0
+    if ((offset > 0 && !request.digest) || (request.digest && request.digest !== digest))
+      throw new Error('Reference changed during export. Try again.')
+    if (offset >= content.length) throw new Error('Invalid reference export offset.')
+    // Offsets are UTF-16 code units. Concatenate chunks before encoding the complete JSON so
+    // supplementary Unicode characters split at a chunk boundary remain lossless.
+    const end = Math.min(content.length, offset + 262144)
+    return {
+      chunk: content.slice(offset, end),
+      digest,
+      nextOffset: end < content.length ? end : undefined
     }
   }
 
@@ -1061,6 +1123,29 @@ class LiteratureCatalog {
         ? undefined
         : requested
     return row ? toItemView(row) : undefined
+  }
+
+  async sources(itemId: string): Promise<LiteratureSourceRecordView[]> {
+    const client = await this.getClient()
+    return client.$transaction(async (transaction) => {
+      const requested = await transaction.literatureItem.findUnique({ where: { id: itemId } })
+      const item = requested?.mergedIntoItemId
+        ? await transaction.literatureItem.findUnique({ where: { id: requested.mergedIntoItemId } })
+        : requested
+      if (!item || item.deletedAt) throw new Error('Literature Item is unavailable.')
+      const rows = await transaction.literatureSourceRecord.findMany({
+        where: { itemId: item.id },
+        orderBy: [{ fetchedAt: 'desc' }, { id: 'asc' }]
+      })
+      return rows.map((row) => ({
+        id: row.id,
+        provider: row.provider,
+        externalId: row.externalId ?? undefined,
+        sourceUrl: row.sourceUrl ?? undefined,
+        rawMetadata: JSON.parse(row.rawMetadataJson) as Record<string, unknown>,
+        savedAt: row.fetchedAt.getTime()
+      }))
+    })
   }
 
   async getMany(itemIds: readonly string[]): Promise<LiteratureItemView[]> {
@@ -1251,21 +1336,33 @@ class LiteratureCatalog {
         duplicateGroups.delete(await this.getClient())
     }
   }
-  private deleteAttachment(
+  private async deleteAttachment(
     command: Extract<LiteratureCatalogCommand, { kind: 'delete-attachment' }>
   ): Promise<LiteratureCatalogReceipt> {
-    return this.withAttachmentRemoval((assertUnreferenced) =>
+    if (!this.content) throw new Error('Literature content operations are unavailable.')
+    // The session barrier protects reference confirmation and the deletion transaction only.
+    const contentIds = await this.withAttachmentRemoval((assertUnreferenced) =>
       this.deleteUnreferencedAttachment(command, assertUnreferenced)
     )
+    let cleanupPending = false
+    try {
+      const sweep = await this.content.sweep({
+        contentIds,
+        createdBefore: new Date(Date.now() + 1)
+      })
+      cleanupPending = sweep.failedIds.length > 0
+    } catch {
+      cleanupPending = true
+    }
+    return { kind: 'item', id: command.itemId, state: 'unlinked', cleanupPending }
   }
 
   private async deleteUnreferencedAttachment(
     command: Extract<LiteratureCatalogCommand, { kind: 'delete-attachment' }>,
     assertUnreferenced: (attachmentIds: readonly string[]) => void
-  ): Promise<LiteratureCatalogReceipt> {
-    if (!this.content) throw new Error('Literature content operations are unavailable.')
+  ): Promise<string[]> {
     const client = await this.getClient()
-    const contentIds = await client.$transaction(async (transaction) => {
+    return client.$transaction(async (transaction) => {
       const attachment = await transaction.literatureAttachment.findFirst({
         where: {
           id: command.attachmentId,
@@ -1279,17 +1376,6 @@ class LiteratureCatalog {
       await transaction.literatureAttachment.delete({ where: { id: command.attachmentId } })
       return attachment.versions.map(({ contentBlobId }) => contentBlobId)
     })
-    let cleanupPending = false
-    try {
-      const sweep = await this.content.sweep({
-        contentIds,
-        createdBefore: new Date(Date.now() + 1)
-      })
-      cleanupPending = sweep.failedIds.length > 0
-    } catch {
-      cleanupPending = true
-    }
-    return { kind: 'item', id: command.itemId, state: 'unlinked', cleanupPending }
   }
 
   private async verifyAttachment(
@@ -1643,10 +1729,13 @@ class LiteratureCatalog {
             update: {}
           })
         }
-        await this.attachSource(transaction, {
-          source: candidate.source,
-          candidateId: persisted.id
-        })
+        // Repeated discoveries retain the first reviewed candidate and its matching evidence.
+        if (previous?.id !== persisted.id) {
+          await this.attachSource(transaction, {
+            source: candidate.source,
+            candidateId: persisted.id
+          })
+        }
       }
       return {
         kind: 'candidate',

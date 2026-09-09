@@ -3,8 +3,13 @@ import {
   type LiteratureDeletionDiagnostic
 } from '../../../../shared/literature-deletion'
 import { LiteratureDeletionNotice } from './LiteratureDeletionNotice'
+import { readLiteratureSelectionPage } from './literature-read-pages'
+import { LiteratureOversizedNotice } from './LiteratureOversizedNotice'
 import type { TFunction } from 'i18next'
+import { LiteratureSources } from './LiteratureSources'
 import { LiteratureAttachments } from './LiteratureAttachments'
+import { LiteratureAttachmentOperations } from './LiteratureAttachmentOperations'
+import { useAttachmentOperations } from './literature-attachment-operations'
 import { LITERATURE_JOB_MAX_ITEMS } from '../../../../shared/literature-jobs'
 import {
   LITERATURE_COLLECTION_NAME_CONFLICT,
@@ -131,7 +136,7 @@ import {
   LITERATURE_RECORD_IMPORT_MAX_BYTES,
   normalizeLiteratureIdentifierValue
 } from '../../../../shared/literature'
-import { formatUploadSizeLimit } from '../../../../shared/uploads'
+import { formatUploadSizeLimit, type UploadTransferProgress } from '../../../../shared/uploads'
 import { stageComposerFile } from '../workspace/composer-upload-transfer'
 import { FilePreviewDialog } from '../workspace/FilePreviewDialog'
 import { LITERATURE_PREVIEW_SESSION_ID } from '../workspace/preview-file-item'
@@ -1338,6 +1343,7 @@ const LiteratureLibraryPage = (): React.JSX.Element => {
   const [collections, setCollections] = useState<LiteratureCollectionView[]>([])
   const [projectItemCounts, setProjectItemCounts] = useState<Record<string, number>>({})
   const [selectedCandidate, setSelectedCandidate] = useState<LiteratureInboxCandidateView>()
+  const attachmentOperations = useAttachmentOperations((state) => state.operations)
   const [detailController] = useState(createLiteratureDetailController)
   const selectedItem = detailController.getSnapshot().item
   const selectedItemId = selectedItem?.id
@@ -1360,7 +1366,9 @@ const LiteratureLibraryPage = (): React.JSX.Element => {
   const [pendingImportPdf, setPendingImportPdf] = useState<File>()
   const [pendingImportDraft, setPendingImportDraft] = useState<LiteratureItemInput>()
   const [isReadingImportMetadata, setIsReadingImportMetadata] = useState(false)
-  const [recordImport, setRecordImport] = useState<RecordImportDraft>()
+  const [recordImport, setRecordImport] = useState<
+    RecordImportDraft & { destination: { name: string; projectId?: string; collectionId?: string } }
+  >()
   const [duplicatePolicy, setDuplicatePolicy] = useState<LiteratureDuplicatePolicy>('reuse')
   const recordImportRequest = useRef(0)
 
@@ -1396,6 +1404,96 @@ const LiteratureLibraryPage = (): React.JSX.Element => {
   const [isDeletingCollection, setIsDeletingCollection] = useState(false)
   const [collectionDeleteError, setCollectionDeleteError] = useState<string>()
   const [isAddingPdf, setIsAddingPdf] = useState(false)
+  const addingPdfRef = useRef(false)
+  const [pdfUpload, setPdfUpload] = useState<{
+    progress: UploadTransferProgress
+    phase: 'uploading' | 'cancelling' | 'saving'
+  }>()
+  const pdfUploadRef = useRef<{ controller: AbortController; transferId: string } | undefined>(
+    undefined
+  )
+  const uploadPageMountedRef = useRef(true)
+  const stagePdf = async (
+    file: File,
+    transferId: string
+  ): Promise<Awaited<ReturnType<typeof stageComposerFile>>> => {
+    const controller = new AbortController()
+    pdfUploadRef.current = { controller, transferId }
+    if (!uploadPageMountedRef.current) controller.abort()
+    return stageComposerFile(file, window.api.uploads, {
+      transferId,
+      name: file.name,
+      signal: controller.signal,
+      onProgress: (progress) =>
+        setPdfUpload({
+          progress,
+          phase: controller.signal.aborted ? 'cancelling' : 'uploading'
+        })
+    })
+  }
+  const finishPdfStaging = (): void => {
+    if (pdfUploadRef.current?.controller.signal.aborted)
+      throw new DOMException('Upload cancelled.', 'AbortError')
+    pdfUploadRef.current = undefined
+    setPdfUpload((current) => (current ? { ...current, phase: 'saving' } : current))
+  }
+  const cancelPdfUpload = (): void => {
+    const controller = pdfUploadRef.current?.controller
+    if (!controller || controller.signal.aborted || !pdfUpload || pdfUpload.phase !== 'uploading')
+      return
+    controller.abort()
+    setPdfUpload({ ...pdfUpload, phase: 'cancelling' })
+    void window.api.uploads
+      .abortTransfer({ transferId: pdfUpload.progress.transferId })
+      .catch(() => undefined)
+  }
+  useEffect(() => {
+    uploadPageMountedRef.current = true
+    return () => {
+      uploadPageMountedRef.current = false
+      const upload = pdfUploadRef.current
+      if (!upload) return
+      upload.controller.abort()
+      void window.api.uploads
+        .abortTransfer({ transferId: upload.transferId })
+        .catch(() => undefined)
+    }
+  }, [])
+  const pdfUploadNotice = pdfUpload ? (
+    <div className="shrink-0 space-y-2 border-b border-border px-5 py-3">
+      <p className="truncate text-sm font-medium">{pdfUpload.progress.name}</p>
+      <progress
+        className="h-2 w-full accent-primary"
+        aria-label={t('Upload progress')}
+        max={Math.max(1, pdfUpload.progress.totalBytes)}
+        value={pdfUpload.progress.receivedBytes}
+      />
+      <div className="flex items-center justify-between gap-3">
+        <p role="status" className="text-xs text-muted-foreground">
+          {pdfUpload.phase === 'cancelling'
+            ? t('Cancelling…')
+            : pdfUpload.phase === 'saving'
+              ? t('Saving…')
+              : t('{{received}} / {{total}} bytes uploaded', {
+                  received: pdfUpload.progress.receivedBytes.toLocaleString(),
+                  total: pdfUpload.progress.totalBytes.toLocaleString()
+                })}
+        </p>
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          disabled={pdfUpload.phase !== 'uploading'}
+          onClick={cancelPdfUpload}
+        >
+          {t('Cancel upload')}
+        </Button>
+      </div>
+      <p className="text-xs text-muted-foreground">
+        {t('Keep this window open until the upload finishes or is cancelled.')}
+      </p>
+    </div>
+  ) : null
   const [pdfError, setPdfError] = useState<string>()
   const [projectLinkError, setProjectLinkError] = useState<string>()
   const [collectionLinkError, setCollectionLinkError] = useState<string>()
@@ -1801,6 +1899,7 @@ const LiteratureLibraryPage = (): React.JSX.Element => {
   )
   const entriesRequest = useMemo(() => buildEntriesRequest(), [buildEntriesRequest])
   const {
+    oversizedItemId,
     loading: entriesLoading,
     failed: entriesFailed,
     pageTransitionLoading: entriesPageTransitionLoading,
@@ -1827,6 +1926,7 @@ const LiteratureLibraryPage = (): React.JSX.Element => {
   const { changeMode: changeDetailMode } = metadata
 
   const closeSelectedItemDetail = useCallback((): void => {
+    if (addingPdfRef.current) return
     detailInteractionRef.current += 1
     detailTagMenuOpenRef.current = false
     detailSelectOpenRef.current = false
@@ -2371,17 +2471,16 @@ const LiteratureLibraryPage = (): React.JSX.Element => {
 
   const addPdf = async (file: File): Promise<void> => {
     const { item: current, generation } = detailController.getSnapshot()
-    if (!current || isAddingPdf) return
+    if (!current || addingPdfRef.current) return
+    addingPdfRef.current = true
     setIsAddingPdf(true)
     setPdfError(undefined)
     const transferId = crypto.randomUUID()
     let staged: Awaited<ReturnType<typeof stageComposerFile>> | undefined
     try {
-      staged = await stageComposerFile(file, window.api.uploads, {
-        transferId,
-        name: file.name
-      })
+      staged = await stagePdf(file, transferId)
       await window.api.uploads.claimLocalFile?.({ transferId })
+      finishPdfStaging()
       const receipt = await window.api.literature.importPdf({
         itemId: current.id,
         attachment: staged
@@ -2393,10 +2492,17 @@ const LiteratureLibraryPage = (): React.JSX.Element => {
       await loadEntries(true)
     } catch (error) {
       if (detailController.getSnapshot().generation === generation)
-        setPdfError(pdfImportErrorMessage(error, t))
+        setPdfError(
+          pdfUploadRef.current?.controller.signal.aborted
+            ? t('PDF upload cancelled. The reference was kept.')
+            : pdfImportErrorMessage(error, t)
+        )
     } finally {
       if (staged)
         await window.api.uploads.deleteUpload({ path: staged.path }).catch(() => undefined)
+      pdfUploadRef.current = undefined
+      setPdfUpload(undefined)
+      addingPdfRef.current = false
       setIsAddingPdf(false)
     }
   }
@@ -2404,11 +2510,25 @@ const LiteratureLibraryPage = (): React.JSX.Element => {
   const { isDragging: isDraggingPdf, dropZoneProps: pdfDropZoneProps } = useFileDropZone({
     enabled: !isAddingPdf,
     onFiles: (files) => {
-      const pdf = files.find(
-        (file) => file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')
+      const unsupported = files.filter(
+        (file) => file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')
       )
-      if (pdf) void addPdf(pdf)
-      else setPdfError(t('PDF could not be added.'))
+      if (files.length !== 1 || unsupported.length) {
+        setPdfError(
+          [
+            t('Choose one PDF at a time. No files were added.'),
+            ...(unsupported.length
+              ? [
+                  t('Unsupported files: {{names}}', {
+                    names: unsupported.map((file) => file.name).join(', ')
+                  })
+                ]
+              : [])
+          ].join(' ')
+        )
+        return
+      }
+      void addPdf(files[0])
     }
   })
 
@@ -2657,11 +2777,9 @@ const LiteratureLibraryPage = (): React.JSX.Element => {
         pending.destination = undefined
       }
       if (pending.file && !pending.pdfItem) {
-        staged = await stageComposerFile(pending.file, window.api.uploads, {
-          transferId,
-          name: pending.file.name
-        })
+        staged = await stagePdf(pending.file, transferId)
         await window.api.uploads.claimLocalFile?.({ transferId })
+        finishPdfStaging()
         pending.pdfItem = (
           await window.api.literature.importPdf({ itemId: pending.id, attachment: staged })
         ).item
@@ -2687,7 +2805,11 @@ const LiteratureLibraryPage = (): React.JSX.Element => {
       if (created) {
         closeItemEditor()
         openSelectedItemDetail(created)
-        setPdfError(pdfImportErrorMessage(error, t))
+        setPdfError(
+          pdfUploadRef.current?.controller.signal.aborted
+            ? t('PDF upload cancelled. The reference was kept.')
+            : pdfImportErrorMessage(error, t)
+        )
       } else {
         setCreateItemError(
           pending
@@ -2705,6 +2827,8 @@ const LiteratureLibraryPage = (): React.JSX.Element => {
       if (staged)
         await window.api.uploads.deleteUpload({ path: staged.path }).catch(() => undefined)
       void loadEntries(true)
+      pdfUploadRef.current = undefined
+      setPdfUpload(undefined)
       creatingItemRef.current = false
       setIsSavingNewItem(false)
     }
@@ -2749,8 +2873,15 @@ const LiteratureLibraryPage = (): React.JSX.Element => {
   const previewRecordImport = async (file: File): Promise<void> => {
     setDuplicatePolicy('reuse')
     const request = ++recordImportRequest.current
+    const destination = {
+      name: selectedProject?.name ?? selectedCollection?.name ?? t('All references'),
+      projectId,
+      collectionId
+    }
+    setRecordImport({ fileName: file.name, content: '', reading: true, destination })
     if (file.size > LITERATURE_RECORD_IMPORT_MAX_BYTES) {
       setRecordImport({
+        destination,
         fileName: file.name,
         content: '',
         error: t('{{fileName}}: file is too large (limit {{limit}}).', {
@@ -2763,13 +2894,14 @@ const LiteratureLibraryPage = (): React.JSX.Element => {
     try {
       const content = await file.text()
       if (request !== recordImportRequest.current) return
-      setRecordImport({ fileName: file.name, content })
+      setRecordImport({ fileName: file.name, content, destination })
       const preview = await window.api.literature.importRecords({ mode: 'preview', content })
       if (request !== recordImportRequest.current) return
-      setRecordImport({ fileName: file.name, content, preview })
+      setRecordImport({ fileName: file.name, content, preview, destination })
     } catch {
       if (request !== recordImportRequest.current) return
       setRecordImport({
+        destination,
         fileName: file.name,
         content: '',
         error: t('Reference file could not be read.')
@@ -2779,6 +2911,7 @@ const LiteratureLibraryPage = (): React.JSX.Element => {
 
   const commitRecordImport = async (): Promise<void> => {
     if (!recordImport?.preview || recordImport.preview.items.length === 0) return
+    const { projectId, collectionId } = recordImport.destination
     setIsImportingRecords(true)
     setRecordImport((current) =>
       current ? { ...current, error: undefined, failedCount: undefined } : current
@@ -2872,7 +3005,7 @@ const LiteratureLibraryPage = (): React.JSX.Element => {
       for (;;) {
         if (seenOffsets.has(offset)) throw new Error('Repeated Literature page.')
         seenOffsets.add(offset)
-        const page = await window.api.literature.search({
+        const page = await readLiteratureSelectionPage({
           ...buildEntriesRequest(offset),
           limit: 100
         })
@@ -3027,7 +3160,10 @@ const LiteratureLibraryPage = (): React.JSX.Element => {
       section === 'trash' ||
       entry.deletedAt !== undefined ||
       !version ||
-      version.availability === 'unavailable'
+      version.availability === 'unavailable' ||
+      useAttachmentOperations
+        .getState()
+        .operations.some((operation) => operation.itemId === entry.id && operation.pending)
     )
       return
     setPreviewItem({
@@ -3130,7 +3266,7 @@ const LiteratureLibraryPage = (): React.JSX.Element => {
         let offset = 0
         while (!seen.has(offset)) {
           seen.add(offset)
-          const page = await window.api.literature.search(buildEntriesRequest(offset))
+          const page = await readLiteratureSelectionPage(buildEntriesRequest(offset))
           if (request !== batchReadingRequest.current) return
           entries.push(
             ...page.entries
@@ -4398,6 +4534,20 @@ const LiteratureLibraryPage = (): React.JSX.Element => {
               }}
             </LiteratureSelectionBoundary>
           </div>
+          <LiteratureAttachmentOperations
+            detailController={detailController}
+            onChanged={(operation) => {
+              if (!operation.item) return
+              const current = detailController.getSnapshot().item
+              const updated =
+                current?.id === operation.itemId
+                  ? { ...current, attachments: operation.item.attachments }
+                  : operation.item
+              detailController.replace(updated)
+              updateMetadataItem(updated)
+              void loadEntries(true)
+            }}
+          />
           {batchLookup ? (
             <LiteratureBatchLookupDialog
               key={batchLookup.jobId ?? `${batchLookup.mode}:${batchLookup.itemIds.join(',')}`}
@@ -4514,7 +4664,9 @@ const LiteratureLibraryPage = (): React.JSX.Element => {
               />
             </div>
           ) : null}
-          {(linkedItemError || error) &&
+          {oversizedItemId ? <LiteratureOversizedNotice itemId={oversizedItemId} /> : null}
+          {!oversizedItemId &&
+          (linkedItemError || error) &&
           !(
             permanentDeleteResult &&
             !linkedItemError &&
@@ -5064,7 +5216,11 @@ const LiteratureLibraryPage = (): React.JSX.Element => {
                                       })}
                                       disabled={
                                         section === 'trash' ||
-                                        attachmentVersion.availability === 'unavailable'
+                                        attachmentVersion.availability === 'unavailable' ||
+                                        attachmentOperations.some(
+                                          (operation) =>
+                                            operation.itemId === entry.id && operation.pending
+                                        )
                                       }
                                       onClick={() => previewFirstAttachment(entry)}
                                     >
@@ -5275,7 +5431,7 @@ const LiteratureLibraryPage = (): React.JSX.Element => {
           duplicatePolicy={duplicatePolicy}
           onDuplicatePolicyChange={setDuplicatePolicy}
           isImportingRecords={isImportingRecords}
-          destination={selectedProject?.name ?? selectedCollection?.name ?? t('All references')}
+          destination={recordImport.destination.name}
           itemDescription={itemDescription}
           itemTypeLabels={itemTypeLabels}
           onClose={() => {
@@ -5323,6 +5479,7 @@ const LiteratureLibraryPage = (): React.JSX.Element => {
                 </Button>
               </Dialog.Close>
             </div>
+            {isSavingNewItem ? pdfUploadNotice : null}
             {pendingImportPdf && isReadingImportMetadata ? (
               <div
                 className="grid min-h-80 place-items-center text-sm text-muted-foreground"
@@ -5739,12 +5896,14 @@ const LiteratureLibraryPage = (): React.JSX.Element => {
                         size="icon-sm"
                         className={dialogCloseButtonClassName}
                         aria-label={t('Close')}
+                        disabled={isAddingPdf}
                         onClick={closeSelectedItemDetail}
                       >
                         <X className="size-4" aria-hidden="true" />
                       </Button>
                     </div>
                   </div>
+                  {isAddingPdf ? pdfUploadNotice : null}
                   {metadata.mode === 'full-text' ? (
                     <LiteratureFullTextLookup
                       key={`${selectedItem.id}:${selectedItem.metadataRevision}`}
@@ -6053,6 +6212,10 @@ const LiteratureLibraryPage = (): React.JSX.Element => {
                           </dl>
                         ) : null}
                       </section>
+                      <LiteratureSources
+                        key={`${selectedItem.id}:${selectedItem.metadataRevision}`}
+                        itemId={selectedItem.id}
+                      />
                       <div className="py-4">
                         <ResourceTagSummary
                           reference={{
@@ -6146,12 +6309,6 @@ const LiteratureLibraryPage = (): React.JSX.Element => {
                         <LiteratureAttachments
                           key={selectedItem.id}
                           item={selectedItem}
-                          onChanged={(updated) => {
-                            if (detailController.getSnapshot().item?.id === updated.id)
-                              detailController.replace(updated)
-                            updateMetadataItem(updated)
-                            void loadEntries(true)
-                          }}
                           onPreview={(version) =>
                             setPreviewItem({
                               id: `literature:${version.id}`,

@@ -22,6 +22,7 @@ import type { PreviewFileItem } from '@/stores/preview-workbench-store'
 import { createInitialProjectState, useProjectStore } from '@/stores/project-store'
 import { createInitialTagState, useTagStore } from '@/stores/tag-store'
 import { LiteratureLibraryPage } from './LiteratureLibraryPage'
+import { useAttachmentOperations } from './literature-attachment-operations'
 
 if (!Element.prototype.scrollIntoView) {
   Element.prototype.scrollIntoView = (): void => undefined
@@ -204,6 +205,7 @@ describe('LiteratureLibraryPage', () => {
   const saveBlobFile = vi.fn()
 
   beforeEach(() => {
+    useAttachmentOperations.setState({ operations: [] })
     // Failed assertions must not leak unused one-shot IPC replies into another scenario.
     search.mockReset()
     get.mockReset()
@@ -362,6 +364,8 @@ describe('LiteratureLibraryPage', () => {
         platform: 'darwin',
         saveBlobFile,
         literature: {
+          exportRecord: vi.fn(),
+          sources: vi.fn(async () => []),
           lookupMetadata: vi.fn(async () => libraryItem.item),
           jobs: vi.fn(async () => ({ jobs: [], summaries: [] })),
           search: async (request: LiteratureCatalogSearchRequest) => {
@@ -402,7 +406,7 @@ describe('LiteratureLibraryPage', () => {
           appendTransfer: vi.fn(),
           getTransferStatus: vi.fn(),
           finishTransfer: vi.fn(),
-          abortTransfer: vi.fn()
+          abortTransfer: vi.fn().mockResolvedValue(undefined)
         } as unknown as Window['api']['uploads'],
         sessions: {
           filterPdfContextCandidates
@@ -1003,7 +1007,7 @@ describe('LiteratureLibraryPage', () => {
     fireEvent.click(within(nav).getByRole('button', { name: 'All references' }))
     expect(await screen.findByText('No references found')).not.toBeNull()
     const libraryRequests = search.mock.calls.filter(
-      ([request]) => request.scope === 'library' && request.limit !== 1
+      ([request]) => request.scope === 'library' && !request.countOnly
     ).length
     fireEvent.click(within(nav).getByRole('button', { name: 'Duplicates' }))
     fireEvent.click(await screen.findByRole('button', { name: 'Review duplicates' }))
@@ -1038,7 +1042,7 @@ describe('LiteratureLibraryPage', () => {
     fireEvent.click(within(nav).getByRole('button', { name: 'All references' }))
     await waitFor(() =>
       expect(
-        search.mock.calls.filter(([request]) => request.scope === 'library' && request.limit !== 1)
+        search.mock.calls.filter(([request]) => request.scope === 'library' && !request.countOnly)
       ).toHaveLength(libraryRequests + 1)
     )
   })
@@ -1105,14 +1109,14 @@ describe('LiteratureLibraryPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'All references' }))
     const row = await screen.findByLabelText('Select Reference 0')
     const libraryRequests = search.mock.calls.filter(
-      ([request]) => request.scope === 'library' && request.limit !== 1
+      ([request]) => request.scope === 'library' && !request.countOnly
     ).length
     fireEvent.click(screen.getByRole('button', { name: 'Duplicates' }))
     expect(document.body.contains(row)).toBe(true)
     fireEvent.click(screen.getByRole('button', { name: 'All references' }))
     expect(screen.getByLabelText('Select Reference 0')).toBe(row)
     expect(
-      search.mock.calls.filter(([request]) => request.scope === 'library' && request.limit !== 1)
+      search.mock.calls.filter(([request]) => request.scope === 'library' && !request.countOnly)
     ).toHaveLength(libraryRequests)
   })
 
@@ -1906,6 +1910,14 @@ describe('LiteratureLibraryPage', () => {
     expect(useNavigationStore.getState().pendingLiteratureItemId).toBeUndefined()
   })
 
+  it('offers stored metadata sources from reference details', async () => {
+    get.mockResolvedValue(libraryItem)
+    useNavigationStore.getState().openLiteratureItem(libraryItem.id, 'user')
+    render(<LiteratureLibraryPage />)
+    expect(await screen.findByRole('dialog')).not.toBeNull()
+    expect(await screen.findByText('Metadata sources')).not.toBeNull()
+  })
+
   it('explains when a linked Literature reference no longer exists', async () => {
     get.mockResolvedValue(undefined)
     useNavigationStore.getState().openLiteratureItem('missing-item', 'user')
@@ -2486,6 +2498,340 @@ describe('LiteratureLibraryPage', () => {
     }
   )
 
+  it.each(['second.pdf', 'notes.txt'])(
+    'reports rejected multi-file PDF drops including %s before staging any file',
+    async (secondName) => {
+      search.mockImplementation(async (request: { scope: string }) =>
+        request.scope === 'library' ? { entries: [libraryItem] } : { entries: [] }
+      )
+      stageLocalFile.mockResolvedValue({
+        id: 'upload-1',
+        sessionId: '.pending',
+        name: 'first.pdf',
+        originalName: 'first.pdf',
+        path: '/managed/first.pdf',
+        mimeType: 'application/pdf',
+        size: 8
+      })
+      importPdf.mockResolvedValue({ item: libraryItem })
+      render(<LiteratureLibraryPage />)
+      fireEvent.click(screen.getByRole('button', { name: 'All references' }))
+      const detail = await openReferenceDetail(
+        await screen.findByText('Corrective Retrieval Augmented Generation')
+      )
+      await act(async () => {
+        fireEvent.drop(detail.querySelector('[data-slot="literature-pdf-drop-zone"]')!, {
+          dataTransfer: {
+            types: ['Files'],
+            files: [
+              new File(['%PDF-1.7'], 'first.pdf', { type: 'application/pdf' }),
+              new File(['second'], secondName)
+            ]
+          }
+        })
+      })
+      expect(within(detail).getByRole('alert').textContent).toContain(
+        'Choose one PDF at a time. No files were added.'
+      )
+      if (secondName === 'notes.txt')
+        expect(within(detail).getByRole('alert').textContent).toContain(
+          'Unsupported files: notes.txt'
+        )
+      expect(stageLocalFile).not.toHaveBeenCalled()
+      expect(importPdf).not.toHaveBeenCalled()
+    }
+  )
+
+  it('shows a cancellable reference import while the file is still being read', async () => {
+    let finishRead!: (content: string) => void
+    const file = new File(['references'], 'slow.bib')
+    Object.defineProperty(file, 'text', {
+      value: () =>
+        new Promise<string>((resolve) => {
+          finishRead = resolve
+        })
+    })
+    render(<LiteratureLibraryPage />)
+    fireEvent.click(screen.getByRole('button', { name: 'All references' }))
+    fireEvent.change(screen.getByLabelText('Import references'), { target: { files: [file] } })
+    try {
+      expect(importRecords).not.toHaveBeenCalled()
+      const dialog = screen.queryByRole('dialog')
+      expect(dialog).not.toBeNull()
+      expect(within(dialog!).getByRole('status')).not.toBeNull()
+      expect(within(dialog!).getByText('slow.bib')).not.toBeNull()
+      fireEvent.click(within(dialog!).getByRole('button', { name: 'Cancel' }))
+    } finally {
+      await act(async () => {
+        finishRead('@article{x,title={Example}}')
+      })
+    }
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(importRecords).not.toHaveBeenCalled()
+  })
+
+  it('keeps the selection-time reference destination through delayed reading and submission', async () => {
+    let finishRead!: (content: string) => void
+    const file = new File(['references'], 'slow.bib')
+    Object.defineProperty(file, 'text', {
+      value: () =>
+        new Promise<string>((resolve) => {
+          finishRead = resolve
+        })
+    })
+    render(<LiteratureLibraryPage />)
+    fireEvent.click(screen.getByRole('button', { name: 'Retrieval research' }))
+    const allReferences = screen.getByRole('button', { name: 'All references' })
+    fireEvent.change(screen.getByLabelText('Import references'), { target: { files: [file] } })
+    // External navigation can still update page state behind a modal.
+    fireEvent.click(allReferences)
+    await act(async () => {
+      finishRead('@article{x,title={Example}}')
+    })
+    expect(within(screen.getByRole('dialog')).getByText('Retrieval research')).not.toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Import references' }))
+    await waitFor(() =>
+      expect(transact).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: 'set-project-items',
+          projectId: 'project-1',
+          itemIds: [libraryItem.id]
+        })
+      )
+    )
+  })
+
+  it('cleans up a cancelled desktop stage that returns a managed file late', async () => {
+    search.mockImplementation(async (request: { scope: string }) =>
+      request.scope === 'library' ? { entries: [libraryItem] } : { entries: [] }
+    )
+    let finishStage!: (value: unknown) => void
+    stageLocalFile.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishStage = resolve
+        })
+    )
+    render(<LiteratureLibraryPage />)
+    fireEvent.click(screen.getByRole('button', { name: 'All references' }))
+    await openReferenceDetail(await screen.findByText(libraryItem.item.title))
+    fireEvent.change(screen.getByLabelText('Add PDF'), {
+      target: { files: [new File(['pdf'], 'paper.pdf')] }
+    })
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel upload' }))
+    await act(async () => {
+      finishStage({
+        id: 'upload-late',
+        sessionId: '.pending',
+        name: 'paper.pdf',
+        originalName: 'paper.pdf',
+        path: '/managed/late.pdf',
+        mimeType: 'application/pdf',
+        size: 3
+      })
+    })
+    expect(deleteUpload).toHaveBeenCalledWith({ path: '/managed/late.pdf' })
+    expect(importPdf).not.toHaveBeenCalled()
+    expect(claimLocalFile).not.toHaveBeenCalled()
+  })
+
+  it('does not start PDF staging after a pending reference creation outlives the page', async () => {
+    let finishCreate!: (value: unknown) => void
+    transact.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishCreate = resolve
+        })
+    )
+    stageLocalFile.mockResolvedValue({
+      id: 'late',
+      sessionId: '.pending',
+      name: 'paper.pdf',
+      originalName: 'paper.pdf',
+      path: '/managed/late.pdf',
+      mimeType: 'application/pdf',
+      size: 3
+    })
+    importPdf.mockResolvedValue({ item: libraryItem })
+    const page = render(<LiteratureLibraryPage />)
+    fireEvent.click(screen.getByRole('button', { name: 'All references' }))
+    fireEvent.change(screen.getByLabelText('Import PDF'), {
+      target: { files: [new File(['pdf'], 'paper.pdf')] }
+    })
+    await screen.findByLabelText('Title')
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(transact).toHaveBeenCalledOnce()
+    page.unmount()
+    await act(async () => {
+      finishCreate({ kind: 'item', id: libraryItem.id, state: 'present' })
+    })
+    expect(stageLocalFile).not.toHaveBeenCalled()
+    expect(importPdf).not.toHaveBeenCalled()
+  })
+
+  it('aborts the active backend transfer when the library unmounts during native staging', async () => {
+    search.mockImplementation(async (request: { scope: string }) =>
+      request.scope === 'library' ? { entries: [libraryItem] } : { entries: [] }
+    )
+    let finishStage!: (value: unknown) => void
+    stageLocalFile.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishStage = resolve
+        })
+    )
+    const page = render(<LiteratureLibraryPage />)
+    fireEvent.click(screen.getByRole('button', { name: 'All references' }))
+    await openReferenceDetail(await screen.findByText(libraryItem.item.title))
+    fireEvent.change(screen.getByLabelText('Add PDF'), {
+      target: { files: [new File(['pdf'], 'paper.pdf')] }
+    })
+    const request = stageLocalFile.mock.calls[0][1]
+    page.unmount()
+    try {
+      expect(window.api.uploads.abortTransfer).toHaveBeenCalledWith({
+        transferId: request.transferId
+      })
+    } finally {
+      await act(async () => {
+        finishStage({
+          id: 'upload-late',
+          sessionId: '.pending',
+          name: 'paper.pdf',
+          originalName: 'paper.pdf',
+          path: '/managed/late.pdf',
+          mimeType: 'application/pdf',
+          size: 3
+        })
+      })
+    }
+    expect(importPdf).not.toHaveBeenCalled()
+    expect(deleteUpload).toHaveBeenCalledWith({ path: '/managed/late.pdf' })
+  })
+
+  it.each(['existing', 'new'])(
+    'reports cancellation when native staging rejects with an IPC Error for an %s reference',
+    async (owner) => {
+      search.mockImplementation(async (request: { scope: string }) =>
+        request.scope === 'library' ? { entries: [libraryItem] } : { entries: [] }
+      )
+      get.mockResolvedValue(libraryItem)
+      let rejectStage!: (error: Error) => void
+      stageLocalFile.mockImplementationOnce(
+        () =>
+          new Promise((_resolve, reject) => {
+            rejectStage = reject
+          })
+      )
+      render(<LiteratureLibraryPage />)
+      fireEvent.click(screen.getByRole('button', { name: 'All references' }))
+      const file = new File(['pdf'], 'paper.pdf')
+      if (owner === 'existing') {
+        await openReferenceDetail(await screen.findByText(libraryItem.item.title))
+        fireEvent.change(screen.getByLabelText('Add PDF'), { target: { files: [file] } })
+      } else {
+        fireEvent.change(screen.getByLabelText('Import PDF'), { target: { files: [file] } })
+        await screen.findByLabelText('Title')
+        fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+      }
+      fireEvent.click(await screen.findByRole('button', { name: 'Cancel upload' }))
+      await act(async () => {
+        rejectStage(new Error('Upload transfer is no longer active.'))
+      })
+      expect((await screen.findByRole('alert')).textContent).toBe(
+        'PDF upload cancelled. The reference was kept.'
+      )
+      expect(importPdf).not.toHaveBeenCalled()
+    }
+  )
+
+  it.each(['existing', 'new'])(
+    'shows byte progress and cancellation for a %s reference while a Web PDF chunk is pending',
+    async (owner) => {
+      search.mockImplementation(async (request: { scope: string }) =>
+        request.scope === 'library' ? { entries: [libraryItem] } : { entries: [] }
+      )
+      get.mockResolvedValue(libraryItem)
+      const uploads = window.api.uploads
+      delete uploads.stageLocalFile
+      const size = 8 * 1024 * 1024 + 1
+      const status = {
+        transferId: 'upload-web',
+        name: 'large.pdf',
+        receivedBytes: 0,
+        totalBytes: size
+      }
+      vi.mocked(uploads.beginTransfer).mockResolvedValue(status)
+      let finishChunk!: () => void
+      vi.mocked(uploads.appendTransfer).mockImplementation(async (request) => {
+        if (request.offset > 0)
+          await new Promise<void>((resolve) => {
+            finishChunk = resolve
+          })
+        return { ...status, receivedBytes: request.offset + request.chunk.byteLength }
+      })
+      vi.mocked(uploads.finishTransfer).mockResolvedValue({
+        id: 'upload-web',
+        sessionId: '.pending',
+        name: 'large.pdf',
+        originalName: 'large.pdf',
+        path: '/managed/large.pdf',
+        mimeType: 'application/pdf',
+        size
+      })
+      importPdf.mockResolvedValue({ item: libraryItem })
+      const file = new File([new Uint8Array(size)], 'large.pdf', { type: 'application/pdf' })
+      // jsdom Blob lacks arrayBuffer; keep the real staging algorithm and its 8 MiB boundary.
+      Object.defineProperty(file, 'slice', {
+        value: (start: number, end: number) => ({
+          arrayBuffer: async () => new ArrayBuffer(end - start)
+        })
+      })
+      render(<LiteratureLibraryPage />)
+      fireEvent.click(screen.getByRole('button', { name: 'All references' }))
+      if (owner === 'existing') {
+        await openReferenceDetail(
+          await screen.findByText('Corrective Retrieval Augmented Generation')
+        )
+        fireEvent.change(screen.getByLabelText('Add PDF'), { target: { files: [file] } })
+      } else {
+        fireEvent.change(screen.getByLabelText('Import PDF'), { target: { files: [file] } })
+        await screen.findByLabelText('Title')
+        fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+      }
+      const detail = screen.getByRole('dialog')
+      await waitFor(() => expect(uploads.appendTransfer).toHaveBeenCalledTimes(2))
+      try {
+        expect(within(detail).getByRole('progressbar').getAttribute('value')).toBe(String(size - 1))
+        expect(within(detail).getByRole('progressbar').getAttribute('max')).toBe(String(size))
+        expect(
+          within(detail)
+            .getAllByRole('button', { name: 'Close' })
+            .every((button) => (button as HTMLButtonElement).disabled)
+        ).toBe(true)
+        fireEvent.keyDown(detail, { key: 'Escape' })
+        expect(screen.getByRole('dialog')).toBe(detail)
+        const cancel = within(detail).queryByRole('button', { name: /cancel/i })
+        expect(cancel).not.toBeNull()
+        fireEvent.click(cancel!)
+        expect(within(detail).getByText('Cancelling…')).not.toBeNull()
+        expect(uploads.abortTransfer).toHaveBeenCalled()
+        expect(importPdf).not.toHaveBeenCalled()
+      } finally {
+        await act(async () => {
+          finishChunk()
+        })
+      }
+      expect(uploads.abortTransfer).toHaveBeenCalled()
+      expect(importPdf).not.toHaveBeenCalled()
+      expect(uploads.finishTransfer).not.toHaveBeenCalled()
+      expect((await screen.findByRole('alert')).textContent).toContain(
+        'PDF upload cancelled. The reference was kept.'
+      )
+      if (owner === 'new') expect(transact).toHaveBeenCalledTimes(1)
+    }
+  )
+
   it('adds a selected PDF to an existing Literature Item through managed staging', async () => {
     search.mockImplementation((request: { scope: string }) =>
       Promise.resolve(request.scope === 'library' ? { entries: [libraryItem] } : { entries: [] })
@@ -2746,6 +3092,222 @@ describe('LiteratureLibraryPage', () => {
     })
   })
 
+  describe.each(['Retry file verification', 'Remove attachment'])(
+    'pending attachment action: %s',
+    (action) => {
+      const startPendingAction = async (): Promise<{
+        detail: HTMLElement
+        finish: (error?: Error) => Promise<void>
+      }> => {
+        const entry = createLibraryItemWithPdf()
+        search.mockImplementation((request: { scope: string }) =>
+          Promise.resolve(
+            request.scope === 'library'
+              ? { entries: [entry, createLibraryItem(2)] }
+              : { entries: [] }
+          )
+        )
+        get.mockResolvedValue(entry)
+        let resolve!: (value: unknown) => void
+        let reject!: (error: Error) => void
+        const pending = new Promise((done, fail) => {
+          resolve = done
+          reject = fail
+        })
+        transact.mockImplementation(() => pending)
+        render(<LiteratureLibraryPage />)
+        fireEvent.click(screen.getByRole('button', { name: 'All references' }))
+        const detail = await openReferenceDetail(
+          await within(await screen.findByRole('table')).findByText(entry.item.title)
+        )
+        fireEvent.click(
+          within(detail).getByRole('button', { name: 'Attachment actions for paper.pdf' })
+        )
+        fireEvent.click(await screen.findByRole('menuitem', { name: action }))
+        if (action === 'Remove attachment' && screen.queryByRole('alertdialog')) {
+          fireEvent.click(screen.getByRole('button', { name: 'Permanently delete attachment' }))
+        }
+        await waitFor(() => expect(transact).toHaveBeenCalledTimes(1))
+        return {
+          detail,
+          finish: async (error) => {
+            await act(async () => {
+              if (error) reject(error)
+              else
+                resolve({
+                  kind: 'item',
+                  id: entry.id,
+                  state: action === 'Remove attachment' ? 'unlinked' : 'present'
+                })
+              await pending.catch(() => undefined)
+            })
+          }
+        }
+      }
+
+      it('does not submit the same operation again after closing and reopening details', async () => {
+        const { detail, finish } = await startPendingAction()
+        try {
+          const original = transact.mock.calls[0][0]
+          fireEvent.click(within(detail).getByRole('button', { name: 'Close' }))
+          await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+          fireEvent.click(
+            await within(await screen.findByRole('table')).findByText(libraryItem.item.title)
+          )
+          const reopened = await screen.findByRole('dialog')
+          fireEvent.click(
+            await within(reopened).findByRole('button', {
+              name: 'Attachment actions for paper.pdf'
+            })
+          )
+          fireEvent.click(await screen.findByRole('menuitem', { name: action }))
+          if (action === 'Remove attachment' && screen.queryByRole('alertdialog')) {
+            fireEvent.click(screen.getByRole('button', { name: 'Permanently delete attachment' }))
+          }
+          await act(async () => {
+            await Promise.resolve()
+          })
+          expect(transact.mock.calls.map(([command]) => command)).toEqual([original])
+        } finally {
+          await finish()
+        }
+      })
+
+      it('keeps progress and the completed result visible after details close', async () => {
+        const { detail, finish } = await startPendingAction()
+        try {
+          fireEvent.click(within(detail).getByRole('button', { name: 'Close' }))
+          await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+          expect(await screen.findByRole('status')).not.toBeNull()
+          expect(screen.getByRole('button', { name: 'Preview paper.pdf' })).toHaveProperty(
+            'disabled',
+            true
+          )
+          expect(
+            screen.getByText(
+              action === 'Remove attachment' ? 'Removing attachment…' : 'Verifying file…'
+            )
+          ).not.toBeNull()
+          await finish()
+          expect(
+            await screen.findByText(
+              action === 'Remove attachment' ? 'Attachment removed.' : 'File integrity verified'
+            )
+          ).not.toBeNull()
+          fireEvent.click(
+            screen.getByRole('button', { name: 'Dismiss attachment result for paper.pdf' })
+          )
+          expect(screen.queryByRole('status')).toBeNull()
+        } finally {
+          await finish()
+        }
+      })
+
+      it('retains admission when the entire library page remounts', async () => {
+        const { finish } = await startPendingAction()
+        try {
+          cleanup()
+          render(<LiteratureLibraryPage />)
+          fireEvent.click(screen.getByRole('button', { name: 'All references' }))
+          fireEvent.click(
+            await within(await screen.findByRole('table')).findByText(libraryItem.item.title)
+          )
+          const detail = await screen.findByRole('dialog')
+          fireEvent.click(
+            await within(detail).findByRole('button', { name: 'Attachment actions for paper.pdf' })
+          )
+          fireEvent.click(await screen.findByRole('menuitem', { name: action }))
+          if (action === 'Remove attachment' && screen.queryByRole('alertdialog')) {
+            fireEvent.click(screen.getByRole('button', { name: 'Permanently delete attachment' }))
+          }
+          expect(transact).toHaveBeenCalledTimes(1)
+          await finish()
+          await waitFor(() => expect(detail.querySelector('[aria-busy="true"]')).toBeNull())
+        } finally {
+          await finish()
+        }
+      })
+
+      it('does not replace a different reference when the operation completes', async () => {
+        const { detail, finish } = await startPendingAction()
+        try {
+          fireEvent.click(within(detail).getByRole('button', { name: 'Close' }))
+          await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+          const other = createLibraryItem(2)
+          get.mockResolvedValue(other)
+          const otherDetail = await openReferenceDetail(
+            await within(await screen.findByRole('table')).findByText(other.item.title)
+          )
+          get.mockResolvedValue(createLibraryItemWithPdf())
+          await finish()
+          expect(within(otherDetail).getByText(other.item.title)).not.toBeNull()
+          expect(
+            within(otherDetail).queryByRole('button', { name: 'Preview paper.pdf' })
+          ).toBeNull()
+        } finally {
+          await finish()
+        }
+      })
+
+      it('shows a failure after closing and permits a deliberate retry', async () => {
+        const { detail, finish } = await startPendingAction()
+        try {
+          fireEvent.click(within(detail).getByRole('button', { name: 'Close' }))
+          await finish(new Error('Storage unavailable'))
+          expect(await screen.findByRole('alert')).not.toBeNull()
+          fireEvent.click(
+            await within(await screen.findByRole('table')).findByText(libraryItem.item.title)
+          )
+          const reopened = await screen.findByRole('dialog')
+          transact.mockResolvedValue({ kind: 'item', id: 'item-1', state: 'present' })
+          fireEvent.click(
+            await within(reopened).findByRole('button', {
+              name: 'Attachment actions for paper.pdf'
+            })
+          )
+          fireEvent.click(await screen.findByRole('menuitem', { name: action }))
+          if (action === 'Remove attachment' && screen.queryByRole('alertdialog')) {
+            fireEvent.click(screen.getByRole('button', { name: 'Permanently delete attachment' }))
+          }
+          await waitFor(() => expect(transact).toHaveBeenCalledTimes(2))
+        } finally {
+          await finish()
+        }
+      })
+
+      it('blocks conflicting actions within the same opening', async () => {
+        const { detail, finish } = await startPendingAction()
+        try {
+          fireEvent.click(
+            within(detail).getByRole('button', { name: 'Attachment actions for paper.pdf' })
+          )
+          fireEvent.click(
+            await screen.findByRole('menuitem', {
+              name: action === 'Remove attachment' ? 'Retry file verification' : 'Remove attachment'
+            })
+          )
+          expect(transact).toHaveBeenCalledTimes(1)
+        } finally {
+          await finish()
+        }
+      })
+
+      it('exposes waiting feedback and disables preview while the operation is pending', async () => {
+        const { detail, finish } = await startPendingAction()
+        try {
+          expect.soft(within(detail).queryByRole('status')).not.toBeNull()
+          expect.soft(detail.querySelector('[aria-busy="true"]')).not.toBeNull()
+          expect
+            .soft(within(detail).getByRole('button', { name: 'Preview paper.pdf' }))
+            .toHaveProperty('disabled', true)
+          expect.soft(within(detail).queryByText('File integrity verified')).toBeNull()
+        } finally {
+          await finish()
+        }
+      })
+    }
+  )
+
   it.each(['deletion', 'merge'] as const)(
     'closes an open reference and its preview when returning after %s in another window',
     async (change) => {
@@ -2810,6 +3372,8 @@ describe('LiteratureLibraryPage', () => {
       within(detail).getByRole('button', { name: 'Attachment actions for paper.pdf' })
     )
     fireEvent.click(await screen.findByRole('menuitem', { name: 'Remove attachment' }))
+    expect(screen.getByRole('alertdialog').textContent).toContain('paper.pdf')
+    fireEvent.click(screen.getByRole('button', { name: 'Permanently delete attachment' }))
     await waitFor(() =>
       expect(transact).toHaveBeenCalledWith({
         kind: 'delete-attachment',
@@ -2876,6 +3440,8 @@ describe('LiteratureLibraryPage', () => {
       within(detail).getByRole('button', { name: 'Attachment actions for paper.pdf' })
     )
     fireEvent.click(await screen.findByRole('menuitem', { name: 'Remove attachment' }))
+    expect(screen.getByRole('alertdialog').textContent).toContain('paper.pdf')
+    fireEvent.click(screen.getByRole('button', { name: 'Permanently delete attachment' }))
     expect(
       await within(detail).findByText(
         'This PDF is referenced by a chat or its message history and cannot be removed. Unlinking the current chat does not remove historical references.'
@@ -2903,6 +3469,8 @@ describe('LiteratureLibraryPage', () => {
       within(detail).getByRole('button', { name: 'Attachment actions for paper.pdf' })
     )
     fireEvent.click(await screen.findByRole('menuitem', { name: 'Remove attachment' }))
+    expect(screen.getByRole('alertdialog').textContent).toContain('paper.pdf')
+    fireEvent.click(screen.getByRole('button', { name: 'Permanently delete attachment' }))
     const alert = await within(detail).findByRole('alert')
     expect(within(detail).getByRole('button', { name: 'Preview paper.pdf' })).not.toBeNull()
     expect.soft(alert.textContent).not.toBe('The attachment operation failed. Try again.')
@@ -2965,6 +3533,9 @@ describe('LiteratureLibraryPage', () => {
         if (entryPoint === 'permanent item') {
           container = screen.getByRole('alertdialog')
           fireEvent.click(within(container).getByRole('button', { name: 'Delete permanently' }))
+        } else {
+          expect(screen.getByRole('alertdialog').textContent).toContain('paper.pdf')
+          fireEvent.click(screen.getByRole('button', { name: 'Permanently delete attachment' }))
         }
         fireEvent.click(await screen.findByRole('button', { name: 'View affected conversations' }))
         expect(screen.getByText('Retained history')).not.toBeNull()
@@ -3022,6 +3593,8 @@ describe('LiteratureLibraryPage', () => {
       within(detail).getByRole('button', { name: 'Attachment actions for paper.pdf' })
     )
     fireEvent.click(await screen.findByRole('menuitem', { name: 'Remove attachment' }))
+    expect(screen.getByRole('alertdialog').textContent).toContain('paper.pdf')
+    fireEvent.click(screen.getByRole('button', { name: 'Permanently delete attachment' }))
     fireEvent.click(await screen.findByRole('button', { name: 'View recovery details' }))
     expect(screen.getByText('damaged-session.json')).not.toBeNull()
     expect(
@@ -3082,6 +3655,8 @@ describe('LiteratureLibraryPage', () => {
       within(detail).getByRole('button', { name: 'Attachment actions for paper.pdf' })
     )
     fireEvent.click(await screen.findByRole('menuitem', { name: 'Remove attachment' }))
+    expect(screen.getByRole('alertdialog').textContent).toContain('paper.pdf')
+    fireEvent.click(screen.getByRole('button', { name: 'Permanently delete attachment' }))
     expect(await within(detail).findByRole('alert')).not.toBeNull()
     expect(
       within(detail).getByText('Attachment removed. Storage cleanup could not finish.')
@@ -4455,7 +5030,7 @@ describe('LiteratureLibraryPage', () => {
       target: { value: 'query' }
     })
     expect(
-      search.mock.calls.filter(([request]) => request.scope === 'library' && request.limit === 1)
+      search.mock.calls.filter(([request]) => request.scope === 'library' && request.countOnly)
     ).toHaveLength(1)
     await openMenu(screen.getByRole('button', { name: 'Add' }))
     fireEvent.click(screen.getByRole('menuitem', { name: 'Add reference' }))
@@ -4478,7 +5053,7 @@ describe('LiteratureLibraryPage', () => {
     expect(await screen.findByRole('heading', { name: 'Manual paper' })).not.toBeNull()
     await within(countButton).findByText('1')
     expect(
-      search.mock.calls.filter(([request]) => request.scope === 'library' && request.limit === 1)
+      search.mock.calls.filter(([request]) => request.scope === 'library' && request.countOnly)
     ).toHaveLength(2)
   })
 
@@ -5269,7 +5844,7 @@ describe('LiteratureLibraryPage', () => {
         )
       }
       const previousQueries = search.mock.calls.filter(
-        ([request]) => request.scope === 'library' && request.limit !== 1
+        ([request]) => request.scope === 'library' && !request.countOnly
       ).length
       const input = screen.getByRole('textbox', {
         name: `Note for ${libraryItem.item.title}`
@@ -5305,16 +5880,14 @@ describe('LiteratureLibraryPage', () => {
       if (!filtered) {
         expect(screen.getByText(libraryItem.item.title)).not.toBeNull()
         expect(
-          search.mock.calls.filter(
-            ([request]) => request.scope === 'library' && request.limit !== 1
-          )
+          search.mock.calls.filter(([request]) => request.scope === 'library' && !request.countOnly)
         ).toHaveLength(previousQueries)
         return
       }
       if (!remains)
         await waitFor(() => expect(screen.queryByText(libraryItem.item.title)).toBeNull())
       expect(
-        search.mock.calls.filter(([request]) => request.scope === 'library' && request.limit !== 1)
+        search.mock.calls.filter(([request]) => request.scope === 'library' && !request.countOnly)
           .length
       ).toBeGreaterThan(previousQueries)
     }
@@ -5939,7 +6512,9 @@ describe('LiteratureLibraryPage', () => {
 
     fireEvent.change(screen.getByLabelText('Import references'), { target: { files: [file] } })
     await screen.findByRole('dialog')
-    expect(screen.getByText('Only the first 1,000 references will be imported.')).not.toBeNull()
+    expect(
+      await screen.findByText('Only the first 1,000 references will be imported.')
+    ).not.toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Import references' }))
     expect(await screen.findByText('Created')).not.toBeNull()
     expect(screen.getByText('Skipped').parentElement?.textContent).toContain('1001Skipped')
@@ -6627,7 +7202,7 @@ describe('LiteratureLibraryPage', () => {
     fireEvent.click(select)
     expect(screen.queryByRole('button', { name: 'Background tasks' })).toBeNull()
     const listRequests = search.mock.calls.filter(
-      ([request]) => request.scope === 'library' && request.limit !== 1
+      ([request]) => request.scope === 'library' && !request.countOnly
     ).length
     get.mockResolvedValue({
       ...libraryItem,
@@ -6648,7 +7223,7 @@ describe('LiteratureLibraryPage', () => {
         .checked
     ).toBe(true)
     expect(
-      search.mock.calls.filter(([request]) => request.scope === 'library' && request.limit !== 1)
+      search.mock.calls.filter(([request]) => request.scope === 'library' && !request.countOnly)
     ).toHaveLength(listRequests)
   })
 
@@ -8337,7 +8912,7 @@ describe('LiteratureLibraryPage', () => {
         entries: request.scope === 'library' ? [updated] : []
       }))
       const listReads = (): number =>
-        search.mock.calls.filter(([request]) => request.scope === 'library' && request.limit !== 1)
+        search.mock.calls.filter(([request]) => request.scope === 'library' && !request.countOnly)
           .length
       const before = listReads()
       fireEvent.click(screen.getByRole('button', { name: 'Inbox' }))

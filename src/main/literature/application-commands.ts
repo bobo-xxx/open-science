@@ -1,5 +1,10 @@
 import { withDataRootWrite } from '../storage/migration-state'
 import {
+  literatureExportRecordContract,
+  type LiteratureExportRecordRequest,
+  type LiteratureExportRecordResult
+} from '../../shared/literature-export'
+import {
   literatureJobsContract,
   type LiteratureJobRequest,
   type LiteratureJobsResult
@@ -20,6 +25,7 @@ import {
   type LiteratureFormatDocumentResult,
   type LiteratureItemInput,
   type LiteratureItemView,
+  type LiteratureSourceRecordView,
   type LiteratureMetadataCompletionRequest,
   type LiteratureMetadataCompletionResult,
   type LiteraturePdfImportReceipt,
@@ -35,6 +41,7 @@ import {
 } from '../application-command-router'
 
 type LiteratureCommandOwner = Readonly<{
+  exportRecord(request: LiteratureExportRecordRequest): Promise<LiteratureExportRecordResult>
   jobs(request: LiteratureJobRequest): Promise<LiteratureJobsResult>
   fullText(request: LiteratureFullTextRequest): Promise<LiteratureFullTextResult>
   lookupMetadata(doi: string): Promise<LiteratureItemInput>
@@ -42,6 +49,7 @@ type LiteratureCommandOwner = Readonly<{
     request: LiteratureMetadataCompletionRequest
   ): Promise<LiteratureMetadataCompletionResult>
   search(request: LiteratureCatalogSearchRequest): Promise<LiteratureCatalogSearchPage>
+  sources(itemId: string): Promise<LiteratureSourceRecordView[]>
   get(itemId: string): Promise<LiteratureItemView | undefined>
   formatReferences(
     request: LiteratureFormatReferencesRequest
@@ -54,6 +62,11 @@ type LiteratureCommandOwner = Readonly<{
 }>
 
 const literatureApplicationCommands = Object.freeze({
+  exportRecord: defineApplicationCommand<
+    'literature:export-record',
+    readonly [LiteratureExportRecordRequest],
+    LiteratureExportRecordResult
+  >('literature:export-record', literatureExportRecordContract),
   jobs: defineApplicationCommand<
     'literature:jobs',
     readonly [LiteratureJobRequest],
@@ -79,6 +92,11 @@ const literatureApplicationCommands = Object.freeze({
     readonly [LiteratureCatalogSearchRequest],
     LiteratureCatalogSearchPage
   >('literature:search', literatureApplicationCommandContracts.search),
+  sources: defineApplicationCommand<
+    'literature:sources',
+    readonly [string],
+    LiteratureSourceRecordView[]
+  >('literature:sources', literatureApplicationCommandContracts.sources),
   get: defineApplicationCommand<
     'literature:get',
     readonly [string],
@@ -117,6 +135,7 @@ const literatureApplicationCommands = Object.freeze({
 })
 
 const literatureApplicationCommandGroup = defineApplicationCommandGroup('literature', [
+  literatureApplicationCommands.exportRecord,
   literatureApplicationCommands.jobs,
   literatureApplicationCommands.fullText,
   literatureApplicationCommands.lookupMetadata,
@@ -125,6 +144,7 @@ const literatureApplicationCommandGroup = defineApplicationCommandGroup('literat
   literatureApplicationCommands.formatReferences,
   literatureApplicationCommands.formatDocument,
   literatureApplicationCommands.get,
+  literatureApplicationCommands.sources,
   literatureApplicationCommands.importPdf,
   literatureApplicationCommands.importRecords,
   literatureApplicationCommands.search,
@@ -138,6 +158,8 @@ const registerLiteratureApplicationCommands = (
   const scope = registrar.createScope()
   try {
     scope.registerGroup(literatureApplicationCommandGroup, {
+      'literature:export-record': ({ args }) =>
+        withDataRootWrite(() => owner.exportRecord(args[0])),
       'literature:jobs': ({ args }) => withDataRootWrite(() => owner.jobs(args[0])),
       'literature:full-text': ({ args }) => withDataRootWrite(() => owner.fullText(args[0])),
       'literature:lookup-metadata': ({ args }) =>
@@ -150,6 +172,7 @@ const registerLiteratureApplicationCommands = (
         withDataRootWrite(() => owner.formatReferences(args[0])),
       'literature:format-document': ({ args }) =>
         withDataRootWrite(() => owner.formatDocument(args[0])),
+      'literature:sources': ({ args }) => withDataRootWrite(() => owner.sources(args[0])),
       'literature:get': ({ args }) => withDataRootWrite(() => owner.get(args[0])),
       'literature:import-pdf': ({ args }) => withDataRootWrite(() => owner.importPdf(args[0])),
       'literature:import-records': ({ args }) =>
