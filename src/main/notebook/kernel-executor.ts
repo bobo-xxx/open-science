@@ -31,11 +31,12 @@ import {
   buildNotebookKernelEnvironment,
   environmentPathRoots
 } from './process-environment'
-import type {
-  NotebookProcessSandbox,
-  NotebookSandboxCleanupReason,
-  NotebookSandboxCleanupResult,
-  NotebookSandboxProcessOutcome
+import {
+  NotebookRuntimeAccessCancelledError,
+  type NotebookProcessSandbox,
+  type NotebookSandboxCleanupReason,
+  type NotebookSandboxCleanupResult,
+  type NotebookSandboxProcessOutcome
 } from './process-sandbox'
 import {
   notebookWorkloadCacheEnv,
@@ -408,6 +409,18 @@ const errorToExecutionResult = (
   kernelDispatched = false,
   helperModulesInitialized: readonly string[] = []
 ): NotebookExecutionResult => {
+  if (error instanceof NotebookRuntimeAccessCancelledError) {
+    return {
+      status: 'cancelled',
+      kernelDispatched,
+      stdout: '',
+      stderr: error.message,
+      traceback: '',
+      cwdAfter: request.cwd,
+      outputs: [],
+      workingFiles: []
+    }
+  }
   if (error instanceof NotebookExecutionCancelledError) {
     return {
       status: 'cancelled',
@@ -564,7 +577,8 @@ class NotebookKernelExecutor implements NotebookExecutor {
           {
             ...request,
             code: notebookHelperInitializationCode(helperModules),
-            helperModules: undefined
+            helperModules: undefined,
+            pythonRandomState: undefined
           },
           () => undefined
         )
@@ -639,6 +653,9 @@ class NotebookKernelExecutor implements NotebookExecutor {
         truncated: response.outputTruncated || figureResult.truncated,
         workingFiles: fileObservation.workingFiles,
         fileEvidence: fileObservation.fileEvidence,
+        ...(fileObservation.confirmedReadPaths
+          ? { confirmedReadPaths: fileObservation.confirmedReadPaths }
+          : {}),
         ...(helperModulesInitialized.length ? { helperModulesInitialized } : {}),
         environmentOverlay: response.environmentOverlay
       }
@@ -649,7 +666,10 @@ class NotebookKernelExecutor implements NotebookExecutor {
         ...(fileObservation
           ? {
               workingFiles: fileObservation.workingFiles,
-              fileEvidence: fileObservation.fileEvidence
+              fileEvidence: fileObservation.fileEvidence,
+              ...(fileObservation.confirmedReadPaths
+                ? { confirmedReadPaths: fileObservation.confirmedReadPaths }
+                : {})
             }
           : {})
       }
@@ -992,6 +1012,17 @@ class NotebookKernelExecutor implements NotebookExecutor {
     if (this.processSandbox && (!sessionId || !projectId)) {
       throw new Error('Notebook network sandbox requires Session and Project context.')
     }
+    // Admission routes external R and the managed default through DEFAULT_R_ENV. Named,
+    // agent-created environments have no per-runtime durable ACL removal workflow.
+    if (kind === 'r' && env === DEFAULT_R_ENV) {
+      await this.processSandbox?.ensureRuntimeAccess?.({
+        executable: invocation.executable,
+        runtime: kind,
+        sessionId: sessionId!,
+        signal: request.signal
+      })
+    }
+    if (request.signal?.aborted) throw new NotebookExecutionCancelledError()
     const sandboxed = this.processSandbox
       ? await this.processSandbox.wrap({
           executable: invocation.executable,
@@ -1011,6 +1042,7 @@ class NotebookKernelExecutor implements NotebookExecutor {
           filesystem: {
             readOnlyRoots: presentPaths([
               request.runtimeRoot,
+              request.resolvedInterpreter?.condaPrefix ?? '',
               request.inputRoot ?? '',
               kernelExecutableReadRoot(invocation.executable, kind, this.platform),
               loopPath,
@@ -1356,7 +1388,8 @@ class NotebookKernelExecutor implements NotebookExecutor {
               reqId,
               request.code,
               request.controlInvocationId,
-              protectedDirAdditions
+              protectedDirAdditions,
+              request.language === 'python' ? request.pythonRandomState : undefined
             )
           )
           for (const directory of protectedDirAdditions) proc.protectedDirs.add(directory)
