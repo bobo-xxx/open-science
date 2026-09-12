@@ -1,4 +1,5 @@
-import { AlertTriangle, LoaderCircle, SearchX, Trash2 } from 'lucide-react'
+import { ErrorNotice } from '@/components/error-notice'
+import { LoaderCircle, SearchX, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { AlertDialog } from 'radix-ui'
@@ -178,8 +179,9 @@ const SkillBulkManageView = (): React.JSX.Element => {
     const deletedIds = new Set<string>()
     const failures: string[] = []
     for (const { skill } of deletableSkills) {
+      if (skill.source === 'featured') continue
       try {
-        await deleteSkill(skill.id)
+        await deleteSkill(skill.id, skill.source, skill.directoryName)
         deletedIds.add(skill.id)
       } catch (error) {
         failures.push(errorMessage(error) || skill.displayName)
@@ -363,13 +365,7 @@ const SkillBulkManageView = (): React.JSX.Element => {
       ) : null}
 
       {bulkError ? (
-        <p
-          role="alert"
-          className="mt-3 flex items-start gap-2 rounded-lg border border-danger-000/30 bg-danger-000/10 px-3 py-2 text-xs text-danger-000"
-        >
-          <AlertTriangle className="size-3.5 shrink-0" aria-hidden="true" />
-          <span>{bulkError}</span>
-        </p>
+        <ErrorNotice role="alert" tone="amber" className="mt-3" description={bulkError} />
       ) : null}
 
       {visible.length > 0 ? (
