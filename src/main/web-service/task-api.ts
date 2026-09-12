@@ -1,6 +1,9 @@
+import type { BootstrapRequest, BootstrapResult } from '../../shared/bootstrap'
+import type { CliLauncherStatus } from '../../shared/cli'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { randomUUID } from 'node:crypto'
 
+import type { ArtifactVersionDescriptor } from '../../shared/artifact-provenance'
 import type { AcpRuntimeEvent } from '../../shared/acp'
 import type {
   FinalizeRunArtifactsRequest,
@@ -149,6 +152,10 @@ class HeadlessTaskApi {
           this.withCurrentCaller(() => this.ports.agent.cancelPrompt(sessionId))
       },
       artifacts: {
+        resolveVersionDescriptors: (request) =>
+          this.invoke('artifacts:resolve-version-descriptors', request) as Promise<
+            ArtifactVersionDescriptor[]
+          >,
         finalizeRun: (request: FinalizeRunArtifactsRequest) =>
           this.invoke('artifacts:finalize-run', request) as Promise<FinalizeRunArtifactsResult>
       },
@@ -232,18 +239,35 @@ class HeadlessTaskApi {
     return this.runner.listProjects()
   }
 
+  async bootstrap(request: BootstrapRequest): Promise<BootstrapResult> {
+    this.requireLocalConnectorCaller()
+    return this.invoke('settings:bootstrap', request) as Promise<BootstrapResult>
+  }
+
+  async installCli(): Promise<CliLauncherStatus> {
+    this.requireLocalConnectorCaller()
+    return this.invoke('cli:install') as Promise<CliLauncherStatus>
+  }
+
   async doctor(): Promise<TaskDoctorReport> {
-    const [preflight, skills] = await Promise.all([
+    const [preflight, skills, bootstrap] = await Promise.all([
       this.invoke('settings:get-preflight') as Promise<ReadinessPreflight>,
-      this.invoke('settings:list-skills') as Promise<SkillView[]>
+      this.invoke('settings:list-skills') as Promise<SkillView[]>,
+      this.invoke('settings:bootstrap', { action: 'status' }) as Promise<BootstrapResult>
     ])
     const { runtimeReadiness, providerReadiness } = preflight
     const next: TaskDoctorReport['next'][number][] = []
     if (runtimeReadiness.status !== 'ready') {
-      next.push({ code: `runtime_${runtimeReadiness.status}` })
+      next.push({
+        code: `runtime_${runtimeReadiness.status}`,
+        ...(bootstrap.ok && bootstrap.next?.runtime ? { argv: bootstrap.next.runtime } : {})
+      })
     }
     if (providerReadiness.status !== 'ready') {
-      next.push({ code: `provider_${providerReadiness.status}` })
+      next.push({
+        code: `provider_${providerReadiness.status}`,
+        ...(bootstrap.ok && bootstrap.next?.provider ? { argv: bootstrap.next.provider } : {})
+      })
     }
     return {
       ready: runtimeReadiness.status === 'ready' && providerReadiness.status === 'ready',
