@@ -32,7 +32,7 @@ const webAdapterSources = [
   'src/main/web-service/task-api.ts'
 ].map(readSource)
 const legacyAdapterBlock = compact(
-  between(ipcSource, "declareElectronAdapter('desktop-utilities'", 'const electronSenderFor')
+  between(ipcSource, 'createDesktopUtilitiesElectronSurface({', 'const electronSenderFor')
 )
 const notificationAdapterBlock = compact(readSource('src/main/ipc-surfaces/notifications.ts'))
 const dependencyBlock = compact(
@@ -44,6 +44,53 @@ const dependencyBlock = compact(
 )
 
 describe('production application command wiring', () => {
+  it('installs desktop utilities with shared owners and retains find-event cleanup', () => {
+    const desktop = compact(
+      between(ipcSource, 'createDesktopUtilitiesElectronSurface({', '// ACP identity resolution')
+    )
+    expect(desktop).toContain(
+      'resolveManagedFilePath, managedFileVersions: managedFileVersionService, notebookInputs: notebookInputRegistry, translate, logs: logsCommandOwner, github: githubCommandOwner, cli: cliCommandOwner'
+    )
+    const phase = between(
+      ipcSource,
+      'surfaceAdapters = beforeAcpAdapters',
+      'surfaceAdapters = afterAcpAdapters'
+    )
+    expect(phase).toContain('createDesktopUtilitiesElectronSurface({')
+    expect(occurrences(ipcSource, 'createDesktopUtilitiesElectronSurface(')).toBe(1)
+    const surface = compact(readSource('src/main/ipc-surfaces/desktop-utilities.ts'))
+    expect(surface).toContain("createElectronSurfaceAdapter('desktop-utilities'")
+    expect(surface).toContain('registerLogsIpcHandlers(logs)')
+    expect(surface).toContain('registerGithubIpcHandlers({}, github)')
+    expect(surface).toContain('registerCliInstallIpcHandlers(cli)')
+    expect(surface).toContain('return registerWindowFindIpcHandlers()')
+    expect(ipcSource).not.toContain('registerWindowFindIpcHandlers')
+    expect(ipcSource).not.toContain('registerFileSaveHandlers')
+  })
+
+  it('installs approval handlers with the shared connector brokers in beforeAcp', () => {
+    const phase = compact(
+      between(
+        ipcSource,
+        'surfaceAdapters = beforeAcpAdapters',
+        'surfaceAdapters = afterAcpAdapters'
+      )
+    )
+    expect(phase).toContain(
+      'surfaceAdapters.push( createConnectorApprovalElectronSurface( approvalBroker, credentialRequestBroker, skillImportApprovalBroker ) )'
+    )
+    expect(occurrences(ipcSource, 'createConnectorApprovalElectronSurface(')).toBe(1)
+    expect(compact(ipcSource)).toContain(
+      'connectorApprovals: approvalBroker, credentialRequests: credentialRequestBroker, skillImportApprovals: skillImportApprovalBroker } = connectorApplication'
+    )
+    const surface = compact(readSource('src/main/ipc-surfaces/connector-approvals.ts'))
+    expect(surface).toContain("createElectronSurfaceAdapter('connector-approvals'")
+    expect(surface).toContain('approvalBroker.respond(request.id, request.decision)')
+    expect(surface).toContain('credentialRequestBroker.respond(request.id, request.configured)')
+    expect(surface).toContain('skillImportApprovalBroker.respond(response)')
+    expect(ipcSource).not.toContain("ipcMainHandle('connectors:approval-respond'")
+  })
+
   it('keeps the upload owner and notification surface in its original installation phase', () => {
     const uploadSurface = compact(readSource('src/main/ipc-surfaces/uploads.ts'))
     expect(uploadSurface).toContain("import { registerUploadIpcHandlers } from '../uploads/ipc'")
@@ -139,13 +186,9 @@ describe('production application command wiring', () => {
         'registerUpdateIpcHandlers(updateStrategy, updateCommandOwner)',
         'update: updateCommandOwner'
       ],
-      ['cliCommandOwner', 'registerCliInstallIpcHandlers(cliCommandOwner)', 'cli: cliCommandOwner'],
-      [
-        'githubCommandOwner',
-        'registerGithubIpcHandlers({}, githubCommandOwner)',
-        'github: githubCommandOwner'
-      ],
-      ['logsCommandOwner', 'registerLogsIpcHandlers(logsCommandOwner)', 'logs: logsCommandOwner'],
+      ['cliCommandOwner', 'cli: cliCommandOwner', 'cli: cliCommandOwner'],
+      ['githubCommandOwner', 'github: githubCommandOwner', 'github: githubCommandOwner'],
+      ['logsCommandOwner', 'logs: logsCommandOwner', 'logs: logsCommandOwner'],
       [
         'uploadCommandOwner',
         'surfaceAdapters.push(createUploadElectronSurface(uploadCommandOwner))',

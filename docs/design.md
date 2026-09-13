@@ -588,13 +588,21 @@ colors communicate a successful or failed probe/migration result.
   Keep the header, sidebar, preview, and composer stable; hide the decorative skeleton from assistive
   technology, and disable its pulse under reduced motion. Already-hydrated Session switches render
   directly so short in-memory transitions never flash a loading surface.
-- Desktop conversations with at least two visible human-authored runs show **Run Marks** in the
+- Desktop conversations with at least four visible human-authored runs show **Run Marks** in the
   scroller's left gutter. One mark belongs to the visible user Message that admitted the Run; model
-  Turns inside that Run do not create marks. At rest, every mark is the same short gray segment.
+  Turns inside that Run do not create marks. At rest, all marks stay equally short. Marks whose conversation segments intersect the transcript
+  viewport use `bg-text-000`; off-screen segments remain gray. Multiple visible segments may be dark
+  at once, including a visible response whose prompt has scrolled off-screen. Scrolling and content
+  resizing refresh this highlight independently of pointer hover.
   Pointer hover or keyboard focus emphasizes one mark and tapers nearby segments by distance; the
-  segments use a compact 10px pitch, and the rail stays fixed at the conversation panel midpoint so
+  segments use a 20px pitch for short lists, tightening to a minimum of 12px as the list grows,
+  with 200ms transform easing and reduced-motion support. Colors
+  update immediately. The rail clips overflow at 480px (or the available window height), never
+  compresses marks below 12px, and follows transcript reading progress only when the current mark reaches a
+  visible edge. The rail does not scroll independently on wheel or touch input; keyboard focus can
+  still reveal a clipped mark. Its outer frame stays fixed at the conversation panel midpoint so
   bottom approval or permission surfaces do not shift it. The current Run remains available through
-  `aria-current` without a persistent visual highlight.
+  `aria-current`; the visible-segment highlight remains when hover ends.
   Activating a mark scrolls that Message to the top with reduced-motion support. The preview shows
   the user Message as a dark single-line excerpt plus up to two muted lines from the first visible
   Agent Message explicitly linked through `responseToMessageId`; historical Agent Messages without
@@ -981,6 +989,10 @@ colors communicate a successful or failed probe/migration result.
 - Stray file drops are neutralized app-wide: the renderer entry prevents the default `dragover` / `drop` so a file released outside a dropzone can never navigate the window to `file://…`.
 
 #### Connectors panel
+
+- The catalog follows the Skills toolbar rhythm: group, agent, Tag and search filters on the first row; **Manage** and **Add connector** right-aligned on the second row. Manage opens **Connectors / Manage connectors** through shared Settings history.
+- Manage lists Featured, Directory and Custom Connectors with group/status/search filters, native selection checkboxes, select-all-results, selected-only view and bulk enable/disable. These actions persist Main Agent availability through the existing settings commands; Specialist assignments and approval policy are unchanged. Unauthenticated or credential-blocked custom Connectors cannot be enabled. Commands run sequentially and report partial completion, keeping failed targets selected for retry.
+- Bulk deletion previews custom Connector configurations only. Bundled Connectors and Connectors used by Specialists are protected. Usage must load successfully from a healthy catalog before preview and is refreshed again before confirmation executes; newly referenced targets are kept. Deletion reuses the existing cleanup workflow and journal, retains shared credentials, and reports failed targets. The preview never expands the set the user reviewed.
 
 - Remembered permission rows identify Connector tools by the current Connector display name,
   public server ID, and exact tool name. The name opens the existing Connector Settings route in

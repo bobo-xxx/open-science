@@ -148,12 +148,11 @@ import { isCustomMcpServerRouteSafe } from './connectors/custom-mcp-bootstrap'
 import { createMoleculePreviewHandler } from './connectors/molecule-preview'
 import { ALL_CONNECTOR_IDS } from './connectors/registry'
 import { connectorSkillSourceDir } from './connectors/provision'
-import { registerFileSaveHandlers } from './file-save'
 import { publishUserFile } from './user-file-publisher'
 import { ImmutableInputAuthority } from './immutable-input-authority'
-import { createCliCommandOwner, registerCliInstallIpcHandlers } from './cli-install/ipc'
+import { createCliCommandOwner } from './cli-install/ipc'
 
-import { createGithubCommandOwner, registerGithubIpcHandlers } from './github-ipc'
+import { createGithubCommandOwner } from './github-ipc'
 import {
   BackendShutdownOutcomeError,
   BackendShutdownCoordinator,
@@ -168,11 +167,11 @@ import {
   type RendererSessionPersistenceSurface,
   type RendererSessionPersistenceTarget
 } from './session-persistence/renderer-flush'
-import { createLogsCommandOwner, registerLogsIpcHandlers } from './logs-ipc'
-import { registerWindowIpcHandlers } from './window-ipc'
-import { registerWindowFindIpcHandlers } from './window-find-ipc'
+import { createLogsCommandOwner } from './logs-ipc'
 import { TaskNotificationService } from './notifications/task-notifications'
 import { createNotificationInboxController } from './notifications/notification-inbox-controller'
+import { createDesktopUtilitiesElectronSurface } from './ipc-surfaces/desktop-utilities'
+import { createConnectorApprovalElectronSurface } from './ipc-surfaces/connector-approvals'
 import { createNotificationElectronSurface } from './ipc-surfaces/notifications'
 import { NotificationInboxDbRepository } from './notifications/notification-inbox-repository'
 import { bindNotificationInboxDeletionRuntime } from './notifications/notification-inbox-runtime'
@@ -417,7 +416,6 @@ import {
   CONNECTOR_TEMPLATE_MAX_BYTES,
   type AppIconPreview,
   type AppIconVariant,
-  type RespondApprovalRequest,
   type SessionAgentConfiguration
 } from '../shared/settings'
 import type { AcpSessionAgentTarget } from '../shared/acp'
@@ -484,7 +482,6 @@ import {
 } from './runtime-electron-wiring'
 import { HostSkillsService, type HostSkillsCatalog } from './skills/host-skills-service'
 import { UserSkillCatalogObserver } from './skills/user-skill-catalog-observer'
-import type { ConversationSkillImportApprovalResponse } from '../shared/settings'
 import type { TaskControlPorts } from './tasks/task-control-ports'
 import type { TaskAgentPort } from './tasks/task-runner'
 import { englishNativeTranslator, type NativeTranslator } from './locale/main-process-messages'
@@ -3124,33 +3121,13 @@ const createApplicationModules = async (
         executionCwd
       )
   )
-  // The renderer's approval card responds here; the broker resolves the held connector call.
-  declareElectronAdapter('connector-approvals', () => {
-    ipcMainHandle('connectors:approval-respond', (_event, request: RespondApprovalRequest) => {
-      approvalBroker.respond(request.id, request.decision)
-    })
-    ipcMainHandle('connectors:approval-replay', (_event, id: unknown) =>
-      typeof id === 'string' ? approvalBroker.getPending(id) : null
+  surfaceAdapters.push(
+    createConnectorApprovalElectronSurface(
+      approvalBroker,
+      credentialRequestBroker,
+      skillImportApprovalBroker
     )
-    ipcMainHandle('connectors:approval-replay-pending', () => approvalBroker.replayPending())
-    ipcMainHandle(
-      'connectors:credential-respond',
-      (_event, request: { id: string; configured: boolean }) =>
-        credentialRequestBroker.respond(request.id, request.configured)
-    )
-    ipcMainHandle('connectors:credential-replay-pending', () =>
-      credentialRequestBroker.replayPending()
-    )
-    ipcMainHandle(
-      'skills:conversation-import-respond',
-      (_event, response: ConversationSkillImportApprovalResponse) => {
-        skillImportApprovalBroker.respond(response)
-      }
-    )
-    ipcMainHandle('skills:conversation-import-replay-pending', () => {
-      skillImportApprovalBroker.replayPending()
-    })
-  })
+  )
 
   const recoverPendingCustomServerDeletions = async (): Promise<void> => {
     const pendingCustomServerDeletionIds =
@@ -3210,25 +3187,17 @@ const createApplicationModules = async (
   await cliCommandOwner.ensureCurrent()
   const githubCommandOwner = createGithubCommandOwner({ fetch: netFetchStandard })
   const logsCommandOwner = createLogsCommandOwner()
-  declareElectronAdapter('desktop-utilities', () => {
-    registerFileSaveHandlers({
+  surfaceAdapters.push(
+    createDesktopUtilitiesElectronSurface({
       resolveManagedFilePath,
-      openLatestManagedFile: (source, request) =>
-        managedFileVersionService.openLatest({ source, ...request }),
-      openManagedFileVersion: (source, request) =>
-        managedFileVersionService.openVersion(
-          { source, projectId: request.projectId, fileId: request.fileId },
-          request.versionId
-        ),
-      openNotebookInput: (request) => notebookInputRegistry.openPreviewKey(request.path),
-      translate
+      managedFileVersions: managedFileVersionService,
+      notebookInputs: notebookInputRegistry,
+      translate,
+      logs: logsCommandOwner,
+      github: githubCommandOwner,
+      cli: cliCommandOwner
     })
-    registerLogsIpcHandlers(logsCommandOwner)
-    registerGithubIpcHandlers({}, githubCommandOwner)
-    registerCliInstallIpcHandlers(cliCommandOwner)
-    registerWindowIpcHandlers()
-    registerWindowFindIpcHandlers()
-  })
+  )
   // ACP identity resolution and the Specialist settings IPC must use the same service instance.
   // Creating it only for settings leaves create-session unable to resolve a selected UUID.
   const approvalSessionLifecycle = bindComputeApprovalSessionLifecycle(

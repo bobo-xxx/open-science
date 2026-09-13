@@ -1,3 +1,4 @@
+import { ConnectorBulkManageView } from './ConnectorBulkManageView'
 import { ErrorNotice } from '@/components/error-notice'
 /* Hallmark · pre-emit critique: P5 H5 E5 S5 R5 V4 */
 /* Hallmark · component: settings side rail · genre: modern-minimal · theme: existing Open Science tokens · slop: pass */
@@ -671,6 +672,33 @@ const SettingsPage = forwardRef<SettingsPageHandle, SettingsPageProps>(function 
     leaf: string
   } | null => {
     if (activePanel === 'skills' && skillsView.kind !== 'list') {
+      if (
+        skillsView.kind === 'marketplace' ||
+        skillsView.kind === 'marketplace-detail' ||
+        skillsView.kind === 'marketplace-batch'
+      ) {
+        return {
+          rootLabelKey: 'Skills',
+          rootTo: { panel: 'skills', view: { kind: 'list' } },
+          ...(skillsView.kind !== 'marketplace'
+            ? {
+                parents: [
+                  {
+                    label: t('Marketplace'),
+                    to: { panel: 'skills', view: { kind: 'marketplace' } },
+                    ariaLabel: t('Back to {{panel}}', { panel: t('Marketplace') })
+                  }
+                ]
+              }
+            : {}),
+          leaf:
+            skillsView.kind === 'marketplace-detail'
+              ? skillsView.displayName
+              : skillsView.kind === 'marketplace-batch'
+                ? t('Batch manage')
+                : t('Marketplace')
+        }
+      }
       const leaf =
         skillsView.kind === 'create'
           ? t('New skill')
@@ -758,21 +786,24 @@ const SettingsPage = forwardRef<SettingsPageHandle, SettingsPageProps>(function 
         }
       }
       const leaf =
-        connectorsView.kind === 'add'
-          ? t('Add connector')
-          : connectorsView.kind === 'import'
-            ? t('Import Connector or MCP configuration')
-            : connectorsView.kind === 'export'
-              ? t('Export {{name}}', {
-                  name:
-                    customServers.find((s) => s.id === connectorsView.id)?.name ?? t('connector')
-                }).trim()
-              : connectorsView.kind === 'edit'
-                ? t('Edit {{name}}', {
+        connectorsView.kind === 'manage'
+          ? t('Manage connectors')
+          : connectorsView.kind === 'add'
+            ? t('Add connector')
+            : connectorsView.kind === 'import'
+              ? t('Import Connector or MCP configuration')
+              : connectorsView.kind === 'export'
+                ? t('Export {{name}}', {
                     name:
                       customServers.find((s) => s.id === connectorsView.id)?.name ?? t('connector')
                   }).trim()
-                : (connectors.find((c) => c.id === connectorsView.id)?.displayName ?? '')
+                : connectorsView.kind === 'edit'
+                  ? t('Edit {{name}}', {
+                      name:
+                        customServers.find((s) => s.id === connectorsView.id)?.name ??
+                        t('connector')
+                    }).trim()
+                  : (connectors.find((c) => c.id === connectorsView.id)?.displayName ?? '')
       return {
         rootLabelKey: 'Connectors',
         rootTo: { panel: 'connectors', view: { kind: 'list' } },
@@ -1115,6 +1146,14 @@ const SettingsPage = forwardRef<SettingsPageHandle, SettingsPageProps>(function 
           // closed intentionally via the ✕ button or Escape.
           onInteractOutside={(event) => event.preventDefault()}
           onEscapeKeyDown={(event) => {
+            // Radix observes Escape in capture, before the inline review can cancel itself.
+            if (
+              event.target instanceof Element &&
+              event.target.closest('[data-slot="skill-marketplace-batch-review"]')
+            ) {
+              event.preventDefault()
+              return
+            }
             if (!isMobileNavOpen) return
             event.preventDefault()
             setIsMobileNavOpen(false)
@@ -1412,17 +1451,30 @@ const SettingsPage = forwardRef<SettingsPageHandle, SettingsPageProps>(function 
             <div data-slot="settings-content-scroll" className="min-h-0 flex-1 overflow-y-auto">
               <div
                 className={cn(
-                  'mx-auto w-full max-w-[880px]',
-                  activePanel === 'memory' || activePanel === 'tags' ? 'h-full' : 'min-h-full'
+                  'mx-auto w-full',
+                  activePanel === 'skills' &&
+                    (skillsView.kind === 'marketplace' || skillsView.kind === 'marketplace-batch')
+                    ? 'max-w-none'
+                    : 'max-w-[880px]',
+                  activePanel === 'memory' ||
+                    activePanel === 'tags' ||
+                    (activePanel === 'skills' && skillsView.kind === 'marketplace-batch')
+                    ? 'h-full'
+                    : 'min-h-full'
                 )}
               >
                 <SettingsPanelLoadingBoundary
                   panelKey={
-                    activePanel === 'connectors' &&
-                    (connectorsView.kind === 'add' || connectorsView.kind === 'edit') &&
-                    connectorsView.credentialView === 'create'
-                      ? `${activePanel}:${Math.max(0, historyIndex - 1)}`
-                      : `${activePanel}:${historyIndex}`
+                    activePanel === 'skills' &&
+                    (skillsView.kind === 'marketplace' ||
+                      skillsView.kind === 'marketplace-detail' ||
+                      skillsView.kind === 'marketplace-batch')
+                      ? 'skills:marketplace'
+                      : activePanel === 'connectors' &&
+                          (connectorsView.kind === 'add' || connectorsView.kind === 'edit') &&
+                          connectorsView.credentialView === 'create'
+                        ? `${activePanel}:${Math.max(0, historyIndex - 1)}`
+                        : `${activePanel}:${historyIndex}`
                   }
                   onClose={onClose}
                 >
@@ -1518,7 +1570,9 @@ const SettingsPage = forwardRef<SettingsPageHandle, SettingsPageProps>(function 
                       }}
                     />
                   ) : activePanel === 'connectors' ? (
-                    connectorsView.kind === 'detail' ? (
+                    connectorsView.kind === 'manage' ? (
+                      <ConnectorBulkManageView />
+                    ) : connectorsView.kind === 'detail' ? (
                       <div>
                         <ResourceTagSummary
                           reference={{
