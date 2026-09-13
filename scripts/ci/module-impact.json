@@ -1020,6 +1020,58 @@
       },
       "capabilityOverlays": ["windows_sensitive"],
       "fallbackCapability": "main_runtime"
+    },
+    "ipc_surfaces": {
+      "ownerPaths": [
+        "src/main/ipc-surfaces/adapter.ts",
+        "src/main/ipc-surfaces/core.ts",
+        "src/main/ipc-surfaces/uploads.ts",
+        "src/main/ipc-surfaces/notifications.ts"
+      ],
+      "interfacePaths": [
+        "src/main/ipc-surfaces/adapter.ts",
+        "src/main/ipc-surfaces/core.ts",
+        "src/main/ipc-surfaces/uploads.ts",
+        "src/main/ipc-surfaces/notifications.ts"
+      ],
+      "consumerModules": [],
+      "testFiles": {
+        "owner": [
+          "src/main/ipc-surfaces/adapter.test.ts",
+          "src/main/ipc-surfaces/core.test.ts",
+          "src/main/ipc-surfaces/uploads.test.ts",
+          "src/main/ipc-surfaces/notifications.test.ts"
+        ],
+        "contract": [
+          "src/main/notifications/notification-inbox-ipc.test.ts",
+          "src/main/notifications/electron-wiring.test.ts",
+          "src/main/notifications/task-notifications.test.ts",
+          "src/main/notifications/notification-inbox-controller.test.ts",
+          "src/main/uploads/ipc.test.ts",
+          "src/main/uploads/command-owner.test.ts",
+          "src/main/renderer-broadcast.test.ts",
+          "src/main/application-events.test.ts",
+          "src/main/ipc-handler-registry.test.ts",
+          "src/main/caller-lifecycle.test.ts",
+          "src/main/runtime-electron-wiring.test.ts",
+          "src/main/application-command-wiring.test.ts",
+          "src/main/permission-grants/ipc.test.ts",
+          "src/main/project-files/ipc.test.ts",
+          "src/main/managed-file-versions/ipc.test.ts",
+          "src/main/local-fs/ipc.test.ts",
+          "src/main/projects/ipc.test.ts",
+          "src/main/lifecycle-broadcast.test.ts"
+        ],
+        "consumer": [
+          "src/main/application-runtime.test.ts",
+          "src/main/index-startup-failure.test.ts",
+          "src/main/application-command-composition.test.ts",
+          "src/main/application-command-electron-adapter.test.ts",
+          "src/main/runtime-state-ownership.architecture.test.ts"
+        ]
+      },
+      "capabilityOverlays": [],
+      "fallbackCapability": "main_runtime"
     }
   }
 }

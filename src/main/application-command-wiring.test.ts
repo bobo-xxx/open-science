@@ -18,6 +18,7 @@ const between = (source: string, start: string, end: string): string => {
 }
 
 const ipcSource = readSource('src/main/ipc.ts')
+const coreSurfaceSource = compact(readSource('src/main/ipc-surfaces/core.ts'))
 const indexSource = readSource('src/main/index.ts')
 const runtimeSource = readSource('src/main/application-runtime.ts')
 const compositionSource = readSource('src/main/application-command-composition.ts')
@@ -33,13 +34,7 @@ const webAdapterSources = [
 const legacyAdapterBlock = compact(
   between(ipcSource, "declareElectronAdapter('desktop-utilities'", 'const electronSenderFor')
 )
-const notificationAdapterBlock = compact(
-  between(
-    ipcSource,
-    "declareElectronAdapter('task-notifications'",
-    'const connectorApplication = await modules.add('
-  )
-)
+const notificationAdapterBlock = compact(readSource('src/main/ipc-surfaces/notifications.ts'))
 const dependencyBlock = compact(
   between(
     ipcSource,
@@ -49,6 +44,20 @@ const dependencyBlock = compact(
 )
 
 describe('production application command wiring', () => {
+  it('keeps the upload owner and notification surface in its original installation phase', () => {
+    const uploadSurface = compact(readSource('src/main/ipc-surfaces/uploads.ts'))
+    expect(uploadSurface).toContain("import { registerUploadIpcHandlers } from '../uploads/ipc'")
+    expect(uploadSurface).toContain('registerUploadIpcHandlers(owner, {')
+    expect(
+      between(
+        ipcSource,
+        'surfaceAdapters = afterAcpAdapters',
+        "declareElectronAdapter('notebook-input-preview'"
+      )
+    ).toContain('surfaceAdapters.push(createUploadElectronSurface(uploadCommandOwner))')
+    expect(occurrences(ipcSource, 'createUploadElectronSurface(uploadCommandOwner)')).toBe(1)
+  })
+
   it('includes active reproducibility kernels in the Session export admission gate', () => {
     expect(compact(ipcSource)).toContain(
       'const notebookLifecycle = withReproducibilityNotebookLifecycle( notebookService, () => artifactReproducibilityAttemptOwnerRef.current )'
@@ -114,21 +123,11 @@ describe('production application command wiring', () => {
         'managedPreview: managedPreviewOwners'
       ],
       [
-        'projectFilesHandlers',
-        'projectDeletionCoordinator, projectFilesHandlers )',
-        'projectFiles: projectFilesHandlers'
-      ],
-      [
         'sessionPersistenceHandlers',
         'reviewRepository, sessionPersistenceHandlers, async (session)',
         '...sessionPersistenceHandlers'
       ],
       ['artifactHandlers', 'artifactHandlers )', 'artifacts: artifactHandlers'],
-      [
-        'permissionGrantProjection',
-        'registerPermissionGrantIpcAdapter(permissionGrantProjection)',
-        'permissionGrants: permissionGrantProjection'
-      ],
       ['storageCommandOwner', 'storageCommandOwner )', 'storage: storageCommandOwner'],
       [
         'reviewerCommandOwner',
@@ -149,7 +148,7 @@ describe('production application command wiring', () => {
       ['logsCommandOwner', 'registerLogsIpcHandlers(logsCommandOwner)', 'logs: logsCommandOwner'],
       [
         'uploadCommandOwner',
-        'registerUploadIpcHandlers(uploadCommandOwner, {',
+        'surfaceAdapters.push(createUploadElectronSurface(uploadCommandOwner))',
         'uploads: uploadCommandOwner'
       ],
       [
@@ -183,7 +182,28 @@ describe('production application command wiring', () => {
     expect(ipcSource).not.toContain("ipcMainHandle('sessions:export-package'")
     expect(ipcSource).not.toContain("ipcMainHandle('sessions:import-package'")
     expect(ipcSource).not.toContain('registerProjectIpcHandlers')
-    expect(legacyAdapterBlock).toContain('registerPreviewStateIpcHandlers(previewStateRepository)')
+    // Keep checking the shared owner identities at the composition root. The extracted module's
+    // actual registration/dispatch is covered by ipc-surfaces/core.test.ts.
+    const coreDependencies = compact(
+      between(ipcSource, '...createCoreElectronSurfaces({', '// Compute IPC handlers')
+    )
+    expect(occurrences(ipcSource, 'createCoreElectronSurfaces(')).toBe(1)
+    expect(coreDependencies).toContain('permissionGrantProjection,')
+    expect(coreDependencies).toContain(
+      'projectFiles: [ projectFilesRepository, sessionPersistenceCoordinator, projectDeletionCoordinator, projectFilesHandlers ]'
+    )
+    expect(coreDependencies).toContain('previewStateRepository')
+    expect(dependencyBlock).toContain('permissionGrants: permissionGrantProjection')
+    expect(dependencyBlock).toContain('projectFiles: projectFilesHandlers')
+    expect(coreSurfaceSource).toContain(
+      'registerPermissionGrantIpcAdapter(dependencies.permissionGrantProjection)'
+    )
+    expect(coreSurfaceSource).toContain(
+      'registerProjectFilesIpcHandlers(...dependencies.projectFiles)'
+    )
+    expect(coreSurfaceSource).toContain(
+      'registerPreviewStateIpcHandlers(dependencies.previewStateRepository)'
+    )
 
     expect(compact(ipcSource)).toContain(
       'electronAdapters: { beforeCompute: beforeComputeAdapters, compute: { handlers: computeIpcModule.handlers, enabledHosts: sessionEnabledComputeHostsOwner },'
@@ -238,9 +258,28 @@ describe('production application command wiring', () => {
   })
 
   it('installs every notification inbox request on the Electron adapter', () => {
-    expect(notificationAdapterBlock).toContain(
-      'registerNotificationInboxIpcAdapter(notificationInbox)'
+    expect(
+      compact(
+        between(
+          ipcSource,
+          'let surfaceAdapters = beforeComputeAdapters',
+          'surfaceAdapters = beforeAcpAdapters'
+        )
+      )
+    ).toContain(
+      'surfaceAdapters.push( createNotificationElectronSurface( notificationInbox, taskNotifications, taskNotificationDeliveryDeps ) )'
     )
+    expect(occurrences(ipcSource, 'createNotificationElectronSurface(')).toBe(1)
+    expect(notificationAdapterBlock).toContain(
+      "import { registerNotificationInboxIpcAdapter, type NotificationInboxIpcOwner } from '../notifications/notification-inbox-ipc'"
+    )
+    expect(notificationAdapterBlock).toContain('registerNotificationInboxIpcAdapter(inbox)')
+    expect(notificationAdapterBlock).toContain('taskNotifications.peekPendingOpenSession()')
+    expect(notificationAdapterBlock).toContain(
+      'taskNotifications.takePendingOpenSession(expectedToken)'
+    )
+    expect(notificationAdapterBlock).toContain('getTaskNotificationAvailability(delivery)')
+    expect(notificationAdapterBlock).toContain('showTestTaskNotification(delivery)')
     expect(notificationIpcSource).toContain("ipcMainHandle('notifications:get-snapshot'")
     expect(notificationIpcSource).toContain("ipcMainHandle('notifications:mark-read'")
     expect(notificationIpcSource).toContain("ipcMainHandle('notifications:mark-all-read'")

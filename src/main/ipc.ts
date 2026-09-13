@@ -1,4 +1,8 @@
 import { transactLiterature } from './literature/transact'
+import { createPdfStructureOwner } from './literature/pdf-structure/owner'
+import { createPdfStructureEngine } from './literature/pdf-structure/engine'
+import { PdfStructureSourceAuthority } from './literature/pdf-structure/source'
+import { PdfStructureReader } from './literature/pdf-structure/reader'
 import { createSpecialistApplicationOwner } from './specialist/application-commands'
 import { basename, dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -17,7 +21,7 @@ import {
   type WebContents
 } from 'electron'
 
-import { createIpcHandlerInstallationScope, ipcMainHandle } from './ipc-handler-registry'
+import { ipcMainHandle } from './ipc-handler-registry'
 import {
   APPLICATION_MODULE_DISPOSAL_BUDGET_MS,
   composeApplicationRuntimeWithAdapters,
@@ -157,7 +161,6 @@ import {
   UPDATE_SHUTDOWN_BUDGET_MS,
   type ShutdownStepOutcome
 } from './lifecycle-shutdown'
-import { registerLifecycleIpcHandlers } from './lifecycle-broadcast'
 import {
   createWebSessionPersistenceFlush,
   rendererSessionPersistenceFlushBlocksShutdown,
@@ -170,16 +173,14 @@ import { registerWindowIpcHandlers } from './window-ipc'
 import { registerWindowFindIpcHandlers } from './window-find-ipc'
 import { TaskNotificationService } from './notifications/task-notifications'
 import { createNotificationInboxController } from './notifications/notification-inbox-controller'
-import { registerNotificationInboxIpcAdapter } from './notifications/notification-inbox-ipc'
+import { createNotificationElectronSurface } from './ipc-surfaces/notifications'
 import { NotificationInboxDbRepository } from './notifications/notification-inbox-repository'
 import { bindNotificationInboxDeletionRuntime } from './notifications/notification-inbox-runtime'
 import {
   buildSkillImportApprovalBroadcast,
   buildConnectorApprovalBroadcast,
   buildConnectorCredentialRequestBroadcast,
-  buildTaskNotificationShow,
-  getTaskNotificationAvailability,
-  showTestTaskNotification
+  buildTaskNotificationShow
 } from './notifications/electron-wiring'
 import { createLogger, diagnosticErrorFields, errorLogFields } from './logger'
 import { startDiagnosticOperation, type DiagnosticOperation } from './diagnostics/operation'
@@ -258,8 +259,7 @@ import {
 import {
   createDefaultPreviewStateRepository,
   createDefaultProjectRepository,
-  createProjectHandlers,
-  registerPreviewStateIpcHandlers
+  createProjectHandlers
 } from './projects/ipc'
 import {
   createReviewerCommandOwner,
@@ -285,12 +285,9 @@ import {
   registerConversationExportIpcHandler
 } from './session-persistence/conversation-export'
 import { SessionProjectionDiagnostics } from './session-persistence/projection-diagnostics'
-import { createProjectFilesHandlers, registerProjectFilesIpcHandlers } from './project-files/ipc'
+import { createProjectFilesHandlers } from './project-files/ipc'
 import { createManagedFileIndexRepository } from './project-files/repository'
-import {
-  createManagedFileVersionHandlers,
-  registerManagedFileVersionIpcHandlers
-} from './managed-file-versions/ipc'
+import { createManagedFileVersionHandlers } from './managed-file-versions/ipc'
 import { ManagedFileVersionService } from './managed-file-versions/service'
 import {
   ProjectDeletionCoordinator,
@@ -302,7 +299,6 @@ import { getProjectDbClient } from './projects/prisma-client'
 import { seedDefaultPermissionGrants } from './permission-grants/defaults'
 import { createPermissionGrantRegistry } from './permission-grants/registry'
 import { isPermissionGrantScopeLive } from './permission-grants/scope-liveness'
-import { registerPermissionGrantIpcAdapter } from './permission-grants/ipc'
 import { createPermissionGrantProjectionController } from './permission-grants/projection-controller'
 import {
   reconcilePendingCustomServerDeletions,
@@ -334,7 +330,8 @@ import { SessionDeletionOwner } from './session-deletion/owner'
 import { buildSessionDetailsUserPrompt, createSessionDetailsOwner } from './session-details/owner'
 import { tryDecryptKey } from './settings/crypto'
 import { SETTINGS_INSTALL_LOG_CHANNEL, registerSettingsIpcHandlers } from './settings/ipc'
-import { registerLocalFsIpcHandlers } from './local-fs/ipc'
+import { createCoreElectronSurfaces } from './ipc-surfaces/core'
+import { createElectronSurfaceAdapter } from './ipc-surfaces/adapter'
 import { GrantedLocalRootsRepository } from './local-fs/granted-roots-repository'
 import { LocalFsService } from './local-fs/service'
 import { SettingsService } from './settings/service'
@@ -430,6 +427,8 @@ import type {
   SessionSummary
 } from '../shared/session-persistence'
 import { registerStorageIpcHandlers } from './storage/ipc'
+import { createLocalModelOwner } from './local-models/owner'
+import { registerLocalModelIpcHandlers } from './local-models/ipc'
 import { createStorageCommandOwner } from './storage/command-owner'
 import {
   initializeDataRootWriteAvailability,
@@ -473,7 +472,8 @@ import {
 } from './update/strategy'
 import type { UpdateBlocker } from '../shared/update'
 import { startUpdateScheduler } from './update/scheduler'
-import { createDefaultUploadRepository, registerUploadIpcHandlers } from './uploads/ipc'
+import { createDefaultUploadRepository } from './uploads/ipc'
+import { createUploadElectronSurface } from './ipc-surfaces/uploads'
 import { createUploadCommandOwner } from './uploads/command-owner'
 import { ContentRepository } from './storage/content-repository'
 import { broadcastToRenderers, installRendererBroadcastEventHub } from './renderer-broadcast'
@@ -579,19 +579,7 @@ const createApplicationModules = async (
   const afterAcpAdapters: NamedElectronSurfaceAdapter[] = []
   let surfaceAdapters = beforeComputeAdapters
   const declareElectronAdapter = (name: string, install: () => void | (() => void)): void => {
-    surfaceAdapters.push({
-      name,
-      install: () => {
-        const scope = createIpcHandlerInstallationScope()
-        try {
-          const cleanup = install()
-          return scope.complete(typeof cleanup === 'function' ? cleanup : undefined)
-        } catch (error) {
-          scope.rollback()
-          throw error
-        }
-      }
-    })
+    surfaceAdapters.push(createElectronSurfaceAdapter(name, install))
   }
   const applicationEvents = await modules.add(
     installRendererBroadcastEventHub,
@@ -2336,26 +2324,13 @@ const createApplicationModules = async (
     onInboxError: (error) =>
       notificationsLog.warn('message center recording failed', errorLogFields(error))
   })
-  // The renderer peeks once sessions are hydrated, then conditionally consumes the same target.
-  // This lets partial recovery open an already-loaded conversation while retaining an omitted one
-  // for retry, without an older IPC round trip clearing a newer click target.
-  declareElectronAdapter('task-notifications', () => {
-    registerNotificationInboxIpcAdapter(notificationInbox)
-    ipcMainHandle('notifications:get-desktop-availability', () =>
-      getTaskNotificationAvailability(taskNotificationDeliveryDeps)
+  surfaceAdapters.push(
+    createNotificationElectronSurface(
+      notificationInbox,
+      taskNotifications,
+      taskNotificationDeliveryDeps
     )
-    ipcMainHandle('notifications:send-test', () =>
-      showTestTaskNotification(taskNotificationDeliveryDeps)
-    )
-    ipcMainHandle('notifications:peek-pending-open-session', () =>
-      taskNotifications.peekPendingOpenSession()
-    )
-    ipcMainHandle('notifications:take-pending-open-session', (_event, expectedToken: unknown) =>
-      typeof expectedToken === 'number' && Number.isSafeInteger(expectedToken) && expectedToken > 0
-        ? taskNotifications.takePendingOpenSession(expectedToken)
-        : null
-    )
-  })
+  )
   // The connector application owns MCP, connector/skill approval, runtime projection, and service
   // construction. Late-bound local tools remain composition-root dependencies and are passed in.
   const moleculePreviewHandler = createMoleculePreviewHandler({
@@ -4468,6 +4443,37 @@ const createApplicationModules = async (
     releaseDataRootInstallAdmission = undefined
     releaseAdmission?.()
   }
+  const localModelOwner = createLocalModelOwner()
+  await modules.add({ localModelOwner }, ({ localModelOwner: owner }) => ({
+    name: 'local-models',
+    capability: undefined,
+    dispose: async () => {
+      await owner.close()
+    }
+  }))
+  declareElectronAdapter('local-models', () => registerLocalModelIpcHandlers(localModelOwner))
+  const pdfStructureOwner = createPdfStructureOwner({
+    models: localModelOwner,
+    sources: new PdfStructureSourceAuthority({
+      literature: literatureAttachmentAuthority,
+      sources: sessionPdfSourceResolver,
+      sessions: sessionPersistenceCoordinator
+    }),
+    engine: createPdfStructureEngine(
+      join(
+        app.getAppPath().replace(/app\.asar$/, 'app.asar.unpacked'),
+        'resources',
+        'pdf-structure'
+      )
+    )
+  })
+  const pdfStructureReader = new PdfStructureReader(pdfStructureOwner)
+  await modules.add({ pdfStructureOwner }, ({ pdfStructureOwner: owner }) => ({
+    name: 'pdf-structure',
+    capability: undefined,
+    dispose: () => owner.close()
+  }))
+
   const storageCommandOwner = createStorageCommandOwner({
     hasActivePackageOperation: () => sessionPackageDesktopLifecycle.isActive(),
     runtime,
@@ -4691,19 +4697,7 @@ const createApplicationModules = async (
         receiptExporter.importEnvironmentLock(sender, request)
     })
   })
-  declareElectronAdapter('uploads', () =>
-    registerUploadIpcHandlers(uploadCommandOwner, {
-      // Standalone "Save as artifact" uploads have no session mutation to piggyback on, so the
-      // Files panel only learns about them through this broadcast.
-      onStandaloneUploadSaved: (projectId, sessionId) =>
-        broadcastToRenderers('project-files:changed', {
-          projectId,
-          sessionId,
-          sources: ['upload'],
-          kind: 'upsert'
-        })
-    })
-  )
+  surfaceAdapters.push(createUploadElectronSurface(uploadCommandOwner))
   declareElectronAdapter('notebook-input-preview', () => {
     ipcMainHandle('notebook:read-input-preview', (_event, request) =>
       notebookInputRegistry.readPreview(request)
@@ -4831,26 +4825,20 @@ const createApplicationModules = async (
     removePackageQuitGuard()
     await sessionPackageDesktop.close()
   }
-  declareElectronAdapter('permission-grants', () =>
-    registerPermissionGrantIpcAdapter(permissionGrantProjection)
+  surfaceAdapters.push(
+    ...createCoreElectronSurfaces({
+      permissionGrantProjection,
+      projectFiles: [
+        projectFilesRepository,
+        sessionPersistenceCoordinator,
+        projectDeletionCoordinator,
+        projectFilesHandlers
+      ],
+      managedFileVersionHandlers,
+      localFsService,
+      previewStateRepository
+    })
   )
-  declareElectronAdapter('project-files', () =>
-    registerProjectFilesIpcHandlers(
-      projectFilesRepository,
-      sessionPersistenceCoordinator,
-      projectDeletionCoordinator,
-      projectFilesHandlers
-    )
-  )
-  declareElectronAdapter('managed-file-versions', () =>
-    registerManagedFileVersionIpcHandlers(managedFileVersionHandlers)
-  )
-  // Backs the "This computer" browser; shares localFsService with the managed-preview resolver.
-  declareElectronAdapter('local-fs', () => registerLocalFsIpcHandlers(localFsService))
-  declareElectronAdapter('preview-state', () =>
-    registerPreviewStateIpcHandlers(previewStateRepository)
-  )
-  declareElectronAdapter('lifecycle', () => registerLifecycleIpcHandlers())
   // Compute IPC handlers are registered earlier (before the notebook RPC server) so computeService
   // can be injected into the RPC server for the computeCall route. See above.
   // Wire the reviewer backend into the app lifecycle: installs ipcMainHandle('reviewer:run', ...)
@@ -5305,6 +5293,8 @@ const createApplicationModules = async (
       withDataRootWrite
     },
     host: {
+      localModels: localModelOwner,
+      pdfStructure: pdfStructureReader,
       cli: cliCommandOwner,
       github: githubCommandOwner,
       localFs: localFsService,
