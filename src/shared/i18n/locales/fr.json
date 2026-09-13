@@ -118,6 +118,7 @@
     "The original package is unavailable. It may have been moved, deleted, or become unreadable. Choose another package.": "Le paquet d’origine est indisponible. Il a peut-être été déplacé, supprimé ou est devenu illisible. Choisissez un autre paquet."
   },
   "renderer": {
+    "Click to enter a page number": "Cliquez pour saisir un numéro de page",
     "Only stable releases can be installed.": "Seules les versions stables peuvent être installées.",
     "R access verification requires network protection to be ready. Review Network settings, then recheck runtimes.": "La vérification de l’accès à R nécessite une protection réseau opérationnelle. Consultez les paramètres réseau, puis vérifiez à nouveau les environnements d’exécution.",
     "Batch operation": "Action groupée",
@@ -6087,6 +6088,10 @@
     "Find deposited corrections and retractions. Missing updates do not establish reliability.": "Rechercher les corrections et rétractations déposées. L’absence de mises à jour ne garantit pas la fiabilité.",
     "Find datasets and software by topic or related DOI.": "Rechercher des jeux de données et des logiciels par sujet ou DOI associé.",
     "Retrieve dataset metadata, rights and publication relationships by DOI.": "Récupérer les métadonnées, les droits et les liens avec les publications d’un jeu de données à partir du DOI.",
-    "Search RNA/DNA against Rfam models. Cancelling stops polling; the service retains results for one week.": "Rechercher des ARN/ADN dans les modèles Rfam. L’annulation arrête les vérifications ; le service conserve les résultats pendant une semaine."
+    "Search RNA/DNA against Rfam models. Cancelling stops polling; the service retains results for one week.": "Rechercher des ARN/ADN dans les modèles Rfam. L’annulation arrête les vérifications ; le service conserve les résultats pendant une semaine.",
+    "Elements: {{total}}": "Éléments : {{total}}",
+    "Parsed pages: {{parsed}} / {{checked}}": "Pages analysées : {{parsed}} / {{checked}}",
+    "Image delivered": "Image fournie",
+    "Some evidence is unavailable or incomplete.": "Certains éléments de preuve sont indisponibles ou incomplets."
   }
 }

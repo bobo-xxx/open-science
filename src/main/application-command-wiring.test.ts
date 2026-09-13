@@ -44,6 +44,44 @@ const dependencyBlock = compact(
 )
 
 describe('production application command wiring', () => {
+  it('returns Office preview cleanup to its scoped afterAcp installation', () => {
+    const phase = compact(
+      between(
+        ipcSource,
+        'surfaceAdapters = afterAcpAdapters',
+        "declareElectronAdapter('notebook-environment'"
+      )
+    )
+    expect(phase).toContain(
+      "declareElectronAdapter('office-preview', () => registerOfficePreviewIpcHandlers(officePreviewSupervisor) )"
+    )
+    expect(
+      occurrences(ipcSource, 'registerOfficePreviewIpcHandlers(officePreviewSupervisor)')
+    ).toBe(1)
+    expect(phase.indexOf("declareElectronAdapter('office-preview-runtime'")).toBeLessThan(
+      phase.indexOf("declareElectronAdapter('office-preview',")
+    )
+  })
+
+  it('installs Settings once with shared owners before Notebook in afterAcp', () => {
+    const phase = compact(
+      between(
+        ipcSource,
+        'surfaceAdapters = afterAcpAdapters',
+        "declareElectronAdapter('background-result-delivery'"
+      )
+    )
+    expect(phase).toContain(
+      'createSettingsElectronSurface({ service: settingsService, workflows: settingsWorkflows, snapshotCommits: settingsSnapshotCommits, listAppIconPreviews, translate })'
+    )
+    expect(phase.indexOf('createSettingsElectronSurface(')).toBeLessThan(
+      phase.indexOf("declareElectronAdapter('notebook',")
+    )
+    expect(occurrences(ipcSource, 'createSettingsElectronSurface(')).toBe(1)
+    expect(ipcSource).not.toContain('registerSettingsIpcHandlers')
+    expect(ipcSource).not.toContain('showSettingsSaveDialog')
+  })
+
   it('installs desktop utilities with shared owners and retains find-event cleanup', () => {
     const desktop = compact(
       between(ipcSource, 'createDesktopUtilitiesElectronSurface({', '// ACP identity resolution')
@@ -162,6 +200,21 @@ describe('production application command wiring', () => {
     )
   })
 
+  it('installs the Artifact surface in its existing phase with the shared owners', () => {
+    expect(compact(ipcSource)).toContain(
+      'surfaceAdapters.push( createArtifactElectronSurface({ artifactRepository, artifactRunRegistry, artifactProvenanceRepository, artifactHandlers, artifactReproducibilityAttemptOwnerRef, archiveCoordinator, sessionPersistenceCoordinator, notebookService, translate }) )'
+    )
+    const installation = ipcSource.indexOf('createArtifactElectronSurface({')
+    expect(installation).toBeGreaterThan(ipcSource.indexOf('surfaceAdapters = afterAcpAdapters'))
+    expect(installation).toBeGreaterThan(ipcSource.indexOf("declareElectronAdapter('storage'"))
+    expect(installation).toBeLessThan(
+      ipcSource.indexOf('createUploadElectronSurface(uploadCommandOwner)')
+    )
+    expect(ipcSource).not.toContain('registerArtifactIpcHandlers')
+    expect(ipcSource).not.toContain('registerArtifactReproducibilityIpcHandlers')
+    expect(ipcSource).not.toContain('createArtifactReproducibilityReceiptExporter')
+  })
+
   it('injects each stateful owner into its Electron adapter and command composition', () => {
     const sharedOwners = [
       [
@@ -174,7 +227,11 @@ describe('production application command wiring', () => {
         'reviewRepository, sessionPersistenceHandlers, async (session)',
         '...sessionPersistenceHandlers'
       ],
-      ['artifactHandlers', 'artifactHandlers )', 'artifacts: artifactHandlers'],
+      [
+        'artifactHandlers',
+        'artifactHandlers, artifactReproducibilityAttemptOwnerRef,',
+        'artifacts: artifactHandlers'
+      ],
       ['storageCommandOwner', 'storageCommandOwner )', 'storage: storageCommandOwner'],
       [
         'reviewerCommandOwner',

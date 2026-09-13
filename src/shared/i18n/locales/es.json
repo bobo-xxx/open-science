@@ -118,6 +118,7 @@
     "The original package is unavailable. It may have been moved, deleted, or become unreadable. Choose another package.": "El paquete original no está disponible. Puede que se haya movido, eliminado o que ya no se pueda leer. Seleccione otro paquete."
   },
   "renderer": {
+    "Click to enter a page number": "Hacer clic para introducir un número de página",
     "Only stable releases can be installed.": "Solo se pueden instalar versiones estables.",
     "R access verification requires network protection to be ready. Review Network settings, then recheck runtimes.": "La verificación del acceso a R requiere que la protección de red esté lista. Revise la configuración de red y vuelva a comprobar los entornos de ejecución.",
     "Batch operation": "Operación por lotes",
@@ -6087,6 +6088,10 @@
     "Find deposited corrections and retractions. Missing updates do not establish reliability.": "Buscar correcciones y retractaciones registradas. La ausencia de actualizaciones no garantiza la fiabilidad.",
     "Find datasets and software by topic or related DOI.": "Buscar conjuntos de datos y software por tema o DOI relacionado.",
     "Retrieve dataset metadata, rights and publication relationships by DOI.": "Obtener metadatos, derechos y relaciones con publicaciones de un conjunto de datos mediante el DOI.",
-    "Search RNA/DNA against Rfam models. Cancelling stops polling; the service retains results for one week.": "Buscar ARN/ADN en los modelos de Rfam. La cancelación detiene las consultas; el servicio conserva los resultados durante una semana."
+    "Search RNA/DNA against Rfam models. Cancelling stops polling; the service retains results for one week.": "Buscar ARN/ADN en los modelos de Rfam. La cancelación detiene las consultas; el servicio conserva los resultados durante una semana.",
+    "Elements: {{total}}": "Elementos: {{total}}",
+    "Parsed pages: {{parsed}} / {{checked}}": "Páginas analizadas: {{parsed}} / {{checked}}",
+    "Image delivered": "Imagen proporcionada",
+    "Some evidence is unavailable or incomplete.": "Algunas evidencias no están disponibles o están incompletas."
   }
 }

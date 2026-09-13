@@ -117,6 +117,7 @@
     "The original package is unavailable. It may have been moved, deleted, or become unreadable. Choose another package.": "Das ursprüngliche Paket ist nicht verfügbar. Es wurde möglicherweise verschoben, gelöscht oder ist nicht mehr lesbar. Wählen Sie ein anderes Paket."
   },
   "renderer": {
+    "Click to enter a page number": "Klicken, um eine Seitenzahl einzugeben",
     "Only stable releases can be installed.": "Es können nur stabile Versionen installiert werden.",
     "R access verification requires network protection to be ready. Review Network settings, then recheck runtimes.": "Die Überprüfung des R-Zugriffs erfordert einen einsatzbereiten Netzwerkschutz. Prüfen Sie die Netzwerkeinstellungen und überprüfen Sie anschließend die Laufzeitumgebungen erneut.",
     "Batch operation": "Stapelaktion",
@@ -5919,6 +5920,10 @@
     "Find deposited corrections and retractions. Missing updates do not establish reliability.": "Hinterlegte Korrekturen und Rücknahmen finden. Fehlende Aktualisierungen belegen keine Zuverlässigkeit.",
     "Find datasets and software by topic or related DOI.": "Datensätze und Software nach Thema oder zugehöriger DOI finden.",
     "Retrieve dataset metadata, rights and publication relationships by DOI.": "Metadaten, Rechte und Publikationsbeziehungen eines Datensatzes per DOI abrufen.",
-    "Search RNA/DNA against Rfam models. Cancelling stops polling; the service retains results for one week.": "RNA/DNA mit Rfam-Modellen durchsuchen. Abbrechen beendet die Abfrage; der Dienst speichert die Ergebnisse eine Woche lang."
+    "Search RNA/DNA against Rfam models. Cancelling stops polling; the service retains results for one week.": "RNA/DNA mit Rfam-Modellen durchsuchen. Abbrechen beendet die Abfrage; der Dienst speichert die Ergebnisse eine Woche lang.",
+    "Elements: {{total}}": "Elemente: {{total}}",
+    "Parsed pages: {{parsed}} / {{checked}}": "Analysierte Seiten: {{parsed}} / {{checked}}",
+    "Image delivered": "Bild bereitgestellt",
+    "Some evidence is unavailable or incomplete.": "Einige Belege sind nicht verfügbar oder unvollständig."
   }
 }

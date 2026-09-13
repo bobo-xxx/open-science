@@ -116,6 +116,7 @@
     "The original package is unavailable. It may have been moved, deleted, or become unreadable. Choose another package.": "원본 패키지를 사용할 수 없습니다. 이동 또는 삭제되었거나 읽을 수 없는 상태일 수 있습니다. 다른 패키지를 선택하세요."
   },
   "renderer": {
+    "Click to enter a page number": "클릭하여 페이지 번호 입력",
     "Only stable releases can be installed.": "안정 버전만 설치할 수 있습니다.",
     "R access verification requires network protection to be ready. Review Network settings, then recheck runtimes.": "R 접근 권한을 검증하려면 네트워크 보호가 준비되어 있어야 합니다. 네트워크 설정을 확인한 후 런타임을 다시 확인하세요.",
     "Batch operation": "일괄 작업",
@@ -5757,6 +5758,10 @@
     "Find deposited corrections and retractions. Missing updates do not establish reliability.": "등록된 정정 및 철회 정보를 찾습니다. 업데이트가 없다고 신뢰성이 보장되지는 않습니다.",
     "Find datasets and software by topic or related DOI.": "주제 또는 관련 DOI로 데이터셋과 소프트웨어를 찾습니다.",
     "Retrieve dataset metadata, rights and publication relationships by DOI.": "DOI로 데이터셋 메타데이터, 권리 및 출판물 관계를 가져옵니다.",
-    "Search RNA/DNA against Rfam models. Cancelling stops polling; the service retains results for one week.": "Rfam 모델을 대상으로 RNA/DNA를 검색합니다. 취소하면 결과 확인이 중단되며 서비스는 결과를 일주일 동안 보관합니다."
+    "Search RNA/DNA against Rfam models. Cancelling stops polling; the service retains results for one week.": "Rfam 모델을 대상으로 RNA/DNA를 검색합니다. 취소하면 결과 확인이 중단되며 서비스는 결과를 일주일 동안 보관합니다.",
+    "Elements: {{total}}": "요소: {{total}}",
+    "Parsed pages: {{parsed}} / {{checked}}": "분석된 페이지: {{parsed}} / {{checked}}",
+    "Image delivered": "이미지 제공됨",
+    "Some evidence is unavailable or incomplete.": "일부 근거를 사용할 수 없거나 근거가 불완전합니다."
   }
 }

@@ -1029,7 +1029,9 @@
         "src/main/ipc-surfaces/notifications.ts",
         "src/main/ipc-surfaces/connector-approvals.ts",
         "src/main/window-find-ipc.ts",
-        "src/main/ipc-surfaces/desktop-utilities.ts"
+        "src/main/ipc-surfaces/desktop-utilities.ts",
+        "src/main/ipc-surfaces/settings.ts",
+        "src/main/ipc-surfaces/artifacts.ts"
       ],
       "interfacePaths": [
         "src/main/ipc-surfaces/adapter.ts",
@@ -1038,7 +1040,9 @@
         "src/main/ipc-surfaces/notifications.ts",
         "src/main/ipc-surfaces/connector-approvals.ts",
         "src/main/window-find-ipc.ts",
-        "src/main/ipc-surfaces/desktop-utilities.ts"
+        "src/main/ipc-surfaces/desktop-utilities.ts",
+        "src/main/ipc-surfaces/settings.ts",
+        "src/main/ipc-surfaces/artifacts.ts"
       ],
       "consumerModules": [],
       "testFiles": {
@@ -1049,9 +1053,20 @@
           "src/main/ipc-surfaces/notifications.test.ts",
           "src/main/ipc-surfaces/connector-approvals.test.ts",
           "src/main/window-find-ipc.test.ts",
-          "src/main/ipc-surfaces/desktop-utilities.test.ts"
+          "src/main/ipc-surfaces/desktop-utilities.test.ts",
+          "src/main/ipc-surfaces/settings.test.ts",
+          "src/main/ipc-surfaces/artifacts.test.ts"
         ],
         "contract": [
+          "src/main/artifacts/ipc.test.ts",
+          "src/main/artifacts/artifact-reproducibility-ipc.test.ts",
+          "src/main/artifacts/artifact-reproducibility-export.test.ts",
+          "src/main/session-persistence/coordinator.architecture.test.ts",
+          "src/main/settings/ipc.test.ts",
+          "src/main/settings/workflows.test.ts",
+          "src/main/settings/connector-template.test.ts",
+          "src/main/settings/save-dialog.test.ts",
+          "src/main/skills/export.test.ts",
           "src/main/connectors/approval-broker.test.ts",
           "src/main/connectors/credential-request-broker.test.ts",
           "src/main/skills/conversation-import.test.ts",
@@ -1078,7 +1093,13 @@
           "src/main/logs-ipc.test.ts",
           "src/main/github-ipc.test.ts",
           "src/main/cli-install/ipc.test.ts",
-          "src/main/window-ipc.test.ts"
+          "src/main/window-ipc.test.ts",
+          "src/main/office-preview/office-preview-electron.test.ts",
+          "src/main/office-preview/office-preview-ipc-lifecycle.test.ts",
+          "src/main/office-preview/office-preview-ipc.test.ts",
+          "src/main/office-preview/office-preview-navigation.test.ts",
+          "src/main/office-preview/office-preview-oopif-supervisor.test.ts",
+          "src/main/office-preview/office-preview-runtime-protocol.test.ts"
         ],
         "consumer": [
           "src/main/application-runtime.test.ts",
