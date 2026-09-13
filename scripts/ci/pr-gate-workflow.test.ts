@@ -71,6 +71,24 @@ const manifest = JSON.parse(
 ) as { bundleOrder: string[]; laneBundles: Record<string, string>; laneOrder: string[] }
 
 describe('PR Gate workflow', () => {
+  it('includes portable Session journeys in both native functional lanes', () => {
+    const { scripts } = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8')) as {
+      scripts: Record<string, string>
+    }
+    for (const platform of ['macos', 'windows']) {
+      const command = workflow.jobs[`${platform}_e2e`].steps?.find(
+        ({ id }) => id === `e2e_functional_${platform}`
+      )?.run
+      const script = command?.match(/^npm run (\S+)/)?.[1]
+      expect(script, `${platform} functional lane must invoke a registered script`).toBeDefined()
+      for (const spec of ['e2e/session-package.spec.ts', 'e2e/session-package-drop.spec.ts'])
+        expect(
+          scripts[script!]?.split(/\s+/),
+          `${platform} must exercise Session packages`
+        ).toContain(spec)
+    }
+  })
+
   it('keeps release certification and Linux E2E out of ordinary pull requests', () => {
     expect(workflow.jobs).not.toHaveProperty('linux_e2e')
     expect(manifest.bundleOrder).not.toContain('linux_e2e')
@@ -155,6 +173,22 @@ describe('PR Gate workflow', () => {
       if (manifest.bundleOrder.includes(lane)) continue
       expect(workflow.jobs[lane], `lane ${lane} must execute through its bundle`).toBeUndefined()
     }
+  })
+
+  it('does not make the renderer layout pilot an unrelated blocking check', () => {
+    const macos = workflow.jobs.macos_e2e.steps?.find(
+      ({ name }) => name === 'Run renderer layout pilot'
+    )
+    const windows = workflow.jobs.windows_e2e.steps?.find(
+      ({ name }) => name === 'Run renderer layout pilot'
+    )
+
+    expect(macos?.if).toContain(
+      "contains(fromJSON(needs.preflight.outputs.plan).lanes, 'e2e_visual_macos')"
+    )
+    // Keep the existing Windows font pilot reachable for Windows-only plans.
+    expect(windows?.if).toBe('${{ matrix.shard == 1 }}')
+    expect(workflowText).toContain('--fail-on-flaky-tests')
   })
 
   it('plans with the trusted base classifier and fails closed during bootstrap', () => {
