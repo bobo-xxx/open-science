@@ -4,6 +4,7 @@ import {
   OFFICIAL_VENDORS,
   defaultVendorModel,
   getOfficialVendor,
+  getOfficialVendorModelIds,
   isOfficialVendorId,
   isVendorModelMultimodal,
   isVendorModelResponsesSupported,
@@ -30,6 +31,14 @@ describe('provider registry', () => {
       expect(hasBaseUrl).not.toBe(hasRegions) // exactly one is set
       expect(vendor.models.length).toBeGreaterThan(0)
       expect(vendor.reasoningEffort).toBeDefined()
+      for (const region of vendor.regions ?? []) {
+        if (!region.modelIds) continue
+        expect(region.modelIds.length).toBeGreaterThan(0)
+        expect(new Set(region.modelIds).size).toBe(region.modelIds.length)
+        for (const modelId of region.modelIds) {
+          expect(vendor.models.some(({ id }) => id === modelId)).toBe(true)
+        }
+      }
     }
   })
 
@@ -132,7 +141,9 @@ describe('provider registry', () => {
       'deepseek-v4-pro',
       'minimax-m3',
       'glm-5.2',
-      'glm-5.1'
+      'glm-5.1',
+      'big-pickle',
+      'mimo-v2.5-free'
     ])
     for (const excluded of ['minimax-m2.7', 'minimax-m2.5', 'qwen3.6-plus']) {
       expect(goModels).not.toContain(excluded)
@@ -146,6 +157,29 @@ describe('provider registry', () => {
     expect(resolveVendorModelApiEndpoints('opencode', 'minimax-m3')).toEqual(['openai'])
     expect(isVendorModelMultimodal('opencode-go', 'glm-5.3-flash')).toBe(true)
     expect(isVendorModelMultimodal('opencode', 'gpt-5.3-codex-spark')).toBe(false)
+  })
+
+  it.each([
+    { vendorId: 'openrouter', model: 'openrouter/free', contextWindow: 200_000, vision: true },
+    {
+      vendorId: 'openrouter',
+      model: 'google/gemma-4-31b-it:free',
+      contextWindow: 262_144,
+      vision: true
+    },
+    { vendorId: 'opencode', model: 'big-pickle', contextWindow: 200_000, vision: false },
+    { vendorId: 'opencode', model: 'mimo-v2.5-free', contextWindow: 200_000, vision: true }
+  ] as const)('offers $vendorId/$model with its documented capabilities', (entry) => {
+    expect(getOfficialVendorModelIds(entry.vendorId)).toContain(entry.model)
+    expect(resolveVendorModelApiEndpoints(entry.vendorId, entry.model)).toEqual(
+      entry.vendorId === 'openrouter' ? ['anthropic', 'openai'] : ['openai']
+    )
+    expect(isVendorModelResponsesSupported(entry.vendorId, entry.model)).toBe(false)
+    expect(resolveModelContextWindow(entry.vendorId, entry.model)).toBe(entry.contextWindow)
+    expect(isVendorModelMultimodal(entry.vendorId, entry.model)).toBe(entry.vision)
+    expect(resolveVendorModelReasoningEffort(entry.vendorId, entry.model)).toEqual({
+      supported: false
+    })
   })
 
   it('routes NVIDIA through Chat Completions with a curated agent catalog', () => {
@@ -424,15 +458,63 @@ describe('provider registry', () => {
     expect(defaultVendorModel('xiaomimimo')).toBe('mimo-v2.5-pro')
   })
 
+  it.each([undefined, 'china', 'unknown'])(
+    'preserves the China endpoint for SenseNova region %s',
+    (region) => {
+      expect(resolveVendorBaseUrl('sensenova', region)).toBe('https://token.sensenova.cn')
+      expect(resolveVendorOpenAiBaseUrl('sensenova', region)).toBe('https://token.sensenova.cn/v1')
+      expect(getOfficialVendorModelIds('sensenova', region)).toContain('sensenova-6.7-flash-lite')
+    }
+  )
+
+  it('keeps the Global SenseNova catalog independent of China and stale discovery', () => {
+    expect(resolveVendorBaseUrl('sensenova', 'global')).toBe('https://token.sensenova.ai')
+    expect(resolveVendorOpenAiBaseUrl('sensenova', 'global')).toBe('https://token.sensenova.ai/v1')
+    expect(resolveVendorApiKeyUrl('sensenova', 'global')).toBe(
+      'https://platform.sensenova.ai/console/keys'
+    )
+    expect(resolveVendorModelsUrl('sensenova', 'global')).toBeUndefined()
+    expect(defaultVendorModel('sensenova', 'global')).toBe('sensenova-6.8-flash-lite')
+    expect(
+      getOfficialVendorModelIds('sensenova', 'global', ['deepseek-v4-pro', 'sensenova-u1-fast'])
+    ).toEqual(['sensenova-6.8-flash-lite'])
+    expect(getOfficialVendorModelIds('minimax', 'global', ['discovered-model'])).toEqual([
+      'discovered-model'
+    ])
+    expect(getOfficialVendorModelIds('minimax', 'china')).toEqual(
+      getOfficialVendorModelIds('minimax', 'global')
+    )
+  })
+
   it('routes SenseNova through both APIs with a curated chat catalog', () => {
     expect(resolveVendorApiEndpoints('sensenova')).toEqual(['anthropic', 'openai'])
     expect(resolveVendorBaseUrl('sensenova')).toBe('https://token.sensenova.cn')
     expect(resolveVendorOpenAiBaseUrl('sensenova')).toBe('https://token.sensenova.cn/v1')
-    expect(resolveVendorApiKeyUrl('sensenova')).toBe('https://platform.sensenova.cn/token-plan')
+    expect(resolveVendorApiKeyUrl('sensenova')).toBe('https://platform.sensenova.cn/console/keys')
     // The live list also serves the image-generation-only sensenova-u1-fast, which the refresh
     // cannot filter out — so refresh-from-vendor is hidden and the chat catalog stays curated.
     expect(resolveVendorModelsUrl('sensenova')).toBeUndefined()
-    expect(defaultVendorModel('sensenova')).toBe('sensenova-6.7-flash-lite')
+    expect(defaultVendorModel('sensenova')).toBe('sensenova-6.8-flash-lite')
+    expect(getOfficialVendorModelIds('sensenova')).toEqual([
+      'sensenova-6.8-flash-lite',
+      'deepseek-v4-pro',
+      'deepseek-v4-flash',
+      'glm-5.2',
+      'kimi-k3',
+      'sensenova-6.7-flash-lite'
+    ])
+    expect(resolveModelContextWindow('sensenova', 'sensenova-6.8-flash-lite')).toBe(262_144)
+    for (const model of ['deepseek-v4-pro', 'glm-5.2', 'kimi-k3']) {
+      expect(resolveVendorModelApiEndpoints('sensenova', model)).toEqual(['openai'])
+      expect(resolveModelContextWindow('sensenova', model)).toBe(1_000_000)
+    }
+    for (const model of [
+      'sensenova-6.8-flash-lite',
+      'deepseek-v4-flash',
+      'sensenova-6.7-flash-lite'
+    ]) {
+      expect(resolveVendorModelApiEndpoints('sensenova', model)).toEqual(['anthropic', 'openai'])
+    }
   })
 
   it('routes Volcengine Ark through all three APIs with a curated Doubao Seed catalog', () => {
@@ -853,7 +935,11 @@ describe('provider registry', () => {
       expect(isVendorModelMultimodal('xiaomimimo', 'mimo-v2.5')).toBe(false)
     })
 
-    it('returns true only for the SenseNova vision model', () => {
+    it('enables SenseNova Flash Lite and hosted Kimi vision without enabling text-only models', () => {
+      expect(isVendorModelMultimodal('sensenova', 'sensenova-6.8-flash-lite')).toBe(true)
+      expect(isVendorModelMultimodal('sensenova', 'kimi-k3')).toBe(true)
+      expect(isVendorModelMultimodal('sensenova', 'deepseek-v4-pro')).toBe(false)
+      expect(isVendorModelMultimodal('sensenova', 'glm-5.2')).toBe(false)
       expect(isVendorModelMultimodal('sensenova', 'sensenova-6.7-flash-lite')).toBe(true)
       expect(isVendorModelMultimodal('sensenova', 'deepseek-v4-flash')).toBe(false)
     })
