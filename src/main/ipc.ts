@@ -6,16 +6,13 @@ import { PdfStructureSourceAuthority } from './literature/pdf-structure/source'
 import { PdfStructureReader } from './literature/pdf-structure/reader'
 import { createSpecialistApplicationOwner } from './specialist/application-commands'
 import { dirname, join } from 'node:path'
-import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { mkdir } from 'node:fs/promises'
 
 import {
   app,
   BrowserWindow,
   dialog,
-  net,
   Notification,
-  protocol,
   session,
   shell,
   webContents,
@@ -158,6 +155,8 @@ import {
 import { createLogsCommandOwner } from './logs-ipc'
 import { TaskNotificationService } from './notifications/task-notifications'
 import { createNotificationInboxController } from './notifications/notification-inbox-controller'
+import { createOfficePreviewElectronSurfaces } from './ipc-surfaces/office-preview'
+import { createSessionPersistenceElectronSurface } from './ipc-surfaces/session-persistence'
 import { createArtifactElectronSurface } from './ipc-surfaces/artifacts'
 import { createSettingsElectronSurface } from './ipc-surfaces/settings'
 import { createDesktopUtilitiesElectronSurface } from './ipc-surfaces/desktop-utilities'
@@ -191,23 +190,8 @@ import {
 } from './managed-preview-ipc'
 import { ManagedPreviewResources } from './managed-preview-resources'
 import type { PreviewProtocolRegistrar } from './managed-preview-protocol'
-import type {
-  AcquireManagedPreviewRequest,
-  ManagedPreviewSource
-} from '../shared/preview-resources'
+import type { ManagedPreviewSource } from '../shared/preview-resources'
 import { resolveEffectiveSpecialistSkills } from '../shared/specialist'
-import {
-  createOfficePreviewFrameProcessResolver,
-  createOfficePreviewProcessMemoryReader
-} from './office-preview/office-preview-electron'
-import { registerOfficePreviewIpcHandlers } from './office-preview/office-preview-ipc'
-import {
-  createOfficePreviewRuntimeUrl,
-  createReviewerPagedPreviewRuntimeUrl,
-  OFFICE_PREVIEW_RUNTIME_ORIGIN,
-  registerOfficePreviewRuntimeProtocol
-} from './office-preview/office-preview-runtime-protocol'
-import { OfficePreviewSupervisor } from './office-preview/office-preview-supervisor'
 import { registerNotebookIpcHandlers } from './notebook/ipc'
 import { registerRuntimeIpcHandlers } from './notebook/runtime-ipc'
 import { NotebookRunRepository, getRuntimeRoot } from './notebook/repository'
@@ -242,10 +226,6 @@ import type {
 import type { NotebookLanguage } from '../shared/notebook'
 import { MAIN_ENABLED_COMPUTE_HOSTS_LIFECYCLE_CLIENT_ID } from '../shared/lifecycle-events'
 import {
-  OFFICE_PREVIEW_STATE_CHANNEL,
-  type OfficePreviewOpenRequest
-} from '../shared/office-preview'
-import {
   createDefaultPreviewStateRepository,
   createDefaultProjectRepository,
   createProjectHandlers
@@ -257,8 +237,7 @@ import {
 } from './reviewer/ipc'
 import { ReviewerModelRuntimeOwner } from './reviewer/model-runtime-owner'
 import { ReviewerProjectRuntimeOwner } from './reviewer/project-runtime-owner'
-import { createReviewerPagedContentResolver } from './reviewer/paged-preview-resolver'
-import { renderPdfPagePreviews } from './uploads/attachment-media'
+import { createReviewerElectronPagedContentResolver } from './reviewer/paged-preview-electron'
 import {
   canReconcileSessionAbsences,
   createDefaultReviewRepository,
@@ -266,7 +245,6 @@ import {
   createSessionPersistenceHandlersWithAttributionAuthority,
   loadSessionMetadataAfterProjectRecovery,
   recoverProjectDeletionsForSessionRead,
-  registerSessionPersistenceIpcHandlers,
   withSessionDeletionCleanup
 } from './session-persistence/ipc'
 import {
@@ -359,11 +337,6 @@ import { OFFICIAL_MARKETPLACE_SOURCE } from './specialist/marketplace/official-s
 import { MarketplaceRepository } from './specialist/marketplace/repository'
 import { MarketplaceService } from './specialist/marketplace/service'
 import { MarketplaceOperationCoordinator } from './specialist/marketplace/operation-coordinator'
-import {
-  saveSpecialistExport,
-  saveSpecialistPackageReport,
-  selectSpecialistArchive
-} from './specialist/package/electron-adapter'
 import { UserSkillSpecialistPackageAdapter } from './skills/specialist-package-adapter'
 import { netFetchStandard } from './skills/net-fetch'
 import { AgentsService } from './agents/agents-service'
@@ -389,11 +362,7 @@ import { installCompletionGateDiagnostics } from './agents/completion-gate-diagn
 import { PendingSessionSpecialistBindings } from './agents/pending-session-specialist-bindings'
 import { createCodexCompletionGateRuntime } from './acp/codex-completion-handoff'
 import { createOpenCodeImmediateHandoffRuntime } from './acp/opencode-immediate-handoff'
-import { registerSpecialistIpcHandlers } from './specialist/ipc'
-import {
-  createContributionTemplateExporter,
-  resolveContributionTemplateReadmePath
-} from './specialist/package/contribution-template'
+import { createSpecialistElectronSurface } from './ipc-surfaces/specialist'
 import { SessionBindingService } from './specialist/session-binding'
 import {
   SessionSpecialistReconfiguration,
@@ -4125,55 +4094,17 @@ const createApplicationModules = async (
   specialistService.subscribe(() =>
     applicationEvents.publish('specialist:catalog-changed', undefined)
   )
-  declareElectronAdapter('specialist', () =>
-    registerSpecialistIpcHandlers(
+  surfaceAdapters.push(
+    createSpecialistElectronSurface({
       specialistService,
       sessionBindingService,
       sessionSpecialistReconfiguration,
-      // A specialist capability edit (skills/connectors/enabled) must reach live sessions on the next
-      // turn: reconnect so the agent respawns (re-provisioning skills) and resumes with the updated
-      // specialist whitelist in the session _meta.
-      () => void runtime.requestSkillsReload(),
-      createContributionTemplateExporter({
-        appVersion: app.getVersion(),
-        translate,
-        showSaveDialog: (options) => dialog.showSaveDialog(options),
-        readReadme: () => readFile(resolveContributionTemplateReadmePath(app.getAppPath()), 'utf8'),
-        writeFile: (filePath, bytes) => writeFile(filePath, bytes)
-      }),
-      {
-        service: specialistPackageService,
-        selectArchive: () =>
-          selectSpecialistArchive(
-            {
-              showOpenDialog: (options) => dialog.showOpenDialog(options),
-              readFile,
-              getFileSize: async (filePath) => (await stat(filePath)).size
-            },
-            translate
-          ),
-        saveReport: (report) =>
-          saveSpecialistPackageReport(
-            {
-              showSaveDialog: (options) => dialog.showSaveDialog(options),
-              writeFile: (filePath, contents) => writeFile(filePath, contents, 'utf8')
-            },
-            report,
-            translate
-          ),
-        saveExport: (archive) =>
-          saveSpecialistExport(
-            {
-              showSaveDialog: (options) => dialog.showSaveDialog(options),
-              writeFile: (filePath, bytes) => writeFile(filePath, bytes)
-            },
-            archive,
-            translate
-          )
-      },
+      onProfilesChanged: () => void runtime.requestSkillsReload(),
+      specialistPackageService,
       marketplaceService,
-      specialistApplicationOwner
-    )
+      specialistApplicationOwner,
+      translate
+    })
   )
   // Runtime Settings UI: discover managed/external environments and pick an interpreter file. The
   // runtime root MUST match the executor/service's
@@ -4206,46 +4137,11 @@ const createApplicationModules = async (
       managedPreviewOwners
     )
   )
-  declareElectronAdapter('office-preview-runtime', () =>
-    registerOfficePreviewRuntimeProtocol(
-      {
-        runtimeHtmlPath: join(__dirname, '../renderer/office-preview.html'),
-        devServerUrl: process.env['ELECTRON_RENDERER_URL'],
-        fetchRuntime: (targetUrl, request) =>
-          net.fetch(targetUrl, {
-            // Runtime assets are public application files. Forwarding custom-protocol headers or its
-            // abort signal makes Chromium treat the local fetch as a cross-site renderer request.
-            method: request.method
-          })
-      },
-      protocol
-    )
-  )
-  const toManagedPreviewRequest = (
-    request: OfficePreviewOpenRequest
-  ): AcquireManagedPreviewRequest =>
-    request.source === 'notebook-input'
-      ? { source: request.source, path: request.path }
-      : {
-          source: request.source,
-          projectId: request.projectId,
-          fileId: request.fileId,
-          ...(request.versionId ? { versionId: request.versionId } : {})
-        }
-  const officePreviewSupervisor = new OfficePreviewSupervisor({
-    inspectResource: (request) => previewResources.inspect(toManagedPreviewRequest(request)),
-    acquireResource: (ownerId, request, snapshot, maxBytes) =>
-      previewResources.acquire(ownerId, toManagedPreviewRequest(request), { snapshot, maxBytes }),
-    releaseResource: (ownerId, resourceId) => previewResources.release(ownerId, { resourceId }),
-    createSessionId: randomUUID,
-    createRuntimeUrl: createOfficePreviewRuntimeUrl,
-    resolveFrameProcess: createOfficePreviewFrameProcessResolver(webContents),
-    getProcessMemoryUsageBytes: createOfficePreviewProcessMemoryReader(app),
-    publishState: (ownerId, state) =>
-      webContents.fromId(ownerId)?.send(OFFICE_PREVIEW_STATE_CHANNEL, state)
-  })
-  declareElectronAdapter('office-preview', () =>
-    registerOfficePreviewIpcHandlers(officePreviewSupervisor)
+  surfaceAdapters.push(
+    ...createOfficePreviewElectronSurfaces({
+      previewResources,
+      runtimeHtmlPath: join(__dirname, '../renderer/office-preview.html')
+    })
   )
 
   // Resolve the shared conda base under the app data root (relocatable, where the runtime install
@@ -4509,28 +4405,16 @@ const createApplicationModules = async (
         )
     }
   })
-  declareElectronAdapter('session-persistence', () => {
-    registerSessionPersistenceIpcHandlers(
+  surfaceAdapters.push(
+    createSessionPersistenceElectronSurface({
       sessionPersistenceBackend,
       reviewRepository,
       sessionPersistenceHandlers,
-      async (session) => {
-        sessionDetailsOwner.afterSessionSaved(session)
-        try {
-          await delegatedWork.root.wakeMessages?.(session.id)
-        } catch (error) {
-          createLogger('delegation:messages').warn(
-            'message wake after Session activation failed',
-            diagnosticErrorFields(error)
-          )
-        }
-      },
-      async (request) => {
-        const error = await shell.openPath(sessionRepository.recoveryFolderPath(request.projectId))
-        if (error) throw new Error('Session recovery folder could not be opened.')
-      }
-    )
-  })
+      sessionDetailsOwner,
+      delegatedWork,
+      sessionRepository
+    })
+  )
   const conversationExportService = createConversationExportService({
     translate,
     loadSession: (projectId, sessionId) => sessionRepository.loadSession(projectId, sessionId),
@@ -4672,59 +4556,7 @@ const createApplicationModules = async (
     managedFileVersions: managedFileVersionService,
     artifactCatalog: projectFilesRepository,
     artifactProvenanceRepository,
-    pagedContentResolver: createReviewerPagedContentResolver({
-      createWindow: () => {
-        const previewWindow = new BrowserWindow({
-          show: false,
-          width: 1_024,
-          height: 1_280,
-          webPreferences: {
-            contextIsolation: true,
-            nodeIntegration: false,
-            sandbox: true,
-            backgroundThrottling: false,
-            partition: 'reviewer-paged-preview'
-          }
-        })
-        previewWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
-        previewWindow.webContents.on('will-navigate', (event, url) => {
-          const target = new URL(url)
-          const runtime = new URL(OFFICE_PREVIEW_RUNTIME_ORIGIN)
-          if (target.protocol !== runtime.protocol || target.hostname !== runtime.hostname) {
-            event.preventDefault()
-          }
-        })
-        previewWindow.webContents.session.setPermissionRequestHandler(
-          (_contents, _permission, callback) => callback(false)
-        )
-        return previewWindow
-      },
-      createSessionId: randomUUID,
-      createRuntimeUrl: createReviewerPagedPreviewRuntimeUrl,
-      acquireResource: (
-        ownerId,
-        resolvedPath,
-        filename,
-        verifiedObservation,
-        verifiedChecksum,
-        maxBytes
-      ) =>
-        previewResources.acquireResolvedFile(
-          ownerId,
-          {
-            path: resolvedPath,
-            mimeType: filename.endsWith('.docx')
-              ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-              : 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-            verifiedObservation,
-            verifiedChecksum
-          },
-          maxBytes
-        ),
-      releaseResource: (ownerId, resourceId) => previewResources.release(ownerId, { resourceId }),
-      renderPdfPages: renderPdfPagePreviews,
-      getProcessMemoryUsageBytes: createOfficePreviewProcessMemoryReader(app)
-    }),
+    pagedContentResolver: createReviewerElectronPagedContentResolver(previewResources),
     resolveSessionAgentTarget,
     saveSessionAgentConfiguration: (
       session: PersistedChatSession,

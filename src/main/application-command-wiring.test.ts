@@ -44,7 +44,46 @@ const dependencyBlock = compact(
 )
 
 describe('production application command wiring', () => {
-  it('returns Office preview cleanup to its scoped afterAcp installation', () => {
+  it('installs Session persistence once with shared owners after Notebook input preview', () => {
+    const phase = compact(
+      between(ipcSource, 'surfaceAdapters = afterAcpAdapters', 'const conversationExportService')
+    )
+    expect(phase).toContain(
+      'createSessionPersistenceElectronSurface({ sessionPersistenceBackend, reviewRepository, sessionPersistenceHandlers, sessionDetailsOwner, delegatedWork, sessionRepository })'
+    )
+    expect(phase.indexOf("declareElectronAdapter('notebook-input-preview'")).toBeLessThan(
+      phase.indexOf('createSessionPersistenceElectronSurface(')
+    )
+    expect(occurrences(ipcSource, 'createSessionPersistenceElectronSurface(')).toBe(1)
+    expect(ipcSource).not.toContain('registerSessionPersistenceIpcHandlers')
+    expect(ipcSource).not.toContain('message wake after Session activation failed')
+    expect(ipcSource).not.toContain('Session recovery folder could not be opened.')
+  })
+
+  it('installs Specialist once with shared owners before Notebook runtime in afterAcp', () => {
+    const phase = compact(
+      between(
+        ipcSource,
+        'surfaceAdapters = afterAcpAdapters',
+        "declareElectronAdapter('notebook-runtime'"
+      )
+    )
+    expect(phase).toContain(
+      'createSpecialistElectronSurface({ specialistService, sessionBindingService, sessionSpecialistReconfiguration, onProfilesChanged: () => void runtime.requestSkillsReload(), specialistPackageService, marketplaceService, specialistApplicationOwner, translate })'
+    )
+    expect(occurrences(ipcSource, 'createSpecialistElectronSurface(')).toBe(1)
+    expect(
+      occurrences(ipcSource, 'const specialistApplicationOwner = createSpecialistApplicationOwner(')
+    ).toBe(1)
+    expect(phase).toContain(
+      "specialistService.subscribe(() => applicationEvents.publish('specialist:catalog-changed', undefined) )"
+    )
+    expect(ipcSource).not.toContain('registerSpecialistIpcHandlers')
+    expect(ipcSource).not.toContain('selectSpecialistArchive')
+    expect(ipcSource).not.toContain('createContributionTemplateExporter')
+  })
+
+  it('installs Office preview once with shared resources between managed preview and environment', () => {
     const phase = compact(
       between(
         ipcSource,
@@ -53,14 +92,16 @@ describe('production application command wiring', () => {
       )
     )
     expect(phase).toContain(
-      "declareElectronAdapter('office-preview', () => registerOfficePreviewIpcHandlers(officePreviewSupervisor) )"
+      "...createOfficePreviewElectronSurfaces({ previewResources, runtimeHtmlPath: join(__dirname, '../renderer/office-preview.html') })"
     )
-    expect(
-      occurrences(ipcSource, 'registerOfficePreviewIpcHandlers(officePreviewSupervisor)')
-    ).toBe(1)
-    expect(phase.indexOf("declareElectronAdapter('office-preview-runtime'")).toBeLessThan(
-      phase.indexOf("declareElectronAdapter('office-preview',")
+    expect(phase).toContain("declareElectronAdapter('managed-preview'")
+    expect(phase.indexOf("declareElectronAdapter('managed-preview'")).toBeLessThan(
+      phase.indexOf('createOfficePreviewElectronSurfaces(')
     )
+    expect(occurrences(ipcSource, 'createOfficePreviewElectronSurfaces(')).toBe(1)
+    expect(ipcSource).not.toContain('new OfficePreviewSupervisor')
+    expect(ipcSource).not.toContain('registerOfficePreviewIpcHandlers')
+    expect(ipcSource).not.toContain('registerOfficePreviewRuntimeProtocol')
   })
 
   it('installs Settings once with shared owners before Notebook in afterAcp', () => {
@@ -224,7 +265,7 @@ describe('production application command wiring', () => {
       ],
       [
         'sessionPersistenceHandlers',
-        'reviewRepository, sessionPersistenceHandlers, async (session)',
+        'reviewRepository, sessionPersistenceHandlers, sessionDetailsOwner, delegatedWork, sessionRepository',
         '...sessionPersistenceHandlers'
       ],
       [
@@ -347,14 +388,20 @@ describe('production application command wiring', () => {
     expect(occurrences(returnedViews, 'applicationCommandComposition.')).toBe(3)
   })
 
-  it('injects the bounded isolated page preview resolver into production reviews', () => {
-    const source = compact(ipcSource)
-    expect(source).toContain('pagedContentResolver: createReviewerPagedContentResolver({')
-    expect(source).toContain("partition: 'reviewer-paged-preview'")
-    expect(source).toContain('contextIsolation: true, nodeIntegration: false, sandbox: true')
-    expect(source).toContain("setWindowOpenHandler(() => ({ action: 'deny' }))")
-    expect(source).toContain('previewResources.acquireResolvedFile(')
-    expect(source).toContain('renderPdfPages: renderPdfPagePreviews')
+  it('shares one Electron page preview resolver with the production Reviewer owner', () => {
+    const options = compact(
+      between(ipcSource, 'const reviewerOptions = {', 'const reviewerCommandOwner =')
+    )
+    expect(options).toContain(
+      'pagedContentResolver: createReviewerElectronPagedContentResolver(previewResources)'
+    )
+    expect(occurrences(ipcSource, 'createReviewerElectronPagedContentResolver(')).toBe(1)
+    expect(compact(ipcSource)).toContain('createReviewerCommandOwner(reviewerOptions)')
+    expect(compact(ipcSource)).toContain(
+      'registerReviewerIpcHandlers(reviewerOptions, reviewerCommandOwner)'
+    )
+    expect(ipcSource).not.toContain('createReviewerPagedContentResolver(')
+    expect(ipcSource).not.toContain("partition: 'reviewer-paged-preview'")
   })
 
   it('installs every notification inbox request on the Electron adapter', () => {
