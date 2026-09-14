@@ -3348,16 +3348,7 @@ const createApplicationModules = async (
           })
       },
       recordUsage: recordAuxiliaryUsage,
-      onEvent: (event) => broadcastToRenderers('side-chat:event', event),
-      setParentInteractionsPaused: (sessionId, paused) => {
-        if (paused) {
-          approvalBroker.pauseSession(sessionId)
-          computeIpcModule.handlers.approvalPauseSession(sessionId)
-          return
-        }
-        approvalBroker.resumeSession(sessionId)
-        computeIpcModule.handlers.approvalResumeSession(sessionId)
-      }
+      onEvent: (event) => broadcastToRenderers('side-chat:event', event)
     } satisfies ConstructorParameters<typeof SideChatRuntimeOwner>[0],
     (options) => {
       const owner = new SideChatRuntimeOwner(options)
@@ -3571,9 +3562,6 @@ const createApplicationModules = async (
     if (!(await completionHandoffLifecycle.canStartUserPrompt(sessionId))) {
       throw new Error('The approved Specialist handoff must finish or be cancelled before sending.')
     }
-    if (sideChatRuntime.hasForParent(sessionId)) {
-      throw new Error('Close Side chat before sending a message to Main.')
-    }
   })
   runtime.setPromptDispatchAdmissionGuard((sessionId, dispatch, requireAvailable) =>
     archiveCoordinator.withSessionDeletionAdmissionById(sessionId, dispatch, requireAvailable)
@@ -3762,9 +3750,10 @@ const createApplicationModules = async (
     log: createLogger('shutdown')
   })
   const durableBackendHandoffGate = createDurableInstallGate(
-    () =>
+    (options) =>
       shutdownCoordinator.runForUpdateGate(UPDATE_SHUTDOWN_BUDGET_MS, {
-        holdSideChatAdmission: true
+        holdSideChatAdmission: true,
+        legacyShellRecoveryToken: options?.legacyShellRecoveryToken
       }),
     () => confirmRendererDurability()
   )
@@ -4240,13 +4229,13 @@ const createApplicationModules = async (
     }
   )
   const waitForRecovery = (): Promise<void> => notebookService.ensureRecovered()
-  // Lets UI provision/repair refuse when recovery left the default env's prefix blocked (an
-  // unknown-liveness orphan may still be writing it) — throws with an actionable message.
+  // Recovery can retain a target for worker uncertainty, cache publication, or journal failure.
+  // A block alone does not identify its cause; detailed reasons are available in Runtimes.
   const assertProvisionAllowed = (language: NotebookLanguage): void => {
     if (notebookService.isDefaultEnvRecoveryBlocked(language)) {
       throw new Error(
-        `The ${language} runtime is recovering from an interrupted operation whose process could not be ` +
-          'confirmed stopped. Use Recheck in Settings → Runtimes. Restarting the app does not prove that the worker stopped.'
+        `RUNTIME_RECOVERY_BLOCKED: recovery of a previous operation on the ${language} runtime has not completed. ` +
+          'Use Recheck in Settings → Runtimes to retry safe recovery and review the remaining recovery requirements.'
       )
     }
   }

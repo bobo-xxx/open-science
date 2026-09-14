@@ -1038,6 +1038,23 @@ class NotebookLocalRpcServer {
     }
   }
 
+  // Runtime generations overlap during adoption. Only a caller holding every current ACP
+  // credential in this alias closure may remove the shared Session state. Concrete release()
+  // callbacks still revoke the caller's own credentials when this ownership check fails.
+  releaseSessionCapabilitiesIfOwned(sessionId: string, capabilityTokens: readonly string[]): void {
+    const expected = new Set(capabilityTokens)
+    let ownsCurrentCapability = false
+    for (const owner of this.resolveSessionCapabilityOwners(sessionId)) {
+      for (const tokens of [this.sessionRpcTokens, this.skillImportRpcTokens, this.planRpcTokens]) {
+        const token = tokens.get(owner)
+        if (!token) continue
+        if (!expected.has(token)) return
+        ownsCurrentCapability = true
+      }
+    }
+    if (ownsCurrentCapability) this.releaseSessionCapabilities(sessionId)
+  }
+
   // Releases ACP-owned session state without revoking the persistent control-plane capability. The
   // Notebook RuntimeSession owns that capability and revokes it through connection.release().
   releaseSessionCapabilities(sessionId: string): void {
@@ -2153,7 +2170,7 @@ class NotebookLocalRpcServer {
       const message = error instanceof Error ? error.message : String(error)
       const serializedError =
         error instanceof NotebookBackgroundRunError
-          ? error.detail
+          ? { ...error.detail, message }
           : error instanceof BackgroundHostMethodUnsafeError
             ? error.detail
             : error instanceof PlanCommandError
@@ -2161,6 +2178,7 @@ class NotebookLocalRpcServer {
               : error instanceof StructuredOutputError
                 ? {
                     code: error.code,
+                    message,
                     ...(error.keyword ? { keyword: error.keyword } : {}),
                     ...(error.instancePath !== undefined
                       ? { instance_path: error.instancePath }
@@ -2758,7 +2776,7 @@ class NotebookLocalRpcServer {
             if (existing.fingerprint !== fingerprint) {
               throw new RpcHttpError(
                 409,
-                'invocation_id was already used with a different submit_job request.'
+                'Compute submission identity conflicts with a different request. The identity is managed by the Host SDK; do not replace it or resubmit the same work. Application recovery is required.'
               )
             }
             return await existing.submission
