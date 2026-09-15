@@ -288,8 +288,21 @@ colors communicate a successful or failed probe/migration result.
 | Token                     | Tailwind class    | Value | Usage                                                                |
 | ------------------------- | ----------------- | ----- | -------------------------------------------------------------------- |
 | `--z-index-modal`         | `z-modal`         | `50`  | Standard portaled modal layer (e.g. the notification center popover) |
-| `--z-index-toast`         | `z-toast`         | `70`  | Toasts and undo snackbars above the modal layer                      |
+| `--z-index-toast`         | `z-toast`         | `40`  | Background notices and undo snackbars below modal backdrops          |
 | `--z-index-markdown-menu` | `z-markdown-menu` | `200` | Streamdown Mermaid and table format menus above fullscreen content   |
+
+Background notices share `z-toast`: action toasts, the notification stack, persistent storage
+recovery alerts, live message notices and their error fallback. Modal backdrops must cover these
+notices while the background is blocked. Inline errors stay within their owning surface. Preserve
+existing notice lifetimes and Undo deadlines when a modal opens.
+
+Quit-cancellation recovery is an explicit foreground exception: its owner mounts it outside the
+inert base presentation at layer 70 so Retry and Dismiss remain reachable over Settings. It does
+not use the background notice layer.
+
+Body-portaled selection controls must respect `inert` and `aria-hidden` on their source ancestors.
+Hide them while that source is inactive and restore them if the original selection remains valid.
+Active-dialog menus and other foreground child layers retain their own ordering.
 
 ### Border Opacity
 
@@ -899,6 +912,21 @@ colors communicate a successful or failed probe/migration result.
 - Public JavaScript host APIs and their object fields use camelCase (`listSkills`, `listConnectors`, `attachSkill`, `displayName`, `systemPrompt`, and related fields). The agent-facing `host.compute` discovery/detail contract preserves its documented wire field names: `listRegistered()` and `listPreferred()` summaries use `provider_id` and `display_name`, while the `details(providerId, { mode: 'read' })` probe snapshot uses `probed_at`, `exit_code`, `error_tail`, `mem_mib`, and `detected_scheduler`; its public method names remain camelCase. Internal transport operation names may remain snake_case behind that boundary.
 
 #### Cross-resource Tags
+
+- Resource assignment pickers in Literature, Skills, Connectors, and Specialists share a
+  searchable combobox. Opening focuses the input; filtering highlights the first matching Tag.
+  Up/Down cycle through matches and the final **Create** option; Enter activates the highlighted
+  option. Existing Tags toggle assignment. With no matching Tags, Enter creates and assigns the
+  input name. Exact normalized names suppress duplicate creation; IME confirmation never submits.
+  The active highlight is independent from the checkmark indicating an existing assignment.
+- Escape dismisses the picker and restores its trigger. Tab dismisses without submitting and
+  continues keyboard navigation. Keep each owner's existing close-on-select policy: Literature
+  supports repeated selection; Settings summaries close after all current saves succeed. Pending
+  creation cannot be submitted twice. Existing Tags update checkmarks optimistically without
+  spinners or disabling other options; users can select or deselect while saves are pending.
+  Failures remain visible in the picker with the query retained;
+  newer input and reopened pickers are not overwritten by an older asynchronous completion.
+  The full Tags editor remains the place to choose a custom name, icon, and color.
 
 - Settings -> Workspace -> Tags is the shared organization surface for catalog resources. V1
   adapters cover Skills, Connectors, and runnable Specialists; the Reviewer placeholder is excluded.
