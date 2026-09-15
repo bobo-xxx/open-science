@@ -116,6 +116,7 @@
     "The original package is unavailable. It may have been moved, deleted, or become unreadable. Choose another package.": "原套件檔案無法使用，可能已移動、刪除或無法讀取。請選擇其他套件檔案。"
   },
   "renderer": {
+    "Open-source license": "開源授權條款",
     "Old Shell launch records are blocking this update.": "舊的命令列啟動記錄阻止了本次更新。",
     "Recovery will back up old Shell launch records and retry the update. Project data and settings are preserved.": "復原操作將備份舊的命令列啟動記錄，然後重試更新。專案資料和設定將保留。",
     "Back up records and retry": "備份記錄並重試",
@@ -5820,6 +5821,9 @@
     "Add a private note": "新增私人備註",
     "No bookmarks yet.": "尚無書籤。",
     "Bookmark note": "書籤備註",
-    "The exact bookmark location could not be found.": "無法找到書籤的確切位置。"
+    "The exact bookmark location could not be found.": "無法找到書籤的確切位置。",
+    "Skill installation blocked": "技能安裝受阻",
+    "Manage local skills": "管理本地技能",
+    "Local conflict": "本機衝突"
   }
 }

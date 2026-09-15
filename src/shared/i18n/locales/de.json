@@ -117,6 +117,7 @@
     "The original package is unavailable. It may have been moved, deleted, or become unreadable. Choose another package.": "Das ursprüngliche Paket ist nicht verfügbar. Es wurde möglicherweise verschoben, gelöscht oder ist nicht mehr lesbar. Wählen Sie ein anderes Paket."
   },
   "renderer": {
+    "Open-source license": "Open-Source-Lizenz",
     "Old Shell launch records are blocking this update.": "Alte Startaufzeichnungen der Befehlszeile blockieren dieses Update.",
     "Recovery will back up old Shell launch records and retry the update. Project data and settings are preserved.": "Die Wiederherstellung sichert alte Startaufzeichnungen der Befehlszeile und versucht das Update erneut. Projektdaten und Einstellungen bleiben erhalten.",
     "Back up records and retry": "Aufzeichnungen sichern und erneut versuchen",
@@ -5981,6 +5982,9 @@
     "No bookmarks yet.": "Noch keine Lesezeichen.",
     "Bookmark note": "Lesezeichennotiz",
     "Bookmarks ({{count}})_one": "Lesezeichen ({{count}})",
-    "The exact bookmark location could not be found.": "Die genaue Position des Lesezeichens wurde nicht gefunden."
+    "The exact bookmark location could not be found.": "Die genaue Position des Lesezeichens wurde nicht gefunden.",
+    "Skill installation blocked": "Installation der Fähigkeit blockiert",
+    "Manage local skills": "Lokale Fähigkeiten verwalten",
+    "Local conflict": "Lokaler Konflikt"
   }
 }
