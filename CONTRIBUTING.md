@@ -327,16 +327,25 @@ ci(review): unify automated AI reviews
   the queue rollout is enabled. The queue validates the combined revision before **squash merge**;
   its squash subject must retain the PR title's Conventional Commit format. Do not update a branch
   merely because `main` advanced; update it for conflicts or a maintainer request.
-- PR commits retain policy/CI Integrity, CodeQL and AI review, relevant static checks, and portable
-  module tests on Ubuntu. Unknown/global changes retain complete portable tests and coverage.
-  Selected native-platform and Electron E2E checks run before merge in the queue. Selective changed
-  coverage is enforced with the native module run in the queue; portable PR module feedback does
-  not claim native coverage. Focused manual E2E runs remain available during development.
-- Until the repository requires merge queue and `PR_GATE_MERGE_QUEUE_ENABLED=true` is enabled,
-  PR Gate retains all existing selected checks. Enable queue enforcement and verify a real queue
-  group before enabling PR deferral; for rollback, restore full PR checks before removing queue
-  enforcement. CodeQL default setup and AI review continue to run for PR updates independently
-  of PR Gate staging.
+- PR commits retain policy/CI Integrity, CodeQL, AI review, static checks and portable tests.
+  Desktop changes run the main Windows business journeys. Ordinary changes run one short macOS
+  core group (project creation/relaunch, persisted theme and window presentation), instead of the
+  four-group Mac matrix. The short job installs, builds and tests on one Mac runner without web
+  build or snapshot transfer. Known non-native main-process descriptors and locale changes use
+  this same short path. Critical desktop paths from the impact manifest, preload, windows,
+  shortcuts, processes, native dependencies, Notebook runtime, build/CI inputs and unknown main
+  ownership or destructive changes retain expanded affected Mac coverage.
+- Merge queue keeps concurrency two and validates the combined revision with Linux/portable
+  checks and the short Mac core. Ordinary changes do not repeat Windows business E2E in queue;
+  platform-sensitive changes retain their selected platform checks. Selected native module
+  coverage remains blocking. The obsolete blanket PR-deferral switch, stage output and separate
+  legacy coverage job have been removed; selected bundles must always pass.
+- New plans carry `macosProfile` (`smoke` or `expanded`). Trusted old plans without this field
+  retain their existing execution and complete fallback matrix. Workflows opt into the new plan
+  with `PR_GATE_PLATFORM_POLICY=risk-v1`; old workflow revisions receive the full legacy plan. Manual focused runs retain their
+  explicitly selected suites. The `macos-smoke` manual choice exercises the actual short Mac job
+  without unrelated platform suites. Plans requesting the retired `coverage_macos` bundle fail
+  validation; old completed runs need no migration. This compatibility concerns CI metadata only.
 - Nightly packaging, Windows Full Test, supplemental Source Regression, and Runtime Resource Soak
   run daily on `main`, at 01:17, 02:47, 03:37, and 05:23 respectively in Singapore time
   (Asia/Singapore, UTC+8). Unchanged successful revisions are skipped;
@@ -371,33 +380,40 @@ core journeys and affected portable tests without selecting unrelated supplement
 ownership, global inputs and destructive changes retain full fallback. Session, permission,
 Delegation, storage and native sandbox changes retain their relevant pre-merge checks.
 
-Source Regression runs the complete supplemental suites daily at 03:37 Asia/Singapore. The gate
+Source Regression runs complete Mac functional/workspace journeys, browser/visual/accessibility
+coverage and supplemental suites daily at 03:37 Asia/Singapore. The gate
 excludes only tests tagged `@capacity`; a three-session body-integrity check remains in the selected
 regression suite while forty-session resource profiling runs in Source Regression. Transcript
 scrolling/find correctness stays in the gate. Focused manual Source Regression runs include capacity
 profiling, and callers without an explicit capacity input retain complete coverage.
 
-### CI control-plane approval rollout
+### CI control-plane approval
 
 CI workflows, local actions, CI scripts, Dependabot configuration and CODEOWNERS itself have
-the `@aipoch/ci-maintainers` team as owner in `.github/CODEOWNERS`. Maintain its membership in
-GitHub instead of editing individual usernames in the file. The team must be visible and have
-explicit repository write access. The intended normal path is an approval from one team member
-other than the PR author, followed by passing Integrity and PR Gate checks and the merge
-queue. Additional commits invalidate stale approval when the main ruleset enforces that policy.
-Ordinary application files have no CODEOWNERS entry.
+`@aipoch/ci-maintainers` as owner in `.github/CODEOWNERS`. Maintain membership in GitHub instead
+of editing individual usernames in the file. The team must be visible and have explicit repository
+write access. The main ruleset requires approval from one owner other than the PR author and
+dismisses stale approvals after new commits. Ordinary application files have no CODEOWNERS entry.
 
-Roll this policy out in order:
+Owner review authorizes control-plane changes; CI Integrity still validates unsafe workflow
+execution, mutable action references, expanded target-workflow permissions and spoofed or missing
+required checks. It runs for both PR admission and merge-group validation. Passing required checks
+and owner approval precede normal merge-queue admission. Never remove the Integrity `merge_group`
+trigger while its check is required.
 
-1. Merge the CI ownership file while retaining the existing protected-control-plane guard.
-2. Enable required code-owner review and stale-approval dismissal in the main ruleset, preserving
-   the required checks, queue and existing bypass configuration. Verify the live ruleset.
-3. Only then replace the unconditional protected-file rejection with native owner authorization;
-   retain Integrity checks for unsafe workflow execution, mutable action references, expanded
-   permissions and spoofed or missing required checks. Verify both PR admission and merge-group
-   validation before considering the migration complete.
+Keep required code-owner review and stale-approval dismissal enabled while relying on this policy.
+CI Integrity also checks module ownership for JavaScript/TypeScript files under `src/` and
+`packages/`. Register new source and test files in `scripts/ci/module-impact.json`, including their
+owner, contract and consumer test coverage. New unregistered files and regressions from existing
+coverage block admission; changes to historical unregistered files produce a nonblocking report
+and retain full test fallback. Renamed files must register their new paths. Manifest-only changes
+are checked against all surviving code files, so removing a mapping cannot silently reduce coverage.
+The checker reads candidate manifests as data using trusted base code and compares against the Git
+merge base; no separate historical allowlist is stored. Global CI inputs retain intentional full
+validation. E2E and CI scripts remain governed by their existing routing and integrity checks.
+Registration proves that a test plan exists, not that its dependency coverage is complete.
 
-Until step 3 lands, editing established protected gate files still requires an explicitly authorized
-maintainer ruleset bypass. GitHub's bypass directly merges the PR; it does not attach an approval to
-carry into a later queue run. Do not enqueue a PR with a known failing required check and expect the
-queue to waive it. Never remove the Integrity `merge_group` trigger while its check is required.
+The migration PR that removes the former unconditional protected-file rejection still encounters
+the old guard from its base revision. Any bootstrap ruleset bypass requires explicit maintainer
+authorization and directly merges the PR; it does not carry approval into a later queue run. Do not
+enqueue a PR with a known failing required check and expect the queue to waive it.
