@@ -323,11 +323,26 @@ ci(review): unify automated AI reviews
   checks ran after the last material edit, and call out uncovered risks.
 - Keep PRs reasonably small and scoped so they are easy to review.
 - Ensure the final Test Impact Set, or the full fallback when required, passes.
-- After the pull request checks pass, merge it directly using **squash merge only**. Do not update the
-  branch only because `main` advanced; update it when it has merge conflicts or a maintainer requests
-  it. The squash commit subject must keep the pull request title's Conventional Commit format.
-- Non-documentation changes merged into `main` trigger the [Nightly workflow](.github/workflows/nightly.yml),
-  which runs post-merge verification and cross-platform package certification on the resulting commit.
+- After required PR checks and review pass, add the pull request to the native merge queue once
+  the queue rollout is enabled. The queue validates the combined revision before **squash merge**;
+  its squash subject must retain the PR title's Conventional Commit format. Do not update a branch
+  merely because `main` advanced; update it for conflicts or a maintainer request.
+- PR commits retain policy/CI Integrity, CodeQL and AI review, relevant static checks, and portable
+  module tests on Ubuntu. Unknown/global changes retain complete portable tests and coverage.
+  Selected native-platform and Electron E2E checks run before merge in the queue. Selective changed
+  coverage is enforced with the native module run in the queue; portable PR module feedback does
+  not claim native coverage. Focused manual E2E runs remain available during development.
+- Until the repository requires merge queue and `PR_GATE_MERGE_QUEUE_ENABLED=true` is enabled,
+  PR Gate retains all existing selected checks. Enable queue enforcement and verify a real queue
+  group before enabling PR deferral; for rollback, restore full PR checks before removing queue
+  enforcement. CodeQL default setup and AI review continue to run for PR updates independently
+  of PR Gate staging.
+- Nightly packaging, Windows Full Test, supplemental Source Regression, and Runtime Resource Soak
+  run daily on `main`, at 01:17, 02:47, 03:37, and 05:23 respectively in Singapore time
+  (Asia/Singapore, UTC+8). Unchanged successful revisions are skipped;
+  manual runs always execute. Formal release certification and post-release Windows Upgrade Smoke
+  retain their existing gates/triggers. Scheduled failures remain visible failures and cannot
+  retroactively block an already merged PR.
 
 ## Reporting Issues
 
@@ -347,3 +362,42 @@ use `npm-v*` tags and are published through the protected `Publish npm package` 
 
 By contributing, you agree that your contributions will be licensed under the
 [Apache License 2.0](./LICENSE), the same license that covers this project.
+
+### Supplemental desktop coverage
+
+The gate selects supplemental regressions and Delegation through critical desktop paths and
+module-consumer overlays. A known connector descriptor or main-process locale-only change keeps
+core journeys and affected portable tests without selecting unrelated supplemental groups. Unknown
+ownership, global inputs and destructive changes retain full fallback. Session, permission,
+Delegation, storage and native sandbox changes retain their relevant pre-merge checks.
+
+Source Regression runs the complete supplemental suites daily at 03:37 Asia/Singapore. The gate
+excludes only tests tagged `@capacity`; a three-session body-integrity check remains in the selected
+regression suite while forty-session resource profiling runs in Source Regression. Transcript
+scrolling/find correctness stays in the gate. Focused manual Source Regression runs include capacity
+profiling, and callers without an explicit capacity input retain complete coverage.
+
+### CI control-plane approval rollout
+
+CI workflows, local actions, CI scripts, Dependabot configuration and CODEOWNERS itself have
+the `@aipoch/ci-maintainers` team as owner in `.github/CODEOWNERS`. Maintain its membership in
+GitHub instead of editing individual usernames in the file. The team must be visible and have
+explicit repository write access. The intended normal path is an approval from one team member
+other than the PR author, followed by passing Integrity and PR Gate checks and the merge
+queue. Additional commits invalidate stale approval when the main ruleset enforces that policy.
+Ordinary application files have no CODEOWNERS entry.
+
+Roll this policy out in order:
+
+1. Merge the CI ownership file while retaining the existing protected-control-plane guard.
+2. Enable required code-owner review and stale-approval dismissal in the main ruleset, preserving
+   the required checks, queue and existing bypass configuration. Verify the live ruleset.
+3. Only then replace the unconditional protected-file rejection with native owner authorization;
+   retain Integrity checks for unsafe workflow execution, mutable action references, expanded
+   permissions and spoofed or missing required checks. Verify both PR admission and merge-group
+   validation before considering the migration complete.
+
+Until step 3 lands, editing established protected gate files still requires an explicitly authorized
+maintainer ruleset bypass. GitHub's bypass directly merges the PR; it does not attach an approval to
+carry into a later queue run. Do not enqueue a PR with a known failing required check and expect the
+queue to waive it. Never remove the Integrity `merge_group` trigger while its check is required.

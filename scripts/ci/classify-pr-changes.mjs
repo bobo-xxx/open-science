@@ -201,12 +201,44 @@ function escapeHtml(value) {
     .replaceAll("'", '&#039;')
 }
 
+// Derived after module/consumer overlays are resolved. Missing metadata in a trusted old plan
+// is handled conservatively by the workflow, which still runs all four groups.
+export function macosGroupsForPlan(plan) {
+  if (!plan.bundles?.includes('macos_e2e')) return []
+  if (plan.mode === 'full') return ['journeys', 'presentation', 'regressions', 'delegation']
+  const groups = {
+    journeys: ['build', 'e2e_functional_macos', 'e2e_workspace_macos'],
+    presentation: ['e2e_accessibility_macos', 'e2e_visual_macos'],
+    regressions: ['e2e_regressions_macos'],
+    delegation: ['e2e_delegation_macos']
+  }
+  return Object.entries(groups)
+    .filter(([, lanes]) => lanes.some((lane) => plan.lanes.includes(lane)))
+    .map(([group]) => group)
+}
+
+// Roll out PR deferral only after the repository requires merge queue. Missing/old trusted
+// classifiers retain full execution. Queue and manual events always validate every selected bundle.
+export function prGateStage(environment = {}) {
+  return environment.EVENT_NAME === 'pull_request' &&
+    environment.PR_GATE_MERGE_QUEUE_ENABLED === 'true'
+    ? 'pr'
+    : 'full'
+}
+
+export function deferredPrGateBundles(stage) {
+  if (stage === 'full') return []
+  if (stage !== 'pr') throw new Error(`Unsupported PR Gate stage: ${stage}`)
+  return ['linux_runtime', 'windows_core', 'macos_e2e', 'windows_e2e']
+}
+
 export function toGitHubOutputPlan(plan) {
   const output = {
     schemaVersion: plan.schemaVersion,
     mode: plan.mode,
     roots: [...plan.roots],
-    lanes: [...plan.lanes]
+    lanes: [...plan.lanes],
+    macosGroups: macosGroupsForPlan(plan)
   }
   if (Array.isArray(plan.bundles)) output.bundles = [...plan.bundles]
   return output

@@ -73,7 +73,8 @@ describe('pull request change classification', () => {
         mode: 'selective',
         roots: expect.any(Array),
         lanes: expect.any(Array),
-        bundles: expect.arrayContaining(['policy', 'static', 'unit', 'macos_e2e'])
+        bundles: expect.arrayContaining(['policy', 'static', 'unit', 'macos_e2e']),
+        macosGroups: ['journeys', 'presentation', 'regressions', 'delegation']
       })
       expect(JSON.parse(outputs.plan)).not.toHaveProperty('reasonChains')
       expect(readFileSync(summary, 'utf8')).toContain(
@@ -255,7 +256,12 @@ describe('pull request change classification', () => {
     expect(plan.mode).toBe('selective')
     expect(plan.roots).toContain('notebook_runtime')
     expect(plan.roots).not.toContain('main_runtime')
-    expect(plan.lanes).toEqual(['policy', 'typecheck_node'])
+    expect(plan.lanes).toEqual([
+      'policy',
+      'typecheck_node',
+      'e2e_regressions_macos',
+      'e2e_delegation_macos'
+    ])
   })
 
   it('keeps risk overlays additive after a specific owner replaces a fallback', () => {
@@ -513,7 +519,9 @@ describe('pull request change classification', () => {
       'typecheck_web',
       'interface_contracts',
       'unit_macos',
-      'build'
+      'build',
+      'e2e_regressions_macos',
+      'e2e_delegation_macos'
     ])
     expect(plan.bundles).toEqual(['policy', 'static', 'unit', 'macos_e2e'])
   })
