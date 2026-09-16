@@ -296,6 +296,13 @@ recovery alerts, live message notices and their error fallback. Modal backdrops 
 notices while the background is blocked. Inline errors stay within their owning surface. Preserve
 existing notice lifetimes and Undo deadlines when a modal opens.
 
+Settings owns a foreground Undo host inside its dialog focus scope, above the panel and centered
+at the viewport top. A stable portal container moves between that host and the background stack;
+opening or closing Settings does not remount receipts or restart their countdowns. Other blocking
+presentations continue to cover and disable Undo. The mobile Settings navigation drawer hides
+and makes the foreground host inert until the drawer closes, without remounting receipts. The viewport-sized dialog boundary has no
+transform or clipping; the inner Settings panel retains its own size, clipping and animation.
+
 Quit-cancellation recovery is an explicit foreground exception: its owner mounts it outside the
 inert base presentation at layer 70 so Retry and Dismiss remain reachable over Settings. It does
 not use the background notice layer.
@@ -479,7 +486,7 @@ Active-dialog menus and other foreground child layers retain their own ordering.
 - Titles, description/content, actions and diagnostics are optional sections of the same component. Compact errors and Notebook provisioning failures compose ErrorNotice; narrow cards place trailing actions below the summary. Technical errors remain scrollable and fully selectable, with existing recovery callbacks.
 - Warning text, badges and confirmation icons use the status-warning token family in both themes. Unrelated amber chart series and favorite stars retain their own palette.
 - Title-only ActionToast feedback and Undo snackbars share noticeCapsuleClassName and reuse the shared surface colors and controls with a compact 24px-radius capsule, 8px vertical padding and vertically centered content. Short ActionToast and Undo text stays on one line with an ellipsis when it overflows. Keep the full text in the DOM and native hover title. Existing business action buttons remain visible; messages without a business action do not gain one. Do not add an expand/collapse row to a capsule. Title-only ActionToast capsules fit their content up to 24rem or the viewport minus 24px; the shared stack centers them horizontally without stretching them. The viewport-wide stack reserves space below the cards for a natural shadow fade; nested Undo wrappers do not clip shadows.
-- Arrow anchoring, event icons, timers, unread state, receipt expiry, recovery and dismissal remain with each existing owner. Embedded cards have no floating shadow; floating notices retain shadow-dialog. The notice stack does not own business state.
+- Arrow anchoring, event icons, timers, unread state, receipt expiry, recovery and dismissal remain with each existing owner. Embedded cards have no floating shadow; floating notices retain shadow-dialog, except Undo capsules use the lighter shadow-menu. Undo enters with a 4px upward offset and 180ms fade, exits over 140ms, and skips motion under reduced-motion preferences. The notice stack does not own business state.
 - Notebook background upgrade progress and environment errors use the bottom-right `BottomNoticeStack`, alongside catalog, remote-job and notification-render recovery errors. Quit recovery stays outside that background stacking context so its existing emergency controls remain above active modals. Its cards flow vertically with an 8px gap, a viewport-bounded scroll area, and 12px edge spacing; it owns no state. Error cards use shared notice chrome; progress stays a compact capsule. Keep Notebook pane recovery local, and preserve the desktop message-center panel, mobile notification sheet, full-page startup gate and native OS surfaces.
 
 ### Dialog / AlertDialog
@@ -635,6 +642,13 @@ Active-dialog menus and other foreground child layers retain their own ordering.
   still reveal a clipped mark. Its outer frame stays fixed at the conversation panel midpoint so
   bottom approval or permission surfaces do not shift it. The current Run remains available through
   `aria-current`; the visible-segment highlight remains when hover ends.
+  The 1px marks share one 256px-wide, 88px-high preview card. Moving between marks repositions that
+  card with a 200ms transform transition; entry and exit fade without changing the button hit areas.
+  The card is hoverable, closes after 120ms outside the rail/card, and dismisses on Escape,
+  transcript scrolling, viewport resizing, rail position changes, activation, or session/branch changes. Keyboard focus
+  opens the same preview and supplies `aria-describedby`. Position is clamped to 12px viewport
+  margins, with the preferred side mirrored in RTL. Reduced motion disables transitions and entry
+  animation. The preview remains hidden below `md`, like the rail.
   Activating a mark scrolls that Message to the top with reduced-motion support. The preview shows
   the user Message as a dark single-line excerpt plus up to two muted lines from the first visible
   Agent Message explicitly linked through `responseToMessageId`; historical Agent Messages without
@@ -1056,6 +1070,11 @@ Active-dialog menus and other foreground child layers retain their own ordering.
 - Manage lists Featured, Directory and Custom Connectors with group/status/search filters and shares the Skill management list, checkbox-only selection, bottom action dock, operation locks, inline non-modal deletion review, result feedback, and focus behavior described above. These actions persist Main Agent availability through the existing settings commands; Specialist assignments and approval policy are unchanged. Unauthenticated or credential-blocked custom Connectors cannot be enabled. Commands run sequentially and report partial completion, keeping failed targets selected for retry.
 - Bulk deletion previews custom Connector configurations only. Bundled Connectors and Connectors used by Specialists are protected. Usage must load successfully from a healthy catalog before preview and is refreshed again before confirmation executes; newly referenced targets are kept. Deletion reuses the existing cleanup workflow and journal, retains shared credentials, and reports failed targets. The preview never expands the set the user reviewed.
 
+- Native web reading in OpenCode and Claude Code offers **Once** and **This conversation**. The
+  conversation grant includes its delegated children and permits reading across websites; show
+  that scope in the approval card body before the user approves. Keep the provider response
+  one-shot so application-owned revocation remains effective. This capability does not grant
+  shell execution, web search, or arbitrary MCP access, and does not change Auto editing.
 - Remembered permission rows identify Connector tools by the current Connector display name,
   public server ID, and exact tool name. The name opens the existing Connector Settings route in
   active, policy-covered, and blocked states. Revoke accessible names also include the scope.
