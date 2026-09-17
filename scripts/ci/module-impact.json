@@ -273,6 +273,7 @@
           "src/main/reviewer/reviewer-fix-loop-owner.test.ts",
           "src/main/reviewer/correction-context.test.ts",
           "src/main/reviewer/correction.test.ts",
+          "src/main/reviewer/correction-owner.test.ts",
           "src/main/reviewer/paged-preview-electron.test.ts",
           "src/main/reviewer/scope.test.ts"
         ],
@@ -828,6 +829,7 @@
         "src/main/artifacts/reviewer-turn-file-evidence-reader.ts",
         "src/main/artifacts/write-budget-owner.ts",
         "src/main/notebook/reproduction-runtime.ts",
+        "src/main/notebook/stdlib-replay.fixture.ts",
         "src/renderer/src/pages/workspace/ArtifactReproducibilityPanel.tsx",
         "src/shared/artifact-reproducibility.ts"
       ],
@@ -857,6 +859,7 @@
           "src/main/artifacts/provenance-write-contract.test.ts",
           "src/main/artifacts/reviewer-turn-file-evidence-reader.test.ts",
           "src/main/artifacts/write-budget-owner.test.ts",
+          "src/main/notebook/dependency-analysis.stdlib-replay.test.ts",
           "src/main/notebook/reproduction-runtime.test.ts",
           "src/renderer/src/pages/workspace/ArtifactReproducibilityPanel.test.tsx"
         ],
@@ -1233,7 +1236,11 @@
       "consumerModules": [],
       "testFiles": {
         "owner": ["src/main/connectors/descriptors/genomes-ensembl.test.ts"],
-        "contract": ["src/main/connectors/registry.test.ts", "src/main/connectors/engine.test.ts"],
+        "contract": [
+          "src/main/connectors/descriptors/genomes.test.ts",
+          "src/main/connectors/registry.test.ts",
+          "src/main/connectors/engine.test.ts"
+        ],
         "consumer": [
           "src/main/connectors/service.test.ts",
           "src/main/connectors/skill-doc.test.ts",
