@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { sanitizeSettings } from './document-codec'
+import { providerValidationFailed } from '../../shared/settings'
 import { CONNECTOR_RESOURCE_LIMITS } from './connector-resource-limits'
 import { SettingsDocumentStore } from './document-store'
 import { SettingsRepository } from './repository'
@@ -54,6 +55,44 @@ afterEach(async () => {
 })
 
 describe('settings repository', () => {
+  it('does not treat a failed validation write as recovery of an in-flight request', async () => {
+    const store = new SettingsDocumentStore(await createStorageRoot())
+    const repository = new SettingsRepository(store)
+    await repository.upsertProvider(
+      provider({
+        lastValidatedAt: 1,
+        lastValidatedTarget: { model: 'a', endpoint: 'openai' }
+      })
+    )
+    vi.spyOn(store, 'mutate').mockImplementationOnce(async (update) => {
+      update(await store.read())
+      throw new Error('Synthetic write failure')
+    })
+    await expect(
+      repository.updateProviderValidationIfTargetMatches(
+        'p1',
+        () => true,
+        { ok: true, category: 'ok' },
+        { model: 'b', endpoint: 'openai' }
+      )
+    ).rejects.toThrow('Synthetic write failure')
+    expect(
+      await repository.updateProviderValidationIfTargetMatches(
+        'p1',
+        () => true,
+        { ok: false, category: 'model-not-found', status: 404 },
+        { model: 'b', endpoint: 'openai' },
+        2
+      )
+    ).toBe(true)
+    expect(
+      providerValidationFailed((await repository.getSettings()).providers[0], {
+        model: 'b',
+        endpoint: 'openai'
+      })
+    ).toBe(true)
+  })
+
   it('publishes an active custom model edit and its selection in one mutation', async () => {
     const dir = await createStorageRoot()
     const store = new SettingsDocumentStore(dir)
@@ -372,7 +411,7 @@ describe('settings repository', () => {
       activeProviderId: 'builtin-codex-isolated',
       providers: [
         { id: 'builtin-codex-shared', type: 'codex-shared', name: 'Existing Codex profile' },
-        { id: 'builtin-codex-isolated', type: 'codex-isolated', name: 'Open Science Codex login' }
+        { id: 'builtin-codex-isolated', type: 'codex-isolated', name: 'Open-Science Codex login' }
       ]
     })
 
@@ -1042,6 +1081,70 @@ describe('settings repository', () => {
     ).toBeUndefined()
   })
 
+  it('retains independent missing-model failures across reloads', async () => {
+    const root = await createStorageRoot()
+    const repository = new SettingsRepository(root)
+    await repository.upsertProvider(provider())
+    const first = { model: 'model-a', endpoint: 'openai' as const }
+    const second = { model: 'model-b', endpoint: 'responses' as const }
+    const failure = { ok: false, category: 'model-not-found' as const, status: 404 }
+    await repository.updateProviderValidationIfTargetMatches('p1', () => true, failure, first)
+    await repository.updateProviderValidationIfTargetMatches('p1', () => true, failure, second)
+    await repository.updateProviderValidationIfTargetMatches('p1', () => true, failure, second)
+    const saved = (await new SettingsRepository(root).getSettings()).providers[0]
+    expect(providerValidationFailed(saved, first)).toBe(true)
+    expect(providerValidationFailed(saved, second)).toBe(true)
+    expect(providerValidationFailed(saved, { model: 'model-c', endpoint: 'openai' })).toBe(false)
+    expect(saved.lastValidationFailure?.targets).toHaveLength(2)
+  })
+
+  it.each(['model-a', 'model-b'])(
+    'a later success restores only %s and retains the other missing model',
+    async (successfulModel) => {
+      const root = await createStorageRoot()
+      const repository = new SettingsRepository(root)
+      await repository.upsertProvider(provider())
+      const first = { model: 'model-a', endpoint: 'openai' as const }
+      const second = { model: 'model-b', endpoint: 'openai' as const }
+      const now = vi.spyOn(Date, 'now').mockReturnValue(1000)
+      try {
+        const failure = { ok: false, category: 'model-not-found' as const, status: 404 }
+        await repository.updateProviderValidationIfTargetMatches('p1', () => true, failure, first)
+        await repository.updateProviderValidationIfTargetMatches('p1', () => true, failure, second)
+        now.mockReturnValue(2000)
+        const successful = successfulModel === first.model ? first : second
+        const remaining = successfulModel === first.model ? second : first
+        await repository.updateProviderValidationIfTargetMatches(
+          'p1',
+          () => true,
+          { ok: true, category: 'ok' },
+          successful
+        )
+        const saved = (await new SettingsRepository(root).getSettings()).providers[0]
+        expect(providerValidationFailed(saved, successful)).toBe(false)
+        expect(providerValidationFailed(saved, remaining)).toBe(true)
+        expect(saved.lastValidationFailure?.target).toEqual(remaining)
+        expect(saved.lastValidationFailure?.targets).toBeUndefined()
+        // The removed primary target's HTTP details must not be attributed to the retained model.
+        if (successfulModel === second.model) {
+          expect(saved.lastValidationFailure?.status).toBeUndefined()
+          expect(saved.lastValidationFailure?.message).toBeUndefined()
+        }
+        await repository.updateProviderValidationIfTargetMatches(
+          'p1',
+          () => true,
+          { ok: true, category: 'ok' },
+          remaining
+        )
+        expect(
+          (await new SettingsRepository(root).getSettings()).providers[0].lastValidationFailure
+        ).toBeUndefined()
+      } finally {
+        now.mockRestore()
+      }
+    }
+  )
+
   it('round-trips a recorded validation failure across a reload', async () => {
     const root = await createStorageRoot()
     const repository = new SettingsRepository(root)
@@ -1211,13 +1314,14 @@ describe('settings repository', () => {
   })
 
   it('stamps onboardingCompletedAt once and is idempotent', async () => {
-    const repository = new SettingsRepository(await createStorageRoot())
+    const root = await createStorageRoot()
+    const repository = new SettingsRepository(root)
 
-    const first = await repository.markOnboardingComplete(1000)
+    const first = await repository.markOnboardingComplete(1000, root)
     expect(first.onboardingCompletedAt).toBe(1000)
 
     // A second call must not overwrite or move the existing timestamp.
-    const second = await repository.markOnboardingComplete(2000)
+    const second = await repository.markOnboardingComplete(2000, root)
     expect(second.onboardingCompletedAt).toBe(1000)
   })
 
@@ -1225,7 +1329,7 @@ describe('settings repository', () => {
     const root = await createStorageRoot()
     const repository = new SettingsRepository(root)
 
-    await repository.markOnboardingComplete(1234)
+    await repository.markOnboardingComplete(1234, root)
 
     const reloaded = await new SettingsRepository(root).getSettings()
     expect(reloaded.onboardingCompletedAt).toBe(1234)
@@ -1286,10 +1390,9 @@ describe('settings repository', () => {
     expect(second.dataRoot).toBe('/mnt/data-b')
     expect(second.onboardingCompletedAt).toBe(1000)
 
-    // getSettings reads through sanitizeSettings, which normalizes the stored path (backslashes on
-    // Windows), so compare against the platform-normalized form rather than the literal.
+    // Reload preserves the actual saved spelling instead of changing the selected path.
     const reloaded = await new SettingsRepository(root).getSettings()
-    expect(reloaded.dataRoot).toBe(normalize('/mnt/data-b'))
+    expect(reloaded.dataRoot).toBe('/mnt/data-b')
   })
 
   it('relocates disabled managed runtime IDs atomically and idempotently with dataRoot', async () => {
@@ -1353,9 +1456,9 @@ describe('settings repository', () => {
     })
   })
 
-  it('sanitizeSettings drops a relative dataRoot and keeps only an absolute, normalized one', () => {
-    // A relative dataRoot (corrupt or hand-edited settings.json) must be dropped so the data tree
-    // never resolves against process.cwd(); initDataRoot then falls back to the default.
+  it('sanitizeSettings retains valid absolute dataRoot verbatim', () => {
+    // The document reader rejects invalid saved paths before sanitization. This lower-level
+    // projection must not turn a relative input into an absolute path.
     expect(sanitizeSettings({ dataRoot: 'relative/path' }).dataRoot).toBeUndefined()
     expect(sanitizeSettings({ dataRoot: './OpenScience' }).dataRoot).toBeUndefined()
 
@@ -1364,12 +1467,13 @@ describe('settings repository', () => {
 
     // Build an absolute path with platform-correct roots so isAbsolute holds on POSIX and Windows.
     const absolute = isAbsolute('/mnt/data') ? '/mnt/data' : `C:${sep}mnt${sep}data`
-    // Surrounding whitespace is trimmed, then the path is kept.
-    expect(sanitizeSettings({ dataRoot: `  ${absolute} ` }).dataRoot).toBe(normalize(absolute))
+    // Leading whitespace makes this non-absolute; trailing whitespace belongs to the directory name.
+    expect(sanitizeSettings({ dataRoot: `  ${absolute} ` }).dataRoot).toBeUndefined()
+    expect(sanitizeSettings({ dataRoot: `${absolute} ` }).dataRoot).toBe(`${absolute} `)
 
-    // A redundant separator AND a trailing separator collapse to the canonical no-trailing-slash form.
+    // Saved spelling is not rewritten during decoding.
     const messy = `${absolute}${sep}${sep}x${sep}`
-    expect(sanitizeSettings({ dataRoot: messy }).dataRoot).toBe(normalize(`${absolute}${sep}x`))
+    expect(sanitizeSettings({ dataRoot: messy }).dataRoot).toBe(messy)
   })
 
   it('never strips a trailing separator past a filesystem root', () => {

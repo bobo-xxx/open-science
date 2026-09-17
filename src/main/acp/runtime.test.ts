@@ -4176,10 +4176,12 @@ describe('ACP runtime session management', () => {
   const installPromptPlanTestWorkflow = (
     runtime: AcpRuntime,
     planService: unknown,
-    sessions = durablePlanSessions()
+    sessions = durablePlanSessions(),
+    hooks: Parameters<typeof composeAcpRuntimePlanWorkflow>[3] = {}
   ): void => {
     const internals = runtime as unknown as {
       sessionInteractions: unknown
+      backendGeneration: unknown
       artifactTurns: unknown
       publication: unknown
       sessionEnvironment: unknown
@@ -4192,13 +4194,15 @@ describe('ACP runtime session management', () => {
       {
         planService,
         planInteractions,
+        backendGeneration: internals.backendGeneration,
         sessionInteractions: internals.sessionInteractions,
         artifactTurns: internals.artifactTurns
       } as unknown as Parameters<typeof composeAcpRuntimePlanWorkflow>[1],
       {
         publication: internals.publication,
         sessionEnvironment: internals.sessionEnvironment
-      } as unknown as Parameters<typeof composeAcpRuntimePlanWorkflow>[2]
+      } as unknown as Parameters<typeof composeAcpRuntimePlanWorkflow>[2],
+      hooks
     )
     Object.assign(internals, { sessionPlanWorkflow })
     Object.assign(internals.promptTurnWorkflow.options, { plan: sessionPlanWorkflow.prompt })
@@ -5417,40 +5421,96 @@ describe('ACP runtime session management', () => {
     expect(process.killed).toBe(true)
   })
 
-  it('restarts a stuck agent when prompt cancellation times out', async () => {
+  it.each([false, true])(
+    'restarts a stuck agent when cancellation times out (blocked write: %s)',
+    async (blockedWrite) => {
+      const process = new FakeAgentProcess()
+      const promptGate = createDeferred()
+      const fakeAgent = startFakeAgent(process, ['cancel-timeout-session'], {
+        onPrompt: () => promptGate.promise
+      })
+      let fireCancelTimeout: (() => void) | undefined
+      const events: string[] = []
+      const runtime = new AcpRuntime({
+        appVersion: '0.2.0',
+        defaultCwd: '/workspace',
+        spawnAgent: () => asAgentProcess(process),
+        cancelTimeoutMs: 1,
+        setTimer: (callback) => {
+          fireCancelTimeout = callback
+          return 1 as unknown as ReturnType<typeof setTimeout>
+        },
+        clearTimer: vi.fn(),
+        callbacks: { onEvent: (event) => events.push(event.title ?? '') }
+      })
+      const session = await runtime.createSession({ cwd: '/workspace' })
+      const prompt = runtime.sendPrompt({ sessionId: session.sessionId, text: 'stay pending' })
+      void prompt.catch(() => undefined)
+      await vi.waitFor(() => expect(fakeAgent.prompts).toHaveLength(1))
+
+      if (blockedWrite) {
+        const connection = (
+          runtime as unknown as {
+            connection: { agent: { notify: (method: unknown, params: unknown) => Promise<void> } }
+          }
+        ).connection
+        vi.spyOn(connection.agent, 'notify').mockImplementationOnce(() => new Promise(() => {}))
+        const cancellation = runtime.cancelPrompt({ sessionId: session.sessionId })
+        const rejected = expect(cancellation).rejects.toThrow('not confirmed')
+        expect(fireCancelTimeout).toBeDefined()
+        fireCancelTimeout?.()
+        await rejected
+        expect(fakeAgent.cancelledSessions).toEqual([])
+        expect(events).not.toContain('Prompt cancellation requested')
+      } else {
+        await runtime.cancelPrompt({ sessionId: session.sessionId })
+        await vi.waitFor(() =>
+          expect(fakeAgent.cancelledSessions).toEqual(['cancel-timeout-session'])
+        )
+        expect(fireCancelTimeout).toBeDefined()
+        fireCancelTimeout?.()
+      }
+
+      await vi.waitFor(() => expect(runtime.getSnapshot().status).toBe('closed'))
+      expect(process.killed).toBe(true)
+      expect(events).toContain('Prompt cancellation timed out')
+      promptGate.resolve()
+    }
+  )
+
+  it('confirms Stop from the prompt finalizer when the cancellation write is still pending', async () => {
     const process = new FakeAgentProcess()
     const promptGate = createDeferred()
-    const fakeAgent = startFakeAgent(process, ['cancel-timeout-session'], {
+    const fakeAgent = startFakeAgent(process, ['cancel-terminal-session'], {
       onPrompt: () => promptGate.promise
     })
-    let fireCancelTimeout: (() => void) | undefined
     const events: string[] = []
     const runtime = new AcpRuntime({
       appVersion: '0.2.0',
       defaultCwd: '/workspace',
       spawnAgent: () => asAgentProcess(process),
-      cancelTimeoutMs: 1,
-      setTimer: (callback) => {
-        fireCancelTimeout = callback
-        return 1 as unknown as ReturnType<typeof setTimeout>
-      },
-      clearTimer: vi.fn(),
       callbacks: { onEvent: (event) => events.push(event.title ?? '') }
     })
     const session = await runtime.createSession({ cwd: '/workspace' })
-    const prompt = runtime.sendPrompt({ sessionId: session.sessionId, text: 'stay pending' })
-    void prompt.catch(() => undefined)
+    const prompt = runtime.sendPrompt({ sessionId: session.sessionId, text: 'finish naturally' })
     await vi.waitFor(() => expect(fakeAgent.prompts).toHaveLength(1))
-
-    await runtime.cancelPrompt({ sessionId: session.sessionId })
-    await vi.waitFor(() => expect(fakeAgent.cancelledSessions).toEqual(['cancel-timeout-session']))
-    expect(fireCancelTimeout).toBeDefined()
-    fireCancelTimeout?.()
-
-    await vi.waitFor(() => expect(runtime.getSnapshot().status).toBe('closed'))
-    expect(process.killed).toBe(true)
-    expect(events).toContain('Prompt cancellation timed out')
+    const connection = (
+      runtime as unknown as {
+        connection: { agent: { notify: (method: unknown, params: unknown) => Promise<void> } }
+      }
+    ).connection
+    vi.spyOn(connection.agent, 'notify').mockImplementationOnce(() => new Promise(() => {}))
+    const cancellation = runtime.cancelPrompt({ sessionId: session.sessionId })
+    const outcome = cancellation.then(
+      () => 'confirmed',
+      (error) => error
+    )
     promptGate.resolve()
+    await prompt
+    await expect(outcome).resolves.toBe('confirmed')
+    expect(events).not.toContain('Prompt cancellation requested')
+    expect(events).not.toContain('Prompt cancellation timed out')
+    await runtime.disconnect()
   })
 
   it('terminates the remaining process and clears sessions after an unexpected protocol close', async () => {
@@ -6119,12 +6179,12 @@ describe('ACP runtime session management', () => {
     const planPrompt = fakeAgent.prompts[0].text
     expect(planPrompt).toContain('## Plan mode (ACTIVE — MANDATORY)')
     expect(planPrompt).toContain(
-      'Review the Skills available in the current session to confirm the catalog covers the task.'
+      'This turn must follow the shared Session Plan workflow before doing execution work'
     )
-    expect(planPrompt).toContain('complete revised plan')
-    expect(planPrompt).toContain('short exact `title`')
-    expect(planPrompt).toContain('Execution starts only after approval.')
-    expect(planPrompt).not.toContain('The plan is presented to the user for review')
+    expect(planPrompt).toContain('even if you would otherwise judge a Plan optional')
+    expect(planPrompt).toContain('wait for approval before execution starts')
+    expect(planPrompt).not.toContain('Generate `task_summary`, `phases`, `desired_outputs`')
+    expect(planPrompt).not.toContain('A revision must be complete')
     for (const forbidden of [
       'search_skills',
       'ask_user',
@@ -6137,6 +6197,7 @@ describe('ACP runtime session management', () => {
     }
     expect(planPrompt).toContain('Analyze this dataset')
     expect(fakeAgent.prompts[1].text).toBe('Here are more details')
+    expect(fakeAgent.prompts[1].text).not.toContain('Plan mode (ACTIVE — MANDATORY)')
     expect(
       events
         .filter((event) => event.kind === 'message' && event.role === 'user')
@@ -10802,7 +10863,7 @@ describe('ACP runtime session management', () => {
         },
         sessionOptions: {
           [OPEN_SCIENCE_SKILL_RUNTIME_SESSION_OPTION]: {
-            command: '/Applications/Open Science.app/Contents/MacOS/Open Science',
+            command: '/Applications/Open-Science.app/Contents/MacOS/Open-Science',
             entryPath: '/app/out/main/index.js',
             root: runtimeRoot
           }
@@ -10811,7 +10872,7 @@ describe('ACP runtime session management', () => {
       notebook: {
         projectId: 'project-1',
         mcpEntryPath: '/app/out/main/index.js',
-        mcpCommand: '/Applications/Open Science.app/Contents/MacOS/Open Science',
+        mcpCommand: '/Applications/Open-Science.app/Contents/MacOS/Open-Science',
         getRpcConnection
       },
       skills: {
@@ -10843,7 +10904,7 @@ describe('ACP runtime session management', () => {
       'open-science-notebook'
     ])
     expect(selectSkills).toHaveBeenCalledOnce()
-    expect(fakeAgent.prompts[0].text).toContain('already loaded by Open Science')
+    expect(fakeAgent.prompts[0].text).toContain('already loaded by Open-Science')
     expect(fakeAgent.prompts[0].text).toContain('PUBMED_RUNTIME_ROUTE_SENTINEL')
     expect(fakeAgent.prompts[0].text).not.toContain(
       'Before any Notebook or Connector call, call `mcp__skills__load_skill`'
@@ -12763,7 +12824,7 @@ describe('ACP runtime session management', () => {
           const sessionOptionId = request.options.find(
             (option) => option.scope === 'session'
           )?.optionId
-          if (!sessionOptionId) throw new Error('Missing Open Science session permission option')
+          if (!sessionOptionId) throw new Error('Missing Open-Science session permission option')
           runtime.respondToPermission({
             requestId: request.requestId,
             optionId: sessionOptionId
@@ -13042,7 +13103,7 @@ describe('ACP runtime session management', () => {
             (option) => option.scope === 'session'
           )?.optionId
           if (!sessionOptionId) {
-            throw new Error('Expected Open Science to provide a conversation permission option')
+            throw new Error('Expected Open-Science to provide a conversation permission option')
           }
           runtime.respondToPermission({
             requestId: request.requestId,
@@ -13999,7 +14060,7 @@ describe('ACP runtime session management', () => {
           const sessionOptionId = request.options.find(
             (option) => option.scope === 'session'
           )?.optionId
-          if (!sessionOptionId) throw new Error('Missing Open Science conversation option')
+          if (!sessionOptionId) throw new Error('Missing Open-Science conversation option')
           runtime.respondToPermission({ requestId: request.requestId, optionId: sessionOptionId })
         }
       }
@@ -19342,6 +19403,131 @@ describe('ACP runtime session management', () => {
     }
   )
 
+  it.each([
+    ['Claude Code', claudeCodeFramework],
+    ['Codex', codexFramework],
+    ['OpenCode', opencodeFramework],
+    ['CodeBuddy', codeBuddyFramework]
+  ] as const)(
+    'delivers a short Plan file reference after %s context reconstruction',
+    async (_name, framework) => {
+      const process = new FakeAgentProcess()
+      const fakeAgent = startFakeAgent(process, ['s1'], {
+        modes:
+          framework.id === 'codex'
+            ? createModes(['read-only', 'agent', 'agent-full-access'], 'agent')
+            : undefined
+      })
+      const runtime = new AcpRuntime({
+        appVersion: '0.1.0',
+        defaultCwd: '/workspace',
+        spawnAgent: () => asAgentProcess(process),
+        framework
+      })
+      const active = restoredPlanProjection('approved', 4)
+      const refresh = vi.fn(async () => ({
+        path: '/private/input/session-plan/current.json',
+        artifactVersionId: active.artifactVersionId,
+        revision: active.revision
+      }))
+      installPromptPlanTestWorkflow(
+        runtime,
+        {
+          getProjection: vi.fn(async () => active)
+        },
+        durablePlanSessions(),
+        { contextFiles: { refresh } }
+      )
+      await runtime.createSession({ cwd: '/workspace', projectId: 'project-1' })
+      await runtime.sendPrompt({
+        sessionId: 's1',
+        text: 'Continue the approved work.',
+        contextReset: true,
+        historyPreamble: 'Recovered task: continue from the existing approved Plan.',
+        provenanceContext: {
+          promptMessageId: 'resumed-message',
+          messageAncestry: ['plan-origin', 'resumed-message']
+        }
+      })
+      const delivered = fakeAgent.prompts[0]?.text ?? ''
+      expect(delivered).toContain('session-plan/current.json')
+      expect(delivered).toContain('OPEN_SCIENCE_INPUT_DIR')
+      expect(delivered).toContain(
+        framework.id === 'codex'
+          ? '`bash_execute`'
+          : framework.id === 'opencode'
+            ? '`open_science_notebook_bash_execute`'
+            : framework.id === 'claude-code'
+              ? '`mcp__open-science-notebook__bash_execute`'
+              : '`mcp__open_science_notebook__bash_execute`'
+      )
+      expect(delivered).toContain('Recovered task:')
+      expect(delivered).not.toContain(active.document.task_summary)
+      expect(delivered).not.toContain('/private/input')
+      expect(refresh).toHaveBeenCalledWith('project-1', 's1')
+    }
+  )
+
+  it('delivers an authoritative Plan summary when file refresh fails after Session resume loss', async () => {
+    const process = new FakeAgentProcess()
+    const fakeAgent = startFakeAgent(process, ['adopted-provider-session'], {
+      supportsResume: true,
+      resumeNotFound: true
+    })
+    const runtime = new AcpRuntime({
+      appVersion: '0.1.0',
+      defaultCwd: '/workspace',
+      spawnAgent: () => asAgentProcess(process),
+      framework: opencodeFramework
+    })
+    const active = restoredPlanProjection('approved', 4)
+    installPromptPlanTestWorkflow(
+      runtime,
+      { getProjection: vi.fn(async () => active) },
+      durablePlanSessions(),
+      {
+        contextFiles: {
+          refresh: vi.fn(async () => {
+            throw new Error('disk unavailable')
+          })
+        }
+      }
+    )
+    const resumed = await runtime.resumeSession({
+      sessionId: 'restored-session',
+      providerSessionId: 'missing-provider-session',
+      cwd: '/workspace',
+      projectId: 'project-1',
+      previousFrameworkId: opencodeFramework.id
+    })
+    expect(resumed).toMatchObject({
+      sessionId: 'restored-session',
+      providerSessionId: 'adopted-provider-session',
+      contextReset: true
+    })
+
+    await runtime.sendPrompt({
+      sessionId: resumed.sessionId,
+      text: 'Continue the approved work.',
+      contextReset: resumed.contextReset,
+      historyPreamble: 'Recovered task: continue from the existing approved Plan.',
+      provenanceContext: {
+        promptMessageId: 'resumed-message',
+        messageAncestry: ['plan-origin', 'resumed-message']
+      }
+    })
+
+    const delivered = fakeAgent.prompts[0]?.text ?? ''
+    expect(delivered).toContain('expectedArtifactVersionId=version-1 expectedRevision=4')
+    expect(delivered).toContain(`task=${active.document.task_summary}`)
+    expect(delivered).toContain('- Analyze: not_started')
+    expect(delivered).toContain('an authoritative summary of the Plan as read for this request')
+    expect(delivered).toContain('do not guarantee that the Plan remained unchanged')
+    expect(delivered).toContain('report it as a blocker instead of guessing')
+    expect(delivered).toContain('earlier file contents may be stale')
+    expect(delivered).not.toContain('session-plan/current.json')
+  })
+
   it('fails closed when an approved Plan belongs to a sibling Message Branch', async () => {
     const process = new FakeAgentProcess()
     const fakeAgent = startFakeAgent(process, ['s1'])
@@ -19850,7 +20036,7 @@ describe('ACP runtime session management', () => {
         ),
         { numTurns: 2, origin: 'human' },
         // Unknown future origins remain eligible so a newly introduced user-driven lane does not
-        // silently under-report model turns until Open Science knows its name.
+        // silently under-report model turns until Open-Science knows its name.
         { numTurns: 3, origin: 'future-user-lane' }
       ],
       onPrompt: () => ({
@@ -19992,7 +20178,7 @@ describe('ACP runtime session management', () => {
       onPrompt: () => ({
         stopReason: 'end_turn',
         // A Responses bridge still returns standard ACP usage even when its adapter does not publish
-        // Open Science's private whole-turn metadata. The footer must not become entirely unavailable.
+        // Open-Science's private whole-turn metadata. The footer must not become entirely unavailable.
         usage: {
           totalTokens: 27,
           inputTokens: 19,
@@ -21276,7 +21462,7 @@ describe('ACP runtime session management', () => {
         dataRoot: '/Users/example/.open-science',
         projectId: 'default-project',
         mcpEntryPath: '/app/out/main/index.js',
-        mcpCommand: '/Applications/Open Science.app/Contents/MacOS/Open Science'
+        mcpCommand: '/Applications/Open-Science.app/Contents/MacOS/Open-Science'
       }
     })
 
@@ -21290,7 +21476,7 @@ describe('ACP runtime session management', () => {
     expect(fakeAgent.newSessions[0].mcpServers).toHaveLength(1)
     expect(fakeAgent.newSessions[0].mcpServers[0]).toMatchObject({
       name: 'open-science-artifacts',
-      command: '/Applications/Open Science.app/Contents/MacOS/Open Science',
+      command: '/Applications/Open-Science.app/Contents/MacOS/Open-Science',
       args: ['/app/out/main/index.js', '--open-science-artifact-mcp']
     })
     expect(
@@ -21395,7 +21581,7 @@ describe('ACP runtime session management', () => {
       notebook: {
         projectId: 'default-project',
         mcpEntryPath: '/app/out/main/index.js',
-        mcpCommand: '/Applications/Open Science.app/Contents/MacOS/Open Science',
+        mcpCommand: '/Applications/Open-Science.app/Contents/MacOS/Open-Science',
         getRpcConnection,
         registerSessionAlias: (aliasSessionId, sessionId) => {
           aliases.push({ aliasSessionId, sessionId })
@@ -21413,7 +21599,7 @@ describe('ACP runtime session management', () => {
     expect(fakeAgent.newSessions[0].mcpServers).toHaveLength(1)
     expect(fakeAgent.newSessions[0].mcpServers[0]).toMatchObject({
       name: 'open-science-notebook',
-      command: '/Applications/Open Science.app/Contents/MacOS/Open Science',
+      command: '/Applications/Open-Science.app/Contents/MacOS/Open-Science',
       args: ['/app/out/main/index.js', '--open-science-notebook-mcp']
     })
     expect(
@@ -21482,7 +21668,7 @@ describe('ACP runtime session management', () => {
       spawnAgent: () => asAgentProcess(process),
       skillImport: {
         mcpEntryPath: '/app/out/main/index.js',
-        mcpCommand: '/Applications/Open Science.app/Contents/MacOS/Open Science',
+        mcpCommand: '/Applications/Open-Science.app/Contents/MacOS/Open-Science',
         getRpcConnection,
         registerSessionAlias: (aliasSessionId, sessionId) => {
           aliases.push({ aliasSessionId, sessionId })
@@ -21495,7 +21681,7 @@ describe('ACP runtime session management', () => {
     expect(fakeAgent.newSessions[0].mcpServers).toHaveLength(1)
     expect(fakeAgent.newSessions[0].mcpServers[0]).toMatchObject({
       name: 'open-science-skills',
-      command: '/Applications/Open Science.app/Contents/MacOS/Open Science',
+      command: '/Applications/Open-Science.app/Contents/MacOS/Open-Science',
       args: ['/app/out/main/index.js', '--open-science-skill-import-mcp']
     })
     const aliasSessionId = getEnvValue(
@@ -21602,7 +21788,7 @@ describe('ACP runtime session management', () => {
         dataRoot: '/Users/example/.open-science',
         projectId: 'default-project',
         mcpEntryPath: '/app/out/main/index.js',
-        mcpCommand: '/Applications/Open Science.app/Contents/MacOS/Open Science'
+        mcpCommand: '/Applications/Open-Science.app/Contents/MacOS/Open-Science'
       }
     })
 
@@ -21703,7 +21889,7 @@ describe('ACP runtime session management', () => {
     expect(fakeAgent.newSessions[0]._meta).toMatchObject({
       systemPrompt: {
         append: expect.stringContaining(
-          'If an Open Science app-owned Connector result includes an `artifact_id`, do not call `mcp__open-science-artifacts__write_artifact_file` again for that file.'
+          'If an Open-Science app-owned Connector result includes an `artifact_id`, do not call `mcp__open-science-artifacts__write_artifact_file` again for that file.'
         )
       }
     })

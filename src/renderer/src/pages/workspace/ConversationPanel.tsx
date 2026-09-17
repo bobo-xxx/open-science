@@ -938,10 +938,10 @@ const ConversationPanel = ({
         return
       }
       if (!(await workflows.wslSetup.start())) {
-        onSetComposerError(t('Open Science could not open the WSL2 setup conversation.'))
+        onSetComposerError(t('Open-Science could not open the WSL2 setup conversation.'))
       }
     } catch {
-      onSetComposerError(t('Open Science could not open the WSL2 setup conversation.'))
+      onSetComposerError(t('Open-Science could not open the WSL2 setup conversation.'))
     }
   }
 
@@ -1192,9 +1192,7 @@ const ConversationPanel = ({
             <WorkspaceMessageScroller
               activeSession={activeSession}
               forkSourceContent={
-                activeSession?.forkOrigin &&
-                activeSession.branchSource &&
-                sessionTools.openSession ? (
+                activeSession?.branchSource && sessionTools.openSession ? (
                   <div className="mb-2 flex items-center gap-2 text-xs">
                     <span className="h-px flex-1 bg-border" aria-hidden="true" />
                     <GitBranch className="size-3 text-muted-foreground" aria-hidden="true" />
