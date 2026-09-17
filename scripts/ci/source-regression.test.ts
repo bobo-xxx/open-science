@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { load } from 'js-yaml'
@@ -146,30 +146,25 @@ describe('trusted supplemental selection', () => {
   })
 
   it.skipIf(process.platform === 'win32')(
-    'requires the Windows browser suite on shard one while allowing idle browser steps on native shards',
+    'requires the Windows browser suite on every runner shard',
     () => {
       const enforce = pr.jobs.windows_e2e.steps.find(
         ({ name }) => name === 'Enforce selected Windows E2E checks'
       )!
-      expect(enforce.env?.E2E_SHARD).toBe('${{ matrix.shard }}')
-      for (const shard of ['1', '2', '3']) {
-        for (const outcome of ['success', 'failure', 'cancelled', 'skipped', '']) {
-          const result = spawnSync('bash', ['-e', '-c', enforce.run!], {
-            encoding: 'utf8',
-            env: {
-              ...process.env,
-              E2E_SHARD: shard,
-              RENDERER_LAYOUT_OUTCOME: outcome,
-              SETUP_OUTCOME: 'success',
-              E2E_ACCESSIBILITY_OUTCOME: 'skipped',
-              E2E_FUNCTIONAL_OUTCOME: 'skipped',
-              E2E_WORKSPACE_OUTCOME: 'skipped'
-            }
-          })
-          const succeeds =
-            outcome === 'success' || (shard !== '1' && ['skipped', ''].includes(outcome))
-          expect(result.status, result.stderr).toBe(succeeds ? 0 : 1)
-        }
+      expect(enforce.env?.E2E_SHARD).toBeUndefined()
+      for (const outcome of ['success', 'failure', 'cancelled', 'skipped', '']) {
+        const result = spawnSync('bash', ['-e', '-c', enforce.run!], {
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            RENDERER_LAYOUT_OUTCOME: outcome,
+            SETUP_OUTCOME: 'success',
+            E2E_ACCESSIBILITY_OUTCOME: 'skipped',
+            E2E_FUNCTIONAL_OUTCOME: 'skipped',
+            E2E_WORKSPACE_OUTCOME: 'skipped'
+          }
+        })
+        expect(result.status, result.stderr).toBe(outcome === 'success' ? 0 : 1)
       }
     }
   )
@@ -268,17 +263,17 @@ describe('independent source regression', () => {
   )
 
   it('batches main on a read-only schedule with one native runner and no package prerequisite', () => {
-    expect(scheduled.on.schedule).toEqual([{ cron: '37 19 * * *' }])
+    expect(scheduled.on.schedule).toEqual([{ cron: '37 7,19 * * *' }])
     expect(scheduled.on).toHaveProperty('workflow_dispatch')
     expect(scheduled.on).not.toHaveProperty('push')
     expect(scheduled.permissions).toEqual({ actions: 'read', contents: 'read' })
-    expect(scheduled.jobs.plan.if).toContain("github.ref == 'refs/heads/main'")
+    expect(scheduled.jobs.regression.if).toContain("github.ref == 'refs/heads/main'")
     expect(scheduled.concurrency).toEqual({
       group: 'source-regression-${{ github.event_name }}-${{ github.ref }}',
       'cancel-in-progress': true
     })
-    expect(Object.keys(scheduled.jobs)).toEqual(['plan', 'regression'])
-    expect(scheduled.jobs.regression.needs).toBe('plan')
+    expect(Object.keys(scheduled.jobs)).toEqual(['regression'])
+    expect(scheduled.jobs.regression.needs).toBeUndefined()
     expect(scheduled.jobs.regression['runs-on']).toBe(pr.jobs.macos_e2e['runs-on'])
     expect(scheduled.jobs.regression['continue-on-error']).toBeUndefined()
     expect(
@@ -302,55 +297,13 @@ describe('independent source regression', () => {
     }
   )
 
-  it.skipIf(process.platform === 'win32')(
-    'skips only a passing scheduled SHA, retries failures and always permits manual validation',
-    () => {
-      const dir = mkdtempSync(join(tmpdir(), 'source-regression-plan-'))
-      try {
-        writeFileSync(
-          join(dir, 'gh'),
-          '#!/bin/sh\nprintf "%s" "$*" > "$ARGS"\nprintf "%s" "$PREVIOUS_SHA"\nexit "$API_STATUS"\n',
-          { mode: 0o755 }
-        )
-        const step = scheduled.jobs.plan.steps.find(({ id }) => id === 'decide')!
-        for (const [event, previous, apiStatus, expected] of [
-          ['schedule', 'current', '0', 'false'],
-          ['schedule', 'older-passing', '0', 'true'],
-          ['schedule', '', '0', 'true'],
-          ['schedule', '', '1', 'true'],
-          ['workflow_dispatch', 'current', '0', 'true']
-        ]) {
-          const output = join(dir, 'output')
-          const args = join(dir, 'args')
-          writeFileSync(output, '')
-          writeFileSync(args, '')
-          const result = spawnSync('bash', ['-e', '-c', step.run!], {
-            encoding: 'utf8',
-            env: {
-              ...process.env,
-              PATH: `${dir}:${process.env.PATH}`,
-              GITHUB_EVENT_NAME: event,
-              GITHUB_REPOSITORY: 'aipoch/open-science',
-              GITHUB_SHA: 'current',
-              GITHUB_OUTPUT: output,
-              PREVIOUS_SHA: previous,
-              API_STATUS: apiStatus,
-              ARGS: args
-            }
-          })
-          expect(result.status, result.stderr).toBe(0)
-          expect(readFileSync(output, 'utf8').trim()).toBe(`should_test=${expected}`)
-          if (event === 'schedule')
-            expect(readFileSync(args, 'utf8')).toContain(
-              'branch=main&event=schedule&status=success'
-            )
-          else expect(readFileSync(args, 'utf8')).toBe('')
-        }
-      } finally {
-        rmSync(dir, { recursive: true, force: true })
-      }
-    }
-  )
+  it('runs both scheduled rounds even when main has not changed', () => {
+    expect(scheduled.jobs).not.toHaveProperty('plan')
+    expect(scheduled.jobs.regression.if).toBe(
+      "github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'"
+    )
+    expect(scheduled.jobs.regression.steps.some(({ run }) => run?.includes('previous'))).toBe(false)
+  })
 
   it.skipIf(process.platform === 'win32')(
     'cannot pass when either scheduled suite fails, cancels or never executes',

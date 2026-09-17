@@ -1184,6 +1184,7 @@ describe('Settings backend ownership architecture', () => {
       'src/main/connectors/application.test.ts',
       'src/main/connectors/custom-mcp-bootstrap.test.ts',
       'src/main/connectors/custom-skill-doc.test.ts',
+      'src/main/connectors/descriptors/variants-gnomad.test.ts',
       'src/main/connectors/mcp-client-manager.test.ts',
       'src/main/connectors/mcp-payload-pagination.integration.test.ts',
       'src/main/connectors/oauth-client.test.ts',
@@ -1451,7 +1452,8 @@ describe('Settings backend ownership architecture', () => {
       'src/renderer/src/stores/runtime-settings-store.test.ts',
       'src/renderer/src/stores/settings-connectors-slice.test.ts',
       'src/shared/renderer-surface-inventory.test.ts',
-      'src/shared/renderer-surface-matrix.test.ts'
+      'src/shared/renderer-surface-matrix.test.ts',
+      'src/main/session-package/fork.test.ts'
     ])
     expect(
       [

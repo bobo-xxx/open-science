@@ -407,7 +407,8 @@
           "src/shared/notebook-network.test.ts",
           "src/shared/renderer-surface-inventory.test.ts",
           "src/shared/renderer-surface-matrix.test.ts",
-          "src/main/settings/skill-catalog.test.ts"
+          "src/main/settings/skill-catalog.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": [],
@@ -750,7 +751,8 @@
           "src/renderer/src/stores/settings-navigation-slice.test.ts",
           "src/renderer/src/stores/settings-store.test.ts",
           "src/renderer/web/bootstrap.test.ts",
-          "src/renderer/web/renderer-argument-shape-characterization.test.ts"
+          "src/renderer/web/renderer-argument-shape-characterization.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts"
         ]
       },
       "capabilityOverlays": ["renderer_state"],
@@ -842,7 +844,8 @@
           "src/renderer/src/pages/workspace/workspace-conversation-controller.test.ts",
           "src/renderer/src/pages/workspace/workspace-message-queue-controller.test.ts",
           "src/renderer/web/bootstrap.test.ts",
-          "src/renderer/web/renderer-argument-shape-characterization.test.ts"
+          "src/renderer/web/renderer-argument-shape-characterization.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts"
         ]
       },
       "capabilityOverlays": ["renderer_state"],
@@ -1330,7 +1333,8 @@
           "src/renderer/src/stores/specialist-store.test.ts",
           "src/renderer/src/stores/specialist-store.upload.test.ts",
           "src/renderer/web/bootstrap.test.ts",
-          "src/renderer/web/renderer-argument-shape-characterization.test.ts"
+          "src/renderer/web/renderer-argument-shape-characterization.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts"
         ]
       },
       "capabilityOverlays": ["renderer_state"],
@@ -1738,7 +1742,8 @@
           "src/renderer/src/pages/workspace/previews/preview-pagination-contract.test.tsx",
           "src/shared/renderer-surface-inventory.test.ts",
           "src/shared/renderer-surface-matrix.test.ts",
-          "src/main/settings/skill-catalog.test.ts"
+          "src/main/settings/skill-catalog.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["windows_sensitive", "e2e_regressions", "e2e_delegation"],
@@ -2279,7 +2284,8 @@
           "src/renderer/web/bootstrap.test.ts",
           "src/renderer/web/renderer-argument-shape-characterization.test.ts",
           "src/shared/renderer-surface-inventory.test.ts",
-          "src/shared/renderer-surface-matrix.test.ts"
+          "src/shared/renderer-surface-matrix.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["windows_sensitive", "e2e_regressions", "e2e_delegation"],
@@ -2906,7 +2912,8 @@
           "src/renderer/src/stores/runtime-settings-store.test.ts",
           "src/renderer/src/stores/settings-connectors-slice.test.ts",
           "src/shared/renderer-surface-inventory.test.ts",
-          "src/shared/renderer-surface-matrix.test.ts"
+          "src/shared/renderer-surface-matrix.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["windows_sensitive", "e2e_regressions", "e2e_delegation"],
@@ -3353,6 +3360,7 @@
           "src/main/connectors/application.test.ts",
           "src/main/connectors/custom-mcp-bootstrap.test.ts",
           "src/main/connectors/custom-skill-doc.test.ts",
+          "src/main/connectors/descriptors/variants-gnomad.test.ts",
           "src/main/connectors/mcp-client-manager.test.ts",
           "src/main/connectors/mcp-payload-pagination.integration.test.ts",
           "src/main/connectors/oauth-client.test.ts",
@@ -3646,7 +3654,8 @@
           "src/renderer/src/stores/runtime-settings-store.test.ts",
           "src/renderer/src/stores/settings-connectors-slice.test.ts",
           "src/shared/renderer-surface-inventory.test.ts",
-          "src/shared/renderer-surface-matrix.test.ts"
+          "src/shared/renderer-surface-matrix.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["windows_sensitive", "e2e_regressions", "e2e_delegation"],
@@ -3887,6 +3896,7 @@
           "src/main/connectors/application.test.ts",
           "src/main/connectors/custom-mcp-bootstrap.test.ts",
           "src/main/connectors/custom-skill-doc.test.ts",
+          "src/main/connectors/descriptors/variants-gnomad.test.ts",
           "src/main/connectors/mcp-client-manager.test.ts",
           "src/main/connectors/mcp-payload-pagination.integration.test.ts",
           "src/main/connectors/oauth-client.test.ts",
@@ -4154,7 +4164,8 @@
           "src/renderer/src/stores/runtime-settings-store.test.ts",
           "src/renderer/src/stores/settings-connectors-slice.test.ts",
           "src/shared/renderer-surface-inventory.test.ts",
-          "src/shared/renderer-surface-matrix.test.ts"
+          "src/shared/renderer-surface-matrix.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["windows_sensitive", "e2e_regressions", "e2e_delegation"],
@@ -4590,7 +4601,8 @@
           "src/renderer/src/pages/workspace/previews/preview-pagination-contract.test.tsx",
           "src/shared/renderer-surface-inventory.test.ts",
           "src/shared/renderer-surface-matrix.test.ts",
-          "src/main/settings/skill-catalog.test.ts"
+          "src/main/settings/skill-catalog.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["windows_sensitive", "e2e_regressions", "e2e_delegation"],
@@ -5044,7 +5056,8 @@
           "src/renderer/src/pages/workspace/artifact-publication-preview.integration.test.tsx",
           "src/renderer/src/pages/workspace/previews/preview-pagination-contract.test.tsx",
           "src/shared/renderer-surface-inventory.test.ts",
-          "src/shared/renderer-surface-matrix.test.ts"
+          "src/shared/renderer-surface-matrix.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["windows_sensitive", "e2e_regressions", "e2e_delegation"],
@@ -5336,7 +5349,8 @@
           "src/renderer/src/pages/workspace/previews/preview-pagination-contract.test.tsx",
           "src/shared/renderer-surface-inventory.test.ts",
           "src/shared/renderer-surface-matrix.test.ts",
-          "src/main/settings/skill-catalog.test.ts"
+          "src/main/settings/skill-catalog.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["windows_sensitive", "e2e_regressions", "e2e_delegation"],
@@ -5864,7 +5878,8 @@
           "src/renderer/web/api-installer.test.ts",
           "src/renderer/web/bootstrap.test.ts",
           "src/renderer/web/renderer-argument-shape-characterization.test.ts",
-          "src/main/settings/skill-catalog.test.ts"
+          "src/main/settings/skill-catalog.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["windows_sensitive", "e2e_regressions", "e2e_delegation"],
@@ -6381,7 +6396,8 @@
           "src/renderer/src/pages/workspace/previews/preview-pagination-contract.test.tsx",
           "src/shared/renderer-surface-inventory.test.ts",
           "src/shared/renderer-surface-matrix.test.ts",
-          "src/main/settings/skill-catalog.test.ts"
+          "src/main/settings/skill-catalog.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["windows_sensitive", "e2e_regressions", "e2e_delegation"],
@@ -6808,7 +6824,8 @@
           "src/renderer/src/pages/workspace/previews/preview-pagination-contract.test.tsx",
           "src/renderer/src/stores/locale-preference-recovery.render.test.tsx",
           "src/shared/renderer-surface-inventory.test.ts",
-          "src/shared/renderer-surface-matrix.test.ts"
+          "src/shared/renderer-surface-matrix.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["i18n_catalog"],
@@ -7067,7 +7084,9 @@
           "src/renderer/src/stores/settings-navigation-slice.test.ts",
           "src/renderer/src/stores/settings-store.test.ts",
           "src/renderer/web/bootstrap.test.ts",
-          "src/renderer/web/renderer-argument-shape-characterization.test.ts"
+          "src/renderer/web/renderer-argument-shape-characterization.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts",
+          "src/renderer/src/pages/workspace/session-action-menu.test.ts"
         ]
       },
       "capabilityOverlays": ["i18n_catalog"],
@@ -7294,7 +7313,8 @@
           "src/renderer/src/pages/literature/LiteratureMetadataEditor.test.tsx",
           "src/renderer/src/pages/settings/PermissionsPanel.render.test.tsx",
           "src/renderer/src/pages/workspace/artifact-publication-preview.integration.test.tsx",
-          "src/shared/renderer-surface-inventory.test.ts"
+          "src/shared/renderer-surface-inventory.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["windows_sensitive", "e2e_regressions", "e2e_delegation"],
@@ -7470,7 +7490,8 @@
           "src/renderer/src/components/SessionPackageOperation.test.tsx",
           "src/renderer/src/components/PackageImportSelection.test.tsx",
           "src/renderer/src/components/ProjectPackageDropZone.test.tsx",
-          "src/main/index-fatal-errors.test.ts"
+          "src/main/index-fatal-errors.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["e2e_regressions", "e2e_delegation"],
@@ -8300,6 +8321,7 @@
           "src/main/connectors/application.test.ts",
           "src/main/connectors/custom-mcp-bootstrap.test.ts",
           "src/main/connectors/custom-skill-doc.test.ts",
+          "src/main/connectors/descriptors/variants-gnomad.test.ts",
           "src/main/connectors/mcp-client-manager.test.ts",
           "src/main/connectors/mcp-payload-pagination.integration.test.ts",
           "src/main/connectors/oauth-client.test.ts",
@@ -8576,7 +8598,8 @@
           "src/renderer/src/stores/settings-connectors-slice.test.ts",
           "src/shared/renderer-surface-inventory.test.ts",
           "src/shared/renderer-surface-matrix.test.ts",
-          "src/shared/run-error-classification.test.ts"
+          "src/shared/run-error-classification.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["windows_sensitive", "e2e_regressions", "e2e_delegation"],
@@ -9193,7 +9216,10 @@
           "src/renderer/web/bootstrap.test.ts",
           "src/renderer/web/renderer-argument-shape-characterization.test.ts",
           "src/shared/renderer-surface-inventory.test.ts",
-          "src/shared/renderer-surface-matrix.test.ts"
+          "src/shared/renderer-surface-matrix.test.ts",
+          "src/main/session-package/fork.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts",
+          "src/renderer/src/pages/workspace/session-action-menu.test.ts"
         ]
       },
       "capabilityOverlays": [],
@@ -9405,6 +9431,7 @@
           "src/main/connectors/application.test.ts",
           "src/main/connectors/custom-mcp-bootstrap.test.ts",
           "src/main/connectors/custom-skill-doc.test.ts",
+          "src/main/connectors/descriptors/variants-gnomad.test.ts",
           "src/main/connectors/mcp-client-manager.test.ts",
           "src/main/connectors/mcp-payload-pagination.integration.test.ts",
           "src/main/connectors/oauth-client.test.ts",
@@ -9756,7 +9783,8 @@
           "src/shared/renderer-surface-inventory.test.ts",
           "src/shared/renderer-surface-matrix.test.ts",
           "scripts/ci/e2e-setup-snapshot.test.ts",
-          "src/main/process-tree-native-loading.macos.integration.test.ts"
+          "src/main/process-tree-native-loading.macos.integration.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["notebook_network_sandbox", "windows_sensitive"],
@@ -10098,7 +10126,8 @@
           "src/renderer/src/pages/workspace/previews/preview-pagination-contract.test.tsx",
           "src/shared/renderer-surface-inventory.test.ts",
           "src/shared/renderer-surface-matrix.test.ts",
-          "scripts/ci/e2e-setup-snapshot.test.ts"
+          "scripts/ci/e2e-setup-snapshot.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["notebook_network_sandbox", "windows_sensitive"],
@@ -10273,6 +10302,7 @@
           "src/main/connectors/application.test.ts",
           "src/main/connectors/custom-mcp-bootstrap.test.ts",
           "src/main/connectors/custom-skill-doc.test.ts",
+          "src/main/connectors/descriptors/variants-gnomad.test.ts",
           "src/main/connectors/mcp-client-manager.test.ts",
           "src/main/connectors/mcp-payload-pagination.integration.test.ts",
           "src/main/connectors/oauth-client.test.ts",
@@ -10546,7 +10576,8 @@
           "src/renderer/src/stores/runtime-settings-store.test.ts",
           "src/renderer/src/stores/settings-connectors-slice.test.ts",
           "src/shared/renderer-surface-inventory.test.ts",
-          "src/shared/renderer-surface-matrix.test.ts"
+          "src/shared/renderer-surface-matrix.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["e2e_regressions", "e2e_delegation", "windows_sensitive"],
@@ -10840,7 +10871,8 @@
           "src/renderer/src/pages/settings/SpecialistEditor.persistence.render.test.tsx",
           "src/renderer/src/stores/specialist-store.test.ts",
           "src/shared/renderer-surface-inventory.test.ts",
-          "src/shared/renderer-surface-matrix.test.ts"
+          "src/shared/renderer-surface-matrix.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["e2e_regressions", "e2e_delegation", "windows_sensitive"],
@@ -11868,7 +11900,8 @@
           "src/renderer/src/stores/specialist-store.test.ts",
           "src/shared/renderer-surface-inventory.test.ts",
           "src/shared/renderer-surface-matrix.test.ts",
-          "src/main/notebook/dependency-analysis.stdlib-replay.test.ts"
+          "src/main/notebook/dependency-analysis.stdlib-replay.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["e2e_regressions", "e2e_delegation", "windows_sensitive"],
@@ -12153,7 +12186,8 @@
           "src/renderer/src/pages/workspace/previews/preview-pagination-contract.test.tsx",
           "src/shared/renderer-surface-inventory.test.ts",
           "src/shared/renderer-surface-matrix.test.ts",
-          "src/main/settings/skill-catalog.test.ts"
+          "src/main/settings/skill-catalog.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["e2e_regressions", "e2e_delegation", "windows_sensitive"],
@@ -12410,7 +12444,19 @@
           "src/main/web-service/http-server.test.ts",
           "src/main/web-service/task-api.test.ts",
           "src/shared/renderer-surface-inventory.test.ts",
-          "src/shared/renderer-surface-matrix.test.ts"
+          "src/shared/renderer-surface-matrix.test.ts",
+          "src/main/session-package/archive.test.ts",
+          "src/main/session-package/deletion.test.ts",
+          "src/main/session-package/desktop-composition.test.ts",
+          "src/main/session-package/desktop.test.ts",
+          "src/main/session-package/export-validation.test.ts",
+          "src/main/session-package/fork.test.ts",
+          "src/main/session-package/inspection-worker.integration.test.ts",
+          "src/main/session-package/literature.test.ts",
+          "src/main/session-package/portability.test.ts",
+          "src/main/session-package/recovery-diagnostics.test.ts",
+          "src/main/session-package/recovery.test.ts",
+          "src/main/session-package/service.test.ts"
         ]
       },
       "capabilityOverlays": ["e2e_regressions", "e2e_delegation", "windows_sensitive"],
@@ -17468,7 +17514,8 @@
           "src/renderer/src/pages/settings/PermissionsPanel.render.test.tsx",
           "src/renderer/src/pages/workspace/artifact-publication-preview.integration.test.tsx",
           "src/shared/renderer-surface-inventory.test.ts",
-          "src/shared/renderer-surface-matrix.test.ts"
+          "src/shared/renderer-surface-matrix.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["e2e_regressions", "e2e_delegation", "windows_sensitive"],
@@ -17723,6 +17770,7 @@
           "src/main/connectors/application.test.ts",
           "src/main/connectors/custom-mcp-bootstrap.test.ts",
           "src/main/connectors/custom-skill-doc.test.ts",
+          "src/main/connectors/descriptors/variants-gnomad.test.ts",
           "src/main/connectors/mcp-client-manager.test.ts",
           "src/main/connectors/mcp-payload-pagination.integration.test.ts",
           "src/main/connectors/oauth-client.test.ts",
@@ -17975,7 +18023,8 @@
           "src/renderer/src/stores/runtime-settings-store.test.ts",
           "src/renderer/src/stores/settings-connectors-slice.test.ts",
           "src/shared/renderer-surface-inventory.test.ts",
-          "src/shared/renderer-surface-matrix.test.ts"
+          "src/shared/renderer-surface-matrix.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["e2e_regressions", "e2e_delegation", "windows_sensitive"],
@@ -18345,7 +18394,8 @@
           "src/renderer/src/pages/workspace/previews/preview-pagination-contract.test.tsx",
           "src/shared/renderer-surface-inventory.test.ts",
           "src/shared/renderer-surface-matrix.test.ts",
-          "src/main/settings/skill-catalog.test.ts"
+          "src/main/settings/skill-catalog.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["e2e_regressions", "e2e_delegation", "windows_sensitive"],
@@ -19494,7 +19544,8 @@
           "src/renderer/src/pages/workspace/previews/renderers/pdf-figure-selections.test.ts",
           "src/shared/renderer-surface-inventory.test.ts",
           "src/shared/renderer-surface-matrix.test.ts",
-          "src/main/settings/skill-catalog.test.ts"
+          "src/main/settings/skill-catalog.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["e2e_regressions", "e2e_delegation", "windows_sensitive"],
@@ -19837,7 +19888,8 @@
           "src/renderer/src/pages/workspace/previews/preview-pagination-contract.test.tsx",
           "src/shared/renderer-surface-inventory.test.ts",
           "src/shared/renderer-surface-matrix.test.ts",
-          "src/main/settings/skill-catalog.test.ts"
+          "src/main/settings/skill-catalog.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["e2e_regressions", "e2e_delegation", "windows_sensitive"],
@@ -20135,7 +20187,8 @@
           "src/renderer/src/pages/workspace/previews/preview-pagination-contract.test.tsx",
           "src/shared/renderer-surface-inventory.test.ts",
           "src/shared/renderer-surface-matrix.test.ts",
-          "src/main/settings/skill-catalog.test.ts"
+          "src/main/settings/skill-catalog.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["e2e_regressions", "e2e_delegation", "windows_sensitive"],
@@ -20540,7 +20593,8 @@
           "src/renderer/src/pages/workspace/previews/preview-pagination-contract.test.tsx",
           "src/shared/renderer-surface-inventory.test.ts",
           "src/shared/renderer-surface-matrix.test.ts",
-          "src/main/settings/skill-catalog.test.ts"
+          "src/main/settings/skill-catalog.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["e2e_regressions", "e2e_delegation", "windows_sensitive"],
@@ -21421,7 +21475,8 @@
           "src/shared/renderer-surface-inventory.test.ts",
           "src/shared/renderer-surface-matrix.test.ts",
           "src/main/notebook/dependency-analysis.stdlib-replay.test.ts",
-          "src/main/settings/skill-catalog.test.ts"
+          "src/main/settings/skill-catalog.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["notebook_network_sandbox", "windows_sensitive"],
@@ -22460,7 +22515,8 @@
           "src/renderer/src/stores/runtime-settings-store.test.ts",
           "src/shared/renderer-surface-inventory.test.ts",
           "src/shared/renderer-surface-matrix.test.ts",
-          "src/main/notebook/dependency-analysis.stdlib-replay.test.ts"
+          "src/main/notebook/dependency-analysis.stdlib-replay.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["notebook_network_sandbox", "windows_sensitive"],
@@ -22570,7 +22626,8 @@
           "src/main/web-service/task-api.test.ts",
           "src/main/window-find-ipc.test.ts",
           "src/shared/renderer-surface-inventory.test.ts",
-          "src/shared/renderer-surface-matrix.test.ts"
+          "src/shared/renderer-surface-matrix.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["e2e_regressions", "e2e_delegation", "windows_sensitive"],
@@ -22762,6 +22819,7 @@
           "src/main/compute/slurm.real-ssh.integration.test.ts",
           "src/main/compute/ssh-runner.test.ts",
           "src/main/connectors/application.test.ts",
+          "src/main/connectors/descriptors/variants-gnomad.test.ts",
           "src/main/connectors/mcp-payload-pagination.integration.test.ts",
           "src/main/connectors/service.test.ts",
           "src/main/database/permission-approval-summary.test.ts",
@@ -23003,7 +23061,10 @@
         "src/main/session-package/service.ts",
         "src/main/session-package/transfer.test.ts",
         "src/main/session-package/transfer.ts",
-        "src/main/session-package/validation.ts"
+        "src/main/session-package/validation.ts",
+        "src/main/session-package/fork-session.test.ts",
+        "src/main/session-package/fork-session.ts",
+        "src/main/session-package/fork.test.ts"
       ],
       "interfacePaths": [
         "src/main/session-package/desktop.ts",
@@ -23032,7 +23093,9 @@
           "src/main/session-package/recovery-diagnostics.test.ts",
           "src/main/session-package/recovery.test.ts",
           "src/main/session-package/service.test.ts",
-          "src/main/session-package/transfer.test.ts"
+          "src/main/session-package/transfer.test.ts",
+          "src/main/session-package/fork-session.test.ts",
+          "src/main/session-package/fork.test.ts"
         ],
         "contract": [
           "src/preload/index.test.ts",
@@ -23606,6 +23669,7 @@
           "src/main/connectors/application.test.ts",
           "src/main/connectors/custom-mcp-bootstrap.test.ts",
           "src/main/connectors/custom-skill-doc.test.ts",
+          "src/main/connectors/descriptors/variants-gnomad.test.ts",
           "src/main/connectors/mcp-client-manager.test.ts",
           "src/main/connectors/mcp-payload-pagination.integration.test.ts",
           "src/main/connectors/oauth-client.test.ts",
@@ -23899,7 +23963,8 @@
           "src/renderer/src/stores/runtime-settings-store.test.ts",
           "src/renderer/src/stores/settings-connectors-slice.test.ts",
           "src/shared/renderer-surface-inventory.test.ts",
-          "src/shared/renderer-surface-matrix.test.ts"
+          "src/shared/renderer-surface-matrix.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["e2e_regressions", "e2e_delegation", "windows_sensitive"],
@@ -25013,7 +25078,8 @@
           "src/renderer/src/stores/specialist-store.test.ts",
           "src/shared/renderer-surface-inventory.test.ts",
           "src/shared/renderer-surface-matrix.test.ts",
-          "src/main/notebook/dependency-analysis.stdlib-replay.test.ts"
+          "src/main/notebook/dependency-analysis.stdlib-replay.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["e2e_regressions", "e2e_delegation", "windows_sensitive"],
@@ -25125,7 +25191,8 @@
           "src/main/web-service/http-server.test.ts",
           "src/main/web-service/task-api.test.ts",
           "src/shared/renderer-surface-inventory.test.ts",
-          "src/shared/renderer-surface-matrix.test.ts"
+          "src/shared/renderer-surface-matrix.test.ts",
+          "src/main/session-package/fork.test.ts"
         ]
       },
       "capabilityOverlays": ["e2e_regressions", "e2e_delegation", "windows_sensitive"],
@@ -25774,7 +25841,8 @@
           "src/renderer/src/stores/settings-navigation-slice.test.ts",
           "src/renderer/src/stores/settings-store.test.ts",
           "src/renderer/web/bootstrap.test.ts",
-          "src/renderer/web/renderer-argument-shape-characterization.test.ts"
+          "src/renderer/web/renderer-argument-shape-characterization.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts"
         ]
       },
       "capabilityOverlays": [],
@@ -26271,7 +26339,8 @@
           "src/renderer/src/stores/settings-navigation-slice.test.ts",
           "src/renderer/src/stores/settings-store.test.ts",
           "src/renderer/web/bootstrap.test.ts",
-          "src/renderer/web/renderer-argument-shape-characterization.test.ts"
+          "src/renderer/web/renderer-argument-shape-characterization.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts"
         ]
       },
       "capabilityOverlays": [],
@@ -26573,7 +26642,8 @@
           "src/renderer/src/stores/settings-navigation-slice.test.ts",
           "src/renderer/src/stores/settings-store.test.ts",
           "src/renderer/web/bootstrap.test.ts",
-          "src/renderer/web/renderer-argument-shape-characterization.test.ts"
+          "src/renderer/web/renderer-argument-shape-characterization.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts"
         ]
       },
       "capabilityOverlays": [],
@@ -26898,7 +26968,8 @@
           "src/renderer/src/stores/settings-navigation-slice.test.ts",
           "src/renderer/src/stores/settings-store.test.ts",
           "src/renderer/web/bootstrap.test.ts",
-          "src/renderer/web/renderer-argument-shape-characterization.test.ts"
+          "src/renderer/web/renderer-argument-shape-characterization.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts"
         ]
       },
       "capabilityOverlays": [],
@@ -27301,7 +27372,8 @@
           "src/renderer/src/stores/settings-navigation-slice.test.ts",
           "src/renderer/src/stores/settings-store.test.ts",
           "src/renderer/web/bootstrap.test.ts",
-          "src/renderer/web/renderer-argument-shape-characterization.test.ts"
+          "src/renderer/web/renderer-argument-shape-characterization.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts"
         ]
       },
       "capabilityOverlays": [],
@@ -27553,7 +27625,8 @@
           "src/renderer/src/stores/settings-navigation-slice.test.ts",
           "src/renderer/src/stores/settings-store.test.ts",
           "src/renderer/web/bootstrap.test.ts",
-          "src/renderer/web/renderer-argument-shape-characterization.test.ts"
+          "src/renderer/web/renderer-argument-shape-characterization.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts"
         ]
       },
       "capabilityOverlays": [],
@@ -27810,7 +27883,9 @@
           "src/renderer/src/stores/settings-navigation-slice.test.ts",
           "src/renderer/src/stores/settings-store.test.ts",
           "src/renderer/web/bootstrap.test.ts",
-          "src/renderer/web/renderer-argument-shape-characterization.test.ts"
+          "src/renderer/web/renderer-argument-shape-characterization.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts",
+          "src/renderer/src/pages/workspace/session-action-menu.test.ts"
         ]
       },
       "capabilityOverlays": [],
@@ -27912,7 +27987,8 @@
           "src/renderer/src/pages/workspace/workspace-session-agent-configuration-controller.availability.test.ts",
           "src/renderer/src/pages/workspace/workspace-session-agent-configuration-controller.test.ts",
           "src/renderer/web/bootstrap.test.ts",
-          "src/renderer/web/renderer-argument-shape-characterization.test.ts"
+          "src/renderer/web/renderer-argument-shape-characterization.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts"
         ]
       },
       "capabilityOverlays": [],
@@ -27955,7 +28031,9 @@
         "src/renderer/src/lib/streaming-metrics.ts",
         "src/renderer/src/lib/theme.ts",
         "src/renderer/src/lib/utils.ts",
-        "src/renderer/src/lib/wsl-support-handoff.ts"
+        "src/renderer/src/lib/wsl-support-handoff.ts",
+        "src/renderer/src/lib/session-fork.test.ts",
+        "src/renderer/src/lib/session-fork.ts"
       ],
       "interfacePaths": [
         "src/renderer/src/lib/active-session-display.ts",
@@ -27979,7 +28057,8 @@
         "src/renderer/src/lib/streaming-metrics.ts",
         "src/renderer/src/lib/theme.ts",
         "src/renderer/src/lib/utils.ts",
-        "src/renderer/src/lib/wsl-support-handoff.ts"
+        "src/renderer/src/lib/wsl-support-handoff.ts",
+        "src/renderer/src/lib/session-fork.ts"
       ],
       "consumerModules": [],
       "testFiles": {
@@ -27997,7 +28076,8 @@
           "src/renderer/src/lib/session-package-export.test.ts",
           "src/renderer/src/lib/session-package-import.test.ts",
           "src/renderer/src/lib/specialist-diagnostics.test.ts",
-          "src/renderer/src/lib/startup-issue.test.ts"
+          "src/renderer/src/lib/startup-issue.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts"
         ],
         "contract": [],
         "consumer": [
@@ -28664,7 +28744,8 @@
           "src/renderer/src/stores/settings-navigation-slice.test.ts",
           "src/renderer/src/stores/settings-store.test.ts",
           "src/renderer/web/bootstrap.test.ts",
-          "src/renderer/web/renderer-argument-shape-characterization.test.ts"
+          "src/renderer/web/renderer-argument-shape-characterization.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts"
         ]
       },
       "capabilityOverlays": [],
@@ -28901,7 +28982,8 @@
           "src/renderer/src/stores/settings-navigation-slice.test.ts",
           "src/renderer/src/stores/settings-store.test.ts",
           "src/renderer/web/bootstrap.test.ts",
-          "src/renderer/web/renderer-argument-shape-characterization.test.ts"
+          "src/renderer/web/renderer-argument-shape-characterization.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts"
         ]
       },
       "capabilityOverlays": [],
@@ -29206,7 +29288,8 @@
           "src/renderer/src/stores/settings-navigation-slice.test.ts",
           "src/renderer/src/stores/settings-store.test.ts",
           "src/renderer/web/bootstrap.test.ts",
-          "src/renderer/web/renderer-argument-shape-characterization.test.ts"
+          "src/renderer/web/renderer-argument-shape-characterization.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts"
         ]
       },
       "capabilityOverlays": [],
@@ -29509,7 +29592,8 @@
           "src/renderer/src/stores/settings-navigation-slice.test.ts",
           "src/renderer/src/stores/settings-store.test.ts",
           "src/renderer/web/bootstrap.test.ts",
-          "src/renderer/web/renderer-argument-shape-characterization.test.ts"
+          "src/renderer/web/renderer-argument-shape-characterization.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts"
         ]
       },
       "capabilityOverlays": [],
@@ -29922,7 +30006,8 @@
           "src/renderer/src/stores/settings-preferences-slice.test.ts",
           "src/renderer/src/stores/settings-store.test.ts",
           "src/renderer/web/bootstrap.test.ts",
-          "src/renderer/web/renderer-argument-shape-characterization.test.ts"
+          "src/renderer/web/renderer-argument-shape-characterization.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts"
         ]
       },
       "capabilityOverlays": [],
@@ -30225,7 +30310,8 @@
           "src/renderer/src/stores/settings-navigation-slice.test.ts",
           "src/renderer/src/stores/settings-store.test.ts",
           "src/renderer/web/bootstrap.test.ts",
-          "src/renderer/web/renderer-argument-shape-characterization.test.ts"
+          "src/renderer/web/renderer-argument-shape-characterization.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts"
         ]
       },
       "capabilityOverlays": [],
@@ -30435,7 +30521,8 @@
           "src/renderer/src/stores/settings-navigation-slice.test.ts",
           "src/renderer/src/stores/settings-store.test.ts",
           "src/renderer/web/bootstrap.test.ts",
-          "src/renderer/web/renderer-argument-shape-characterization.test.ts"
+          "src/renderer/web/renderer-argument-shape-characterization.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts"
         ]
       },
       "capabilityOverlays": [],
@@ -30945,7 +31032,8 @@
           "src/renderer/src/stores/settings-navigation-slice.test.ts",
           "src/renderer/src/stores/settings-store.test.ts",
           "src/renderer/web/bootstrap.test.ts",
-          "src/renderer/web/renderer-argument-shape-characterization.test.ts"
+          "src/renderer/web/renderer-argument-shape-characterization.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts"
         ]
       },
       "capabilityOverlays": [],
@@ -31244,7 +31332,8 @@
           "src/renderer/src/stores/settings-navigation-slice.test.ts",
           "src/renderer/src/stores/settings-store.test.ts",
           "src/renderer/web/bootstrap.test.ts",
-          "src/renderer/web/renderer-argument-shape-characterization.test.ts"
+          "src/renderer/web/renderer-argument-shape-characterization.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts"
         ]
       },
       "capabilityOverlays": [],
@@ -31936,7 +32025,8 @@
           "src/renderer/src/stores/settings-navigation-slice.test.ts",
           "src/renderer/src/stores/settings-store.test.ts",
           "src/renderer/web/bootstrap.test.ts",
-          "src/renderer/web/renderer-argument-shape-characterization.test.ts"
+          "src/renderer/web/renderer-argument-shape-characterization.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts"
         ]
       },
       "capabilityOverlays": [],
@@ -32176,7 +32266,8 @@
           "src/renderer/src/pages/workspace/workspace-conversation-controller.test.ts",
           "src/renderer/src/pages/workspace/workspace-message-queue-controller.test.ts",
           "src/renderer/web/bootstrap.test.ts",
-          "src/renderer/web/renderer-argument-shape-characterization.test.ts"
+          "src/renderer/web/renderer-argument-shape-characterization.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts"
         ]
       },
       "capabilityOverlays": [],
@@ -32509,7 +32600,8 @@
           "src/renderer/src/stores/settings-navigation-slice.test.ts",
           "src/renderer/src/stores/settings-store.test.ts",
           "src/renderer/web/bootstrap.test.ts",
-          "src/renderer/web/renderer-argument-shape-characterization.test.ts"
+          "src/renderer/web/renderer-argument-shape-characterization.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts"
         ]
       },
       "capabilityOverlays": [],
@@ -33137,7 +33229,8 @@
           "src/renderer/src/stores/settings-navigation-slice.test.ts",
           "src/renderer/src/stores/settings-store.test.ts",
           "src/renderer/web/bootstrap.test.ts",
-          "src/renderer/web/renderer-argument-shape-characterization.test.ts"
+          "src/renderer/web/renderer-argument-shape-characterization.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts"
         ]
       },
       "capabilityOverlays": [],
@@ -33634,7 +33727,8 @@
           "src/renderer/src/stores/session-store.archive-order.test.ts",
           "src/renderer/src/stores/session-store.test.ts",
           "src/renderer/web/bootstrap.test.ts",
-          "src/renderer/web/renderer-argument-shape-characterization.test.ts"
+          "src/renderer/web/renderer-argument-shape-characterization.test.ts",
+          "src/renderer/src/lib/session-fork.test.ts"
         ]
       },
       "capabilityOverlays": [],
@@ -34002,7 +34096,8 @@
         "src/shared/session-usage.ts",
         "src/shared/side-chat.ts",
         "src/shared/source-preview.ts",
-        "src/shared/wsl2-preview-manifest.ts"
+        "src/shared/wsl2-preview-manifest.ts",
+        "src/shared/session-branch-source.ts"
       ],
       "interfacePaths": [
         "src/shared/acp.ts",
@@ -34032,7 +34127,8 @@
         "src/shared/session-usage.ts",
         "src/shared/side-chat.ts",
         "src/shared/source-preview.ts",
-        "src/shared/wsl2-preview-manifest.ts"
+        "src/shared/wsl2-preview-manifest.ts",
+        "src/shared/session-branch-source.ts"
       ],
       "consumerModules": [],
       "testFiles": {
