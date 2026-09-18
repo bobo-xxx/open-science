@@ -5,6 +5,8 @@ import { resolve } from 'node:path'
 
 import { describe, expect, it, vi } from 'vitest'
 
+import { loadModuleImpactManifest } from './load-module-impact.mjs'
+
 import {
   collectCodeGraphTests,
   createAffectedTestPlan,
@@ -22,6 +24,84 @@ const currentStatus = JSON.stringify({
 })
 
 describe('module test impact commands', () => {
+  it('collects an empty shard report without discovering the full suite for an empty selection', () => {
+    const plan = createAffectedTestPlan([], { status: 'unavailable-manifest-only', testFiles: [] })
+    const spawn = vi.fn(() => ({ status: 0 }))
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+    const testArguments = ['--shard=1/3', '--reporter=blob', '--outputFile=reports/blob-1.json']
+    try {
+      expect(plan.testFiles).toEqual([])
+      executeModuleTestPlan(plan, {
+        spawn,
+        testArguments,
+        environment: { npm_execpath: '/npm/bin/npm-cli.js' },
+        nodeExecutable: '/node'
+      })
+      expect(spawn).toHaveBeenCalledWith(
+        '/node',
+        ['/npm/bin/npm-cli.js', 'test', '--', ...testArguments, '__no_selected_module_tests__'],
+        expect.anything()
+      )
+      spawn.mockClear()
+      // Ordinary local invocations still do no work for an empty selection.
+      executeModuleTestPlan(plan, { spawn })
+      expect(spawn).not.toHaveBeenCalled()
+    } finally {
+      write.mockRestore()
+    }
+  })
+
+  it.each([
+    ['--shard=2/3', '--reporter=blob', '--outputFile=vitest-reports/blob-2.json'],
+    ['--merge-reports=vitest-reports', '--passWithNoTests']
+  ])('preserves module selection and changed coverage when forwarding %j', (...vitestArguments) => {
+    const spawn = vi.fn(() => ({ status: 0 }))
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+    const source = 'src/main/notebook/mcp-server.ts'
+    const plan = createAffectedTestPlan([{ path: source, status: 'modified' }], {
+      status: 'unavailable-manifest-only',
+      testFiles: []
+    })
+    try {
+      runModuleTestCli(
+        [
+          'affected',
+          '--base',
+          'base',
+          '--head',
+          'head',
+          '--coverage-changed',
+          'base',
+          '--',
+          ...vitestArguments
+        ],
+        {
+          execute: (command: string, args: string[]) => {
+            if (command === 'git' && args[0] === 'merge-base') return 'base\n'
+            if (command === 'git' && args[0] === 'diff') return Buffer.from(`M\0${source}\0`)
+            throw new Error('CodeGraph unavailable in CI')
+          },
+          spawn,
+          environment: { npm_execpath: '/npm/bin/npm-cli.js' }
+        }
+      )
+      const merging = vitestArguments[0].startsWith('--merge-reports')
+      expect(spawn.mock.calls[0]?.[1]).toEqual([
+        '/npm/bin/npm-cli.js',
+        ...(merging ? ['exec', '--', 'vitest', 'run'] : ['test', '--']),
+        '--coverage',
+        `--coverage.include=${source}`,
+        ...vitestArguments,
+        ...(merging ? [] : plan.testFiles)
+      ])
+      expect(spawn.mock.calls[0]?.[2]?.env).toMatchObject({
+        VITEST_CHANGED_COVERAGE_THRESHOLDS: '1'
+      })
+    } finally {
+      write.mockRestore()
+    }
+  })
+
   it('selects the standalone workflow contract instead of the global fallback', () => {
     const plan = createAffectedTestPlan(
       [{ path: 'scripts/ci/pr-gate-workflow.test.ts', status: 'modified' }],
@@ -73,7 +153,7 @@ describe('module test impact commands', () => {
       [{ path: 'src/main/compute/compute-job-lifecycle.ts', status: 'added' }],
       { status: 'current', testFiles: [] }
     )
-    expect(affected.modules).toEqual(['workspace_page', 'compute_service'])
+    expect(affected.modules).toEqual(['compute_service', 'workspace_page'])
     expect(affected.testFiles).toEqual(
       expect.arrayContaining([
         'src/main/compute/compute-job-lifecycle.test.ts',
@@ -96,7 +176,7 @@ describe('module test impact commands', () => {
     })
 
     expect(affected.mode).toBe('selective')
-    expect(affected.modules).toEqual(['workspace_page', 'compute_service'])
+    expect(affected.modules).toEqual(['compute_service', 'workspace_page'])
     expect(affected.testFiles).toEqual(
       expect.arrayContaining([
         'src/main/compute/compute-service.architecture.test.ts',
@@ -199,10 +279,10 @@ describe('module test impact commands', () => {
 
     expect(plan.mode).toBe('selective')
     expect(plan.modules).toEqual([
-      'artifact_storage',
       'artifact_provenance',
-      'session_persistence',
-      'project_lifecycle'
+      'artifact_storage',
+      'project_lifecycle',
+      'session_persistence'
     ])
     expect(plan.testFiles).toContain('src/main/reviewer/ipc.test.ts')
     expect(plan.reasonChains).toContain('artifact_storage -> artifact_provenance')
@@ -687,7 +767,7 @@ describe('module test impact commands', () => {
 })
 
 it('uses only declared owner tests to recover colocated implementation ownership', () => {
-  const manifest = JSON.parse(readFileSync(resolve('scripts/ci/module-impact.json'), 'utf8'))
+  const manifest = loadModuleImpactManifest(resolve('scripts/ci/module-impact.json'))
   const graph = { status: 'unavailable-manifest-only', testFiles: [] }
   const module = manifest.modules.genomes_ensembl_connector
   const source = 'src/main/connectors/descriptors/new-known-descriptor.ts'

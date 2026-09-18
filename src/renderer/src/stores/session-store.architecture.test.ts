@@ -44,6 +44,8 @@ import {
 } from 'typescript'
 import { describe, expect, it } from 'vitest'
 
+import { loadModuleImpactManifest } from '../../../../scripts/ci/load-module-impact.mjs'
+
 const rendererRoot = resolve(__dirname, '..')
 const facadePath = resolve(__dirname, 'session-store.ts')
 const moduleImpactPath = resolve(__dirname, '../../../../scripts/ci/module-impact.json')
@@ -1012,12 +1014,7 @@ describe('Session Store architecture', () => {
   })
 
   it('keeps the architecture suite in the Session renderer impact set', () => {
-    const manifest = JSON.parse(readSource(moduleImpactPath)) as {
-      modules: Record<
-        string,
-        { ownerPaths: string[]; interfacePaths: string[]; testFiles: { owner: string[] } }
-      >
-    }
+    const manifest = loadModuleImpactManifest(moduleImpactPath)
     expect(manifest.modules.session_renderer).toEqual({
       ownerPaths: [
         'src/renderer/src/stores/session-store.ts',
@@ -1356,7 +1353,8 @@ describe('Session Store architecture', () => {
           'src/renderer/src/stores/settings-store.test.ts',
           'src/renderer/web/bootstrap.test.ts',
           'src/renderer/web/renderer-argument-shape-characterization.test.ts',
-          'src/renderer/src/lib/session-fork.test.ts'
+          'src/renderer/src/lib/session-fork.test.ts',
+          'src/renderer/src/components/LegacyDataMoveDialog.storage.test.tsx'
         ]
       },
       capabilityOverlays: ['renderer_state'],

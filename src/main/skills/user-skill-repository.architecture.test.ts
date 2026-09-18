@@ -27,6 +27,8 @@ import {
 } from 'typescript'
 import { describe, expect, it } from 'vitest'
 
+import { loadModuleImpactManifest } from '../../../scripts/ci/load-module-impact.mjs'
+
 import {
   listProductionSources,
   readProductionSource
@@ -153,20 +155,6 @@ const publicOperations = (): string[] => {
     .sort()
 }
 
-type ModuleImpactManifest = {
-  modules: Record<
-    string,
-    {
-      ownerPaths: string[]
-      interfacePaths: string[]
-      consumerModules: string[]
-      testFiles: { owner: string[]; contract: string[]; consumer: string[] }
-      capabilityOverlays: string[]
-      fallbackCapability: string
-    }
-  >
-}
-
 describe('User Skill repository architecture', () => {
   it('locks the compatibility export and operation inventories', () => {
     expect(exportInventory()).toEqual([
@@ -259,7 +247,7 @@ describe('User Skill repository architecture', () => {
   })
 
   it('declares complete ownership and downstream test impact', () => {
-    const manifest = JSON.parse(readSource(manifestPath)) as ModuleImpactManifest
+    const manifest = loadModuleImpactManifest(manifestPath)
     expect(manifest.modules.user_skills_repository).toEqual({
       ownerPaths: [
         'src/main/skills/user-skill-catalog-observer.ts',
@@ -883,6 +871,14 @@ describe('User Skill repository architecture', () => {
           'src/shared/renderer-surface-inventory.test.ts',
           'src/shared/renderer-surface-matrix.test.ts',
           'src/main/session-package/fork.test.ts',
+          'src/main/storage/brand-location.test.ts',
+          'src/main/credential-identity/persistence.test.ts',
+          'src/main/credential-identity/ciphertext-inventory.test.ts',
+          'src/main/credential-identity/linux.test.ts',
+          'src/main/storage/migration-target-race.test.ts',
+          'src/renderer/src/components/LegacyDataMoveDialog.storage.test.tsx',
+          'src/main/credential-identity/macos.test.ts',
+          'src/main/credential-identity/probe-logging.test.ts',
           'src/main/settings/responses-bridge.plan-tools.test.ts',
           'src/main/session-plan/plan-context-file.shell.integration.test.ts',
           'src/main/settings/provider-runtime-health-owner.test.ts',

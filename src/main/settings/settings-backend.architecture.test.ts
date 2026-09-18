@@ -33,6 +33,8 @@ import {
 } from 'typescript'
 import { describe, expect, it } from 'vitest'
 
+import { loadModuleImpactManifest } from '../../../scripts/ci/load-module-impact.mjs'
+
 import {
   listProductionSources,
   readProductionSource
@@ -240,20 +242,6 @@ const stringSetValues = (path: string, variableName: string): string[] => {
     if (!isStringLiteralLike(element)) throw new Error(`${variableName} contains a non-string`)
     return element.text
   })
-}
-
-type ModuleImpactManifest = {
-  modules: Record<
-    string,
-    {
-      ownerPaths: string[]
-      interfacePaths: string[]
-      consumerModules: string[]
-      testFiles: { owner: string[]; contract: string[]; consumer: string[] }
-      capabilityOverlays: string[]
-      fallbackCapability: string
-    }
-  >
 }
 
 const productionSourcePaths = productionSources()
@@ -823,7 +811,7 @@ describe('Settings backend ownership architecture', () => {
   })
 
   it('locks dependency-aware impact owners and cross-surface evidence', () => {
-    const manifest = JSON.parse(readSource(manifestPath)) as ModuleImpactManifest
+    const manifest = loadModuleImpactManifest(manifestPath)
     expect(manifest.modules.settings_repository.ownerPaths).toEqual([
       'src/main/settings/repository.ts',
       'src/main/settings/record-codec.ts',
@@ -840,7 +828,9 @@ describe('Settings backend ownership architecture', () => {
       'src/main/settings/mirror-settings.test.ts',
       'src/main/settings/provider-token-limits.test.ts',
       'src/main/settings/record-codec.test.ts',
-      'src/main/settings/repository.test.ts'
+      'src/main/settings/repository.test.ts',
+      'src/main/settings/document-read-error.ts',
+      'src/main/settings/document-shape.ts'
     ])
     expect(manifest.modules.settings_repository.interfacePaths).toEqual([
       'src/main/settings/repository.ts',
@@ -1460,6 +1450,14 @@ describe('Settings backend ownership architecture', () => {
       'src/shared/renderer-surface-inventory.test.ts',
       'src/shared/renderer-surface-matrix.test.ts',
       'src/main/session-package/fork.test.ts',
+      'src/main/storage/brand-location.test.ts',
+      'src/main/credential-identity/persistence.test.ts',
+      'src/main/credential-identity/ciphertext-inventory.test.ts',
+      'src/main/credential-identity/linux.test.ts',
+      'src/main/storage/migration-target-race.test.ts',
+      'src/renderer/src/components/LegacyDataMoveDialog.storage.test.tsx',
+      'src/main/credential-identity/macos.test.ts',
+      'src/main/credential-identity/probe-logging.test.ts',
       'src/renderer/src/lib/session-persistence/session-persistence.test.ts',
       'src/renderer/src/pages/workspace/workspace-message-queue-controller.test.ts'
     ])

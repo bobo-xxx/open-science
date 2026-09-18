@@ -26,6 +26,8 @@ import {
 } from 'typescript'
 import { describe, expect, it } from 'vitest'
 
+import { loadModuleImpactManifest } from '../../../scripts/ci/load-module-impact.mjs'
+
 const productionFiles = [
   'artifact-provenance-graph.ts',
   'artifact-reproducibility-execution.ts',
@@ -198,20 +200,6 @@ const topLevelValues = (sourceFile: SourceFile): string[] =>
       )
     )
     .sort()
-
-type ModuleImpactManifest = {
-  modules: Record<
-    string,
-    {
-      ownerPaths: string[]
-      interfacePaths: string[]
-      consumerModules: string[]
-      testFiles: { owner: string[]; contract: string[]; consumer: string[] }
-      capabilityOverlays: string[]
-      fallbackCapability: string
-    }
-  >
-}
 
 describe('Artifact Provenance repository architecture', () => {
   const facadeFile = sourceFileFor('provenance-repository.ts')
@@ -416,9 +404,9 @@ describe('Artifact Provenance repository architecture', () => {
 
   it('keeps owner, interface, consumer and Windows-sensitive impact coverage complete', () => {
     const repositoryRoot = resolve(__dirname, '..', '..', '..')
-    const manifest = JSON.parse(
-      readFileSync(resolve(repositoryRoot, 'scripts', 'ci', 'module-impact.json'), 'utf8')
-    ) as ModuleImpactManifest
+    const manifest = loadModuleImpactManifest(
+      resolve(repositoryRoot, 'scripts', 'ci', 'module-impact.json')
+    )
     const module = manifest.modules.artifact_provenance
 
     expect(module.ownerPaths).toEqual([
@@ -942,7 +930,12 @@ describe('Artifact Provenance repository architecture', () => {
       'src/renderer/web/bootstrap.test.ts',
       'src/renderer/web/renderer-argument-shape-characterization.test.ts',
       'src/main/settings/skill-catalog.test.ts',
-      'src/main/session-package/fork.test.ts'
+      'src/main/session-package/fork.test.ts',
+      'src/main/storage/brand-location.test.ts',
+      'src/main/storage/migration-target-race.test.ts',
+      'src/renderer/src/components/LegacyDataMoveDialog.storage.test.tsx',
+      'src/main/settings/provider-runtime-health-owner.test.ts',
+      'src/renderer/src/pages/workspace/workspace-message-queue-controller.test.ts'
     ])
     expect(module.capabilityOverlays).toEqual([
       'windows_sensitive',

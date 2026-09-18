@@ -1,5 +1,13 @@
 import { execFileSync, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -7,7 +15,7 @@ import { load } from 'js-yaml'
 import { describe, expect, it } from 'vitest'
 
 import { evaluatePrGate } from './evaluate-pr-gate.mjs'
-import { runModuleImpactAuthorityCli } from './module-impact-authority.mjs'
+import { loadModuleImpactManifest } from './load-module-impact.mjs'
 
 type Step = {
   'continue-on-error'?: boolean
@@ -72,10 +80,175 @@ const manifest = JSON.parse(
 ) as { bundleOrder: string[]; laneBundles: Record<string, string>; laneOrder: string[] }
 
 describe('PR Gate workflow', () => {
-  it.each(['pull_request', 'merge_group', 'deleted', 'renamed', 'ci-edit', 'unrelated'])(
+  it('rejects module dry-runs against changed application code while allowing CI-only fixes', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'module-coverage-source-'))
+    const git = (...args: string[]): string =>
+      execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
+    const revisions = workflow.jobs.preflight.steps?.find(({ id }) => id === 'revisions')
+    try {
+      git('init', '--quiet')
+      git('config', 'user.email', 'ci@example.com')
+      git('config', 'user.name', 'CI Test')
+      writeFileSync(join(cwd, 'app.ts'), 'export const value = 1\n')
+      git('add', '.')
+      git('commit', '--quiet', '-m', 'application baseline')
+      const comparisonHead = git('rev-parse', 'HEAD')
+      mkdirSync(join(cwd, 'scripts/ci'), { recursive: true })
+      writeFileSync(join(cwd, 'scripts/ci/runner.mjs'), '// updated runner\n')
+      git('add', '.')
+      git('commit', '--quiet', '-m', 'CI-only fix')
+      const env = {
+        ...process.env,
+        EVENT_NAME: 'workflow_dispatch',
+        DRY_RUN_MODE: 'module-coverage',
+        INPUT_COMPARISON_BASE_SHA: comparisonHead,
+        INPUT_COMPARISON_HEAD_SHA: comparisonHead,
+        GITHUB_OUTPUT: join(cwd, 'output')
+      }
+      const matching = spawnSync('bash', ['-c', revisions!.run!], { cwd, env, encoding: 'utf8' })
+      expect(matching.status, matching.stderr).toBe(0)
+      writeFileSync(join(cwd, 'app.ts'), 'export const value = 2\n')
+      git('add', 'app.ts')
+      git('commit', '--quiet', '-m', 'different application')
+      const mismatched = spawnSync('bash', ['-c', revisions!.run!], { cwd, env, encoding: 'utf8' })
+      expect(mismatched.status).toBe(1)
+      expect(mismatched.stderr).toContain('must match comparison head outside CI files')
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('replays explicit module dry-run revisions through the real revision and plan scripts', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'module-coverage-plan-'))
+    const base = execFileSync('git', ['rev-parse', 'HEAD^'], { encoding: 'utf8' }).trim()
+    const head = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+    const revisions = workflow.jobs.preflight.steps?.find(({ id }) => id === 'revisions')
+    const classify = workflow.jobs.preflight.steps?.find(({ id }) => id === 'classify')
+    const output = join(dir, 'output')
+    const env = {
+      ...process.env,
+      EVENT_NAME: 'workflow_dispatch',
+      DRY_RUN_MODE: 'module-coverage',
+      INPUT_COMPARISON_BASE_SHA: base,
+      INPUT_COMPARISON_HEAD_SHA: head,
+      GITHUB_OUTPUT: output
+    }
+    try {
+      const resolved = spawnSync('bash', ['-c', revisions!.run!], { env, encoding: 'utf8' })
+      expect(resolved.status, resolved.stderr).toBe(0)
+      expect(readFileSync(output, 'utf8')).toContain(`base=${base}\nhead=${head}`)
+      const planned = spawnSync('bash', ['-c', classify!.run!], { env, encoding: 'utf8' })
+      expect(planned.status, planned.stderr).toBe(0)
+      const planLine = readFileSync(output, 'utf8')
+        .split('\n')
+        .find((line) => line.startsWith('plan='))!
+      expect(JSON.parse(planLine.slice(5))).toMatchObject({
+        mode: 'selective',
+        macosProfile: 'smoke',
+        lanes: ['policy', 'unit_macos'],
+        bundles: ['policy', 'unit']
+      })
+      const invalid = spawnSync('bash', ['-c', revisions!.run!], {
+        env: { ...env, INPUT_COMPARISON_HEAD_SHA: '--bad-revision' },
+        encoding: 'utf8'
+      })
+      expect(invalid.status).toBe(1)
+      expect(invalid.stderr).toContain('Preflight revisions must be full Git commit SHAs')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('runs affected module coverage in the existing portable shards before enforcing merged thresholds', () => {
+    const shards = workflow.jobs.unit_shard
+    for (const event of ['pull_request', 'merge_group']) {
+      expect(shards.if).toContain(`github.event_name == '${event}'`)
+    }
+    const selected = shards.steps?.find(({ id }) => id === 'unit_macos_related_shard')
+    expect(selected?.run).toContain('npm run test:affected')
+    expect(selected?.run).toContain('--coverage-changed "$BASE_SHA" --')
+    expect(selected?.run).toContain('--shard=${{ matrix.shard }}/3')
+    expect(selected?.run).toContain('--reporter=blob')
+    expect(shards.env?.VITEST_DEFER_COVERAGE_THRESHOLDS).toBe('1')
+    const merge = workflow.jobs.unit.steps?.find(({ id }) => id === 'unit_macos_related_merge')
+    expect(merge?.run).toContain('--coverage-changed "$BASE_SHA" -- --merge-reports=vitest-reports')
+    expect(workflow.jobs.unit.env?.VITEST_DEFER_COVERAGE_THRESHOLDS).toBeUndefined()
+    const serial = workflow.jobs.unit.steps?.find(({ id }) => id === 'unit_macos_related')
+    expect(serial?.if).toContain("needs.unit_shard.result == 'skipped'")
+    const enforce = workflow.jobs.unit.steps?.find(
+      ({ name }) => name === 'Enforce selected unit checks'
+    )
+    const result = spawnSync('bash', ['-c', enforce!.run!], {
+      env: {
+        ...process.env,
+        UNIT_MACOS_FULL_OUTCOME: 'skipped',
+        UNIT_MACOS_RELATED_OUTCOME: 'skipped',
+        UNIT_MACOS_RELATED_MERGE_OUTCOME: 'failure',
+        UNIT_MACOS_SHARDS_RESULT: 'success'
+      },
+      encoding: 'utf8'
+    })
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('unit_macos_related_merge ended with failure')
+  })
+
+  it('retains trusted legacy extraction when the base predates the optional reader', () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'pr-gate-legacy-')))
+    const git = (...args: string[]): string =>
+      execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim()
+    try {
+      mkdirSync(join(root, 'scripts/ci'), { recursive: true })
+      for (const file of [
+        'module-impact-authority.mjs',
+        'module-impact-shadow.mjs',
+        'module-test-impact.mjs',
+        'module-impact.json',
+        'validate-module-impact.mjs',
+        'classify-pr-changes.mjs',
+        'change-impact.json'
+      ])
+        writeFileSync(
+          join(root, 'scripts/ci', file),
+          file.endsWith('.json') ? '{}' : 'process.stdout.write("trusted legacy")\n'
+        )
+      git('init', '--quiet')
+      git('config', 'user.email', 'ci@example.com')
+      git('config', 'user.name', 'CI Test')
+      git('add', '.')
+      git('commit', '--quiet', '-m', 'legacy base')
+      const base = git('rev-parse', 'HEAD')
+      writeFileSync(
+        join(root, 'scripts/ci/load-module-impact.mjs'),
+        'throw new Error("candidate reader")'
+      )
+      const output = join(root, 'outputs')
+      const prepare = workflow.jobs.preflight.steps!.find(({ id }) => id === 'trusted_classifier')!
+      const result = spawnSync('bash', ['-c', prepare.run!], {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, BASE_SHA: base, RUNNER_TEMP: root, GITHUB_OUTPUT: output }
+      })
+      expect(result.status, result.stderr).toBe(0)
+      expect(readFileSync(output, 'utf8')).toContain('source=base')
+      expect(existsSync(join(root, 'pr-gate-trusted-classifier/load-module-impact.mjs'))).toBe(
+        false
+      )
+      expect(
+        execFileSync(
+          process.execPath,
+          [join(root, 'pr-gate-trusted-classifier/module-impact-authority.mjs')],
+          { encoding: 'utf8' }
+        )
+      ).toBe('trusted legacy')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each(['pull_request', 'merge_group', 'deleted', 'renamed', 'ci-edit', 'unrelated', 'sharded'])(
     'resolves actual Git history without mixing trusted policy and PR differences: %s',
     (scenario) => {
-      const root = mkdtempSync(join(tmpdir(), 'pr-gate-revisions-'))
+      const root = realpathSync(mkdtempSync(join(tmpdir(), 'pr-gate-revisions-')))
       const git = (...args: string[]): string =>
         execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim()
       const put = (path: string, contents: string): void => {
@@ -93,11 +266,24 @@ describe('PR Gate workflow', () => {
           'module-impact-shadow.mjs',
           'module-test-impact.mjs',
           'module-impact.json',
+          'load-module-impact.mjs',
           'validate-module-impact.mjs',
           'classify-pr-changes.mjs',
           'change-impact.json'
         ]) {
-          put(`scripts/ci/${name}`, readFileSync(`scripts/ci/${name}`, 'utf8'))
+          put(
+            `scripts/ci/${name}`,
+            name === 'module-impact.json'
+              ? JSON.stringify(loadModuleImpactManifest())
+              : readFileSync(`scripts/ci/${name}`, 'utf8')
+          )
+        }
+        if (scenario === 'sharded') {
+          const registered = loadModuleImpactManifest()
+          put('scripts/ci/module-impact.json', JSON.stringify({ schemaVersion: 1 }))
+          for (const [id, module] of Object.entries(registered.modules)) {
+            put(`scripts/ci/module-impact/${id}.json`, JSON.stringify(module))
+          }
         }
         put(source, 'export const value = 1\n')
         put(test, '// initial contract\n')
@@ -181,15 +367,33 @@ describe('PR Gate workflow', () => {
         expect(
           readFileSync(join(root, 'pr-gate-trusted-classifier/classify-pr-changes.mjs'), 'utf8')
         ).toContain('// current trusted policy')
-        const { plan } = runModuleImpactAuthorityCli(
-          ['--base', revisions.base, '--head', revisions.head],
+        expect(
+          loadModuleImpactManifest(join(root, 'pr-gate-trusted-classifier/module-impact.json'))
+        ).toEqual(loadModuleImpactManifest())
+        const classified = spawnSync(
+          process.execPath,
+          [
+            join(root, 'pr-gate-trusted-classifier/module-impact-authority.mjs'),
+            '--base',
+            revisions.base,
+            '--head',
+            revisions.head
+          ],
           {
-            EVENT_NAME: scenario === 'merge_group' ? 'merge_group' : 'pull_request',
-            PR_GATE_PLATFORM_POLICY: 'risk-v1'
-          },
-          { cwd: root, write: () => undefined }
+            cwd: root,
+            encoding: 'utf8',
+            env: {
+              ...process.env,
+              EVENT_NAME: scenario === 'merge_group' ? 'merge_group' : 'pull_request',
+              PR_GATE_PLATFORM_POLICY: 'risk-v1',
+              GITHUB_OUTPUT: '',
+              GITHUB_STEP_SUMMARY: ''
+            }
+          }
         )
-        if (scenario === 'pull_request') {
+        expect(classified.status, classified.stderr).toBe(0)
+        const plan = JSON.parse(classified.stdout)
+        if (scenario === 'pull_request' || scenario === 'sharded') {
           expect(git('diff', '--name-only', revisions.base, head).split('\n')).toEqual([
             test,
             source
@@ -282,6 +486,7 @@ describe('PR Gate workflow', () => {
           options: [
             'classified',
             'unit-coverage',
+            'module-coverage',
             'i18n',
             'runtime-bundle',
             'windows-e2e',
@@ -289,6 +494,15 @@ describe('PR Gate workflow', () => {
             'source-regressions',
             'macos-smoke'
           ]
+        },
+        comparison_base_sha: {
+          description: 'Test-selection diff base for module-coverage (full SHA; runs dispatch ref)',
+          type: 'string'
+        },
+        comparison_head_sha: {
+          description:
+            'Test-selection diff head (full SHA; only CI files may differ from dispatch ref)',
+          type: 'string'
         }
       }
     })
@@ -636,7 +850,7 @@ describe('PR Gate workflow', () => {
     expect(unit.env?.VITEST_DEFER_COVERAGE_THRESHOLDS).toBeUndefined()
     expect(shards).toMatchObject({
       env: { VITEST_DEFER_COVERAGE_THRESHOLDS: '1', VITEST_PORTABLE_CI: '1' },
-      name: 'Full portable tests (Ubuntu, shard ${{ matrix.shard }}/3)',
+      name: 'Portable tests (Ubuntu, shard ${{ matrix.shard }}/3)',
       needs: 'preflight',
       'runs-on': 'ubuntu-latest',
       strategy: {
@@ -703,13 +917,13 @@ describe('PR Gate workflow', () => {
     expect(merge).toMatchObject({
       id: 'unit_macos_full',
       'continue-on-error': true,
-      if: "${{ needs.unit_shard.result != 'skipped' }}",
+      if: "${{ needs.unit_shard.result != 'skipped' && (fromJSON(needs.preflight.outputs.plan).mode == 'full' || !contains(fromJSON(needs.preflight.outputs.plan).lanes, 'unit_macos')) }}",
       run: 'npx vitest run --merge-reports=vitest-reports --coverage --passWithNoTests'
     })
     expect(unit.steps?.some(({ name }) => name === 'Test Renderer (blocking)')).toBe(false)
     expect(unit.steps?.filter(({ run }) => run === 'npm run test:coverage')).toHaveLength(0)
     expect(coverageUpload).toMatchObject({
-      if: "${{ always() && (steps.unit_macos_related.outcome != 'skipped' || steps.unit_macos_full.outcome != 'skipped') }}",
+      if: "${{ always() && (steps.unit_macos_related.outcome != 'skipped' || steps.unit_macos_full.outcome != 'skipped' || steps.unit_macos_related_merge.outcome != 'skipped') }}",
       'continue-on-error': true,
       with: {
         name: 'coverage-report',
@@ -1100,13 +1314,14 @@ describe('PR Gate workflow', () => {
     expect(enforceUnit?.env).toEqual({
       UNIT_MACOS_FULL_OUTCOME: '${{ steps.unit_macos_full.outcome }}',
       UNIT_MACOS_RELATED_OUTCOME: '${{ steps.unit_macos_related.outcome }}',
+      UNIT_MACOS_RELATED_MERGE_OUTCOME: '${{ steps.unit_macos_related_merge.outcome }}',
       UNIT_MACOS_SHARDS_RESULT: '${{ needs.unit_shard.result }}'
     })
     expect(enforceUnit?.run).toContain('check unit_macos_related "$UNIT_MACOS_RELATED_OUTCOME"')
     expect(enforceUnit?.run).toContain('check unit_macos_full "$UNIT_MACOS_FULL_OUTCOME"')
     expect(enforceUnit?.run).toContain('check unit_macos_shards "$UNIT_MACOS_SHARDS_RESULT"')
     expect(enforceUnit?.run).toContain(
-      '[[ "$UNIT_MACOS_RELATED_OUTCOME" == "skipped" && "$UNIT_MACOS_FULL_OUTCOME" == "skipped" ]]'
+      '[[ "$UNIT_MACOS_RELATED_OUTCOME" == "skipped" && "$UNIT_MACOS_FULL_OUTCOME" == "skipped" && "$UNIT_MACOS_RELATED_MERGE_OUTCOME" == "skipped" ]]'
     )
     expect(enforceUnit?.run).toContain('Selected unit bundle did not execute a Module-test path')
   })

@@ -50,6 +50,8 @@ import {
 } from 'typescript'
 import { describe, expect, it } from 'vitest'
 
+import { loadModuleImpactManifest } from '../../../scripts/ci/load-module-impact.mjs'
+
 const productionFiles = [
   'coordinator.ts',
   'delegated-question-owner.ts',
@@ -398,20 +400,6 @@ const concreteCoordinatorConsumerFiles = (): string[] =>
     })
     .map((path) => relative(projectRoot, path).split(sep).join('/'))
     .sort()
-
-type ModuleImpactManifest = {
-  modules: Record<
-    string,
-    {
-      ownerPaths: string[]
-      interfacePaths: string[]
-      consumerModules: string[]
-      testFiles: { owner: string[]; contract: string[]; consumer: string[] }
-      capabilityOverlays: string[]
-      fallbackCapability: string
-    }
-  >
-}
 
 describe('Session persistence coordinator architecture', () => {
   const facadeFile = sourceFileFor('coordinator.ts')
@@ -1120,9 +1108,7 @@ describe('Session persistence coordinator architecture', () => {
   })
 
   it('keeps the module-impact manifest closed over owners and certification tests', () => {
-    const manifest = JSON.parse(
-      readFileSync(resolve(projectRoot, 'scripts/ci/module-impact.json'), 'utf8')
-    ) as ModuleImpactManifest
+    const manifest = loadModuleImpactManifest(resolve(projectRoot, 'scripts/ci/module-impact.json'))
     const sessionPersistence = manifest.modules.session_persistence
 
     expect(sessionPersistence.ownerPaths).toEqual([
@@ -1636,8 +1622,12 @@ describe('Session persistence coordinator architecture', () => {
       'src/shared/renderer-surface-matrix.test.ts',
       'src/main/settings/skill-catalog.test.ts',
       'src/main/session-package/fork.test.ts',
+      'src/main/storage/migration-target-race.test.ts',
+      'src/renderer/src/components/LegacyDataMoveDialog.storage.test.tsx',
+      'src/main/storage/brand-location.test.ts',
       'src/main/session-plan/plan-legacy-compatibility.test.ts',
-      'src/main/session-plan/plan-context-file.shell.integration.test.ts'
+      'src/main/session-plan/plan-context-file.shell.integration.test.ts',
+      'src/renderer/src/pages/workspace/workspace-message-queue-controller.test.ts'
     ])
     expect(sessionPersistence.capabilityOverlays).toEqual([
       'windows_sensitive',
