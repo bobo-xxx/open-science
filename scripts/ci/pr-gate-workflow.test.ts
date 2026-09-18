@@ -120,7 +120,14 @@ describe('PR Gate workflow', () => {
 
   it('replays explicit module dry-run revisions through the real revision and plan scripts', () => {
     const dir = mkdtempSync(join(tmpdir(), 'module-coverage-plan-'))
-    const base = execFileSync('git', ['rev-parse', 'HEAD^'], { encoding: 'utf8' }).trim()
+    // Mirror the revisions step fallback: shallow or single-commit checkouts have no parent, so
+    // compare HEAD against itself instead of failing the whole suite.
+    const parent = spawnSync('git', ['rev-parse', 'HEAD^'], { encoding: 'utf8' })
+    const base = (
+      parent.status === 0
+        ? parent.stdout
+        : execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' })
+    ).trim()
     const head = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
     const revisions = workflow.jobs.preflight.steps?.find(({ id }) => id === 'revisions')
     const classify = workflow.jobs.preflight.steps?.find(({ id }) => id === 'classify')
@@ -167,7 +174,7 @@ describe('PR Gate workflow', () => {
     const selected = shards.steps?.find(({ id }) => id === 'unit_macos_related_shard')
     expect(selected?.run).toContain('npm run test:affected')
     expect(selected?.run).toContain('--coverage-changed "$BASE_SHA" --')
-    expect(selected?.run).toContain('--shard=${{ matrix.shard }}/3')
+    expect(selected?.run).toContain('--shard=${{ matrix.shard }}/4')
     expect(selected?.run).toContain('--reporter=blob')
     expect(shards.env?.VITEST_DEFER_COVERAGE_THRESHOLDS).toBe('1')
     const merge = workflow.jobs.unit.steps?.find(({ id }) => id === 'unit_macos_related_merge')
@@ -850,12 +857,12 @@ describe('PR Gate workflow', () => {
     expect(unit.env?.VITEST_DEFER_COVERAGE_THRESHOLDS).toBeUndefined()
     expect(shards).toMatchObject({
       env: { VITEST_DEFER_COVERAGE_THRESHOLDS: '1', VITEST_PORTABLE_CI: '1' },
-      name: 'Portable tests (Ubuntu, shard ${{ matrix.shard }}/3)',
+      name: 'Portable tests (Ubuntu, shard ${{ matrix.shard }}/4)',
       needs: 'preflight',
       'runs-on': 'ubuntu-latest',
       strategy: {
         'fail-fast': false,
-        matrix: { shard: [1, 2, 3] }
+        matrix: { shard: [1, 2, 3, 4] }
       }
     })
     expect(shards.if).toContain("fromJSON(needs.preflight.outputs.plan).mode == 'full'")
@@ -869,7 +876,7 @@ describe('PR Gate workflow', () => {
         '--coverage',
         '--coverage.reporter=text-summary',
         '--testTimeout=30000',
-        '--shard=${{ matrix.shard }}/3',
+        '--shard=${{ matrix.shard }}/4',
         '--reporter=blob',
         '--reporter=github-actions',
         '--outputFile=vitest-reports/blob-${{ matrix.shard }}.json'
