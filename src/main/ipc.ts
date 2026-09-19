@@ -1,3 +1,4 @@
+import { RuntimeWriterOwner } from './session-persistence/runtime-writer'
 import { getDefaultPermissionProfile } from '../shared/permission-profiles'
 import { PackageLiteratureReader } from './session-package/literature-reader'
 import { PdfElementAgentReader } from './literature/pdf-structure/agent-reader'
@@ -1986,6 +1987,7 @@ const createApplicationModules = async (
       translate,
       helperModuleCatalog: settingsService.registeredHelperCatalog(),
       processSandbox: notebookNetworkSandbox,
+      getGrantedLocalRoots: () => grantedRootsRepository.list(),
       onBackgroundRunTerminal: (source) =>
         backgroundResultDelivery.enqueue(source).then(() => undefined),
       onBackgroundRunAdmitted: (source) =>
@@ -2924,12 +2926,6 @@ const createApplicationModules = async (
                     agentConfiguration: toSessionAgentConfiguration(agentTarget)
                   })
                 }
-                const started = await delivery.startDispatch()
-                if (started !== 'started') {
-                  throw new DelegateMessageParkedError(
-                    'Parent message dispatch fence was not acquired.'
-                  )
-                }
                 if (!runtime.hasLiveSession(latest.projectId, latest.id) || agentTarget) {
                   await runtime.resumeSession({
                     sessionId: latest.id,
@@ -2956,7 +2952,14 @@ const createApplicationModules = async (
                     ...(agentTarget ? { agentTarget } : {})
                   })
                 }
-              }
+                const started = await delivery.startDispatch()
+                if (started !== 'started') {
+                  throw new DelegateMessageParkedError(
+                    'Parent message dispatch fence was not acquired.'
+                  )
+                }
+              },
+              delivery.messageId
             )
           }
         )
@@ -4503,8 +4506,14 @@ const createApplicationModules = async (
         )
     }
   })
+  const runtimeWriter = new RuntimeWriterOwner(undefined, undefined, (clientId) => {
+    if (!clientId.startsWith('electron:')) return undefined
+    const sender = webContents.fromId(Number(clientId.slice('electron:'.length)))
+    return Boolean(sender && !sender.isDestroyed() && !sender.isCrashed())
+  })
   surfaceAdapters.push(
     createSessionPersistenceElectronSurface({
+      runtimeWriter,
       sessionPersistenceBackend,
       reviewRepository,
       sessionPersistenceHandlers,
@@ -4881,6 +4890,7 @@ const createApplicationModules = async (
       clearAll: () => memoryService.clearAll()
     },
     dataContent: {
+      runtimeWriter,
       artifacts: artifactHandlers,
       electron: {
         sessionPackageOperation: async (invocation) =>

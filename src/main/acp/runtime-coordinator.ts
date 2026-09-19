@@ -45,7 +45,9 @@ import { projectPermissionRequest } from './runtime-publication-owner'
 const QUIT_PREPARATION_TIMEOUT_MS = 4_000
 
 const isOwnershipScopedControlEvent = (event: AcpRuntimeEvent): boolean =>
-  event.kind === 'compaction' || event.recoverable === 'context-overflow'
+  event.kind === 'compaction' ||
+  event.recoverable === 'context-overflow' ||
+  event.recoverable === 'session-lost'
 
 const hasArtifactProvenance = (event: AcpRuntimeEvent): boolean =>
   Boolean(event.runId && event.promptMessageId && event.artifactClaimId)
@@ -634,11 +636,16 @@ class AcpRuntimeCoordinator {
     // Keep the prior owner authoritative until adoption finishes. The renderer does not create the
     // incoming optimistic run until this promise resolves, so terminal events emitted while the old
     // generation drains can still settle its own Runtime Segment without touching the next one.
-    if (transfersOwnership) {
-      this.pendingSessionAdoptions.set(request.sessionId, {
-        runtime,
-        projectId: request.projectId ?? owner?.liveSessionProjectId(request.sessionId)
-      })
+    const pendingAdoption = transfersOwnership
+      ? {
+          runtime,
+          projectId: request.projectId ?? owner?.liveSessionProjectId(request.sessionId)
+        }
+      : undefined
+    // A duplicate resume for the same app Session replaces the map entry. Keep the record identity
+    // so an older failure cannot clear or retire the runtime needed by the newer adoption.
+    if (pendingAdoption) {
+      this.pendingSessionAdoptions.set(request.sessionId, pendingAdoption)
     }
 
     let response: AcpCreateSessionResponse
@@ -647,7 +654,7 @@ class AcpRuntimeCoordinator {
     } catch (error) {
       if (
         transfersOwnership &&
-        this.pendingSessionAdoptions.get(request.sessionId)?.runtime === runtime
+        this.pendingSessionAdoptions.get(request.sessionId) === pendingAdoption
       ) {
         this.pendingSessionAdoptions.delete(request.sessionId)
       }
@@ -664,11 +671,11 @@ class AcpRuntimeCoordinator {
 
     if (
       transfersOwnership &&
-      (this.pendingSessionAdoptions.get(request.sessionId)?.runtime !== runtime ||
+      (this.pendingSessionAdoptions.get(request.sessionId) !== pendingAdoption ||
         !this.runtimes.has(runtime) ||
         this.retiredRuntimes.has(runtime))
     ) {
-      if (this.pendingSessionAdoptions.get(request.sessionId)?.runtime === runtime) {
+      if (this.pendingSessionAdoptions.get(request.sessionId) === pendingAdoption) {
         this.pendingSessionAdoptions.delete(request.sessionId)
       }
       throw new Error('ACP session adoption was superseded before ownership could commit')
@@ -676,7 +683,7 @@ class AcpRuntimeCoordinator {
 
     if (
       transfersOwnership &&
-      this.pendingSessionAdoptions.get(request.sessionId)?.runtime === runtime
+      this.pendingSessionAdoptions.get(request.sessionId) === pendingAdoption
     ) {
       this.pendingSessionAdoptions.delete(request.sessionId)
     }
@@ -1037,17 +1044,24 @@ class AcpRuntimeCoordinator {
 
   startContinuationWhenDispatchAdmitted(
     request: AcpPromptRequest,
-    validate: () => Promise<void>
+    validate: () => Promise<void>,
+    delegatedMessageId?: string
   ): Promise<DelegateMessageAcceptanceEvidence> {
     // The caller owns final deletion admission for the whole validation/resume/acceptance lifecycle.
     // Bypass only the nested dispatch guard; root-session admission remains linearized below.
-    return this.startContinuationWhenWithDispatchAdmission(request, validate, true)
+    return this.startContinuationWhenWithDispatchAdmission(
+      request,
+      validate,
+      true,
+      delegatedMessageId
+    )
   }
 
   private startContinuationWhenWithDispatchAdmission(
     request: AcpPromptRequest,
     validate: () => Promise<void>,
-    dispatchAdmitted: boolean
+    dispatchAdmitted: boolean,
+    delegatedMessageId?: string
   ): Promise<DelegateMessageAcceptanceEvidence> {
     let resolve!: (evidence: DelegateMessageAcceptanceEvidence) => void
     let reject!: (error: unknown) => void
@@ -1084,7 +1098,19 @@ class AcpRuntimeCoordinator {
         )
       }
       await (dispatchAdmitted
-        ? this.dispatchAdmittedPrompt(request, acceptance, 'sendAppContinuation')
+        ? this.dispatchAdmittedPrompt(
+            request,
+            acceptance,
+            'sendAppContinuation',
+            undefined,
+            false,
+            undefined,
+            undefined,
+            undefined,
+            'renderer',
+            undefined,
+            delegatedMessageId
+          )
         : this.dispatchPrompt(request, acceptance, 'sendAppContinuation'))
       if (!acceptance.settled) {
         acceptance.settled = true
@@ -1146,7 +1172,8 @@ class AcpRuntimeCoordinator {
     onApplicationPromptAdmitted?: (prompt: ReturnType<AcpRuntime['sendPrompt']>) => void,
     onPromptAdmitted?: () => Promise<AcpPromptRequest['provenanceContext']>,
     runtimeReviewOwner: 'task' | 'renderer' = 'renderer',
-    startAdmission?: PromptAcceptance
+    startAdmission?: PromptAcceptance,
+    delegatedMessageId?: string
   ): ReturnType<AcpRuntime['sendPrompt']> {
     if (this.promptAdmissionClosedForQuit) return this.rejectPromptForQuit()
     const owner = pinnedRuntime ?? this.findRuntimeForSession(request.sessionId)
@@ -1235,7 +1262,9 @@ class AcpRuntimeCoordinator {
           ? runtime.sendPrompt(taskRequest, attempt.id, admitPrompt)
           : runtime.sendPrompt(taskRequest, attempt.id)
       }
-      return runtime.sendAppContinuation(taskRequest, attempt.id)
+      return delegatedMessageId
+        ? runtime.sendAppContinuation(taskRequest, attempt.id, undefined, delegatedMessageId)
+        : runtime.sendAppContinuation(taskRequest, attempt.id)
     })
     onApplicationPromptAdmitted?.(prompt)
     return prompt
