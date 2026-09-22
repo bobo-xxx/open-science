@@ -187,7 +187,7 @@ export const OFFICIAL_VENDORS: OfficialVendor[] = [
   {
     id: 'xai',
     label: 'xAI (Grok)',
-    // xAI documents four selectable effort values for Grok 4.6. Models with a different capability
+    // xAI documents four selectable effort values for Grok 4.6 and 4.7. Models with a different capability
     // override this default below; models without a documented effort control stay unsupported.
     reasoningEffort: 'low-medium-high-xhigh',
     // xAI serves OpenAI-compatible Chat Completions and native Responses from the same versioned
@@ -201,6 +201,8 @@ export const OFFICIAL_VENDORS: OfficialVendor[] = [
     // audio, and video generation models, so exposing refresh would pollute the chat-model picker.
     // Experimental Grok 4.20 beta variants are intentionally omitted from the stable default list.
     models: [
+      // https://docs.x.ai/developers/grok-4-7
+      { id: 'grok-4.7', contextWindow: 500_000 },
       { id: 'grok-4.6', contextWindow: 500_000 },
       { id: 'grok-4.5', contextWindow: 500_000 },
       {
@@ -609,10 +611,17 @@ export const OFFICIAL_VENDORS: OfficialVendor[] = [
     apiKeyUrl: 'https://platform.xiaomimimo.com/console/api-keys',
     modelsListUrl: 'https://api.xiaomimimo.com/v1/models',
     models: [
+      { id: 'mimo-v2.6-pro', contextWindow: 1_000_000 },
+      { id: 'mimo-v2.6-flash', contextWindow: 1_000_000 },
+      { id: 'mimo-v2.6-pro-ultraspeed', contextWindow: 1_000_000 },
       { id: 'mimo-v2.5-pro', contextWindow: 1_000_000 },
       { id: 'mimo-v2.5', contextWindow: 1_000_000 }
-    ]
-    // Xiaomi MiMo's chat models are text-only, so no `multimodal` rule (image input stays disabled).
+    ],
+    // V2.6 supports image input on both APIs; keep capabilities scoped to the documented ids.
+    // https://mimo.mi.com/docs/en-US/news/latest/v2-6
+    multimodal: {
+      multimodalModels: ['mimo-v2.6-pro', 'mimo-v2.6-flash', 'mimo-v2.6-pro-ultraspeed']
+    }
   },
   {
     id: 'sensenova',

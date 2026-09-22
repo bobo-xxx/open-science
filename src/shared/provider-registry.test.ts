@@ -339,7 +339,7 @@ describe('provider registry', () => {
   it('exposes the first catalog entry as the default model', () => {
     expect(defaultVendorModel('openai')).toBe('gpt-5.6-sol')
     expect(defaultVendorModel('anthropic')).toBe('claude-opus-5')
-    expect(defaultVendorModel('xai')).toBe('grok-4.6')
+    expect(defaultVendorModel('xai')).toBe('grok-4.7')
     expect(defaultVendorModel('zhipu')).toBe('glm-5.3')
   })
 
@@ -488,8 +488,28 @@ describe('provider registry', () => {
     expect(resolveVendorBaseUrl('xiaomimimo')).toBe('https://api.xiaomimimo.com/anthropic')
     expect(resolveVendorOpenAiBaseUrl('xiaomimimo')).toBe('https://api.xiaomimimo.com/v1')
     expect(resolveVendorModelsUrl('xiaomimimo')).toBe('https://api.xiaomimimo.com/v1/models')
-    expect(defaultVendorModel('xiaomimimo')).toBe('mimo-v2.5-pro')
+    expect(defaultVendorModel('xiaomimimo')).toBe('mimo-v2.6-pro')
+    expect(getOfficialVendorModelIds('xiaomimimo')).toEqual([
+      'mimo-v2.6-pro',
+      'mimo-v2.6-flash',
+      'mimo-v2.6-pro-ultraspeed',
+      'mimo-v2.5-pro',
+      'mimo-v2.5'
+    ])
   })
+
+  it.each(['mimo-v2.6-pro', 'mimo-v2.6-flash', 'mimo-v2.6-pro-ultraspeed'])(
+    'resolves Xiaomi MIMO %s capabilities',
+    (model) => {
+      expect(resolveModelContextWindow('xiaomimimo', model)).toBe(1_000_000)
+      expect(resolveVendorModelApiEndpoints('xiaomimimo', model)).toEqual(['anthropic', 'openai'])
+      expect(isVendorModelMultimodal('xiaomimimo', model)).toBe(true)
+      expect(resolveVendorModelReasoningEffort('xiaomimimo', model)).toEqual({
+        supported: true,
+        slots: ['none', 'high', 'high', 'high', 'high']
+      })
+    }
+  )
 
   it.each([undefined, 'china', 'unknown'])(
     'preserves the China endpoint for SenseNova region %s',
@@ -702,7 +722,24 @@ describe('provider registry', () => {
     // xAI's live catalog also includes image, audio, and video generation models, so keep refresh
     // hidden and expose only the curated language-model catalog.
     expect(resolveVendorModelsUrl('xai')).toBeUndefined()
-    expect(defaultVendorModel('xai')).toBe('grok-4.6')
+    expect(defaultVendorModel('xai')).toBe('grok-4.7')
+  })
+
+  it('exposes Grok 4.7 with its documented capabilities and keeps existing xAI models', () => {
+    expect(getOfficialVendorModelIds('xai')).toEqual([
+      'grok-4.7',
+      'grok-4.6',
+      'grok-4.5',
+      'grok-4.3',
+      'grok-build-0.1'
+    ])
+    expect(resolveModelContextWindow('xai', 'grok-4.7')).toBe(500_000)
+    expect(isVendorModelMultimodal('xai', 'grok-4.7')).toBe(true)
+    expect(resolveVendorModelApiEndpoints('xai', 'grok-4.7')).toEqual(['openai', 'responses'])
+    expect(resolveVendorModelReasoningEffort('xai', 'grok-4.7')).toEqual({
+      supported: true,
+      slots: ['low', 'medium', 'high', 'xhigh', 'xhigh']
+    })
   })
 
   it('routes Apodex core models through Messages and Chat Completions', () => {
@@ -1009,9 +1046,10 @@ describe('provider registry', () => {
       expect(isVendorModelMultimodal('kimiforcode', 'kimi-for-coding-highspeed')).toBe(false)
     })
 
-    it('returns false for Xiaomi MIMO models (no vision support)', () => {
+    it('preserves Xiaomi MIMO legacy and unknown model vision defaults', () => {
       expect(isVendorModelMultimodal('xiaomimimo', 'mimo-v2.5-pro')).toBe(false)
       expect(isVendorModelMultimodal('xiaomimimo', 'mimo-v2.5')).toBe(false)
+      expect(isVendorModelMultimodal('xiaomimimo', 'mimo-unknown')).toBe(false)
     })
 
     it('enables SenseNova Flash Lite and hosted Kimi vision without enabling text-only models', () => {
