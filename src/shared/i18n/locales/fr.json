@@ -6170,7 +6170,7 @@
     "Remembered for this conversation": "Mémorisé pour cette conversation",
     "This conversation or this call": "Cette conversation ou cet appel",
     "DeepSeek routes deepseek-v4-flash and deepseek-v4-flash-vision-exp to DeepSeek V4.1 Flash (deepseek-flash), with Flash pricing.": "DeepSeek redirige deepseek-v4-flash et deepseek-v4-flash-vision-exp vers DeepSeek V4.1 Flash (deepseek-flash), aux tarifs Flash.",
-    "Open Science keeps legacy model names after refresh so existing sessions can continue using their original model IDs.": "Open Science conserve les anciens noms de modèles après actualisation afin que les sessions existantes puissent continuer à utiliser leurs identifiants de modèle d’origine.",
+    "Open-Science keeps legacy model names after refresh so existing sessions can continue using their original model IDs.": "Open-Science conserve les anciens noms de modèles après actualisation afin que les sessions existantes puissent continuer à utiliser leurs identifiants de modèle d’origine.",
     "DeepSeek API model and routing details": "Détails des modèles et du routage de l’API DeepSeek",
     "Saved to Inbox": "Enregistré dans la boîte de réception",
     "PDF downloaded to Inbox": "PDF téléchargé dans la boîte de réception",
@@ -6542,6 +6542,9 @@
     "The previous automatic run stopped or could not save its progress. Check storage before resuming. Saved results are preserved.": "La précédente exécution automatique a été arrêtée ou sa progression n’a pas pu être enregistrée. Vérifiez le stockage avant de reprendre. Les résultats enregistrés sont conservés.",
     "Resume automatic updates": "Reprendre les mises à jour automatiques",
     "This run reached {{limit}} automatic requests, including retries. Resume to evaluate the remaining references.": "Cette exécution a atteint {{limit}} requêtes automatiques, nouvelles tentatives comprises. Reprenez pour traiter les références restantes.",
-    "Automatic updates pause after {{run}} requests per run or {{day}} across all collections in 24 hours. Retries count toward these limits.": "Les mises à jour automatiques sont suspendues après {{run}} requêtes par exécution ou {{day}} pour toutes les collections sur 24 heures. Les nouvelles tentatives sont comptabilisées."
+    "Automatic updates pause after {{run}} requests per run or {{day}} across all collections in 24 hours. Retries count toward these limits.": "Les mises à jour automatiques sont suspendues après {{run}} requêtes par exécution ou {{day}} pour toutes les collections sur 24 heures. Les nouvelles tentatives sont comptabilisées.",
+    "Check an InterProScan job once. Wait at least 10 seconds between checks.": "Vérifier une fois le statut d’une tâche InterProScan. Attendre au moins 10 secondes entre les vérifications.",
+    "Retrieve the complete TSV report for a finished InterProScan job. Results expire at the service.": "Récupérer le rapport TSV complet d’une tâche InterProScan terminée. Les résultats expirent sur le service.",
+    "InterProScan job status and TSV result retrieval via EMBL-EBI.": "État des tâches InterProScan et récupération des résultats TSV via l’EMBL-EBI."
   }
 }
