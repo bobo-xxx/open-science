@@ -1464,7 +1464,7 @@ if (process.argv.includes('--version')) {
             }
           })
           if (!layoutGate) {
-            for (let chunk = 1; chunk < 30; chunk += 1) {
+            for (let chunk = intentChunksBeforeTool; chunk < 30; chunk += 1) {
               await context.client.notify(acp.methods.client.session.update, {
                 sessionId: context.params.sessionId,
                 update: {
