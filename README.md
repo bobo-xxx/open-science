@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/aipoch/open-science/releases/latest">
+  <a href="https://aipoch.com/open-science/download">
     <img alt="Download" src="https://img.shields.io/badge/Download-Latest%20Release-2f9e44?style=flat">
   </a>
   <a href="https://github.com/aipoch/open-science/releases/latest">
@@ -47,7 +47,7 @@ AIPOCH Open-Science is an AI research workbench for scientists and researchers, 
 
 AIPOCH Open-Science supports computational and data-intensive research across disciplines, including machine learning, statistics, life sciences, chemistry, materials science, physics and environmental science. It supports the research process from literature review and hypothesis development to code execution, data analysis, simulation, visualization, and the production of traceable research outputs.
 
-> 💡 **[AIPOCH Open-Science v0.33.1 released](https://github.com/aipoch/open-science/releases/latest)** _(last updated September 2026)_. AIPOCH Open-Science v0.33.1 brings live smart Literature screening with pause and resume, two new research connectors — HMMER sequence search and InterProScan job results — plus Clustal Omega multiple sequence alignment in the Genomes connector, and GPT-6 and Claude Opus 5.5 in the provider catalogs. PDF evidence can now travel with the first message of a workspace conversation, and session diagnostics can include sensitive package evidence when you opt in. Windows managed Python runtimes are restored, notebook and compute save races recover cleanly, and the agent bridge reconnects when vision capabilities change. See the [latest release notes](https://github.com/aipoch/open-science/releases/latest) for full details.
+> 💡 **[AIPOCH Open-Science v0.33.2 released](https://github.com/aipoch/open-science/releases/latest)** _(last updated September 2026)_. AIPOCH Open-Science v0.33.2 ships code-signed Windows installers, so the SmartScreen first-run warning is gone. The protein-annotation connector gains STRING protein-interaction enrichment analysis, live-source browser previews now persist between visits, and delegation preserves completed results through cleanup failures. The Figure Composer workflow is refreshed, file icons appear in preview headers, and downloads point to the official download page. See the [latest release notes](https://github.com/aipoch/open-science/releases/latest) for full details.
 
 <p align="center">
  <img width="1920" height="1140" alt="AIPOCH Open-Science banner: Science, Open to All — an open-source, model-agnostic, self-hosted scientific AI research workbench" src="docs/images/readme/open-science-banner.png" />
@@ -71,16 +71,16 @@ AIPOCH Open-Science supports computational and data-intensive research across di
 
 ### 1. Download the app
 
-Open the [latest release](https://github.com/aipoch/open-science/releases/latest), expand **Assets**, and choose the installer for your computer:
+Open the [official download page](https://aipoch.com/open-science/download) and choose the installer for your computer:
 
 | Your computer                           | Choose                                   |
 | --------------------------------------- | ---------------------------------------- |
 | macOS 12+ — Apple Silicon (M1 or newer) | The macOS DMG for Apple Silicon / ARM64  |
 | macOS 12+ — Intel                       | The macOS DMG for Intel / x64            |
-| Windows x64                             | The Windows x64 installer                |
+| Windows x64                             | The Windows x64 installer (code-signed)  |
 | Linux x64                               | The Linux x64 AppImage or Debian package |
 
-Download from the official release page; see [download verification](SECURITY.md#verifying-your-download) if needed.
+Download from the [official download page](https://aipoch.com/open-science/download); see [download verification](SECURITY.md#verifying-your-download) if needed.
 
 On macOS, you can also install with [Homebrew](https://brew.sh):
 

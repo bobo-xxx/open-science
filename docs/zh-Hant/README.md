@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/aipoch/open-science/releases/latest">
+  <a href="https://aipoch.com/open-science/download">
     <img alt="下載" src="https://img.shields.io/badge/Download-Latest%20Release-2f9e44?style=flat">
   </a>
   <a href="https://github.com/aipoch/open-science/releases/latest">
@@ -49,7 +49,7 @@ AIPOCH Open-Science 是面向科學家與研究人員的 AI 研究工作台，�
 
 AIPOCH Open-Science 支援機器學習、統計學、生命科學、化學、材料科學、物理學及環境科學等領域的運算密集與資料密集研究。它涵蓋從文獻回顧、假設建立，到程式碼執行、資料分析、模擬、視覺化，以及產出可追溯研究成果的完整研究流程。
 
-> 💡 **[AIPOCH Open-Science v0.33.1 已發佈](https://github.com/aipoch/open-science/releases/latest)** _（最後更新於 2026 年 9 月）_。AIPOCH Open-Science v0.33.1 帶來支援暫停與恢復的即時智慧文獻篩選、兩個新的研究連接器——HMMER 序列搜尋與 InterProScan 工作結果——以及 Genomes 連接器中的 Clustal Omega 多序列比對，還有服務商目錄中的 GPT-6 與 Claude Opus 5.5。PDF 證據現在可以隨工作區對話的第一則訊息一同傳送；在你選擇加入後，工作階段診斷還可以包含敏感的套件證據。Windows 託管 Python 執行階段已恢復，Notebook 與計算儲存競爭可乾淨恢復，視覺能力變化時代理橋接會自動重連。詳情請查看[最新發行說明](https://github.com/aipoch/open-science/releases/latest)。
+> 💡 **[AIPOCH Open-Science v0.33.2 已發佈](https://github.com/aipoch/open-science/releases/latest)** _（最後更新於 2026 年 9 月）_。AIPOCH Open-Science v0.33.2 提供經過程式碼簽署的 Windows 安裝程式，SmartScreen 首次執行警告已成為過去。蛋白質註解連接器新增 STRING 蛋白質交互作用富集分析，即時來源的瀏覽器預覽現在會在多次造訪之間持久保留，委派功能也能在清理失敗時保住已完成的結果。Figure Composer 工作流程已重新整理，檔案圖示會出現在預覽標題中，下載也改為指向官方下載頁面。詳情請查看[最新發行說明](https://github.com/aipoch/open-science/releases/latest)。
 
 <p align="center">
  <img width="1920" height="1140" alt="AIPOCH Open-Science 首屏橫幅：Science, Open to All——開源、模型無關、可自行託管的科學 AI 研究工作台" src="../images/readme/open-science-banner.png" />
@@ -72,16 +72,16 @@ AIPOCH Open-Science 支援機器學習、統計學、生命科學、化學、材
 
 ### 1. 下載應用程式
 
-開啟[最新版本](https://github.com/aipoch/open-science/releases/latest)，展開 **Assets**，並選擇適合你電腦的安裝程式：
+開啟[官方應用程式下載頁面](https://aipoch.com/open-science/download)，並選擇適合你電腦的安裝程式：
 
 | 你的電腦                                | 選擇                                      |
 | --------------------------------------- | ----------------------------------------- |
 | macOS 12+ — Apple 晶片（M1 或更新型號） | 適用於 Apple Silicon / ARM64 的 macOS DMG |
 | macOS 12+ — Intel                       | 適用於 Intel / x64 的 macOS DMG           |
-| Windows x64                             | Windows x64 安裝程式                      |
+| Windows x64                             | Windows x64 安裝程式（已程式碼簽署）      |
 | Linux x64                               | Linux x64 AppImage 或 Debian 套件         |
 
-從官方版本頁下載安裝套件；如需驗證，請參閱[驗證下載](../../SECURITY.md#verifying-your-download)。
+從[官方應用程式下載頁面](https://aipoch.com/open-science/download)下載安裝套件；如需驗證，請參閱[驗證下載](../../SECURITY.md#verifying-your-download)。
 
 macOS 使用者也可以透過 [Homebrew](https://brew.sh) 安裝：
 

@@ -328,7 +328,7 @@ describe('codexFramework', () => {
     expect(codexNativeModelInstructions).not.toContain('coding agent')
   })
 
-  it('disables native multi-agent, Shell, and memory across every backend route', () => {
+  it('disables native plugins, apps, multi-agent, Shell, and memory across every backend route', () => {
     const framework = createCodexFramework()
     const configurations = [
       framework.prepareModelConfig(
@@ -398,9 +398,12 @@ describe('codexFramework', () => {
 
     expect(codexConfigs.map(({ features }) => features)).toEqual(
       configurations.map((_configuration, index) => ({
+        apps: false,
         memories: false,
         multi_agent: false,
         multi_agent_v2: false,
+        plugins: false,
+        remote_plugin: false,
         code_mode: {
           direct_only_tool_namespaces:
             index === 2 ? ['mcp__skills', 'mcp__open_science_plan'] : ['mcp__skills']
@@ -709,6 +712,36 @@ describe('codexFramework', () => {
     expect(config.persistentSystemPrompt).toBe('Stable bridge guidance.')
   })
 
+  it('uses the DeepSeek Responses API base documented for deepseek-flash', () => {
+    const framework = createCodexFramework()
+    const config = framework.prepareModelConfig(
+      {
+        type: 'official',
+        vendorId: 'deepseek',
+        apiEndpoints: ['anthropic', 'openai', 'responses'],
+        baseUrl: 'https://api.deepseek.com/anthropic',
+        openaiBaseUrl: 'https://api.deepseek.com/v1',
+        responsesBaseUrl: 'https://api.deepseek.com',
+        model: 'deepseek-flash',
+        key: 'sk-plaintext-secret'
+      },
+      {
+        storageRoot: '/data',
+        executablePath: '/runtime/codex-acp',
+        nativeVersion: CODEX_VERSION
+      }
+    )
+
+    expect(JSON.parse(config.env?.CODEX_CONFIG ?? '')).toMatchObject({
+      model_providers: {
+        'open-science': {
+          base_url: 'https://api.deepseek.com',
+          wire_api: 'responses'
+        }
+      }
+    })
+  })
+
   it('drives a native-Responses vendor directly on its OpenAI /v1 base, ignoring the bridge', () => {
     const framework = createCodexFramework()
     // A dual-endpoint vendor (e.g. MiniMax) advertises openai + responses and keeps its Anthropic
@@ -942,9 +975,12 @@ describe('codexFramework', () => {
         CODEX_HOME: join('/data', 'codex-subscription'),
         CODEX_CONFIG: JSON.stringify({
           features: {
+            apps: false,
             memories: false,
             multi_agent: false,
             multi_agent_v2: false,
+            plugins: false,
+            remote_plugin: false,
             code_mode: { direct_only_tool_namespaces: ['mcp__skills'] },
             shell_tool: false
           },
@@ -967,9 +1003,12 @@ describe('codexFramework', () => {
         CODEX_HOME: join('/data', 'codex-subscription'),
         CODEX_CONFIG: JSON.stringify({
           features: {
+            apps: false,
             memories: false,
             multi_agent: false,
             multi_agent_v2: false,
+            plugins: false,
+            remote_plugin: false,
             code_mode: { direct_only_tool_namespaces: ['mcp__skills'] },
             shell_tool: false
           },
