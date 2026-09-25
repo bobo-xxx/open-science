@@ -183,6 +183,9 @@ test('returns from Library to the originating conversation and New Conversation 
   const draft = 'Compare these findings with the references in our library.'
   await composer.fill(draft)
   await page.getByRole('button', { name: 'Library', exact: true }).click()
+  await expect(page.getByRole('region', { name: 'Library preview' })).toBeVisible()
+  await expect(composer).toBeVisible()
+  await page.getByRole('button', { name: 'Open in Literature', exact: true }).click()
   const back = page.getByRole('button', { name: 'Back to Project', exact: true })
   await expect(back).toBeVisible()
   await expect(page.getByRole('button', { name: 'Back to Home', exact: true })).toHaveCount(0)
@@ -201,6 +204,9 @@ test('returns from Library to the originating conversation and New Conversation 
   await page.getByRole('button', { name: 'New', exact: true }).click()
   await composer.fill('Unsent new conversation draft')
   await page.getByRole('button', { name: 'Library', exact: true }).click()
+  await expect(page.getByRole('region', { name: 'Library preview' })).toBeVisible()
+  await expect(composer).toBeVisible()
+  await page.getByRole('button', { name: 'Open in Literature', exact: true }).click()
   await back.click()
   await expect(page.getByRole('heading', { name: 'New conversation' })).toBeVisible()
   await expect(composer).toHaveText('Unsent new conversation draft')
@@ -288,7 +294,7 @@ test('explains disabled revision navigation while a turn is running', async ({ a
   await page.screenshot({ path: testInfo.outputPath('revision-navigation-idle.png') })
 })
 
-test('edits and navigates message revisions that persist after relaunch', async ({
+test('edits and navigates message revisions that persist after relaunch @pr-mainline-conversation', async ({
   app
 }, testInfo) => {
   await app.completeOnboarding()
@@ -422,7 +428,7 @@ test('keeps Memory reversible while the replacement session awaits history repla
     })
 })
 
-test('resolves Agent permission requests through both Allow and Deny decisions', async ({
+test('resolves Agent permission requests through both Allow and Deny decisions @pr-mainline-conversation', async ({
   app
 }) => {
   await app.completeOnboarding()
