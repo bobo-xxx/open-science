@@ -131,6 +131,9 @@
     "This Session package requires a newer version of Open Science. Update Open Science, then try importing it again.": "Este paquete de sesión requiere una versión más reciente de Open Science. Actualice Open Science y vuelva a importarlo."
   },
   "renderer": {
+    "Remembered for this project": "Recordar para este proyecto",
+    "Remembered across all projects": "Recordar para todos los proyectos",
+    "Try again when the connection is available, or close this dialog.": "Volver a intentar cuando la conexión esté disponible o cerrar este diálogo.",
     "The installed Claude Code CLI is incompatible or its version could not be verified. Update Claude Code to 2.1.118 or later, then re-detect it in Settings.": "La CLI de Claude Code instalada es incompatible o no se pudo verificar su versión. Actualice Claude Code a la versión 2.1.118 o posterior y vuelva a detectarla en la configuración.",
     "Other classification tokens": "Tokens de otras clasificaciones",
     "Literature classification tokens": "Tokens de clasificación de bibliografía",
@@ -1687,6 +1690,8 @@
     "Reconstructed directly from the immutable Execution Log · see <logLink>Execution Log</logLink> for the raw record": "Reconstruido directamente a partir del Registro de ejecución inmutable · consulte <logLink>Registro de ejecución</logLink> para obtener el registro sin formato",
     "Reconstructing directly from recorded helper and execution evidence.": "Reconstruyendo directamente a partir de las pruebas registradas del código auxiliar y de la ejecución.",
     "This script can be reconstructed directly from the immutable Execution Log.": "Este script puede reconstruirse directamente a partir del Registro de ejecución inmutable.",
+    "Interface scale": "Escala de la interfaz",
+    "Adjust the size of text and controls across the app. Changes apply immediately.": "Ajuste el tamaño del texto y los controles en toda la aplicación. Los cambios se aplican de inmediato.",
     "Language": "Idioma",
     "Large files (artifacts, notebooks, environments) go here. Your settings and history always stay in the default location. You can change this later in Settings.": "Los archivos grandes (artefactos, Notebooks y entornos) se guardan aquí. Sus ajustes y su historial permanecen siempre en la ubicación predeterminada. Puede cambiarlo más adelante en Configuración.",
     "Last checked {{time}}": "Última comprobación {{time}}",
@@ -2608,6 +2613,8 @@
     "Previous match": "Coincidencia anterior",
     "Next match": "Coincidencia siguiente",
     "Close search": "Cerrar búsqueda",
+    "Match case": "Distinguir mayúsculas y minúsculas",
+    "Whole word": "Palabra completa",
     "Remove PDF area": "Eliminar área del PDF",
     "Expand": "Expandir",
     "Collapse": "Contraer",
@@ -3945,9 +3952,9 @@
     "These files were moved aside so you can inspect or recover them manually.": "Estos archivos se apartaron para que pueda inspeccionarlos o recuperarlos manualmente.",
     "Project: {{projectId}}": "Proyecto: {{projectId}}",
     "Open recovery folder": "Abrir carpeta de recuperación",
-    "{{count}} damaged saved conversations were moved aside. Project archive stays unavailable because their state cannot be verified. You can still permanently delete the project._one": "Se apartó {{count}} conversación guardada dañada. El proyecto sigue sin poder archivarse porque no se puede verificar su estado. Aún puede eliminar el proyecto de forma permanente.",
-    "{{count}} damaged saved conversations were moved aside. Project archive stays unavailable because their state cannot be verified. You can still permanently delete the project._other": "Se apartaron {{count}} conversaciones guardadas dañadas. El proyecto sigue sin poder archivarse porque no se puede verificar su estado. Aún puede eliminar el proyecto de forma permanente.",
-    "{{count}} damaged saved conversations were moved aside. Project archive stays unavailable because their state cannot be verified. You can still permanently delete the project._many": "Se apartaron {{count}} conversaciones guardadas dañadas. El proyecto sigue sin poder archivarse porque no se puede verificar su estado. Aún puede eliminar el proyecto de forma permanente.",
+    "{{count}} damaged saved conversations were moved aside. Archiving remains unavailable for affected project data because its state cannot be verified. You can still permanently delete the affected project data._one": "Se apartó {{count}} conversación guardada dañada. El archivado de los datos afectados sigue sin estar disponible porque no se puede verificar su estado. Aún puede eliminar los datos afectados de forma permanente.",
+    "{{count}} damaged saved conversations were moved aside. Archiving remains unavailable for affected project data because its state cannot be verified. You can still permanently delete the affected project data._other": "Se apartaron {{count}} conversaciones guardadas dañadas. El archivado de los datos afectados sigue sin estar disponible porque no se puede verificar su estado. Aún puede eliminar los datos afectados de forma permanente.",
+    "{{count}} damaged saved conversations were moved aside. Archiving remains unavailable for affected project data because its state cannot be verified. You can still permanently delete the affected project data._many": "Se apartaron {{count}} conversaciones guardadas dañadas. El archivado de los datos afectados sigue sin estar disponible porque no se puede verificar su estado. Aún puede eliminar los datos afectados de forma permanente.",
     "Project index needs repair": "El índice del proyecto necesita reparación",
     "Saved conversations loaded, but the project index could not be rebuilt. Repair the index before archiving projects.": "Se cargaron las conversaciones guardadas, pero no se pudo reconstruir el índice del proyecto. Repare el índice antes de archivar proyectos.",
     "Some saved conversations could not be indexed. Repair the index before archiving projects.": "Algunas conversaciones guardadas no se pudieron indexar. Repare el índice antes de archivar proyectos.",
@@ -6611,6 +6618,14 @@
     "Start an update to see the screening process.": "Inicie una actualización para ver el proceso de selección.",
     "Pending candidates": "Candidatos pendientes",
     "Pause analysis": "Pausar análisis",
-    "Auto-approve workspace edits and supported Library workflows. Other tools follow their permission rules.": "Aprobar automáticamente las ediciones del espacio de trabajo y los flujos de la biblioteca compatibles. Las demás herramientas siguen sus reglas de permisos."
+    "Auto-approve workspace edits and supported Library workflows. Other tools follow their permission rules.": "Aprobar automáticamente las ediciones del espacio de trabajo y los flujos de la biblioteca compatibles. Las demás herramientas siguen sus reglas de permisos.",
+    "Continue for now": "Continuar por ahora",
+    "Your choice could not be saved. Continue for now to keep using this folder; we may ask again after restarting.": "No se pudo guardar su elección. Puede seguir usando esta carpeta por ahora; es posible que se le vuelva a preguntar después de reiniciar.",
+    "Could not send your response.": "No se pudo enviar su respuesta.",
+    "Restore the file or reconnect its drive before retrying. You can close this preview and continue working.": "Restaurar el archivo o volver a conectar su unidad antes de reintentar. Puede cerrar esta vista previa y seguir trabajando.",
+    "Open the file from your current storage location, or close this preview and continue working.": "Abrir el archivo desde la ubicación de almacenamiento actual o cerrar esta vista previa y seguir trabajando.",
+    "This conversation cannot continue until its Plan is restored or explicitly discarded. You can switch to another conversation while recovery continues.": "Esta conversación no puede continuar hasta que se restaure su plan o se descarte explícitamente. Puede cambiar a otra conversación mientras continúa la recuperación.",
+    "If recovery keeps failing, check that Open-Science is running on the host computer and that both devices are connected. Save a copy of unsent drafts before leaving this page.": "Si la recuperación sigue fallando, compruebe que Open-Science se esté ejecutando en el equipo anfitrión y que ambos dispositivos estén conectados. Guarde una copia de los borradores sin enviar antes de salir de esta página.",
+    "Appearance changed elsewhere. Review the current appearance before trying again.": "La apariencia se ha modificado en otro lugar. Revise la apariencia actual antes de volver a intentarlo."
   }
 }

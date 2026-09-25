@@ -129,6 +129,9 @@
     "This Session package requires a newer version of Open Science. Update Open Science, then try importing it again.": "此會話研究套件需要較新版本的 Open Science。請更新 Open Science 後重新匯入。"
   },
   "renderer": {
+    "Remembered for this project": "在此專案中記住授權",
+    "Remembered across all projects": "在所有專案中記住授權",
+    "Try again when the connection is available, or close this dialog.": "連線恢復後可重試，也可以關閉此對話框。",
     "The installed Claude Code CLI is incompatible or its version could not be verified. Update Claude Code to 2.1.118 or later, then re-detect it in Settings.": "已安裝的 Claude Code CLI 不相容或無法驗證其版本。請將 Claude Code 更新至 2.1.118 或更新版本，然後在設定中重新偵測。",
     "Other classification tokens": "其他分類詞元",
     "Literature classification tokens": "文獻分類詞元",
@@ -1705,6 +1708,8 @@
     "Reconstructed directly from the immutable Execution Log · see <logLink>Execution Log</logLink> for the raw record": "直接根據不可變執行日誌重建 · 原始記錄見<logLink>執行日誌</logLink>",
     "Reconstructing directly from recorded helper and execution evidence.": "正在直接根據已記錄的輔助程式碼和執行證據重建。",
     "This script can be reconstructed directly from the immutable Execution Log.": "此指令碼可直接根據不可變執行日誌重建。",
+    "Interface scale": "介面縮放",
+    "Adjust the size of text and controls across the app. Changes apply immediately.": "調整整個應用程式中的文字與控制項大小。變更會立即生效。",
     "Language": "語言",
     "Large files (artifacts, notebooks, environments) go here. Your settings and history always stay in the default location. You can change this later in Settings.": "大型檔案（產物、Notebook、環境）存放在這裡。你的設定和歷史記錄始終保留在預設位置。之後可以在「設定」中修改。",
     "Last checked {{time}}": "上次檢測於 {{time}}",
@@ -2602,6 +2607,8 @@
     "Previous match": "上一個相符項目",
     "Next match": "下一個相符項目",
     "Close search": "關閉搜尋",
+    "Match case": "區分大小寫",
+    "Whole word": "全詞比對",
     "Remove PDF area": "移除 PDF 區域",
     "Expand": "展開",
     "Collapse": "收合",
@@ -3760,7 +3767,7 @@
     "These files were moved aside so you can inspect or recover them manually.": "這些檔案已移至一旁，以便您手動檢查或復原。",
     "Project: {{projectId}}": "專案：{{projectId}}",
     "Open recovery folder": "開啟復原資料夾",
-    "{{count}} damaged saved conversations were moved aside. Project archive stays unavailable because their state cannot be verified. You can still permanently delete the project._other": "已移出 {{count}} 個損壞的已儲存對話。由於無法驗證它們的狀態，專案封存仍無法使用。你仍可永久刪除該專案。",
+    "{{count}} damaged saved conversations were moved aside. Archiving remains unavailable for affected project data because its state cannot be verified. You can still permanently delete the affected project data._other": "已移出 {{count}} 個損壞的已儲存對話。由於無法驗證其狀態，受影響的專案資料仍無法封存。你仍可永久刪除受影響的專案資料。",
     "Project index needs repair": "專案索引需要修復",
     "Saved conversations loaded, but the project index could not be rebuilt. Repair the index before archiving projects.": "已儲存的對話已載入，但無法重建專案索引。請先修復索引，再封存專案。",
     "Some saved conversations could not be indexed. Repair the index before archiving projects.": "部分已儲存的對話無法建立索引。請先修復索引，再封存專案。",
@@ -6287,6 +6294,14 @@
     "Start an update to see the screening process.": "開始更新後即可檢視篩選過程。",
     "Pending candidates": "待篩選論文",
     "Pause analysis": "暫停分析",
-    "Auto-approve workspace edits and supported Library workflows. Other tools follow their permission rules.": "自動核准工作區編輯和支援的文獻庫流程。其他工具遵循各自的權限規則。"
+    "Auto-approve workspace edits and supported Library workflows. Other tools follow their permission rules.": "自動核准工作區編輯和支援的文獻庫流程。其他工具遵循各自的權限規則。",
+    "Continue for now": "僅此次繼續",
+    "Your choice could not be saved. Continue for now to keep using this folder; we may ask again after restarting.": "無法儲存您的選擇。您可以僅此次繼續使用此資料夾；重新啟動後可能會再次詢問。",
+    "Could not send your response.": "無法傳送您的回應。",
+    "Restore the file or reconnect its drive before retrying. You can close this preview and continue working.": "請先還原檔案或重新連接其所在磁碟機，再重試。您可以關閉此預覽並繼續工作。",
+    "Open the file from your current storage location, or close this preview and continue working.": "請從目前的儲存位置開啟檔案，或關閉此預覽並繼續工作。",
+    "This conversation cannot continue until its Plan is restored or explicitly discarded. You can switch to another conversation while recovery continues.": "此對話需要還原或明確捨棄其計畫後才能繼續。還原期間，您可以切換到其他對話。",
+    "If recovery keeps failing, check that Open-Science is running on the host computer and that both devices are connected. Save a copy of unsent drafts before leaving this page.": "如果還原持續失敗，請檢查主機上的 Open-Science 是否正在執行，以及兩台裝置是否均已連線。離開此頁面前，請儲存未傳送草稿的副本。",
+    "Appearance changed elsewhere. Review the current appearance before trying again.": "外觀已在其他位置變更。請先檢查目前外觀，再重試。"
   }
 }
