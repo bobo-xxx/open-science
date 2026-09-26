@@ -1021,7 +1021,7 @@
     "Context compacted after run {{run}}": "Contexto compactado después de la ejecución {{run}}",
     "Context compaction cancelled": "Compactación de contexto cancelada",
     "Context compaction failed": "Falló la compactación del contexto",
-    "Earlier context is unchanged.": "El contexto anterior no ha cambiado.",
+    "Your conversation history is preserved.": "Se conserva el historial de la conversación.",
     "Earlier context was summarized so the session can continue.": "Se resumió el contexto anterior para que la sesión pueda continuar.",
     "Summarizing earlier context…": "Resumiendo el contexto anterior…",
     "Current composition": "Composición actual",
@@ -4927,6 +4927,7 @@
     "Kept": "Conservado",
     "Apply metadata": "Aplicar metadatos",
     "Use Crossref": "Usar Crossref",
+    "Use {{source}}": "Usar {{source}}",
     "Use PubMed": "Usar PubMed",
     "Rights": "Derechos",
     "Citation key": "Clave de cita",
@@ -6659,9 +6660,13 @@
     "No references on this page": "No hay referencias en esta página",
     "References may have moved or been removed. Return to the first page.": "Es posible que las referencias se hayan movido o eliminado. Vuelva a la primera página.",
     "First page": "Primera página",
+    "PDF text could not be read. For scanned pages, use a searchable PDF. Review the metadata before importing.": "No se pudo leer el texto del PDF. Para las páginas escaneadas, utilice un PDF con texto que se pueda buscar. Revise los metadatos antes de importar.",
+    "Some metadata could not be retrieved. Review the available details before importing.": "No se pudieron recuperar algunos metadatos. Revise la información disponible antes de importar.",
     "Running": "En ejecución",
     "Pinned": "Fijado",
     "Recent sessions": "Sesiones recientes",
-    "More": "Más"
+    "More": "Más",
+    "Codex CLI v{{minimumVersion}} or later is required. Update or repair Codex before using it.": "Se requiere Codex CLI v{{minimumVersion}} o una versión posterior. Actualice o repare Codex antes de usarlo.",
+    "Repair installs an app-managed Codex CLI without changing your external installation. You can also update it manually and re-detect.": "La reparación instala una CLI de Codex administrada por la aplicación sin modificar la instalación externa. También puede actualizarla manualmente y volver a detectarla."
   }
 }

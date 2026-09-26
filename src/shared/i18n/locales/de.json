@@ -962,7 +962,7 @@
     "Context compacted after run {{run}}": "Kontext nach Ausführung {{run}} komprimiert",
     "Context compaction cancelled": "Kontextkomprimierung abgebrochen",
     "Context compaction failed": "Kontextkomprimierung fehlgeschlagen",
-    "Earlier context is unchanged.": "Der frühere Kontext bleibt unverändert.",
+    "Your conversation history is preserved.": "Ihr Konversationsverlauf bleibt erhalten.",
     "Earlier context was summarized so the session can continue.": "Der frühere Kontext wurde zusammengefasst, damit die Sitzung fortgesetzt werden kann.",
     "Summarizing earlier context…": "Früherer Kontext wird zusammengefasst…",
     "Current composition": "Aktuelle Zusammensetzung",
@@ -4625,6 +4625,7 @@
     "Try a different search or add references from a research session.": "Versuchen Sie eine andere Suche oder fügen Sie Literaturangaben aus einer Forschungssitzung hinzu.",
     "URL": "URL",
     "Use Crossref": "Crossref verwenden",
+    "Use {{source}}": "{{source}} verwenden",
     "Use PubMed": "PubMed verwenden",
     "Use this reference in collections.": "Diese Literaturangabe in Sammlungen verwenden.",
     "Use this reference in projects.": "Diese Literaturangabe in Projekten verwenden.",
@@ -6493,9 +6494,13 @@
     "No references on this page": "Keine Literaturangaben auf dieser Seite",
     "References may have moved or been removed. Return to the first page.": "Literaturangaben wurden möglicherweise verschoben oder entfernt. Kehren Sie zur ersten Seite zurück.",
     "First page": "Erste Seite",
+    "PDF text could not be read. For scanned pages, use a searchable PDF. Review the metadata before importing.": "Der PDF-Text konnte nicht gelesen werden. Verwenden Sie für gescannte Seiten eine durchsuchbare PDF-Datei. Prüfen Sie die Metadaten vor dem Import.",
+    "Some metadata could not be retrieved. Review the available details before importing.": "Einige Metadaten konnten nicht abgerufen werden. Prüfen Sie die verfügbaren Angaben vor dem Import.",
     "Running": "Wird ausgeführt",
     "Pinned": "Angeheftet",
     "Recent sessions": "Letzte Sitzungen",
-    "More": "Mehr"
+    "More": "Mehr",
+    "Codex CLI v{{minimumVersion}} or later is required. Update or repair Codex before using it.": "Codex CLI v{{minimumVersion}} oder neuer ist erforderlich. Aktualisieren oder reparieren Sie Codex vor der Verwendung.",
+    "Repair installs an app-managed Codex CLI without changing your external installation. You can also update it manually and re-detect.": "Die Reparatur installiert eine von der App verwaltete Codex CLI, ohne Ihre externe Installation zu ändern. Sie können diese auch manuell aktualisieren und erneut erkennen lassen."
   }
 }

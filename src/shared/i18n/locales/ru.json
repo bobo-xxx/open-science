@@ -1030,7 +1030,7 @@
     "Context compacted after run {{run}}": "Контекст сжат после запуска {{run}}",
     "Context compaction cancelled": "Сжатие контекста отменено",
     "Context compaction failed": "Сбой сжатия контекста",
-    "Earlier context is unchanged.": "Предыдущий контекст не изменён.",
+    "Your conversation history is preserved.": "История вашего диалога сохранена.",
     "Earlier context was summarized so the session can continue.": "Предыдущий контекст был кратко изложен, чтобы продолжить сеанс.",
     "Summarizing earlier context…": "Составляется краткое изложение предыдущего контекста…",
     "Current composition": "Текущая композиция",
@@ -5050,6 +5050,7 @@
     "Kept": "Сохранено",
     "Apply metadata": "Применить метаданные",
     "Use Crossref": "Использовать Crossref",
+    "Use {{source}}": "Использовать {{source}}",
     "Use PubMed": "Использовать PubMed",
     "Rights": "Права",
     "Citation key": "Ключ цитирования",
@@ -6796,9 +6797,13 @@
     "No references on this page": "На этой странице нет источников",
     "References may have moved or been removed. Return to the first page.": "Возможно, источники перемещены или удалены. Вернитесь на первую страницу.",
     "First page": "Первая страница",
+    "PDF text could not be read. For scanned pages, use a searchable PDF. Review the metadata before importing.": "Не удалось прочитать текст PDF. Для отсканированных страниц используйте PDF с возможностью поиска по тексту. Проверьте метаданные перед импортом.",
+    "Some metadata could not be retrieved. Review the available details before importing.": "Не удалось получить часть метаданных. Проверьте доступные сведения перед импортом.",
     "Running": "Запущено",
     "Pinned": "Фиксировано",
     "Recent sessions": "Последние сессии",
-    "More": "Больше"
+    "More": "Больше",
+    "Codex CLI v{{minimumVersion}} or later is required. Update or repair Codex before using it.": "Требуется Codex CLI v{{minimumVersion}} или новее. Перед использованием обновите или восстановите Codex.",
+    "Repair installs an app-managed Codex CLI without changing your external installation. You can also update it manually and re-detect.": "Восстановление установит Codex CLI под управлением приложения, не изменяя внешнюю установку. Вы также можете обновить её вручную и повторить обнаружение."
   }
 }
