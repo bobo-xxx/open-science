@@ -1013,7 +1013,6 @@
     "Choose what the titlebar close button does.": "设置标题栏关闭按钮的行为。",
     "Choose which coding-agent backend drives your sessions. Select a card to switch; switching starts a fresh agent session, and open conversations have their transcript replayed to the new backend. The active runtime can't be uninstalled — switch to the other one first.": "选择驱动会话的编码智能体后端。选中一张卡片即可切换；切换会开启一个全新的智能体会话，已打开的对话会把其记录重放到新后端。当前使用中的运行时无法卸载 —— 请先切换到另一个。",
     "Choose who can reach this computer's Open-Science workspace. All projects, agents, files, and notebook runtimes continue to run on this computer. Install and sign in to the Remote.It desktop app before enabling access. <lnk>Download Remote.It App</lnk>": "选择谁可以访问此计算机上的 Open-Science 工作区。所有项目、智能体、文件和 Notebook 运行时将继续在此计算机上运行。请在启用访问权限之前安装并登录 Remote.It 桌面应用。<lnk>下载 Remote.It 应用</lnk>",
-    "Chromium v": "Chromium 版本 ",
     "Claude authentication": "Claude 认证方式",
     "Claude setup token": "Claude 设置令牌",
     "Claude sign-out did not complete. Try again.": "Claude 退出未完成。重试一次。",
@@ -1416,7 +1415,6 @@
     "Elapsed time": "已用时间",
     "Elapsed {{duration}}": "耗时 {{duration}}",
     "Elapsed {{time}}": "已用 {{time}}",
-    "Electron v": "Electron 版本 ",
     "Empty directory": "空目录",
     "Empty folder": "空文件夹",
     "Empty prompt": "空提示",
@@ -2010,7 +2008,6 @@
     "No skills match your search.": "没有技能符合你的搜索。",
     "No Specialists installed yet.": "尚未安装专家。",
     "No subfolders.": "没有子文件夹。",
-    "Node v": "Node 版本 ",
     "None": "无",
     "Not available yet.": "暂不可用。",
     "The app could not write to the log file during its most recent attempt.": "应用在最近一次尝试中无法写入日志文件。",
@@ -6394,6 +6391,12 @@
     "Attach files in the conversation. Research tasks save generated files here.": "在对话中附加文件。研究任务生成的文件会保存在这里。",
     "Predict regulatory signals from DNA sequences.": "根据 DNA 序列预测调控信号。",
     "Added {{date}}": "添加于 {{date}}",
-    "Choose your provider. Use Custom Gateway for a compatible endpoint or a local model server.": "选择供应商。兼容端点或本地模型服务可使用自定义网关。"
+    "Choose your provider. Use Custom Gateway for a compatible endpoint or a local model server.": "选择供应商。兼容端点或本地模型服务可使用自定义网关。",
+    "A runtime operation is in progress. Wait for it to finish, then try again.": "正在处理运行时操作，请完成后重试。",
+    "This runtime is being set up. Wait for setup to finish, then try again.": "正在设置此运行时，请设置完成后重试。",
+    "Select a personal R library before allowing package installation. Use Advanced options to choose an existing folder.": "请先选择个人 R 包库，再允许安装软件包。可在“高级选项”中选择已有文件夹。",
+    "Turn off Allow package install before changing the personal R library.": "请先关闭“允许安装软件包”，再更换个人 R 包库。",
+    "Enable this R runtime before authorizing access.": "请先启用此 R 运行时，再授权访问。",
+    "This R runtime is not runnable. Resolve its reported issue, then click Recheck.": "此 R 运行时无法运行。请解决显示的问题，然后点击“重新检测”。"
   }
 }
