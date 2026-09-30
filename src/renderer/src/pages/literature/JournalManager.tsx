@@ -20,6 +20,7 @@ import {
   Eye,
   EyeOff,
   Hash,
+  Info,
   List,
   ListChecks,
   LoaderCircle,
@@ -44,7 +45,9 @@ import { useFileDropZone } from '@/hooks/useFileDropZone'
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
+  SelectLabel,
   SelectSeparator,
   SelectTrigger,
   SelectValue
@@ -2632,11 +2635,18 @@ export const JournalManager = memo(function JournalManager({
               )}
             </p>
           ) : null}
-          <p className="text-xs text-muted-foreground">
-            {t(
-              'Original column and Example value come from your file. Import as controls matching or storing. Saved name and Value type apply to journal attributes. Skipped columns are not saved.'
-            )}
-          </p>
+          <div className="space-y-1 text-xs text-muted-foreground">
+            <p>
+              {t(
+                'Use identity columns to match journals. Choose Journal attribute for values to show and filter in the literature table.'
+              )}
+            </p>
+            <p>
+              {t(
+                'Saved name and Value type apply only to journal attributes. Skipped columns are not saved.'
+              )}
+            </p>
+          </div>
           {dataset ? (
             <label className="flex items-center gap-2 text-xs">
               {t('Existing values')}
@@ -2699,14 +2709,51 @@ export const JournalManager = memo(function JournalManager({
                             })}
                             className="w-full max-w-40 min-w-0"
                           >
-                            <SelectValue />
+                            <SelectValue>{roles[column.role]}</SelectValue>
                           </SelectTrigger>
-                          <SelectContent>
-                            {Object.entries(roles).map(([value, label]) => (
-                              <SelectItem key={value} value={value}>
-                                {label}
-                              </SelectItem>
-                            ))}
+                          <SelectContent className="w-60 max-w-[calc(100vw-2rem)]">
+                            <SelectItem value="ignore">{roles.ignore}</SelectItem>
+                            <SelectSeparator />
+                            <SelectGroup>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <SelectLabel className="flex items-center gap-1.5 py-2 font-semibold">
+                                    {t('Identify journals')}
+                                    <Info className="size-3.5" aria-hidden="true" />
+                                  </SelectLabel>
+                                </TooltipTrigger>
+                                <TooltipContent side="right">
+                                  {t('Used for matching, not as attribute columns.')}
+                                </TooltipContent>
+                              </Tooltip>
+                              {(['name', 'alias', 'issn', 'externalId'] as const).map((value) => (
+                                <Tooltip key={value}>
+                                  <TooltipTrigger asChild>
+                                    <SelectItem value={value}>{roles[value]}</SelectItem>
+                                  </TooltipTrigger>
+                                  <TooltipContent side="right">
+                                    {t('Used for matching, not as attribute columns.')}
+                                  </TooltipContent>
+                                </Tooltip>
+                              ))}
+                            </SelectGroup>
+                            <SelectSeparator />
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <SelectItem value="attribute">
+                                  <span className="flex items-center gap-1.5">
+                                    {roles.attribute}
+                                    <Info
+                                      className="size-3.5 text-muted-foreground"
+                                      aria-hidden="true"
+                                    />
+                                  </span>
+                                </SelectItem>
+                              </TooltipTrigger>
+                              <TooltipContent side="right">
+                                {t('Show and filter these columns in the literature table.')}
+                              </TooltipContent>
+                            </Tooltip>
                           </SelectContent>
                         </Select>
                       </td>
