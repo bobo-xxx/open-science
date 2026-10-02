@@ -5,6 +5,11 @@ export function connectorDescription(
   connector: { id: string; description: string; sources?: string[] },
   t: TFunction
 ): string {
+  if (connector.id === 'cellosaurus') {
+    return t(
+      'Cell line identity, origin, diseases, quality records and database mappings from Cellosaurus.'
+    )
+  }
   if (connector.id === 'monarch') {
     return t(
       'Disease and gene phenotype associations with evidence sources via Monarch Initiative.'
@@ -58,6 +63,12 @@ export function connectorDescription(
 
 export function connectorToolDescription(id: string, fallback: string, t: TFunction): string {
   switch (id) {
+    case 'cellosaurus/search_cell_lines':
+      return t('Search cell lines by name or synonym.')
+    case 'cellosaurus/get_cell_line':
+      return t(
+        'Retrieve cell line identity, origin, quality records and database mappings by CVCL or RRID.'
+      )
     case 'monarch/monarch_get_disease_phenotypes':
       return t('Retrieve disease–phenotype associations with evidence sources and relation types.')
     case 'monarch/monarch_get_gene_phenotypes':
@@ -201,6 +212,14 @@ export function connectorToolDescription(id: string, fallback: string, t: TFunct
       return t('List Enrichr gene-set libraries and their coverage statistics for an organism.')
     case 'genes/enrich_gene_set_enrichr':
       return t('Run Enrichr enrichment for gene symbols or identifiers.')
+    case 'omics-archives/geo_get_series':
+      return t('Retrieve GEO series metadata, samples and supplementary-file links.')
+    case 'omics-archives/geo_get_matrix_files':
+      return t('Find GEO Series Matrix and NCBI RNA-seq count file links for manual download.')
+    case 'omics-archives/geo_preflight_matrix':
+      return t(
+        'Check decompressed GEO matrix structure, dimensions and sample alignment before analysis.'
+      )
     case 'omics-archives/workbench_search_compounds':
       return t('Look up Metabolomics Workbench compound structures and cross-references.')
     case 'omics-archives/workbench_search_studies':

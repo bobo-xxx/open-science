@@ -296,7 +296,7 @@ export const CONNECTOR_CATALOG: ConnectorMeta[] = [
     description:
       'Omics data archives — expression (ArrayExpress, GEO), sequencing reads (ENA), metabolomics (MetaboLights, Metabolomics Workbench), metagenomics (MGnify) and proteomics (PRIDE).',
     useWhen:
-      'Use when finding or looking up omics datasets across the major archives — functional-genomics / expression experiments in ArrayExpress (BioStudies) or NCBI GEO series (by keyword, organism, assay, or accession, with per-sample metadata); metabolomics studies and data files in MetaboLights (MTBLS), or Metabolomics Workbench (ST) study records, samples, experimental factors, analysis metadata and compound structures/cross-references; metagenomics studies, analyses and downloadable result files in MGnify (MGYS, by free text or biome lineage); or proteomics projects, proteins and paged project file inventories with download locations in PRIDE Archive (PXD/PRD, by keyword/organism/instrument/disease, or protein↔project). Discover ENA sequencing runs by taxonomy, library strategy and title/description keywords, or resolve ENA/INSDC study, experiment or sample accessions to runs. List archive-generated FASTQ URLs or original submitted file locations (including BAM/CRAM), sizes and MD5 checksums for a run; resolve GEO/ArrayExpress/MGnify IDs to linked INSDC accessions first. Sourced from ArrayExpress, GEO, ENA, MetaboLights, Metabolomics Workbench, MGnify and PRIDE.',
+      'Use when finding or looking up omics datasets across the major archives — functional-genomics / expression experiments in ArrayExpress (BioStudies) or NCBI GEO series (by keyword, organism, assay, or accession, with per-sample metadata); metabolomics studies and data files in MetaboLights (MTBLS), or Metabolomics Workbench (ST) study records, samples, experimental factors, analysis metadata and compound structures/cross-references; metagenomics studies, analyses and downloadable result files in MGnify (MGYS, by free text or biome lineage); or proteomics projects, proteins and paged project file inventories with download locations in PRIDE Archive (PXD/PRD, by keyword/organism/instrument/disease, or protein↔project). Discover GEO Series Matrix and NCBI-generated RNA-seq count files, then preflight decompressed matrix format, dimensions and sample correspondence with geo_preflight_matrix. Discover ENA sequencing runs by taxonomy, library strategy and title/description keywords, or resolve ENA/INSDC study, experiment or sample accessions to runs. List archive-generated FASTQ URLs or original submitted file locations (including BAM/CRAM), sizes and MD5 checksums for a run; resolve GEO/ArrayExpress/MGnify IDs to linked INSDC accessions first. Sourced from ArrayExpress, GEO, ENA, MetaboLights, Metabolomics Workbench, MGnify and PRIDE.',
     sources: [
       'ArrayExpress',
       'GEO',
@@ -320,6 +320,19 @@ export const CONNECTOR_CATALOG: ConnectorMeta[] = [
     sources: ['CELLxGENE Discover'],
     termsUrl: 'https://cellxgene.cziscience.com/',
     requiresNcbi: false
+  },
+  {
+    id: 'cellosaurus',
+    displayName: 'Cellosaurus',
+    aliases: ['Cellosaurus', 'cell line identity', 'CVCL'],
+    description:
+      'Cell line identity, origin, diseases, quality records and database mappings from Cellosaurus.',
+    useWhen:
+      'Use for laboratory cell line identity and curated quality information: search names and aliases, resolve CVCL or RRID:CVCL identifiers, inspect species/tissue origin and donor disease, known contamination or misidentification, ICLAC registrations, and external database mappings. Search returns candidates; select an accession before requesting details. No recorded problem does not certify a sample. This read-only API requires no authentication.',
+    sources: ['Cellosaurus'],
+    termsUrl: 'https://www.cellosaurus.org/description.html',
+    requiresNcbi: false,
+    group: 'directory'
   },
   {
     id: 'cellguide',
