@@ -134,6 +134,9 @@
     "More items": "Weitere Sitzungen"
   },
   "renderer": {
+    "Disease and gene phenotype associations with evidence sources via Monarch Initiative.": "Krankheits- und Gen-Phänotyp-Assoziationen mit Evidenzquellen über Monarch Initiative.",
+    "Retrieve disease–phenotype associations with evidence sources and relation types.": "Krankheits-Phänotyp-Assoziationen mit Evidenzquellen und Beziehungstypen abrufen.",
+    "Retrieve gene–phenotype associations with evidence sources and relation types.": "Gen-Phänotyp-Assoziationen mit Evidenzquellen und Beziehungstypen abrufen.",
     "Public collections, datasets, versions and file download links from CELLxGENE Discover.": "Öffentliche Sammlungen, Datensätze, Versionen und Datei-Downloadlinks von CELLxGENE Discover.",
     "Search public CELLxGENE Discover collections.": "Öffentliche Sammlungen in CELLxGENE Discover suchen.",
     "Retrieve collection metadata and a page of datasets.": "Sammlungsmetadaten und eine Seite mit Datensätzen abrufen.",
@@ -5838,7 +5841,6 @@
     "read-only history": "schreibgeschützten Verlauf lesen",
     "continue research": "Forschung fortsetzen",
     "Choose a .science file": "Eine .science-Datei auswählen",
-    "Drop files": "Dateien ablegen",
     "Models": "Modelle",
     "Model source": "Modellquelle",
     "Local parsing models": "Lokale Analysemodelle",
@@ -5879,7 +5881,9 @@
     "Find candidate figures, captions and copyable tables in Literature PDFs.": "Kandidaten für Abbildungen, Beschriftungen und kopierbare Tabellen in Literatur-PDFs finden.",
     "Manage optional local capabilities. Download their resources when needed.": "Optionale lokale Funktionen verwalten. Ressourcen bei Bedarf herunterladen.",
     "PDF figures and tables": "PDF-Abbildungen und -Tabellen",
-    "Display limit reached. Remaining pages were not processed.": "Anzeigelimit erreicht. Verbleibende Seiten wurden nicht verarbeitet.",
+    "Parallel pages": "Parallele Seiten",
+    "1x, 2x, or 4x analyzes 1, 2, or 4 pages at a time. Higher settings can be faster but use more memory. Results stay in page order.": "1x, 2x oder 4x analysiert 1, 2 oder 4 Seiten gleichzeitig. Höhere Werte können schneller sein, benötigen aber mehr Arbeitsspeicher. Die Ergebnisse bleiben in Seitenreihenfolge.",
+    "Display limit reached. Some analyzed pages are not shown.": "Anzeigelimit erreicht. Einige analysierte Seiten werden nicht angezeigt.",
     "PDF parsing results": "PDF-Analyseergebnisse",
     "PDF reading mode": "PDF-Lesemodus",
     "Original PDF": "Original-PDF",
@@ -6262,7 +6266,6 @@
     "Unsupported native annotations: {{count}}_other": "Nicht unterstützte native Anmerkung: {{count}}",
     "Native annotation import failed.": "Native Anmerkungen konnten nicht importiert werden.",
     "Native annotation import limit reached. Some annotations were not imported.": "Das Importlimit für native Anmerkungen wurde erreicht. Einige Anmerkungen wurden nicht importiert.",
-    "Widen the window to show notes beside the PDF": "Verbreitern Sie das Fenster, um Notizen neben dem PDF anzuzeigen",
     "Show notes sidebar": "Notizseitenleiste anzeigen",
     "Hide notes sidebar": "Notizseitenleiste ausblenden",
     "Resize notes sidebar": "Breite der Notizseitenleiste ändern",
@@ -6967,6 +6970,11 @@
     "Full screen": "Vollbild",
     "Documentation": "Dokumentation",
     "Load earlier messages": "Frühere Nachrichten laden",
-    "Return to current step": "Zum aktuellen Schritt zurückkehren"
+    "Return to current step": "Zum aktuellen Schritt zurückkehren",
+    "File access failed. System permissions or Notebook protection may be responsible.": "Der Dateizugriff ist fehlgeschlagen. Die Ursache können Systemberechtigungen oder der Notebook-Schutz sein.",
+    "Folder access was updated. Run the command again when you are ready.": "Der Ordnerzugriff wurde aktualisiert. Führen Sie den Befehl erneut aus, wenn Sie bereit sind.",
+    "This folder permission applies across Sessions until you revoke it in Files. Commands will not run automatically.": "Diese Ordnerberechtigung gilt sitzungsübergreifend, bis Sie sie unter Dateien widerrufen. Befehle werden nicht automatisch ausgeführt.",
+    "Drop files to attach or import a .science package": "Dateien zum Anhängen oder ein .science-Paket zum Importieren ablegen",
+    "Files cannot be attached right now.": "Dateien können derzeit nicht angehängt werden."
   }
 }

@@ -136,6 +136,9 @@
     "More items": "Другие сеансы"
   },
   "renderer": {
+    "Disease and gene phenotype associations with evidence sources via Monarch Initiative.": "Связи заболеваний и генов с фенотипами и источники доказательств через Monarch Initiative.",
+    "Retrieve disease–phenotype associations with evidence sources and relation types.": "Получить связи заболеваний с фенотипами, источники доказательств и типы отношений.",
+    "Retrieve gene–phenotype associations with evidence sources and relation types.": "Получить связи генов с фенотипами, источники доказательств и типы отношений.",
     "Public collections, datasets, versions and file download links from CELLxGENE Discover.": "Общедоступные коллекции, наборы данных, версии и ссылки на скачивание файлов из CELLxGENE Discover.",
     "Search public CELLxGENE Discover collections.": "Поиск общедоступных коллекций CELLxGENE Discover.",
     "Retrieve collection metadata and a page of datasets.": "Получение метаданных коллекции и одной страницы наборов данных.",
@@ -6133,7 +6136,6 @@
     "read-only history": "прочитать историю только для чтения",
     "continue research": "продолжить исследование",
     "Choose a .science file": "Выбрать файл .science",
-    "Drop files": "Перетащите файлы",
     "Models": "Модели",
     "Model source": "Источник модели",
     "Local parsing models": "Локальные модели разбора",
@@ -6174,7 +6176,9 @@
     "Find candidate figures, captions and copyable tables in Literature PDFs.": "Поиск кандидатов рисунков, подписей и копируемых таблиц в PDF библиотеки.",
     "Manage optional local capabilities. Download their resources when needed.": "Управление дополнительными локальными возможностями. Скачивайте ресурсы по мере необходимости.",
     "PDF figures and tables": "Рисунки и таблицы PDF",
-    "Display limit reached. Remaining pages were not processed.": "Достигнут предел отображения. Остальные страницы не обработаны.",
+    "Parallel pages": "Параллельные страницы",
+    "1x, 2x, or 4x analyzes 1, 2, or 4 pages at a time. Higher settings can be faster but use more memory. Results stay in page order.": "1x, 2x или 4x означает анализ 1, 2 или 4 страниц одновременно. Более высокие значения могут ускорить анализ, но требуют больше памяти. Результаты сохраняют порядок страниц.",
+    "Display limit reached. Some analyzed pages are not shown.": "Достигнут предел отображения. Некоторые проанализированные страницы не показаны.",
     "PDF parsing results": "Результаты разбора PDF",
     "PDF reading mode": "Режим чтения PDF",
     "Original PDF": "Исходный PDF",
@@ -6567,7 +6571,6 @@
     "Unsupported native annotations: {{count}}_other": "Неподдерживаемая нативная аннотация: {{count}}",
     "Native annotation import failed.": "Не удалось импортировать встроенные аннотации.",
     "Native annotation import limit reached. Some annotations were not imported.": "Достигнут лимит импорта встроенных аннотаций. Некоторые аннотации не импортированы.",
-    "Widen the window to show notes beside the PDF": "Расширьте окно, чтобы показать заметки рядом с PDF",
     "Show notes sidebar": "Показать панель заметок",
     "Hide notes sidebar": "Скрыть панель заметок",
     "Resize notes sidebar": "Изменить ширину панели заметок",
@@ -7274,6 +7277,11 @@
     "Full screen": "Полный экран",
     "Documentation": "Документация",
     "Load earlier messages": "Загрузить предыдущие сообщения",
-    "Return to current step": "Вернуться к текущему шагу"
+    "Return to current step": "Вернуться к текущему шагу",
+    "File access failed. System permissions or Notebook protection may be responsible.": "Не удалось получить доступ к файлу. Причиной могут быть системные разрешения или защита Notebook.",
+    "Folder access was updated. Run the command again when you are ready.": "Доступ к папке обновлён. Запустите команду повторно, когда будете готовы.",
+    "This folder permission applies across Sessions until you revoke it in Files. Commands will not run automatically.": "Это разрешение для папки действует во всех сессиях, пока вы не отзовёте его в разделе «Файлы». Команды не будут запускаться автоматически.",
+    "Drop files to attach or import a .science package": "Перетащите файлы для прикрепления или пакет .science для импорта",
+    "Files cannot be attached right now.": "Сейчас невозможно прикрепить файлы."
   }
 }

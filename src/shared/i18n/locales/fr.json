@@ -135,6 +135,9 @@
     "More items": "Plus de sessions"
   },
   "renderer": {
+    "Disease and gene phenotype associations with evidence sources via Monarch Initiative.": "Associations entre maladies, gènes et phénotypes avec les sources de preuves via Monarch Initiative.",
+    "Retrieve disease–phenotype associations with evidence sources and relation types.": "Récupérer les associations maladie–phénotype avec les sources de preuves et les types de relations.",
+    "Retrieve gene–phenotype associations with evidence sources and relation types.": "Récupérer les associations gène–phénotype avec les sources de preuves et les types de relations.",
     "Public collections, datasets, versions and file download links from CELLxGENE Discover.": "Collections publiques, jeux de données, versions et liens de téléchargement de fichiers de CELLxGENE Discover.",
     "Search public CELLxGENE Discover collections.": "Rechercher des collections publiques de CELLxGENE Discover.",
     "Retrieve collection metadata and a page of datasets.": "Récupérer les métadonnées d’une collection et une page de jeux de données.",
@@ -6000,7 +6003,6 @@
     "read-only history": "lire l’historique en lecture seule",
     "continue research": "poursuivre la recherche",
     "Choose a .science file": "Choisir un fichier .science",
-    "Drop files": "Déposez des fichiers",
     "Models": "Modèles",
     "Model source": "Source du modèle",
     "Local parsing models": "Modèles d’analyse locaux",
@@ -6041,7 +6043,9 @@
     "Find candidate figures, captions and copyable tables in Literature PDFs.": "Repérer des figures, légendes et tableaux copiables candidats dans les PDF de la bibliothèque.",
     "Manage optional local capabilities. Download their resources when needed.": "Gérez les fonctionnalités locales facultatives. Téléchargez leurs ressources au besoin.",
     "PDF figures and tables": "Figures et tableaux PDF",
-    "Display limit reached. Remaining pages were not processed.": "Limite d’affichage atteinte. Les pages restantes n’ont pas été traitées.",
+    "Parallel pages": "Pages en parallèle",
+    "1x, 2x, or 4x analyzes 1, 2, or 4 pages at a time. Higher settings can be faster but use more memory. Results stay in page order.": "1x, 2x ou 4x analyse 1, 2 ou 4 pages à la fois. Une valeur plus élevée peut accélérer l’analyse, mais utilise davantage de mémoire. Les résultats restent dans l’ordre des pages.",
+    "Display limit reached. Some analyzed pages are not shown.": "Limite d’affichage atteinte. Certaines pages analysées ne sont pas affichées.",
     "PDF parsing results": "Résultats d’analyse PDF",
     "PDF reading mode": "Mode de lecture PDF",
     "Original PDF": "PDF original",
@@ -6429,7 +6433,6 @@
     "Unsupported native annotations: {{count}}_other": "Annotation native non prise en charge: {{count}}",
     "Native annotation import failed.": "Échec de l’importation des annotations natives.",
     "Native annotation import limit reached. Some annotations were not imported.": "La limite d’importation des annotations natives a été atteinte. Certaines annotations n’ont pas été importées.",
-    "Widen the window to show notes beside the PDF": "Élargissez la fenêtre pour afficher les notes à côté du PDF",
     "Show notes sidebar": "Afficher le panneau des notes",
     "Hide notes sidebar": "Masquer le panneau des notes",
     "Resize notes sidebar": "Redimensionner le panneau des notes",
@@ -7135,6 +7138,11 @@
     "Full screen": "Plein écran",
     "Documentation": "Documentation",
     "Load earlier messages": "Charger les messages précédents",
-    "Return to current step": "Revenir à l’étape actuelle"
+    "Return to current step": "Revenir à l’étape actuelle",
+    "File access failed. System permissions or Notebook protection may be responsible.": "L’accès au fichier a échoué. Cela peut être dû aux autorisations du système ou à la protection de Notebook.",
+    "Folder access was updated. Run the command again when you are ready.": "L’accès au dossier a été mis à jour. Relancez la commande lorsque vous le souhaitez.",
+    "This folder permission applies across Sessions until you revoke it in Files. Commands will not run automatically.": "Cette autorisation de dossier s’applique à toutes les sessions jusqu’à sa révocation dans Fichiers. Les commandes ne seront pas exécutées automatiquement.",
+    "Drop files to attach or import a .science package": "Déposez des fichiers à joindre ou un paquet .science à importer",
+    "Files cannot be attached right now.": "Impossible de joindre des fichiers pour le moment."
   }
 }

@@ -122,6 +122,7 @@ import {
 } from '../pdf-region-evidence'
 import { PdfOutlineSidebar, type PdfOutlineItem } from './PdfOutlineSidebar'
 import { PdfFiguresView } from './PdfFiguresView'
+import type { PdfStructureSource } from '../../../../../../shared/pdf-structure'
 import { PdfNotebookView } from './PdfNotebookView'
 import {
   countPdfSearchOccurrences,
@@ -2048,6 +2049,7 @@ export const PdfPreviewContent = ({
   annotationProps,
   pdfEvidenceSource,
   pdfBookmarkSource,
+  structureSource,
   pdfBookmarkSourceUnavailable = false,
   pdfRevealSource,
   nativeImportProgress,
@@ -2067,6 +2069,7 @@ export const PdfPreviewContent = ({
   onReadingPositionChange?: PreviewFileRendererProps['onPdfReadingPositionChange']
   annotationProps?: PreviewFileRendererProps
   pdfEvidenceSource?: PdfAnnotation['source']
+  structureSource?: PdfStructureSource
   pdfBookmarkSource?: PdfAnnotationSource
   pdfBookmarkSourceUnavailable?: boolean
   pdfRevealSource?: PdfAnnotation['source']
@@ -2081,6 +2084,10 @@ export const PdfPreviewContent = ({
     source === 'literature'
       ? (parseLiteratureAttachmentVersionReference(path) ?? undefined)
       : undefined
+  const figuresSource = useMemo<PdfStructureSource | undefined>(
+    () => structureSource ?? (attachmentVersionId ? { attachmentVersionId } : undefined),
+    [structureSource, attachmentVersionId]
+  )
   const requestKey = createPreviewResourceKey({
     projectId,
     sessionId,
@@ -2120,16 +2127,17 @@ export const PdfPreviewContent = ({
   const notesResizeRef = useRef<
     { pointerId: number; startX: number; startWidth: number } | undefined
   >(undefined)
-  const hasReadingTabs =
-    Boolean(attachmentVersionId || pdfBookmarkSource) && presentation !== 'search'
-  const canShowNotesSidebar =
-    presentation !== 'search' && readerWidth >= NOTES_SIDEBAR_MIN_READER_WIDTH
-  const showNotesSidebar = canShowNotesSidebar && notesOpen && readingMode === 'original'
+  const hasNotes = Boolean(attachmentVersionId || pdfBookmarkSource)
+  const hasReadingTabs = Boolean(figuresSource || pdfBookmarkSource) && presentation !== 'search'
+  const showNotesSidebar = presentation !== 'search' && notesOpen && readingMode === 'original'
+  const floatingNotes = showNotesSidebar && readerWidth < NOTES_SIDEBAR_MIN_READER_WIDTH
   const maxNotesWidth = Math.min(
     NOTES_SIDEBAR_MAX_WIDTH,
     Math.max(NOTES_SIDEBAR_MIN_WIDTH, readerWidth - 752)
   )
-  const effectiveNotesWidth = Math.min(notesWidth, maxNotesWidth)
+  const effectiveNotesWidth = floatingNotes
+    ? Math.max(0, Math.min(320, readerWidth - 16))
+    : Math.min(notesWidth, maxNotesWidth)
   const resizeNotes = (width: number): void =>
     setNotesWidth(Math.max(NOTES_SIDEBAR_MIN_WIDTH, Math.min(maxNotesWidth, width)))
   const [currentPage, setCurrentPage] = useState(1)
@@ -2796,7 +2804,7 @@ export const PdfPreviewContent = ({
           ['area', 'area-annotation', 'text-annotation'].includes(cursorMode)
         }
         data-preview-escape-boundary={
-          source === 'literature' && selectedBookmarkId ? '' : undefined
+          floatingNotes || (source === 'literature' && selectedBookmarkId) ? '' : undefined
         }
         onKeyDown={(event) => {
           // Portalled panels remain mounted during exit motion. Let their own
@@ -2816,6 +2824,13 @@ export const PdfPreviewContent = ({
             event.preventDefault()
             event.stopPropagation()
             setSelectedBookmarkId(undefined)
+            return
+          }
+          if (event.key === 'Escape' && !event.nativeEvent.isComposing && floatingNotes) {
+            event.preventDefault()
+            event.stopPropagation()
+            setNotesOpen(false)
+            notesToggleRef.current?.focus()
             return
           }
           if (
@@ -3024,7 +3039,7 @@ export const PdfPreviewContent = ({
                 </Tabs.Trigger>
                 <PdfToolbarTooltip plain side="bottom" label={t('Original PDF')} />
               </Tooltip>
-              {attachmentVersionId ? (
+              {figuresSource ? (
                 <Tooltip>
                   <Tabs.Trigger
                     value="figures"
@@ -3052,49 +3067,44 @@ export const PdfPreviewContent = ({
                   <PdfToolbarTooltip plain side="bottom" label={t('Figures & Tables')} />
                 </Tooltip>
               ) : null}
-              <Tooltip>
-                <Tabs.Trigger
-                  value="notes"
-                  ref={notesTabRef}
-                  aria-controls={notebookPanelId}
-                  className="flex h-full min-w-0 items-center gap-1.5 whitespace-nowrap border-b-2 border-transparent px-1 text-xs text-muted-foreground data-[state=active]:border-primary data-[state=active]:font-semibold data-[state=active]:text-primary focus-visible:outline-ring"
-                  asChild
-                >
-                  <TooltipTrigger>
-                    <NotebookPen className="size-3.5 shrink-0" aria-hidden="true" />
-                    <span className="truncate">{t('Notes & Annotations')}</span>
-                  </TooltipTrigger>
-                </Tabs.Trigger>
-                <PdfToolbarTooltip plain side="bottom" label={t('Notes & Annotations')} />
-              </Tooltip>
-              {readingMode === 'original' ? (
+              {hasNotes ? (
+                <Tooltip>
+                  <Tabs.Trigger
+                    value="notes"
+                    ref={notesTabRef}
+                    aria-controls={notebookPanelId}
+                    className="flex h-full min-w-0 items-center gap-1.5 whitespace-nowrap border-b-2 border-transparent px-1 text-xs text-muted-foreground data-[state=active]:border-primary data-[state=active]:font-semibold data-[state=active]:text-primary focus-visible:outline-ring"
+                    asChild
+                  >
+                    <TooltipTrigger>
+                      <NotebookPen className="size-3.5 shrink-0" aria-hidden="true" />
+                      <span className="truncate">{t('Notes & Annotations')}</span>
+                    </TooltipTrigger>
+                  </Tabs.Trigger>
+                  <PdfToolbarTooltip plain side="bottom" label={t('Notes & Annotations')} />
+                </Tooltip>
+              ) : null}
+              {hasNotes && readingMode === 'original' ? (
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <Button
                       type="button"
                       variant={showNotesSidebar ? 'secondary' : 'ghost'}
                       size="icon-sm"
-                      className="absolute right-2 top-0.5 size-7 aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
+                      className="absolute right-2 top-0.5 size-7"
                       aria-label={
                         showNotesSidebar ? t('Hide notes sidebar') : t('Show notes sidebar')
                       }
                       ref={notesToggleRef}
                       aria-expanded={showNotesSidebar}
                       aria-controls={notebookPanelId}
-                      aria-disabled={!canShowNotesSidebar}
-                      onClick={() => {
-                        if (canShowNotesSidebar) setNotesOpen((open) => !open)
-                      }}
+                      onClick={() => setNotesOpen((open) => !open)}
                     >
                       <PanelRight className="size-4" aria-hidden="true" />
                     </Button>
                   </TooltipTrigger>
                   <TooltipContent>
-                    {!canShowNotesSidebar
-                      ? t('Widen the window to show notes beside the PDF')
-                      : showNotesSidebar
-                        ? t('Hide notes sidebar')
-                        : t('Show notes sidebar')}
+                    {showNotesSidebar ? t('Hide notes sidebar') : t('Show notes sidebar')}
                   </TooltipContent>
                 </Tooltip>
               ) : null}
@@ -3111,7 +3121,9 @@ export const PdfPreviewContent = ({
               inert={readingMode !== 'original'}
               aria-hidden={readingMode !== 'original'}
               data-pdf-original-view
-              style={showNotesSidebar ? { right: effectiveNotesWidth } : undefined}
+              style={
+                showNotesSidebar && !floatingNotes ? { right: effectiveNotesWidth } : undefined
+              }
             >
               {document && outlineOpen && (pageCount > 1 || attachmentVersionId) ? (
                 <PdfOutlineSidebar
@@ -3308,7 +3320,7 @@ export const PdfPreviewContent = ({
               </div>
             </div>
           </Tabs.Content>
-          {attachmentVersionId && figuresVisited && document ? (
+          {figuresSource && figuresVisited && document && presentation !== 'search' ? (
             <Tabs.Content value="figures" tabIndex={-1} forceMount asChild>
               <div
                 className={cn(
@@ -3322,7 +3334,7 @@ export const PdfPreviewContent = ({
                 <PdfFiguresView
                   key={requestKey}
                   active={readingMode === 'figures'}
-                  attachmentVersionId={attachmentVersionId}
+                  source={figuresSource}
                   pageCount={pageCount}
                   onBusyChange={setFiguresBusy}
                   onNavigate={(page) => {
@@ -3345,6 +3357,7 @@ export const PdfPreviewContent = ({
                 className={cn(
                   'absolute inset-y-0 right-0',
                   showNotesSidebar ? 'border-l border-border bg-bg-000' : 'left-0',
+                  floatingNotes && 'z-50 shadow-lg',
                   readingMode !== 'notes' && !showNotesSidebar && 'invisible pointer-events-none'
                 )}
                 id={notebookPanelId}
@@ -3374,7 +3387,7 @@ export const PdfPreviewContent = ({
                   onOpenPdf={() => setReadingMode('original')}
                   pageCount={pageCount}
                 />
-                {showNotesSidebar ? (
+                {showNotesSidebar && !floatingNotes ? (
                   <button
                     type="button"
                     role="separator"
@@ -3426,7 +3439,9 @@ export const PdfPreviewContent = ({
   )
 }
 
-const PdfPreviewRendererContent = (props: PreviewFileRendererProps): React.JSX.Element => {
+const PdfPreviewRendererContent = (
+  props: PreviewFileRendererProps & { structureSource?: PdfStructureSource }
+): React.JSX.Element => {
   const target = resolvePdfContextTarget(props.item)
   const libraryAnnotations = usePdfAnnotations()
   const isLibrary = target?.sourceKind === 'literature-attachment-version'
@@ -3789,6 +3804,7 @@ const PdfPreviewRendererContent = (props: PreviewFileRendererProps): React.JSX.E
       onReadingPositionChange={props.onPdfReadingPositionChange}
       annotationProps={props}
       pdfEvidenceSource={pdfEvidenceSource}
+      structureSource={props.structureSource}
       pdfBookmarkSource={pdfBookmarkSource}
       pdfBookmarkSourceUnavailable={pdfBookmarkSourceUnavailable}
       pdfRevealSource={pdfRevealSource}
@@ -3814,16 +3830,32 @@ const PdfPreviewRendererContent = (props: PreviewFileRendererProps): React.JSX.E
 
 export const PdfPreviewRenderer = (props: PreviewFileRendererProps): React.JSX.Element => {
   const parentAnnotations = usePdfAnnotations()
+  const target = resolvePdfContextTarget(props.item)
+  const { projectId } = props.item
+  const sourceKind = target?.sourceKind
+  const sourceFileId = target?.sourceFileId
+  const sourceVersionId = target?.sourceVersionId
+  const structureSource = useMemo<PdfStructureSource | undefined>(() => {
+    if (!sourceKind || !sourceVersionId) return undefined
+    if (sourceKind === 'literature-attachment-version')
+      return { attachmentVersionId: sourceVersionId }
+    if (!projectId || !sourceFileId) return undefined
+    return { source: { kind: 'managed', projectId, sourceKind, sourceFileId, sourceVersionId } }
+  }, [projectId, sourceKind, sourceFileId, sourceVersionId])
   if (props.readOnly) {
     return (
       <PdfAnnotationsProvider writable={false} loadAnnotations={false}>
-        <PdfPreviewContent {...props.item} source={props.item.source ?? 'artifact'} />
+        <PdfPreviewContent
+          {...props.item}
+          source={props.item.source ?? 'artifact'}
+          structureSource={structureSource}
+          presentation={props.presentation}
+        />
       </PdfAnnotationsProvider>
     )
   }
-  const target = resolvePdfContextTarget(props.item)
   if (!target || parentAnnotations.document?.versionId === target.sourceVersionId)
-    return <PdfPreviewRendererContent {...props} />
+    return <PdfPreviewRendererContent {...props} structureSource={structureSource} />
   const library = target.sourceKind === 'literature-attachment-version'
   return (
     <PdfAnnotationsProvider
@@ -3834,7 +3866,7 @@ export const PdfPreviewRenderer = (props: PreviewFileRendererProps): React.JSX.E
       versionId={target.sourceVersionId}
       writable={!parentAnnotations.scoped || parentAnnotations.available}
     >
-      <PdfPreviewRendererContent {...props} />
+      <PdfPreviewRendererContent {...props} structureSource={structureSource} />
     </PdfAnnotationsProvider>
   )
 }
