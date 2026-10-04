@@ -76,6 +76,7 @@ describe('provider registry', () => {
     expect(isOfficialVendorId('tencentcodingplan')).toBe(true)
     expect(isOfficialVendorId('tencenttokenplan')).toBe(true)
     expect(isOfficialVendorId('nvidia')).toBe(true)
+    expect(isOfficialVendorId('requesty')).toBe(true)
     expect(isOfficialVendorId(undefined)).toBe(false)
     expect(isOfficialVendorId(42)).toBe(false)
   })
@@ -670,9 +671,10 @@ describe('provider registry', () => {
     })
     expect(
       resolveVendorModelReasoningEffort('openrouter', 'google/gemini-3.1-pro-preview')
-    ).toEqual({ supported: false })
+    ).toEqual({ supported: true, slots: ['low', 'medium', 'high', 'high', 'high'] })
     expect(resolveVendorModelReasoningEffort('openrouter', 'x-ai/grok-4.5')).toEqual({
-      supported: false
+      supported: true,
+      slots: ['low', 'medium', 'high', 'high', 'high']
     })
     expect(resolveVendorModelReasoningEffort('openrouter', 'qwen/qwen3.7-max')).toEqual({
       supported: true,
@@ -713,6 +715,100 @@ describe('provider registry', () => {
     // Curated (300+ live ids would flood the picker), so refresh-from-vendor is hidden.
     expect(resolveVendorModelsUrl('openrouter')).toBeUndefined()
     expect(defaultVendorModel('openrouter')).toBe('anthropic/claude-opus-5')
+  })
+
+  it('routes Requesty through both APIs after OpenRouter with a curated catalog', () => {
+    const openRouterIndex = OFFICIAL_VENDORS.findIndex((vendor) => vendor.id === 'openrouter')
+
+    expect(OFFICIAL_VENDORS[openRouterIndex + 1]?.id).toBe('requesty')
+    expect(resolveVendorApiEndpoints('requesty')).toEqual(['anthropic', 'openai'])
+    expect(resolveVendorBaseUrl('requesty')).toBe('https://router.requesty.ai')
+    expect(resolveVendorOpenAiBaseUrl('requesty')).toBe('https://router.requesty.ai/v1')
+    expect(resolveVendorApiKeyUrl('requesty')).toBe('https://app.requesty.ai/api-keys')
+    expect(resolveVendorModelsUrl('requesty')).toBeUndefined()
+    expect(usesVendorAnthropicApiKeyHeader('requesty')).toBe(false)
+    expect(defaultVendorModel('requesty')).toBe('anthropic/claude-sonnet-5')
+    expect(resolveModelContextWindow('requesty', 'openai/gpt-5.4-mini')).toBe(400_000)
+    expect(isVendorModelMultimodal('requesty', 'google/gemini-3.5-flash')).toBe(true)
+    expect(isVendorModelMultimodal('requesty', 'somevendor/unknown-model')).toBe(false)
+    expect(resolveVendorModelReasoningEffort('requesty', 'openai/gpt-5.5')).toEqual({
+      supported: true,
+      slots: ['none', 'low', 'medium', 'high', 'xhigh']
+    })
+    expect(resolveVendorModelReasoningEffort('requesty', 'anthropic/claude-haiku-4-5')).toEqual({
+      supported: false
+    })
+  })
+
+  it.each([
+    ['openrouter', 'anthropic/claude-opus-5.5', 1_000_000, true],
+    ['openrouter', 'anthropic/claude-sonnet-5.5', 1_000_000, true],
+    ['openrouter', 'anthropic/claude-fable-5.1', 1_000_000, true],
+    ['openrouter', 'openai/gpt-6.1-sol', 1_050_000, true],
+    ['openrouter', 'openai/gpt-6.1-sol-pro', 1_050_000, true],
+    ['openrouter', 'openai/gpt-6-astra', 1_050_000, true],
+    ['openrouter', 'openai/gpt-6-astra-pro', 1_050_000, true],
+    ['openrouter', 'openai/gpt-6-luna', 1_050_000, true],
+    ['openrouter', 'openai/gpt-6-luna-pro', 1_050_000, true],
+    ['openrouter', 'x-ai/grok-4.7', 500_000, true],
+    ['openrouter', 'deepseek/deepseek-v4.1-flash', 1_048_576, true],
+    ['openrouter', 'z-ai/glm-5.3', 1_048_576, false],
+    ['openrouter', 'z-ai/glm-5.3-flash', 1_048_576, true],
+    ['openrouter', 'qwen/qwen3.8-max-0902', 1_000_000, true],
+    ['openrouter', 'minimax/minimax-m3', 1_048_576, true],
+    ['openrouter', 'xiaomi/mimo-v2.6-pro', 1_050_000, true],
+    ['openrouter', 'xiaomi/mimo-v2.6-flash', 1_050_000, true],
+    ['requesty', 'anthropic/claude-sonnet-5-5', 1_000_000, true],
+    ['requesty', 'anthropic/claude-fable-5.1', 1_000_000, true],
+    ['requesty', 'openai/gpt-6.1-sol', 1_050_000, true],
+    ['requesty', 'openai/gpt-6-astra', 1_050_000, true],
+    ['requesty', 'openai/gpt-6-luna', 1_050_000, true],
+    ['requesty', 'google/gemini-3.6-flash', 1_048_576, true],
+    ['requesty', 'xai/grok-4.7', 500_000, true],
+    ['requesty', 'deepseek/deepseek-v4.1-flash', 1_000_000, true],
+    ['requesty', 'zai/glm-5.3', 1_000_000, true],
+    ['requesty', 'zai/glm-5.3-flash', 1_000_000, true],
+    ['requesty', 'xiaomi/mimo-v2.6-pro', 1_048_576, true],
+    ['requesty', 'xiaomi/mimo-v2.6-flash', 1_048_576, true]
+  ] as const)(
+    'offers %s %s with gateway-specific capabilities',
+    (vendor, model, context, vision) => {
+      expect(getOfficialVendorModelIds(vendor)).toContain(model)
+      expect(resolveModelContextWindow(vendor, model)).toBe(context)
+      expect(isVendorModelMultimodal(vendor, model)).toBe(vision)
+      expect(resolveVendorModelApiEndpoints(vendor, model)).toEqual(['anthropic', 'openai'])
+    }
+  )
+
+  it.each([
+    ['openrouter', 'openai/gpt-6.1-sol', ['low', 'medium', 'high', 'xhigh', 'max']],
+    ['openrouter', 'openai/gpt-6-luna', ['none', 'low', 'medium', 'high', 'max']],
+    ['openrouter', 'x-ai/grok-4.7', ['low', 'medium', 'high', 'xhigh', 'xhigh']],
+    ['openrouter', 'deepseek/deepseek-v4.1-flash', ['none', 'low', 'high', 'max', 'max']],
+    ['openrouter', 'z-ai/glm-5.3', ['low', 'high', 'max', 'max', 'max']],
+    ['openrouter', 'qwen/qwen3.8-max-0902', ['low', 'medium', 'high', 'xhigh', 'xhigh']],
+    ['openrouter', 'google/gemini-3.5-flash', ['minimal', 'low', 'medium', 'high', 'high']],
+    ['requesty', 'openai/gpt-6.1-sol', ['low', 'medium', 'high', 'xhigh', 'xhigh']],
+    ['requesty', 'openai/gpt-6-astra', ['low', 'medium', 'high', 'xhigh', 'xhigh']],
+    ['requesty', 'openai/gpt-6-luna', ['low', 'medium', 'high', 'xhigh', 'xhigh']],
+    ['requesty', 'anthropic/claude-sonnet-5-5', ['low', 'medium', 'high', 'max', 'max']],
+    ['requesty', 'google/gemini-3.6-flash', ['low', 'medium', 'high', 'high', 'high']]
+  ] as const)('uses gateway effort semantics for %s %s', (vendor, model, slots) => {
+    expect(resolveVendorModelReasoningEffort(vendor, model)).toEqual({ supported: true, slots })
+  })
+
+  it.each([
+    ['openrouter', 'minimax/minimax-m3'],
+    ['openrouter', 'xiaomi/mimo-v2.6-pro'],
+    ['openrouter', 'xiaomi/mimo-v2.6-flash'],
+    ['requesty', 'xai/grok-4.7'],
+    ['requesty', 'deepseek/deepseek-v4.1-flash'],
+    ['requesty', 'zai/glm-5.3'],
+    ['requesty', 'zai/glm-5.3-flash'],
+    ['requesty', 'xiaomi/mimo-v2.6-pro'],
+    ['requesty', 'xiaomi/mimo-v2.6-flash']
+  ] as const)('hides undocumented effort controls for %s %s', (vendor, model) => {
+    expect(resolveVendorModelReasoningEffort(vendor, model)).toEqual({ supported: false })
   })
 
   it('routes Xiaomi MIMO through both APIs with a live model list', () => {
@@ -1327,7 +1423,8 @@ describe('provider registry', () => {
     })
 
     it('returns false for OpenRouter text-only models', () => {
-      expect(isVendorModelMultimodal('openrouter', 'openai/gpt-5.3-codex')).toBe(false)
+      expect(isVendorModelMultimodal('openrouter', 'openai/gpt-5.3-codex')).toBe(true)
+      expect(isVendorModelMultimodal('openrouter', 'qwen/qwen3.7-max')).toBe(false)
       expect(isVendorModelMultimodal('openrouter', 'deepseek/deepseek-v4-pro')).toBe(false)
       expect(isVendorModelMultimodal('openrouter', 'z-ai/glm-5.2')).toBe(false)
     })

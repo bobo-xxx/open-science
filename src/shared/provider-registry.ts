@@ -39,6 +39,7 @@ export type OfficialVendorId =
   | 'opencode-go'
   | 'opencode'
   | 'openrouter'
+  | 'requesty'
 
 // A selectable endpoint for vendors that publish more than one host — e.g. a Global vs. China region
 // (MiniMax) or a separate overseas/domestic console (GLM's Z.AI vs. BigModel). Each carries its own
@@ -1334,6 +1335,21 @@ export const OFFICIAL_VENDORS: OfficialVendor[] = [
         reasoningEffort: 'standard-5'
       },
       {
+        id: 'anthropic/claude-opus-5.5',
+        contextWindow: 1_000_000,
+        reasoningEffort: 'standard-5'
+      },
+      {
+        id: 'anthropic/claude-sonnet-5.5',
+        contextWindow: 1_000_000,
+        reasoningEffort: 'standard-5'
+      },
+      {
+        id: 'anthropic/claude-fable-5.1',
+        contextWindow: 1_000_000,
+        reasoningEffort: 'standard-5'
+      },
+      {
         id: 'anthropic/claude-opus-4.8',
         contextWindow: 1_000_000,
         reasoningEffort: 'standard-5'
@@ -1349,6 +1365,39 @@ export const OFFICIAL_VENDORS: OfficialVendor[] = [
         reasoningEffort: 'unsupported'
       },
       // OpenAI
+      // Effort choices come from OpenRouter reasoning metadata, not upstream defaults.
+      // GPT-6 Luna spans none through max within the existing five-choice UI; Qwen omits minimal.
+      // Current tool-capable chat models from the public catalog (2026-10-04).
+      {
+        id: 'openai/gpt-6.1-sol',
+        contextWindow: 1_050_000,
+        reasoningEffort: 'standard-5'
+      },
+      {
+        id: 'openai/gpt-6.1-sol-pro',
+        contextWindow: 1_050_000,
+        reasoningEffort: 'standard-5'
+      },
+      {
+        id: 'openai/gpt-6-astra',
+        contextWindow: 1_050_000,
+        reasoningEffort: 'standard-5'
+      },
+      {
+        id: 'openai/gpt-6-astra-pro',
+        contextWindow: 1_050_000,
+        reasoningEffort: 'standard-5'
+      },
+      {
+        id: 'openai/gpt-6-luna',
+        contextWindow: 1_050_000,
+        reasoningEffort: 'none-low-medium-high-max'
+      },
+      {
+        id: 'openai/gpt-6-luna-pro',
+        contextWindow: 1_050_000,
+        reasoningEffort: 'none-low-medium-high-max'
+      },
       // These profiles are baked from OpenRouter's public model reasoning metadata. Where a model
       // exposes six values, keep the product's five-option ceiling and span off through its top rung.
       {
@@ -1398,9 +1447,49 @@ export const OFFICIAL_VENDORS: OfficialVendor[] = [
       },
       // Other top-ranked vendors on OpenRouter
       {
-        id: 'google/gemini-3.1-pro-preview',
+        id: 'x-ai/grok-4.7',
+        contextWindow: 500_000,
+        reasoningEffort: 'low-medium-high-xhigh'
+      },
+      {
+        id: 'deepseek/deepseek-v4.1-flash',
+        contextWindow: 1_048_576,
+        reasoningEffort: 'none-low-high-max'
+      },
+      {
+        id: 'z-ai/glm-5.3',
+        contextWindow: 1_048_576,
+        reasoningEffort: 'low-high-max'
+      },
+      {
+        id: 'z-ai/glm-5.3-flash',
+        contextWindow: 1_048_576,
+        reasoningEffort: 'low-high-max'
+      },
+      {
+        id: 'qwen/qwen3.8-max-0902',
+        contextWindow: 1_000_000,
+        reasoningEffort: 'low-medium-high-xhigh'
+      },
+      {
+        id: 'minimax/minimax-m3',
         contextWindow: 1_048_576,
         reasoningEffort: 'unsupported'
+      },
+      {
+        id: 'xiaomi/mimo-v2.6-pro',
+        contextWindow: 1_050_000,
+        reasoningEffort: 'unsupported'
+      },
+      {
+        id: 'xiaomi/mimo-v2.6-flash',
+        contextWindow: 1_050_000,
+        reasoningEffort: 'unsupported'
+      },
+      {
+        id: 'google/gemini-3.1-pro-preview',
+        contextWindow: 1_048_576,
+        reasoningEffort: 'low-medium-high'
       },
       {
         id: 'google/gemini-3.6-flash',
@@ -1410,9 +1499,9 @@ export const OFFICIAL_VENDORS: OfficialVendor[] = [
       {
         id: 'google/gemini-3.5-flash',
         contextWindow: 1_048_576,
-        reasoningEffort: 'unsupported'
+        reasoningEffort: 'minimal-low-medium-high'
       },
-      { id: 'x-ai/grok-4.5', contextWindow: 500_000, reasoningEffort: 'unsupported' },
+      { id: 'x-ai/grok-4.5', contextWindow: 500_000, reasoningEffort: 'low-medium-high' },
       {
         id: 'deepseek/deepseek-v4-pro',
         contextWindow: 1_048_576,
@@ -1449,9 +1538,25 @@ export const OFFICIAL_VENDORS: OfficialVendor[] = [
     ],
     // OpenRouter's catalog is curated (no live refresh), and vision support is an unpredictable subset
     // across vendors — so it is an explicit id list rather than a blanket rule or pattern. The
-    // text-only members (gpt-5.3-codex, deepseek-v4-pro, glm-5.2) are intentionally omitted.
+    // Text-only members (deepseek-v4-pro, glm-5.2, glm-5.3, qwen3.7-max) are omitted.
     multimodal: {
       multimodalModels: [
+        'anthropic/claude-opus-5.5',
+        'anthropic/claude-sonnet-5.5',
+        'anthropic/claude-fable-5.1',
+        'openai/gpt-6.1-sol',
+        'openai/gpt-6.1-sol-pro',
+        'openai/gpt-6-astra',
+        'openai/gpt-6-astra-pro',
+        'openai/gpt-6-luna',
+        'openai/gpt-6-luna-pro',
+        'x-ai/grok-4.7',
+        'deepseek/deepseek-v4.1-flash',
+        'z-ai/glm-5.3-flash',
+        'qwen/qwen3.8-max-0902',
+        'minimax/minimax-m3',
+        'xiaomi/mimo-v2.6-pro',
+        'xiaomi/mimo-v2.6-flash',
         'anthropic/claude-opus-5',
         'anthropic/claude-opus-4.8',
         'anthropic/claude-sonnet-5',
@@ -1464,14 +1569,162 @@ export const OFFICIAL_VENDORS: OfficialVendor[] = [
         'openai/gpt-5.6-luna',
         'openai/gpt-5.5-pro',
         'openai/gpt-5.5',
+        'openai/gpt-5.3-codex',
         'google/gemini-3.1-pro-preview',
         'google/gemini-3.6-flash',
         'google/gemini-3.5-flash',
         'x-ai/grok-4.5',
         'moonshotai/kimi-k3',
-        'qwen/qwen3.7-max',
         'openrouter/free',
         'google/gemma-4-31b-it:free'
+      ]
+    }
+  },
+  // Requesty is also a multi-vendor gateway, so it follows OpenRouter at the end of the picker.
+  {
+    id: 'requesty',
+    label: 'Requesty',
+    // Like OpenRouter, each curated entry declares its own capability and unknown ids stay
+    // conservative.
+    reasoningEffort: 'unsupported',
+    // Anthropic /v1/messages at the router root and the OpenAI-compatible /v1/chat/completions under
+    // `/v1`. The live catalog has hundreds of `vendor/model` ids, so ship a short curated set (no
+    // modelsListUrl) instead of a refresh that would flood the picker.
+    apiEndpoints: ['anthropic', 'openai'],
+    baseUrl: 'https://router.requesty.ai',
+    openaiBaseUrl: 'https://router.requesty.ai/v1',
+    apiKeyUrl: 'https://app.requesty.ai/api-keys',
+    // Ids, context windows, and vision from https://router.requesty.ai/v1/models (2026-10-04).
+    models: [
+      {
+        id: 'anthropic/claude-sonnet-5',
+        contextWindow: 1_000_000,
+        reasoningEffort: 'standard-5'
+      },
+      // https://docs.requesty.ai/features/reasoning: OpenAI max maps to high and none to low.
+      // Use low through xhigh; other new families without documented effort values stay hidden.
+      // Current tool-capable chat models from the public catalog (2026-10-04).
+      {
+        id: 'anthropic/claude-sonnet-5-5',
+        contextWindow: 1_000_000,
+        reasoningEffort: 'low-medium-high-max'
+      },
+      {
+        id: 'anthropic/claude-fable-5.1',
+        contextWindow: 1_000_000,
+        reasoningEffort: 'low-medium-high-max'
+      },
+      {
+        id: 'openai/gpt-6.1-sol',
+        contextWindow: 1_050_000,
+        reasoningEffort: 'low-medium-high-xhigh'
+      },
+      {
+        id: 'openai/gpt-6-astra',
+        contextWindow: 1_050_000,
+        reasoningEffort: 'low-medium-high-xhigh'
+      },
+      {
+        id: 'openai/gpt-6-luna',
+        contextWindow: 1_050_000,
+        reasoningEffort: 'low-medium-high-xhigh'
+      },
+      {
+        id: 'google/gemini-3.6-flash',
+        contextWindow: 1_048_576,
+        reasoningEffort: 'low-medium-high'
+      },
+      {
+        id: 'xai/grok-4.7',
+        contextWindow: 500_000,
+        reasoningEffort: 'unsupported'
+      },
+      {
+        id: 'deepseek/deepseek-v4.1-flash',
+        contextWindow: 1_000_000,
+        reasoningEffort: 'unsupported'
+      },
+      {
+        id: 'zai/glm-5.3',
+        contextWindow: 1_000_000,
+        reasoningEffort: 'unsupported'
+      },
+      {
+        id: 'zai/glm-5.3-flash',
+        contextWindow: 1_000_000,
+        reasoningEffort: 'unsupported'
+      },
+      {
+        id: 'xiaomi/mimo-v2.6-pro',
+        contextWindow: 1_048_576,
+        reasoningEffort: 'unsupported'
+      },
+      {
+        id: 'xiaomi/mimo-v2.6-flash',
+        contextWindow: 1_048_576,
+        reasoningEffort: 'unsupported'
+      },
+      {
+        id: 'anthropic/claude-opus-5-5',
+        contextWindow: 1_000_000,
+        reasoningEffort: 'standard-5'
+      },
+      {
+        id: 'anthropic/claude-haiku-4-5',
+        contextWindow: 200_000,
+        reasoningEffort: 'unsupported'
+      },
+      {
+        id: 'openai/gpt-5.5',
+        contextWindow: 1_050_000,
+        reasoningEffort: 'none-low-medium-high-xhigh'
+      },
+      {
+        id: 'openai/gpt-5.4',
+        contextWindow: 1_050_000,
+        reasoningEffort: 'low-medium-high-xhigh'
+      },
+      {
+        id: 'openai/gpt-5.4-mini',
+        contextWindow: 400_000,
+        reasoningEffort: 'low-medium-high-xhigh'
+      },
+      {
+        id: 'google/gemini-3.1-pro-preview',
+        contextWindow: 1_048_576,
+        reasoningEffort: 'unsupported'
+      },
+      {
+        id: 'google/gemini-3.5-flash',
+        contextWindow: 1_048_576,
+        reasoningEffort: 'unsupported'
+      },
+      { id: 'xai/grok-4.6', contextWindow: 500_000, reasoningEffort: 'unsupported' }
+    ],
+    // Curated like OpenRouter, so vision support is an explicit id list; unlisted ids stay text-only.
+    multimodal: {
+      multimodalModels: [
+        'anthropic/claude-sonnet-5-5',
+        'anthropic/claude-fable-5.1',
+        'openai/gpt-6.1-sol',
+        'openai/gpt-6-astra',
+        'openai/gpt-6-luna',
+        'google/gemini-3.6-flash',
+        'xai/grok-4.7',
+        'deepseek/deepseek-v4.1-flash',
+        'zai/glm-5.3',
+        'zai/glm-5.3-flash',
+        'xiaomi/mimo-v2.6-pro',
+        'xiaomi/mimo-v2.6-flash',
+        'anthropic/claude-sonnet-5',
+        'anthropic/claude-opus-5-5',
+        'anthropic/claude-haiku-4-5',
+        'openai/gpt-5.5',
+        'openai/gpt-5.4',
+        'openai/gpt-5.4-mini',
+        'google/gemini-3.1-pro-preview',
+        'google/gemini-3.5-flash',
+        'xai/grok-4.6'
       ]
     }
   }

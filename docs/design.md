@@ -422,10 +422,14 @@ Active-dialog menus and other foreground child layers retain their own ordering.
 
 ### PDF reading and annotations
 
+- PDF floating toolbars use 28px fine-pointer buttons, at least 24px-wide split disclosures, compact gaps and 44px coarse-pointer targets. Keep selected states, focus indicators and tooltips. Notes & Annotations uses 32px controls, 12px utility text and 4px vertical toolbar padding, matching Replay density.
+- Completed PDF analysis shows the figures/tables directly, including cached results on reopen, with a screen-reader completion announcement. Keep analysis options (parallel pages and explicit re-analysis) in the result header's overflow popover, or beside the empty-result message. Loading, active progress, cancellation, partial results and failures retain their existing visible feedback and recovery actions.
+
 - Original PDF, Figures & Tables, and Notes & Annotations use distinct leading document, image, and notebook icons with visible labels. Figures & Tables also accepts finalized upload/artifact PDF versions independently of Literature membership, Agent context, or annotation write access. Opening Figures & Tables restores cached results only. New analysis requires an explicit Analyze PDF or Download and continue action; uploading, opening a preview, and switching tabs never start analysis. Cancellation does not automatically restart analysis.
 - Parsed PDF tables in Figures & Tables preserve source row/column spans, use a collapsed border on every cell, and share one neutral theme surface without inferring headers from the first row or merged cells. Text and numbers use the same start alignment, with tabular digits and numeric no-wrap retained. Only the hovered cell is tinted, including when it spans multiple rows; row-spanning content stays vertically centered. Minimum widths apply uniformly because the first DOM cell below a rowspan may belong to a later column. These rules also apply to cached tables and do not change source text or exports.
 - Empty Notes shows a short explanation and a return-to-PDF action; an unavailable source shows a status instead of an empty panel.
-- Literature annotations belong to the exact PDF attachment version and appear in both Library and project previews. Upload/artifact annotations remain conversation-scoped. Both use the shared tag catalog.
+- Notes & Annotations belong to an immutable PDF document within the current user’s personal database. Workspace and Literature sources with the same verified SHA-256 and byte length share one notebook, including independent uploads across Projects. Different PDF bytes remain isolated; names, paths, titles and bibliographic identifiers do not establish PDF identity. Historical groups join only after verification, with reviewed choices for conflicting edits, deletions or missing native-import baselines. Shared edits, Tags and deletions apply to every linked source; removing one source or Project retains notes while another managed copy/reference survives. Session identity records creation context, while Bookmarks retain their independent Session scope. Package notes remain optional, inert read-only snapshots.
+- Uploading a PDF to Workspace does not create a Literature reference. Add to Literature uses the Literature icon and navigates to the current Project’s Literature view with the PDF staged in the existing Add PDFs metadata-review flow. Confirmation imports the verified managed version without re-uploading, links the reference to the Project and makes it visible in All references. The flow reuses existing bibliographic duplicate policies and attachment-error recovery; it does not offer a separate reference/Collection selector, add a Project–Collection relationship or require a Share notes action.
 - Active text marking uses the I-beam cursor across the document; area selection uses a crosshair, and comment buttons retain a pointer. Escape dismisses the inner popup or exits the active tool before closing a containing preview dialog.
 - PDF navigation uses the same 1120px reader-width breakpoint as Notes: docked on wide readers and floating at the left edge on narrow readers, including resized dialogs. Floating navigation does not shrink the PDF, has no backdrop or focus trap, leaves at least 16px on the right, and hides its resize handle. Escape or Close dismisses it and returns focus to the PDF. When both sidebars float, Escape closes Notes if focus is within Notes or its toggle; otherwise it closes navigation first. Resizing preserves its selected mode and preferred docked width. When no readable native outline is available, Outline is visibly disabled with `aria-disabled`, guarded activation, and a reason tooltip on hover or keyboard focus; Pages remains usable.
 - Notes docks beside the PDF when the reader is at least 1120px wide, including the full preview dialog at the default application size. In narrower readers (including a modal after shrinking the application) it floats at the right edge without shrinking the PDF, with no backdrop or focus trap; its width is capped to leave a 16px left margin. Floating notes retain Close and full-view actions, hide the resize handle, and consume Escape after nested controls. Resizing preserves drafts and the preferred docked width.
@@ -567,7 +571,8 @@ Active-dialog menus and other foreground child layers retain their own ordering.
 - Use `Tabs` for files, views, and viewer top bars.
 - Active tab: `h-8 rounded-md bg-accent px-3 py-1.5 text-sm text-accent-foreground`.
 - Inactive tab: `h-8 rounded-md px-3 py-1.5 text-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground`.
-- Tab container: `h-11 px-2 overflow-x-auto`.
+- Tab container: `h-11 px-2 overflow-x-auto`. The preview tab strip reuses `scrollbar-auto-hide` from the session list for a thin, transparent-track scrollbar revealed on hover or keyboard focus. Preserve horizontal scrolling and selected-tab reveal.
+- Side chat tabs use the same decorative `size-3.5` Lucide icon treatment as other tool tabs.
 - Close icon: `size-4 rounded-sm opacity-0 group-hover:opacity-100 focus-visible:opacity-100`.
 - Use `ToggleGroup type="single"` for grid/list mutually exclusive switches.
 
@@ -598,6 +603,14 @@ Active-dialog menus and other foreground child layers retain their own ordering.
 - Interactive Session previews use non-modal Popover, with explicit ArrowRight entry from the row to rename, Escape dismissal, and focus restoration. Tab retains natural row/action traversal. Finishing a keyboard rename returns focus to its title control; deliberate blur navigation keeps its chosen focus. Editing and pending saves protect the active Session against hover replacement; Enter/blur commits and Escape cancels through the existing rename flow.
 
 ### Session information
+
+- Keep a persistent ellipsis menu immediately after the diagnostics button in the conversation
+  header for an existing Session. Reuse the sidebar action catalog and owner bindings for Edit,
+  Pin/Unpin, Fork, the Export submenu, and Archive, including their existing availability and
+  confirmation rules. Group Edit/Pin, Side chat/Fork, Export, and Archive with separators. Its New side
+  chat action opens an empty side chat and preserves the main composer's draft, annotations and
+  attachments; it never sends the main draft. Retain the existing Side chat availability policy
+  and display the reason on unavailable actions. The composer entry retains its draft-send behavior.
 
 The upper-right pin toggles the current Session through the shared Session controller, moving it into or out of the sidebar’s pinned section. Its pressed state follows the Session store; it stays disabled until Session persistence is ready.
 
@@ -963,6 +976,7 @@ The upper-right pin toggles the current Session through the shared Session contr
 - Activity stream: `ScrollArea className="min-w-0 flex-1"`.
 - Composer: fixed to the bottom of the activity stream and constrained to `max-w-4xl`, with the composer text track aligned to the message content.
 - Right viewer area: `border-l border-border/20`.
+- Side chat headers follow Replay chrome: a compact title/information popover on the left and ghost icon actions for the main Session, full screen, and close on the right. The information popover identifies the owning Session; it does not represent the exact conversation context snapshot. Reuse tool-panel expansion so draft, transcript and running state survive layout changes; returning to the main Session collapses the expanded surface.
 - Desktop side-panel dividers reveal a centered, full-height 2px `text-200` line on hover,
   keyboard focus, and drag. Mouse resize targets extend 10px to either side of the divider;
   collapsed dividers stay hidden and disabled. Keep the one-pixel layout footprint.
