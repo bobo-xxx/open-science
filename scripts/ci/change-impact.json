@@ -79,7 +79,9 @@
         "electron-builder.yml",
         "scripts/ci/**",
         ".github/workflows/pr-gate.yml",
-        "playwright.browser.config.*",
+        "e2e/playwright.*.config.ts",
+        "e2e/vite.browser-test.config.ts",
+        "test/config/**",
         ".github/actions/source-regression/**",
         ".github/workflows/source-regression.yml"
       ],
@@ -185,6 +187,7 @@
         "src/main/local-rpc-transport.ts",
         "src/main/notebook/dependency-analysis-python.ts",
         "src/main/notebook/dependency-analysis-repl.ts",
+        "src/main/notebook/dependency-projection.ts",
         "src/main/notebook/conditional-restore-script.ts",
         "src/main/notebook/environment-discovery.ts",
         "src/main/notebook/environment-lock.ts",
