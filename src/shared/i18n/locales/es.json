@@ -44,7 +44,9 @@
     "Export Session package": "Exportar paquete de sesión",
     "Import Session package": "Importar paquete de sesión",
     "Wait for all Session activity and pending approvals to finish before forking.": "Espere a que terminen todas las actividades de la sesión y las aprobaciones pendientes antes de bifurcar.",
-    "Close window": "Cerrar ventana"
+    "Close window": "Cerrar ventana",
+    "Review potentially destructive code": "Revisar código potencialmente destructivo",
+    "Confirm Notebook kernel and environment": "Confirmar el kernel y el entorno de Notebook"
   },
   "native": {
     "Linux OS credentials require the original selected Secret Service or KWallet backend and /usr/bin/busctl. Unlock the original default keyring or wallet and restart. Do not change the password-store backend or profile to bypass this check.": "Las credenciales del sistema Linux requieren el backend Secret Service o KWallet seleccionado originalmente y /usr/bin/busctl. Desbloquee el llavero o la cartera predeterminados originales y reinicie. No cambie el backend password-store ni el perfil para omitir esta comprobación.",
@@ -140,6 +142,8 @@
     "Retrieve PDC study metadata and available versions.": "Obtener metadatos y versiones disponibles de estudios de PDC.",
     "Map PDC aliquots to samples, cases and external references.": "Relacionar alícuotas de PDC con muestras, casos y referencias externas.",
     "Discover PDC study files and quantitative reports without downloading files.": "Buscar archivos de estudios e informes cuantitativos de PDC sin descargar archivos.",
+    "Query linkage disequilibrium between two variants in a specified population.": "Consultar el desequilibrio de ligamiento entre dos variantes en una población especificada.",
+    "Find nearby variants in high linkage disequilibrium in a specified population.": "Buscar variantes cercanas con alto desequilibrio de ligamiento en una población especificada.",
     "List GWAS summary statistics files, YAML metadata, reference genomes and standard column definitions by GCST accession.": "Consultar archivos de estadísticas resumidas de GWAS, metadatos YAML, genomas de referencia y definiciones estándar de columnas mediante un identificador GCST.",
     "PDF analysis options": "Opciones de análisis del PDF",
     "Retrieve GEO series metadata, samples and supplementary-file links.": "Obtener metadatos, muestras y enlaces a archivos complementarios de una serie de GEO.",
@@ -7460,6 +7464,19 @@
     "Add term": "Añadir término",
     "The glossary is too long. Shorten terms or remove some entries.": "El glosario es demasiado largo. Acorte los términos o elimine algunas entradas.",
     "Each source term must appear only once in the glossary.": "Cada término de origen solo puede aparecer una vez en el glosario.",
-    "Enter a source term and a translation for every glossary entry.": "Introduzca un término de origen y una traducción para cada entrada del glosario."
+    "Enter a source term and a translation for every glossary entry.": "Introduzca un término de origen y una traducción para cada entrada del glosario.",
+    "Approval applies only to this run.": "La autorización se aplica solo a esta ejecución.",
+    "This selects an environment. It does not approve future destructive code.": "Esto selecciona un entorno. No autoriza código destructivo futuro.",
+    "Line {{line}}": "Línea {{line}}",
+    "Review risky code": "Revisar código de riesgo",
+    "This code may make irreversible changes.": "Este código puede realizar cambios irreversibles.",
+    "Execution details": "Detalles de ejecución",
+    "Code risk review": "Revisión de riesgos del código",
+    "Allowed once": "Permitido una vez",
+    "This code could not be fully checked. Review it before execution.": "No se ha podido comprobar completamente este código. Revíselo antes de ejecutarlo.",
+    "Showing {{shown}} of {{total}} findings. Review the full code below.": "Se muestran {{shown}} de {{total}} hallazgos. Revise el código completo a continuación.",
+    "Current environment": "Entorno actual",
+    "Selected environment": "Entorno seleccionado",
+    "Switching environments clears the current kernel's variables.": "Al cambiar de entorno se borran las variables del Kernel actual."
   }
 }
