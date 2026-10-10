@@ -1527,7 +1527,7 @@ describe('Session persistence coordinator architecture', () => {
       'src/main/compute/skill-provisioning.test.ts',
       'src/main/compute/slurm.real-ssh.integration.test.ts',
       'src/main/compute/ssh-runner.test.ts',
-      'src/main/connectors/application.test.ts',
+      'src/main/composition/connector-application.test.ts',
       'src/main/data-content-application-commands.test.ts',
       'src/main/database/literature-inbox-integrity-migration.test.ts',
       'src/main/database/managed-file-version-domain.test.ts',
@@ -1843,7 +1843,8 @@ describe('Session persistence coordinator architecture', () => {
       'src/main/session-plan/session-plan-turn-outcome.test.ts',
       'src/main/notebook/runtime-repair.windows.integration.test.ts',
       'src/main/acp/specialist-switch-recovery.integration.test.ts',
-      'src/main/agents/production-completion-handoff.test.ts'
+      'src/main/agents/production-completion-handoff.test.ts',
+      'src/main/notebook/auto-mode-budget.integration.test.ts'
     ])
     expect(sessionPersistence.capabilityOverlays).toEqual([
       'windows_sensitive',

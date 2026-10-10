@@ -138,7 +138,7 @@
       "src/main/compute/skill-provisioning.test.ts",
       "src/main/compute/slurm.real-ssh.integration.test.ts",
       "src/main/compute/ssh-runner.test.ts",
-      "src/main/connectors/application.test.ts",
+      "src/main/composition/connector-application.test.ts",
       "src/main/data-content-application-commands.test.ts",
       "src/main/database/literature-inbox-integrity-migration.test.ts",
       "src/main/database/managed-file-version-domain.test.ts",
@@ -462,7 +462,8 @@
       "src/main/notebook/runtime-repair.windows.integration.test.ts",
       "src/main/acp/specialist-switch-recovery.integration.test.ts",
       "src/main/agents/production-completion-handoff.test.ts",
-      "src/main/notebook/working-file-observer-plain-host.test.ts"
+      "src/main/notebook/working-file-observer-plain-host.test.ts",
+      "src/main/notebook/auto-mode-budget.integration.test.ts"
     ]
   },
   "capabilityOverlays": ["i18n_catalog"],
