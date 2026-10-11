@@ -23,7 +23,10 @@ import type { LocalePreferenceSnapshot } from '../shared/locale'
 import { acquireRuntimeDirectorySync } from './runtime-ownership'
 import { CredentialIdentityError } from './credential-identity/selection'
 import { credentialRecoveryMessage } from './credential-identity/recovery'
-import { currentApplicationShutdownTrigger } from './application-shutdown-trigger'
+import {
+  currentApplicationShutdownTrigger,
+  markApplicationShutdownTrigger
+} from './application-shutdown-trigger'
 import { configureRuntimeMetadata } from './runtime-metadata'
 import { configureIpcHandlerRegistry, ipcMainHandle } from './ipc-handler-registry'
 import { configureCredentialStore, getCredentialStore } from './settings/credential-store-mode'
@@ -37,6 +40,7 @@ import { startOrAttachDesktopBackend, desktopBackendPaths } from './desktop-runt
 import { connectDesktopRuntime, type DesktopRuntimeClient } from './desktop-runtime-client'
 import { installDesktopRuntimeElectronAdapter } from './desktop-runtime-electron-adapter'
 import { createDesktopNativeHandler } from './desktop-native-electron'
+import { handleOwnedBackendDisconnect } from './desktop-backend-exit'
 import { createDesktopPreviewProxy } from './desktop-preview-proxy'
 import type { DesktopShutdownWork } from './desktop-runtime-lifecycle'
 import { PackageFileOpenRelay, packagePathsFromArgv } from './session-package/file-open'
@@ -564,6 +568,20 @@ async function startDesktop(): Promise<void> {
         if (launch.startedProcess && launch.startedProcess.exitCode === null)
           launch.startedProcess.once('exit', restart)
         else restart()
+      } else if (launch.startedProcess) {
+        handleOwnedBackendDisconnect({
+          child: launch.startedProcess,
+          runtimePid: client?.processId(),
+          error,
+          isUpdateCommitted: () => updateCommitted,
+          onCleanExit: () => {
+            // The backend is already gone: renderer persistence and delegated-work gates cannot
+            // complete, so this shutdown is best-effort like a system power-off, not a user quit.
+            markApplicationShutdownTrigger('system')
+            app.quit()
+          },
+          onFailure: reportError
+        })
       } else if (!updateCommitted) reportError(error)
     }
   })
