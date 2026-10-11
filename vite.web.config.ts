@@ -21,7 +21,12 @@ export default defineConfig({
   },
   // Prebundle linked CommonJS leaves when serving the renderer in development.
   optimizeDeps: {
-    include: ['@aipoch/connector-mcp-client/oauth-redirect', '@aipoch/diagnostics']
+    include: [
+      '@aipoch/connector-mcp-client/oauth-redirect',
+      '@aipoch/diagnostics',
+      '@aipoch/skills/document',
+      '@aipoch/notebook-analysis/contracts'
+    ]
   },
   plugins: [react(), tailwindcss()],
   build: {
@@ -30,7 +35,8 @@ export default defineConfig({
     commonjsOptions: {
       include: [
         /node_modules/,
-        /packages[\\/](?:connector-(?:core|mcp-client)|diagnostics)[\\/]dist/
+        /packages[\\/](?:connector-(?:core|mcp-client)|diagnostics|skills)[\\/]dist/,
+        /packages[\\/]notebook-analysis[\\/]dist/
       ]
     },
     emptyOutDir: true

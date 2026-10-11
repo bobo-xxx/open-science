@@ -1,5 +1,4 @@
 import { JournalAttributes } from '../literature/journal-attributes'
-import { QUIT_SHUTDOWN_BUDGET_MS } from '../lifecycle-shutdown'
 import { runtimeNetwork } from '../runtime-network'
 import { join } from 'node:path'
 import type { ApplicationEvents } from '../application-events'
@@ -8,8 +7,8 @@ import { AgentPdfAcquisition } from '../literature/agent-pdf-acquisition'
 import { LiteratureBatchJobs } from '../literature/batch-jobs'
 import { LiteratureCatalog } from '../literature/catalog'
 import { LiteratureCitationDocument } from '../literature/citation-document'
-import { LiteratureCitationFormatter } from '../literature/citation-formatter'
-import { LiteratureCitationStyleLibrary } from '../literature/citation-style-library'
+import { LiteratureCitationFormatter } from '@aipoch/literature-citations'
+import { LiteratureCitationStyleLibrary } from '@aipoch/literature-citations/styles'
 import { LiteratureDocumentReader } from '../literature/document-reader'
 import { downloadFullText } from '../literature/full-text-download'
 import { LiteratureFullTextFinder } from '../literature/full-text-finder'
@@ -27,7 +26,7 @@ import type { SessionPersistenceCommands } from '../session-persistence/coordina
 import { tryDecryptKey } from '../settings/crypto'
 import { SettingsService } from '../settings/service'
 import { parseSystemProxyRules } from '../settings/system-proxy'
-import { netFetchStandard } from '../skills/net-fetch'
+import { netFetchStandard } from '../network-fetch'
 import { SpecialistService } from '../specialist/service'
 import { resolveConfigRoot, resolveDataRoot } from '../storage-root'
 import { ContentRepository } from '../storage/content-repository'
@@ -128,12 +127,6 @@ export async function composeResearchCatalog({
     () => getProjectDbClient(configRoot),
     () => applicationEvents.publish('literature:changed', { revision: ++smartCollectionRevision })
   )
-  await modules.add({ journalAttributes }, ({ journalAttributes: owner }) => ({
-    name: 'literature-journal-attributes',
-    capability: owner,
-    dispose: () => owner.dispose(),
-    disposeTimeoutMs: QUIT_SHUTDOWN_BUDGET_MS
-  }))
   const literatureCatalog = new LiteratureCatalog(
     () => getProjectDbClient(configRoot),
     () => tagService.notifyAssignmentsChanged(),

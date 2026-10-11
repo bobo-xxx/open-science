@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 
@@ -252,21 +252,45 @@ describe('module test impact commands', () => {
   })
 
   it('expands User Skill repository changes through Settings and cross-surface consumers', () => {
+    const manifest = loadModuleImpactManifest()
+    const packageTests = manifest.modules.skill_package.testFiles.owner
+    expect(packageTests.length).toBeGreaterThan(0)
+    // Check local module plans too: CI's package exclusions must not hide stale host evidence.
+    for (const [id, module] of Object.entries(manifest.modules)) {
+      if (id === 'skill_package') continue
+      expect(
+        Object.values(module.testFiles)
+          .flat()
+          .filter((path) => path.startsWith('packages/skills/')),
+        `${id} must not register unchanged upstream Skill package units`
+      ).toEqual([])
+    }
+    for (const path of [
+      'src/main/skills/catalog.ts',
+      'src/main/skill-marketplace/service.ts',
+      'src/renderer/src/pages/settings/SkillEditor.tsx',
+      'src/main/compute/skill-provisioning.ts'
+    ]) {
+      const hostPlan = createAffectedTestPlan([{ path, status: 'modified' }], {
+        status: 'unavailable-manifest-only',
+        testFiles: []
+      })
+      expect(hostPlan.mode, path).toBe('selective')
+      expect(
+        hostPlan.testFiles.some((file) => file.startsWith('packages/skills/')),
+        path
+      ).toBe(false)
+    }
     const direct = createModuleTestPlan('user_skills_repository')
     expect(direct.testFiles).toEqual(
       expect.arrayContaining([
-        'src/main/skills/user-skill-catalog-observer.test.ts',
-        'src/main/skills/user-skill-compatibility-index.test.ts',
         'src/main/skills/user-skill-repository.architecture.test.ts',
-        'src/main/skills/user-skill-repository.atomic.test.ts',
-        'src/main/skills/user-skill-repository.test.ts',
         'src/main/skills/host-skills-service.test.ts',
         'src/main/skills/conversation-import.test.ts',
-        'src/main/skills/specialist-package-adapter.test.ts',
         'src/main/notebook/local-rpc-server.test.ts',
         'src/main/notebook/local-rpc-server.skill-import.test.ts',
         'src/main/notebook/local-rpc-server.skills.test.ts',
-        'src/main/settings/skill-catalog.test.ts',
+        'src/main/skills/catalog.test.ts',
         'src/main/settings/service.test.ts',
         'src/main/specialist/package/release-certification.test.ts',
         'src/main/specialist/package/service.test.ts',
@@ -277,33 +301,54 @@ describe('module test impact commands', () => {
     )
 
     for (const { path, status } of [
-      { path: 'src/main/skills/user-skill-catalog-observer.ts', status: 'modified' },
-      { path: 'src/main/skills/user-skill-compatibility-index.ts', status: 'added' },
+      { path: 'packages/skills/src/user-skill-catalog-observer.ts', status: 'modified' },
+      { path: 'packages/skills/src/user-skill-compatibility-index.ts', status: 'added' },
       { path: 'src/main/skills/user-skill-repository.ts', status: 'modified' },
-      { path: 'src/main/skills/user-skill-store.ts', status: 'modified' },
-      { path: 'src/main/skills/agent-home-skill-owner.ts', status: 'added' },
-      { path: 'src/main/skills/skill-bundle-import-owner.ts', status: 'modified' },
-      { path: 'src/main/skills/user-skill-import-contracts.ts', status: 'added' },
-      { path: 'src/main/skills/skill-mutation-owner.ts', status: 'modified' },
-      { path: 'src/main/skills/skill-package-transaction-owner.ts', status: 'modified' }
+      { path: 'packages/skills/src/user-skill-store.ts', status: 'modified' },
+      { path: 'packages/skills/src/agent-home-skill-owner.ts', status: 'added' },
+      { path: 'packages/skills/src/skill-bundle-import-owner.ts', status: 'modified' },
+      { path: 'packages/skills/src/user-skill-import-contracts.ts', status: 'added' },
+      { path: 'packages/skills/src/skill-mutation-owner.ts', status: 'modified' },
+      { path: 'packages/skills/src/skill-package-transaction-owner.ts', status: 'modified' }
     ] as const) {
       const affected = createAffectedTestPlan([{ path, status }], {
         status: 'current',
         testFiles: []
       })
+      const prefix = path.startsWith('packages/skills/') ? 'skill_package -> ' : ''
       expect([...affected.modules].sort()).toEqual([
+        ...(prefix ? ['settings_operations'] : []),
         'settings_service_facade',
+        ...(prefix ? ['skill_marketplace', 'skill_package'] : []),
         'user_skills_repository',
         'workspace_page',
         'workspace_runtime'
       ])
       expect(affected.reasonChains).toEqual(
         expect.arrayContaining([
-          'user_skills_repository -> settings_service_facade',
-          'user_skills_repository -> settings_service_facade -> workspace_runtime',
-          'user_skills_repository -> settings_service_facade -> workspace_runtime -> workspace_page'
+          `${prefix}user_skills_repository -> settings_service_facade`,
+          `${prefix}user_skills_repository -> settings_service_facade -> workspace_runtime`,
+          `${prefix}user_skills_repository -> settings_service_facade -> workspace_runtime -> workspace_page`
         ])
       )
+      expect(
+        affected.testFiles.filter((file) => file.startsWith('packages/skills/')).sort()
+      ).toEqual(prefix ? [...packageTests].sort() : [])
+      if (prefix) {
+        expect(affected.reasonChains).toEqual(
+          expect.arrayContaining([
+            'skill_package -> skill_marketplace',
+            'skill_package -> skill_marketplace -> settings_operations'
+          ])
+        )
+        expect(affected.testFiles).toEqual(
+          expect.arrayContaining([
+            'src/main/skill-marketplace/installation.test.ts',
+            'src/main/skill-marketplace/service.test.ts',
+            'src/main/settings/workflows.test.ts'
+          ])
+        )
+      }
       expect(affected.testFiles).toEqual(
         expect.arrayContaining([
           'packages/open-science/cli.test.ts',
@@ -944,4 +989,153 @@ it.each([
     testFiles: []
   })
   expect(plan.mode).toBe('full')
+})
+
+describe('Notebook package module boundaries', () => {
+  const manifest = loadModuleImpactManifest()
+  const packageModules = [
+    'notebook_syntax',
+    'notebook_code_risk',
+    'notebook_analysis',
+    'notebook_analysis_engine'
+  ]
+  const packageRoots = [
+    'packages/notebook-syntax/',
+    'packages/notebook-code-risk/',
+    'packages/notebook-analysis/'
+  ]
+  const packageTests = (tests: string[]): string[] =>
+    tests.filter((path) => packageRoots.some((root) => path.startsWith(root)))
+  const graph = { status: 'unavailable-manifest-only', testFiles: [] }
+
+  it('never registers upstream Notebook unit tests as downstream host evidence', () => {
+    for (const [id, module] of Object.entries(manifest.modules)) {
+      if (packageModules.includes(id)) continue
+      expect(packageTests(Object.values(module.testFiles).flat()), id).toEqual([])
+      expect(
+        module.consumerModules.filter((consumer) => packageModules.includes(consumer)),
+        id
+      ).toEqual([])
+      if (!module.fullTestReason)
+        expect(packageTests(createModuleTestPlan(id, manifest).testFiles), id).toEqual([])
+    }
+  })
+
+  it('owns pure path and package-projection regressions inside analysis', () => {
+    const units = [
+      'input-path-analysis.test.ts',
+      'input-resource-analysis.test.ts',
+      'dependency-projection.r-packages.test.ts',
+      'dependency-analysis.chord.native.test.ts',
+      'dependency-analysis.circlize.native.test.ts',
+      'dependency-analysis.filesystem-diagnostics.native.test.ts',
+      'dependency-analysis.iteration-snapshots.native.test.ts',
+      'dependency-analysis.structured-results.native.test.ts',
+      'dependency-analysis.r-directory.native.test.ts',
+      'dependency-analysis.r-pipelines.native.test.ts'
+    ].map((name) => `packages/notebook-analysis/src/${name}`)
+    expect(manifest.modules.notebook_analysis_engine.testFiles.owner).toEqual(
+      expect.arrayContaining(units)
+    )
+    for (const module of Object.values(manifest.modules)) {
+      expect(
+        Object.values(module.testFiles)
+          .flat()
+          .filter((path) =>
+            units.some(
+              (unit) =>
+                path === unit.replace('packages/notebook-analysis/src/', 'src/main/notebook/')
+            )
+          )
+      ).toEqual([])
+    }
+    for (const path of [
+      'src/main/notebook/runtime-service.ts',
+      'src/main/notebook/dependency-analysis-adapter.ts',
+      'src/main/notebook/scientific-output-analysis.ts'
+    ]) {
+      const plan = createAffectedTestPlan([{ path, status: 'modified' }], graph, manifest)
+      expect(plan.mode).toBe('selective')
+      expect(packageTests(plan.testFiles)).toEqual([])
+      expect(plan.testFiles).toContain('src/main/notebook/code-risk-admission.test.ts')
+      expect(plan.testFiles).toContain(
+        'src/main/notebook/working-file-observer.write-scope.integration.test.ts'
+      )
+    }
+  })
+
+  it.each([
+    ['src/main/notebook/runtime-service.ts', 'src/main/notebook/runtime-service.test.ts'],
+    [
+      'src/main/notebook/dependency-analysis-adapter.ts',
+      'src/main/notebook/dependency-analysis-adapter.test.ts'
+    ],
+    [
+      'src/main/notebook/working-file-observer.ts',
+      'src/main/notebook/working-file-observer.test.ts'
+    ],
+    ['src/main/storage/content-repository.ts', 'src/main/storage/content-repository.test.ts']
+  ])('keeps host integrations without upstream package units for %s', (path, integration) => {
+    const plan = createAffectedTestPlan([{ path, status: 'modified' }], graph, manifest)
+    expect(plan.mode).toBe('selective')
+    expect(plan.testFiles).toContain(integration)
+    expect(packageTests(plan.testFiles)).toEqual([])
+  })
+
+  it.each([
+    ['notebook_code_risk', 'packages/notebook-code-risk/src/index.ts', ['notebook_code_risk']],
+    [
+      'notebook_analysis_engine',
+      'packages/notebook-analysis/src/dependency-analysis.ts',
+      ['notebook_analysis_engine']
+    ],
+    [
+      'notebook_syntax',
+      'packages/notebook-syntax/src/index.ts',
+      ['notebook_syntax', 'notebook_code_risk', 'notebook_analysis_engine']
+    ]
+  ])(
+    'selects only downstream package suites and host integrations for %s',
+    (id, path, selected) => {
+      const plan = createAffectedTestPlan([{ path, status: 'modified' }], graph, manifest)
+      expect(plan.mode).toBe('selective')
+      for (const candidate of packageModules) {
+        const owned = manifest.modules[candidate].testFiles.owner
+        if (candidate !== 'notebook_analysis') expect(owned.length).toBeGreaterThan(0)
+        if (selected.includes(candidate))
+          expect(plan.testFiles).toEqual(expect.arrayContaining(owned))
+        else
+          expect(
+            plan.testFiles.filter((test) => owned.includes(test)),
+            `${id} -> ${candidate}`
+          ).toEqual([])
+      }
+      expect(plan.testFiles).toContain('src/main/notebook/runtime-service.test.ts')
+      expect(plan.testFiles).toContain('src/main/notebook/code-risk-admission.test.ts')
+    }
+  )
+})
+
+it('separates analysis implementation consumers from broad shared contract consumers', () => {
+  const manifest = loadModuleImpactManifest()
+  const graph = { status: 'unavailable-manifest-only', testFiles: [] }
+  const implementation = createAffectedTestPlan(
+    [{ path: 'packages/notebook-analysis/src/dependency-analysis-python.ts', status: 'modified' }],
+    graph,
+    manifest
+  )
+  const contract = createAffectedTestPlan(
+    [{ path: 'packages/notebook-analysis/src/contracts.ts', status: 'modified' }],
+    graph,
+    manifest
+  )
+  expect(implementation.modules).toContain('notebook_analysis_engine')
+  expect(implementation.modules).not.toContain('notebook_analysis')
+  expect(implementation.modules).not.toContain('session_persistence')
+  expect(contract.modules).toEqual(
+    expect.arrayContaining(['notebook_analysis', 'notebook_analysis_engine', 'session_persistence'])
+  )
+  expect(contract.testFiles).toEqual(expect.arrayContaining(implementation.testFiles))
+  expect(implementation.testFiles).toContain('src/main/notebook/analysis-file-evidence.test.ts')
+  expect(implementation.testFiles).toContain('src/main/notebook/serialized-file-provenance.test.ts')
 })

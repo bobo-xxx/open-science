@@ -155,14 +155,14 @@ describe('Auto operation completeness against real tool registrations', () => {
         'artifacts/mcp-server.ts':
           '6b43e2b69387c7310dee65d97674b94e608a349f987ef90d7dd5cee7ff675c7f',
         'literature/library-mcp-server.ts':
-          'f67afa11e9d035610ef4a863424cbfd4504dd3444808803b993989f32caa84d2',
+          'c817960f2000793ac238dc8bae59cce0fc1e7733f39cbfa7668aca1d8c7a0dab',
         'literature/mcp-server.ts':
           'd7baeae460b294940d198e2a16f701c399b7630da945f31226260f19decdae72',
         'notebook/mcp-server.ts':
           'ad036e2da30658225b2526d3fabed33355ce189e9b1825c0fa86b22b021640af',
         'session-plan/plan-mcp-server.ts':
           'b32ac73d8a2655f556c50b067892eb4caa3940acdcae6df7d8475d81cf7b98d9',
-        'skills/mcp-server.ts': '65e6e7632855c2799a8f58cd6292777b2eb50779170148bd3c6fdd0f1e257edc'
+        'skills/mcp-server.ts': '3064af8275f8026e9dbf84b445f3a5061d41619c523def579c4b759c0aac338b'
       },
       notebookSchemas: {
         ask_user_question: 'f4a3e6c178ec5dc5fbbd9ef256a046f32565a58be8bc8fa263a9e642e789002a',

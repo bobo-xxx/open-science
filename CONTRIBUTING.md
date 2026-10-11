@@ -70,6 +70,19 @@ for native build prerequisites, secure-storage requirements and host capability 
 npm run dev
 ```
 
+Development reuses unchanged package builds and the verified Node runtime. Package edits rebuild
+automatically; renderer package edits reload the page and may reset transient state. React keeps HMR.
+
+For backend/main/preload changes, wait for a successful build, quit the app normally, stop the dev
+command, then run `npm run dev` again. Web/headless development has no live reload.
+
+For a new local package, follow an existing `tsconfig.dev.json`, reference its local dependencies,
+and add it to `tsconfig.packages.json`. Use `npm run build:packages:dev` to build packages alone.
+
+Native credential helpers build incrementally in development. On macOS, keep
+`packages/credential-identity-probe-native/build/` between launches: a clean rebuild can change
+the helper's identity and require Keychain authorization again.
+
 Windows standard-mode development does not require a separate Notebook runtime.
 Enabling Notebook protection prepares verified Node and PowerShell components on demand:
 compatible official installations are preferred, and missing components are downloaded from
@@ -571,6 +584,19 @@ registrations can enter the normal merge queue after required checks pass, witho
 Trusted-base CI Integrity validates candidate registration data in both PRs and merge groups.
 It preserves surviving owner/interface/test paths, consumer edges, capability overlays, fallback
 routing and existing full-validation markers. References to actually deleted files may be removed.
+A surviving consumer test may leave `testFiles.consumer` only when the trusted checker proves
+that its base revision reached the module and its head revision no longer reaches any old or new
+owner path through static imports or the union of base/head runtime-consumer declarations. The
+checker reads Git blobs as data, resolves public local-package exports and renderer aliases, and
+retains evidence when imports cannot be resolved, dynamic imports are computed, or the module
+requires full validation. Verified retirements appear in the Integrity summary.
+Historical consumer entries for tests owned by a foreign package may also retire when complete
+source graphs for both revisions prove no path to the module, preserving the unique original
+package test owner and the union of runtime edges. Missing package manifests or incomplete
+evidence retain the registration. This does not authorize retirement of already-unproven host
+consumer contracts. These exceptions do not remove owner/contract tests, interfaces, module
+consumer edges, or routing obligations; they execute only from trusted-base code. Merge a policy
+change before proposing registration cleanup that depends on it.
 New explicit ownership cannot hide existing inferred test coverage. Unknown policy metadata and
 coverage reductions fail the check; owner approval alone does not waive these invariants.
 Module moves and consolidation must preserve surviving ownership, interfaces, test evidence and
@@ -581,6 +607,13 @@ preserved policy/evidence against the merge base, and adds evidence to the trust
 dropping newer mainline registrations. Changed records select their module evidence, including new
 tests. Unsupported or invalid registrations retain full portable routing; Integrity still blocks
 invalid data. Candidate scripts never authorize selective routing.
+The exact consumer-evidence guard also retains entries when a dependency cone is incomplete
+(for example, a generated native addon or computed import). Absence from a static graph alone
+must not demand removal that trusted Integrity cannot verify. Fully resolved obsolete consumers
+are still rejected; missing consumer coverage is still required. Package boundary checks inspect
+the executable test plan: retained historical registrations must not make host-only source edits
+run unchanged upstream package units.
+
 Introducing this exception changes protected policy files and therefore still needs owner approval.
 It can then enter the normal queue; no bootstrap bypass is required when its checks pass.
 
@@ -591,9 +624,19 @@ and owner approval precede normal merge-queue admission. Never remove the Integr
 trigger while its check is required; the `required-check-triggers` rule rejects a PR Gate or CI
 Integrity revision that drops its `merge_group` or pull request trigger.
 
+Trusted policy may retire a historical cross-package contract test registration only when
+its existing package selector already excludes that test package for every owner path. Both Git
+snapshots must retain the test's unique owner and owner-test evidence, and complete static plus
+base-and-head runtime dependencies must show no path to the original owner. Candidate registry
+changes cannot authorize an exclusion. Missing evidence, real downstream dependencies, global
+owners and full-validation markers retain the registration. This removes redundant routing data,
+not the test or its package's coverage. Owner/interface registrations remain protected.
+
 Keep required code-owner review and stale-approval dismissal enabled while relying on this policy.
 CI Integrity checks exact module ownership under `src/` and `packages/`, covering all tracked code,
 native sources, runtime helpers, assets and fixtures regardless of file extension.
+Package-root `tsconfig.json`, `tsconfig.*.json`, `package.json` and `package-lock.json` are exempt
+from ownership registration, but still participate in test selection. Runtime JSON and fixtures are not exempt.
 Register each file in exactly one module's `ownerPaths` in `scripts/ci/module-impact/<module-id>.json`,
 including owner, contract and consumer test evidence. Consumer-test membership does not establish
 ownership. New unregistered files and ownership regressions block admission; renames must register

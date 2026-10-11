@@ -50,7 +50,7 @@
       "src/main/settings/ipc.test.ts",
       "src/main/settings/provider-accounts.test.ts",
       "src/main/settings/service.test.ts",
-      "src/main/settings/skill-catalog.test.ts",
+      "src/main/skills/catalog.test.ts",
       "src/main/storage/ipc.test.ts",
       "src/main/storage/migration-service.test.ts",
       "src/main/acp/ipc.test.ts",
@@ -391,9 +391,9 @@
       "src/main/notebook/cell-execution-input.test.ts",
       "src/main/notebook/runtime-service-logging.integration.test.ts",
       "src/main/notebook/runtime-service.export.test.ts",
-      "src/main/settings/skill-catalog.registered-helpers.test.ts",
+      "src/main/skills/catalog.registered-helpers.test.ts",
       "src/main/update/legacy-shell-recovery.integration.test.ts",
-      "src/main/notebook/dependency-analysis.lineage-regressions.test.ts",
+      "src/main/notebook/kernel-lineage-recovery.integration.test.ts",
       "src/main/notebook/scientific-replay.test.ts",
       "src/main/artifacts/artifact-reproducibility-execution.test.ts",
       "src/main/notebook/reproduction-runtime.integration.test.ts",
@@ -416,7 +416,6 @@
       "src/main/compute/compute-password-auth.release.test.ts",
       "src/main/compute/application-commands.test.ts",
       "src/main/node-process-host.test.ts",
-      "src/main/literature/citation-style-library.test.ts",
       "src/main/notebook/micromamba.test.ts",
       "src/main/notebook/shell-process.test.ts",
       "src/main/notebook/windows-runtime-manager.test.ts",
@@ -461,7 +460,8 @@
       "src/main/acp/specialist-switch-recovery.integration.test.ts",
       "src/main/agents/production-completion-handoff.test.ts",
       "src/main/notebook/auto-mode-budget.integration.test.ts",
-      "src/main/connectors/mcp-host-dependencies.test.ts"
+      "src/main/connectors/mcp-host-dependencies.test.ts",
+      "src/renderer/src/pages/literature/literature-localization.render.test.tsx"
     ]
   },
   "capabilityOverlays": ["e2e_regressions", "e2e_delegation", "windows_sensitive"],

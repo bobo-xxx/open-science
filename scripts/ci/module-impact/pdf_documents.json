@@ -277,7 +277,7 @@
       "src/main/settings/service.providers.test.ts",
       "src/main/settings/service.test.ts",
       "src/main/settings/session-details-model-owner.test.ts",
-      "src/main/settings/skill-catalog.test.ts",
+      "src/main/skills/catalog.test.ts",
       "src/main/settings/workflows.test.ts",
       "src/main/settings/workflows/connectors-diagnostic.test.ts",
       "src/main/side-chat/ipc.test.ts",
@@ -340,7 +340,8 @@
       "src/main/desktop-native-electron.test.ts",
       "src/main/session-plan/session-plan-turn-outcome.test.ts",
       "src/main/acp/specialist-switch-recovery.integration.test.ts",
-      "src/main/agents/production-completion-handoff.test.ts"
+      "src/main/agents/production-completion-handoff.test.ts",
+      "src/renderer/src/pages/literature/literature-localization.render.test.tsx"
     ]
   },
   "capabilityOverlays": ["e2e_regressions"],

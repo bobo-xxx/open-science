@@ -409,6 +409,14 @@ ${inspected}
 
 ${violations}
 
+### Verified consumer retirements
+
+${(result.retiredConsumers ?? []).map((entry) => `- <code>${escapeHtml(entry)}</code>`).join('\n') || '- None'}
+
+### Verified excluded package test retirements
+
+${(result.retiredPackageTests ?? []).map((entry) => `- <code>${escapeHtml(entry)}</code>`).join('\n') || '- None'}
+
 ### Historical module ownership gaps (nonblocking)
 
 ${(result.legacyGaps ?? []).map((path) => `- <code>${escapeHtml(path)}</code>`).join('\n') || '- None'}
@@ -422,6 +430,8 @@ export function runCiIntegrityCli(arguments_ = process.argv.slice(2), environmen
   const ownership = moduleOwnershipFromRevisions(base, head)
   result.violations.push(...ownership.violations)
   result.legacyGaps = ownership.legacyGaps
+  result.retiredConsumers = ownership.retiredConsumers
+  result.retiredPackageTests = ownership.retiredPackageTests
   result.ok = result.ok && ownership.ok
 
   if (environment.GITHUB_STEP_SUMMARY) {

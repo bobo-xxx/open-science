@@ -249,7 +249,7 @@
       "src/main/settings/network-proxy-settings.test.ts",
       "src/main/settings/runtime-application-commands.test.ts",
       "src/main/settings/settings-snapshot-commit-owner.test.ts",
-      "src/main/settings/skill-catalog.test.ts",
+      "src/main/skills/catalog.test.ts",
       "src/main/side-chat/ipc.test.ts",
       "src/main/side-chat/runtime-owner.test.ts",
       "src/main/specialist/application-commands.test.ts",
@@ -307,7 +307,6 @@
       "src/main/settings/service.test.ts",
       "src/main/storage/migration-service.test.ts",
       "src/main/artifacts/ipc.test.ts",
-      "src/main/literature/citation-style-library.test.ts",
       "src/main/local-fs/service.test.ts",
       "src/main/notebook/kernel-executor.test.ts",
       "src/main/notebook/micromamba.test.ts",
@@ -343,7 +342,7 @@
       "src/main/settings/provider-runtime-projection.test.ts",
       "src/main/settings/service.connectors.test.ts",
       "src/main/settings/service.providers.test.ts",
-      "src/main/settings/skill-catalog.registered-helpers.test.ts",
+      "src/main/skills/catalog.registered-helpers.test.ts",
       "src/main/settings/workflows/connectors-diagnostic.test.ts",
       "src/main/settings/xai-provider-account-owner.test.ts",
       "src/main/side-chat/session-lifetime.test.ts",
@@ -357,7 +356,8 @@
       "src/main/side-chat/application-commands.test.ts",
       "src/main/artifacts/artifact-reproducibility-commands.test.ts",
       "src/main/acp/specialist-switch-recovery.integration.test.ts",
-      "src/main/connectors/mcp-host-dependencies.test.ts"
+      "src/main/connectors/mcp-host-dependencies.test.ts",
+      "src/renderer/src/pages/literature/literature-localization.render.test.tsx"
     ]
   },
   "capabilityOverlays": ["e2e_regressions", "e2e_delegation", "windows_sensitive"],

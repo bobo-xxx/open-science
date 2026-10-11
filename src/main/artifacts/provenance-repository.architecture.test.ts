@@ -1,9 +1,9 @@
+import { readFileSync } from 'node:fs'
+import { dirname, relative, resolve, sep } from 'node:path'
 import {
   listProductionSources,
   readProductionSource
 } from '../../../test/architecture-source-index'
-import { readFileSync } from 'node:fs'
-import { dirname, relative, resolve, sep } from 'node:path'
 
 import {
   canHaveModifiers,
@@ -519,7 +519,6 @@ describe('Artifact Provenance repository architecture', () => {
       'src/main/artifacts/write-budget-owner.test.ts',
       'src/main/notebook/reproduction-runtime.test.ts',
       'src/renderer/src/pages/workspace/ArtifactReproducibilityPanel.test.tsx',
-      'src/main/notebook/dependency-analysis.stdlib-replay.test.ts',
       'src/main/artifacts/resumed-finalization-ownership.test.ts',
       'src/main/artifacts/export-filename.ts',
       'src/main/artifacts/artifact-reproducibility-commands.test.ts',
@@ -583,7 +582,6 @@ describe('Artifact Provenance repository architecture', () => {
       'src/main/artifacts/provenance-write-contract.test.ts',
       'src/main/artifacts/reviewer-turn-file-evidence-reader.test.ts',
       'src/main/artifacts/write-budget-owner.test.ts',
-      'src/main/notebook/dependency-analysis.stdlib-replay.test.ts',
       'src/main/notebook/reproduction-runtime.test.ts',
       'src/renderer/src/pages/workspace/ArtifactReproducibilityPanel.test.tsx',
       'src/main/artifacts/artifact-reproducibility-outputs.test.ts',
@@ -768,8 +766,8 @@ describe('Artifact Provenance repository architecture', () => {
       'src/main/managed-preview-resources.test.ts',
       'src/main/notebook/cross-turn-input-repro.integration.test.ts',
       'src/main/notebook/delegated-lane-capability.test.ts',
-      'src/main/notebook/dependency-analysis.r-directory.test.ts',
-      'src/main/notebook/dependency-analysis.r-plot-repro.test.ts',
+      'src/main/notebook/artifact-analysis-contract.integration.test.ts',
+      'src/main/notebook/artifact-r-reproduction.integration.test.ts',
       'src/main/notebook/e2e.certification.test.ts',
       'src/main/notebook/environment-state-tracker.test.ts',
       'src/main/notebook/host-artifacts-service.test.ts',
@@ -951,7 +949,7 @@ describe('Artifact Provenance repository architecture', () => {
       'src/renderer/web/api-installer.test.ts',
       'src/renderer/web/bootstrap.test.ts',
       'src/renderer/web/renderer-argument-shape-characterization.test.ts',
-      'src/main/settings/skill-catalog.test.ts',
+      'src/main/skills/catalog.test.ts',
       'src/main/session-package/fork.test.ts',
       'src/main/storage/brand-location.test.ts',
       'src/main/storage/migration-target-race.test.ts',
@@ -998,7 +996,8 @@ describe('Artifact Provenance repository architecture', () => {
       'src/main/desktop-native-electron.test.ts',
       'src/main/session-plan/session-plan-turn-outcome.test.ts',
       'src/main/acp/specialist-switch-recovery.integration.test.ts',
-      'src/main/agents/production-completion-handoff.test.ts'
+      'src/main/agents/production-completion-handoff.test.ts',
+      'src/renderer/src/pages/literature/literature-localization.render.test.tsx'
     ])
     expect(module.capabilityOverlays).toEqual([
       'windows_sensitive',

@@ -459,9 +459,9 @@
       "src/main/settings/service.connectors.test.ts",
       "src/main/settings/service.test.ts",
       "src/main/settings/session-details-model-owner.test.ts",
-      "src/main/settings/skill-catalog.python-availability.test.ts",
-      "src/main/settings/skill-catalog.registered-helpers.test.ts",
-      "src/main/settings/skill-catalog.test.ts",
+      "src/main/skills/catalog.python-availability.test.ts",
+      "src/main/skills/catalog.registered-helpers.test.ts",
+      "src/main/skills/catalog.test.ts",
       "src/main/settings/transport-validation.test.ts",
       "src/main/settings/workflows.test.ts",
       "src/main/settings/workflows/connectors-diagnostic.test.ts",
@@ -552,7 +552,7 @@
       "src/main/notebook/real-notebook-lineage.integration.test.ts",
       "src/main/notebook/real-parquet-lineage.integration.test.ts",
       "src/main/notebook/r-connection-guard.test.ts",
-      "src/main/notebook/dependency-analysis.lineage-regressions.test.ts",
+      "src/main/notebook/kernel-lineage-recovery.integration.test.ts",
       "src/main/session-diagnostics/export-evidence.integration.test.ts",
       "src/main/permission-grants/connector-broker.test.ts",
       "src/main/session-persistence/missing-runtime-session-repro.test.ts",
@@ -591,7 +591,8 @@
       "src/main/notebook/auto-mode-budget.integration.test.ts",
       "src/main/connectors/custom-mcp-config.test.ts",
       "src/main/connectors/mcp-host-dependencies.test.ts",
-      "src/main/session-diagnostics/schema-compatibility.integration.test.ts"
+      "src/main/session-diagnostics/schema-compatibility.integration.test.ts",
+      "src/renderer/src/pages/literature/literature-localization.render.test.tsx"
     ]
   },
   "capabilityOverlays": ["windows_sensitive", "e2e_regressions", "e2e_delegation"],

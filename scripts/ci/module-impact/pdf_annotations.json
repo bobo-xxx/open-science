@@ -247,7 +247,7 @@
       "src/main/side-chat/ipc.test.ts",
       "src/main/acp/prompt-turn-workflow.test.ts",
       "src/main/acp/turn-skill-owner.test.ts",
-      "src/main/settings/skill-catalog.test.ts",
+      "src/main/skills/catalog.test.ts",
       "src/main/acp/prompt-outcome-finalizer.test.ts",
       "src/main/acp/prompt-preparation-owner.test.ts",
       "src/main/acp/restricted-inference-runner.test.ts",
@@ -671,7 +671,8 @@
       "src/main/desktop-native-electron.test.ts",
       "src/main/session-plan/session-plan-turn-outcome.test.ts",
       "src/main/acp/specialist-switch-recovery.integration.test.ts",
-      "src/main/agents/production-completion-handoff.test.ts"
+      "src/main/agents/production-completion-handoff.test.ts",
+      "src/renderer/src/pages/literature/literature-localization.render.test.tsx"
     ]
   },
   "capabilityOverlays": ["e2e_regressions"],
