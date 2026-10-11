@@ -30,7 +30,7 @@ import { SessionPdfSourceResolver } from '../literature/session-pdf-source-resol
 import { createLocalModelApi } from '../local-models/owner'
 
 import { createLocalModelOwner } from '../local-models/owner'
-import { createLogger, errorLogFields } from '../logger'
+import { createLogger, errorLogFields } from '@aipoch/diagnostics/node'
 import { PdfAnnotationRepository } from '../pdf-annotations/repository'
 import { PdfAnnotationService } from '../pdf-annotations/service'
 import { getProjectDbClient } from '../projects/prisma-client'
@@ -195,13 +195,7 @@ export async function composeDocumentReading({
   const pdfStructureOwner = createPdfStructureOwner({
     models: localModelOwner,
     sources: pdfStructureSources,
-    engine: createPdfStructureEngine(
-      join(
-        runtimeMetadata().applicationPath.replace(/app\.asar$/, 'app.asar.unpacked'),
-        'resources',
-        'pdf-structure'
-      )
-    )
+    engine: createPdfStructureEngine()
   })
   const pdfStructureReader = new PdfStructureReader(pdfStructureOwner)
   await modules.add({ pdfStructureOwner }, ({ pdfStructureOwner: owner }) => ({

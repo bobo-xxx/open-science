@@ -6,6 +6,14 @@ export const isElectronPackage = (name) =>
 const packageName = (specifier) =>
   specifier.startsWith('@') ? specifier.split('/').slice(0, 2).join('/') : specifier.split('/')[0]
 
+// node-gyp keeps compiler intermediates (e.g. *.o) in build/Release/obj.target. They are dead
+// weight at runtime and, being unsigned Mach-O objects, break packaged signature verification —
+// so dependency copies for the standalone backend must never include them.
+export const isShippableDependencyPath = (relativePath) => {
+  const parts = relativePath.split(/[\\/]/)
+  return parts[0] !== 'node_modules' && parts[0] !== '.git' && !parts.includes('obj.target')
+}
+
 // esbuild inputs cover the entire reachable source/worker graph; outputs record actual external
 // runtime imports after type erasure. Packaging independently walks every dependency and peer.
 export function assertBackendImports(metafiles, dependencies) {
@@ -33,4 +41,19 @@ export function assertBackendImports(metafiles, dependencies) {
       }
     }
   }
+}
+
+// Local file: dependencies are symlinks in development. Keep the PDF package's source/fixtures
+// out of shipped runtimes, using its deliberately literal top-level npm files allowlist.
+export function backendDependencyIncludes(manifest, relativePath) {
+  const top = relativePath.split(/[\\/]/)[0]
+  if (!isShippableDependencyPath(relativePath)) return false
+  if (!['@aipoch/pdf-structure', '@aipoch/pdf-translation'].includes(manifest.name) || !top)
+    return true
+  if (
+    !Array.isArray(manifest.files) ||
+    manifest.files.some((path) => !/^[a-zA-Z0-9_.-]+$/.test(path))
+  )
+    throw new Error('PDF package staging requires literal top-level files entries.')
+  return top === 'package.json' || manifest.files.includes(top)
 }

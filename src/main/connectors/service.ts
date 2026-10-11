@@ -1,4 +1,4 @@
-import { isSensitiveDiagnosticKey, redactSensitiveText } from '../../shared/diagnostic-redaction'
+import { isSensitiveDiagnosticKey, redactSensitiveText } from '@aipoch/diagnostics'
 import { ConnectorHttpError, ParserEngine } from '@aipoch/connector-core'
 import type { ConnectorRegistry } from '@aipoch/connector-core'
 import {
@@ -90,6 +90,9 @@ type ConnectorServiceDeps = {
     availability: CustomMcpFailureAvailability | undefined
   ) => void
 }
+
+export const CONNECTOR_USER_AGENT =
+  'Mozilla/5.0 (compatible; Open-Science/1.0; +https://github.com/aipoch/open-science)'
 
 // Optional routing context for a connector call. Present for calls that originate inside a session
 // (e.g. notebook host.mcp); absent for context-free callers.
@@ -239,7 +242,12 @@ export class ConnectorService {
     }
   >()
   constructor(private readonly deps: ConnectorServiceDeps) {
-    this.engine = deps.engine ?? new ParserEngine({ redactDiagnosticText: redactSensitiveText })
+    this.engine =
+      deps.engine ??
+      new ParserEngine({
+        redactDiagnosticText: redactSensitiveText,
+        userAgent: CONNECTOR_USER_AGENT
+      })
     this.permissionBroker = new ConnectorPermissionBroker(
       deps.permissionGrantRegistry,
       deps.requestApproval

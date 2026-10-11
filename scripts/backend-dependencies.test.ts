@@ -1,5 +1,12 @@
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { assertBackendImports, isElectronPackage } from './backend-dependencies.mjs'
+import {
+  assertBackendImports,
+  backendDependencyIncludes,
+  isElectronPackage,
+  isShippableDependencyPath
+} from './backend-dependencies.mjs'
 
 describe('standalone dependency boundary', () => {
   it.each([
@@ -47,4 +54,64 @@ describe('standalone dependency boundary', () => {
       )
     ).not.toThrow()
   })
+  describe('isShippableDependencyPath', () => {
+    it.each([
+      'package.json',
+      'build/Release/probe.node',
+      join('build', 'Release', 'probe.node'),
+      'src/index.js'
+    ])('ships %s', (path) => {
+      expect(isShippableDependencyPath(path)).toBe(true)
+    })
+    it.each([
+      'node_modules',
+      join('node_modules', 'left-pad', 'index.js'),
+      '.git',
+      join('.git', 'HEAD'),
+      'build/Release/obj.target',
+      join('build', 'Release', 'obj.target', 'probe', 'src', 'probe.o'),
+      join('build', 'Release', 'obj.target')
+    ])('excludes %s', (path) => {
+      expect(isShippableDependencyPath(path)).toBe(false)
+    })
+  })
 })
+
+const pdfManifest = JSON.parse(readFileSync('packages/pdf-structure/package.json', 'utf8'))
+it.each(['/', '\\'])('stages the PDF npm runtime without source fixtures (%s)', (separator) => {
+  for (const path of [
+    'dist/index.js',
+    'dist/result.d.ts',
+    'resources/host.mjs',
+    'package.json',
+    'LICENSE',
+    'README.md'
+  ])
+    expect(backendDependencyIncludes(pdfManifest, path.split('/').join(separator))).toBe(true)
+  for (const path of [
+    'src/engine.ts',
+    'test/fixtures/case.jsonl',
+    'node_modules/sharp/index.js',
+    '.git/config',
+    'resources/obj.target/worker.o',
+    'tsconfig.json'
+  ])
+    expect(backendDependencyIncludes(pdfManifest, path.split('/').join(separator))).toBe(false)
+  expect(backendDependencyIncludes(pdfManifest, '')).toBe(true)
+})
+
+it.each(['/', '\\'])(
+  'keeps native build intermediates out of the staged dependency closure (%s)',
+  (separator) => {
+    const manifest = { name: 'native-addon' }
+    expect(
+      backendDependencyIncludes(
+        manifest,
+        ['build', 'Release', 'obj.target', 'addon.o'].join(separator)
+      )
+    ).toBe(false)
+    expect(
+      backendDependencyIncludes(manifest, ['build', 'Release', 'addon.node'].join(separator))
+    ).toBe(true)
+  }
+)

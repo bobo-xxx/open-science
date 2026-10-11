@@ -36,10 +36,10 @@ describe('module test impact commands', () => {
       expect(plan.capabilityOverlays).toEqual([])
       expect(plan.testFiles).toEqual(
         expect.arrayContaining([
-          'src/main/literature/pdf-translation/writer.test.ts',
+          'packages/pdf-translation/test/writer.test.ts',
           'src/main/settings/provider-text-generation.test.ts',
-          'src/renderer/src/pages/workspace/previews/renderers/pdf-translation-extraction.test.ts',
-          'src/shared/pdf-translation-recovery.test.ts',
+          'packages/pdf-translation/test/reader/pdf-translation-extraction.test.ts',
+          'packages/pdf-translation/test/recovery.test.ts',
           'test/pdf-translation-native-verification.test.ts'
         ])
       )
@@ -99,8 +99,10 @@ describe('module test impact commands', () => {
         expect.anything()
       )
       spawn.mockClear()
-      // Ordinary local invocations still do no work for an empty selection.
-      executeModuleTestPlan(plan, { spawn })
+      // Ordinary local invocations still do no work for an empty selection. Pass a controlled
+      // environment: under CI the job exports OPEN_SCIENCE_CI_SELECTED_PACKAGE_ROOTS, and an
+      // ambient non-empty selection would make the plan spawn despite the empty module list.
+      executeModuleTestPlan(plan, { spawn, environment: {} })
       expect(spawn).not.toHaveBeenCalled()
     } finally {
       write.mockRestore()
@@ -899,4 +901,47 @@ it.each([
   })
   expect(plan.mode).toBe('selective')
   expect(plan.testFiles).toContain(testFile)
+})
+
+it.each([
+  'src/main/session-diagnostics/notebook.ts',
+  'src/main/session-diagnostics/worker-entry.ts',
+  'src/main/session-diagnostics/desktop.ts'
+])('keeps Session export selective with storage, transport and UI contracts for %s', (path) => {
+  const manifest = loadModuleImpactManifest(resolve('scripts/ci/module-impact.json'))
+  const plan = createAffectedTestPlan(
+    [{ path, status: 'modified' }],
+    {
+      status: 'unavailable-manifest-only',
+      testFiles: []
+    },
+    manifest
+  )
+  expect(plan.mode).toBe('selective')
+  expect(plan.modules).toEqual(['session_diagnostics'])
+  expect(plan.testFiles).toEqual(
+    expect.arrayContaining([
+      ...Object.values(manifest.modules.session_diagnostics.testFiles).flat(),
+      'src/main/session-diagnostics/desktop.test.ts',
+      'src/main/session-diagnostics/collector.test.ts',
+      'src/main/desktop-runtime-transport.integration.test.ts'
+    ])
+  )
+  expect(plan.capabilityOverlays).toEqual(
+    expect.arrayContaining(['e2e_regressions', 'windows_sensitive'])
+  )
+  expect(plan.testFiles.some((file) => file.startsWith('packages/connector-'))).toBe(false)
+})
+
+it.each([
+  'packages/diagnostics/src/logger.ts',
+  'packages/diagnostics/src/diagnostic-redaction.ts',
+  'packages/diagnostics/src/node.ts',
+  'packages/diagnostics/package.json'
+])('retains full host validation for common diagnostic or build input %s', (path) => {
+  const plan = createAffectedTestPlan([{ path, status: 'modified' }], {
+    status: 'unavailable-manifest-only',
+    testFiles: []
+  })
+  expect(plan.mode).toBe('full')
 })

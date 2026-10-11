@@ -1,4 +1,4 @@
-import { CONNECTOR_CATALOG } from '@aipoch/connector-builtins/catalog'
+import { CONNECTOR_CATALOG } from '../connectors/catalog'
 import { createSettingsExportFiles, createSettingsFileCommands } from '../settings/file-commands'
 import { createBackgroundResultActivityOwner } from '../background-result-delivery/ipc'
 import {
@@ -15,7 +15,7 @@ import { BackgroundResultDeliveryRepository } from '../background-result-deliver
 import { type ResolvedBackgroundResultSource } from '../background-result-delivery/source-resolver'
 import { ALL_CONNECTOR_IDS } from '../connectors/registry'
 
-import { createLogger } from '../logger'
+import { createLogger } from '@aipoch/diagnostics/node'
 import { createNotebookApplicationModule } from '../notebook/application'
 
 import { createPermissionGrantProjectionController } from '../permission-grants/projection-controller'
