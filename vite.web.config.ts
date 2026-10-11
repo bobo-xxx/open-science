@@ -23,9 +23,15 @@ export default defineConfig({
   optimizeDeps: {
     include: [
       '@aipoch/connector-mcp-client/oauth-redirect',
+      '@aipoch/compute',
       '@aipoch/diagnostics',
       '@aipoch/skills/document',
-      '@aipoch/notebook-analysis/contracts'
+      '@aipoch/notebook-analysis/contracts',
+      '@aipoch/environment/contracts',
+      '@aipoch/specialists',
+      '@aipoch/reproducibility/contracts',
+      '@aipoch/reproducibility/comparison',
+      '@aipoch/reproducibility/execution-context'
     ]
   },
   plugins: [react(), tailwindcss()],
@@ -35,8 +41,8 @@ export default defineConfig({
     commonjsOptions: {
       include: [
         /node_modules/,
-        /packages[\\/](?:connector-(?:core|mcp-client)|diagnostics|skills)[\\/]dist/,
-        /packages[\\/]notebook-analysis[\\/]dist/
+        /packages[\\/](?:connector-(?:core|mcp-client)|compute|diagnostics|skills|specialists)[\\/]dist/,
+        /packages[\\/](?:notebook-analysis|environment|reproducibility)[\\/]dist/
       ]
     },
     emptyOutDir: true

@@ -1,18 +1,22 @@
 import { randomUUID } from 'node:crypto'
 
 import type {
-  NotebookCell,
   NotebookEnvironmentManifest,
+  NotebookLiveEnvironmentOverlay
+} from '../../shared/notebook'
+import type {
+  NotebookRunEnvironmentCapture,
+  NotebookRunEnvironmentLockCapture
+} from '@aipoch/environment/contracts'
+import type {
+  NotebookCell,
   NotebookHelperModuleEvidence,
   NotebookHelperEvidenceStatus,
   NotebookKernelInstanceIdentity,
   NotebookKernelMetadata,
   NotebookLanguage,
-  NotebookLiveEnvironmentOverlay,
   NotebookNamespaceVariable,
   NotebookOutput,
-  NotebookRunEnvironmentCapture,
-  NotebookRunEnvironmentLockCapture,
   NotebookRunInputFile,
   NotebookRunSource,
   NotebookRunStatus,
@@ -97,7 +101,7 @@ export type NotebookSessionExecutionRequest = {
   // binds this domain epoch to the OS process owner so startup recovery never adopts a stale writer.
   kernelEpochId?: string
   code: string
-  pythonRandomState?: import('../../shared/notebook-execution-context').NotebookExecutionContext['before']['pythonRandomState']
+  pythonRandomState?: import('@aipoch/reproducibility/execution-context').NotebookExecutionContext['before']['pythonRandomState']
   helperModules?: readonly NotebookHelperModuleInjection[]
   cwd: string
   notebookSessionRoot: string

@@ -7,7 +7,7 @@ import { literatureDeletionError } from '../../../../shared/literature-deletion'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { literatureJobRequestSchema } from '../../../../shared/literature-jobs'
+import { literatureJobRequestSchema } from '@aipoch/literature-discovery/jobs'
 import {
   LITERATURE_IMPORT_IDENTITY_CONFLICT,
   literatureCatalogCommandSchema
@@ -20,7 +20,7 @@ import type {
   LiteratureItemInput,
   LiteratureItemView
 } from '../../../../shared/literature'
-import type { SmartCollectionView } from '../../../../shared/literature-smart-collections'
+import type { SmartCollectionView } from '@aipoch/literature-screening/contracts'
 import type { Project } from '../../../../shared/projects'
 import { useNavigationStore } from '@/stores/navigation-store'
 import { createInitialSessionState, useSessionStore } from '@/stores/session-store'

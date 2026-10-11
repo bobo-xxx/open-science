@@ -112,53 +112,56 @@ describe('module test impact commands', () => {
   it.each([
     ['--shard=2/3', '--reporter=blob', '--outputFile=vitest-reports/blob-2.json'],
     ['--merge-reports=vitest-reports', '--passWithNoTests']
-  ])('preserves module selection and changed coverage when forwarding %j', (...vitestArguments) => {
-    const spawn = vi.fn(() => ({ status: 0 }))
-    const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
-    const source = 'src/main/notebook/mcp-server.ts'
-    const plan = createAffectedTestPlan([{ path: source, status: 'modified' }], {
-      status: 'unavailable-manifest-only',
-      testFiles: []
-    })
-    try {
-      runModuleTestCli(
-        [
-          'affected',
-          '--base',
-          'base',
-          '--head',
-          'head',
-          '--coverage-changed',
-          'base',
-          '--',
-          ...vitestArguments
-        ],
-        {
-          execute: (command: string, args: string[]) => {
-            if (command === 'git' && args[0] === 'merge-base') return 'base\n'
-            if (command === 'git' && args[0] === 'diff') return Buffer.from(`M\0${source}\0`)
-            throw new Error('CodeGraph unavailable in CI')
-          },
-          spawn,
-          environment: { npm_execpath: '/npm/bin/npm-cli.js' }
-        }
-      )
-      const merging = vitestArguments[0].startsWith('--merge-reports')
-      expect(spawn.mock.calls[0]?.[1]).toEqual([
-        '/npm/bin/npm-cli.js',
-        ...(merging ? ['exec', '--', 'vitest', 'run'] : ['test', '--']),
-        '--coverage',
-        `--coverage.include=${source}`,
-        ...vitestArguments,
-        ...(merging ? [] : plan.testFiles)
-      ])
-      expect(spawn.mock.calls[0]?.[2]?.env).toMatchObject({
-        VITEST_CHANGED_COVERAGE_THRESHOLDS: '1'
+  ])(
+    'preserves module selection and changed coverage when forwarding %j',
+    async (...vitestArguments) => {
+      const spawn = vi.fn(() => ({ status: 0 }))
+      const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+      const source = 'src/main/notebook/mcp-server.ts'
+      const plan = createAffectedTestPlan([{ path: source, status: 'modified' }], {
+        status: 'unavailable-manifest-only',
+        testFiles: []
       })
-    } finally {
-      write.mockRestore()
+      try {
+        await runModuleTestCli(
+          [
+            'affected',
+            '--base',
+            'base',
+            '--head',
+            'head',
+            '--coverage-changed',
+            'base',
+            '--',
+            ...vitestArguments
+          ],
+          {
+            execute: (command: string, args: string[]) => {
+              if (command === 'git' && args[0] === 'merge-base') return 'base\n'
+              if (command === 'git' && args[0] === 'diff') return Buffer.from(`M\0${source}\0`)
+              throw new Error('CodeGraph unavailable in CI')
+            },
+            spawn,
+            environment: { npm_execpath: '/npm/bin/npm-cli.js' }
+          }
+        )
+        const merging = vitestArguments[0].startsWith('--merge-reports')
+        expect(spawn.mock.calls[0]?.[1]).toEqual([
+          '/npm/bin/npm-cli.js',
+          ...(merging ? ['exec', '--', 'vitest', 'run'] : ['test', '--']),
+          '--coverage',
+          `--coverage.include=${source}`,
+          ...vitestArguments,
+          ...(merging ? [] : plan.testFiles)
+        ])
+        expect(spawn.mock.calls[0]?.[2]?.env).toMatchObject({
+          VITEST_CHANGED_COVERAGE_THRESHOLDS: '1'
+        })
+      } finally {
+        write.mockRestore()
+      }
     }
-  })
+  )
 
   it('selects the standalone workflow contract instead of the global fallback', () => {
     const plan = createAffectedTestPlan(
@@ -193,9 +196,9 @@ describe('module test impact commands', () => {
     expect(plan.testFiles).toEqual(
       expect.arrayContaining([
         'src/main/compute/compute-job-lifecycle.test.ts',
-        'src/main/compute/job-deletion-owner.test.ts',
+        'src/main/compute/job-deletion-runtime-isolation.test.ts',
         'src/main/compute/compute-service.test.ts',
-        'src/main/compute/ssh-runner.test.ts',
+        'src/main/compute/connection-broker.test.ts',
         'src/main/compute/ipc.test.ts',
         'src/main/notebook/local-rpc-server.mcpcall.test.ts'
       ])
@@ -208,7 +211,7 @@ describe('module test impact commands', () => {
     expect(plan.fallbackCapabilities).toEqual(['main_runtime'])
 
     const affected = createAffectedTestPlan(
-      [{ path: 'src/main/compute/compute-job-lifecycle.ts', status: 'added' }],
+      [{ path: 'src/main/compute/dispatch-evidence.ts', status: 'added' }],
       { status: 'current', testFiles: [] }
     )
     expect(affected.modules).toEqual(['compute_service', 'workspace_page'])
@@ -221,12 +224,12 @@ describe('module test impact commands', () => {
   })
 
   it.each([
-    'src/main/compute/compute-job-lifecycle.ts',
-    'src/main/compute/job-deletion-owner.ts',
+    'packages/compute/src/compute-job-lifecycle.ts',
+    'packages/compute/src/job-deletion-owner.ts',
     'src/main/compute/job-repository.ts',
-    'src/main/compute/concurrency-manager.ts',
-    'src/main/compute/job-dispatcher.ts',
-    'src/main/compute/job-poller.ts'
+    'packages/compute/src/concurrency-manager.ts',
+    'packages/compute/src/job-dispatcher.ts',
+    'packages/compute/src/job-poller.ts'
   ])('routes Compute lifecycle changes through its complete certification set for %s', (path) => {
     const affected = createAffectedTestPlan([{ path, status: 'modified' }], {
       status: 'current',
@@ -234,13 +237,26 @@ describe('module test impact commands', () => {
     })
 
     expect(affected.mode).toBe('selective')
-    expect(affected.modules).toEqual(['compute_service', 'workspace_page'])
+    expect(affected.modules).toEqual(
+      path.startsWith('packages/')
+        ? ['compute_package', 'compute_service', 'workspace_page']
+        : ['compute_service', 'workspace_page']
+    )
+    if (path.startsWith('packages/'))
+      expect(affected.testFiles).toEqual(
+        expect.arrayContaining([
+          'packages/compute/src/concurrency-manager.test.ts',
+          'packages/compute/src/job-deletion-owner.test.ts'
+        ])
+      )
+    else
+      expect(affected.testFiles.filter((file) => file.startsWith('packages/compute/'))).toEqual([])
     expect(affected.testFiles).toEqual(
       expect.arrayContaining([
         'src/main/compute/compute-service.architecture.test.ts',
         'src/main/compute/compute-job-lifecycle.test.ts',
-        'src/main/compute/job-deletion-owner.test.ts',
-        'src/main/compute/concurrency-manager.test.ts',
+        'src/main/compute/job-deletion-runtime-isolation.test.ts',
+        'src/main/compute/concurrency-integration.test.ts',
         'src/main/compute/job-dispatcher.test.ts',
         'src/main/compute/job-poller.test.ts',
         'src/main/compute/compute-jobs.integration.test.ts',
@@ -349,9 +365,10 @@ describe('module test impact commands', () => {
           ])
         )
       }
+      expect(affected.testFiles).not.toContain('packages/open-science/cli.test.ts')
+      expect(affected.testFiles).not.toContain('packages/open-science/client.test.ts')
       expect(affected.testFiles).toEqual(
         expect.arrayContaining([
-          'packages/open-science/cli.test.ts',
           'src/main/acp/task-agent-port.test.ts',
           'src/main/notebook/local-rpc-notebook-adapter.test.ts',
           'src/main/notebook/local-rpc-server.mcpcall.test.ts',
@@ -682,7 +699,7 @@ describe('module test impact commands', () => {
     write.mockRestore()
   })
 
-  it('pins coverage to the PR diff when checkout contains newer main changes', () => {
+  it('pins coverage to the PR diff when checkout contains newer main changes', async () => {
     const cwd = mkdtempSync(resolve(tmpdir(), 'module-coverage-'))
     const git = (...args: string[]): string =>
       execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
@@ -709,15 +726,18 @@ describe('module test impact commands', () => {
       // Vitest coverage.changed compares with checkout HEAD, including this unrelated file.
       expect(git('diff', '--name-only', `${base}...HEAD`)).toContain('src/main-only.ts')
       const spawn = vi.fn(() => ({ status: 0 }))
-      runModuleTestCli(['affected', '--base', base, '--head', head, '--coverage-changed', base], {
-        cwd,
-        execute: (command: string, args: string[]) => {
-          if (command === 'codegraph') throw new Error('CodeGraph unavailable in CI')
-          return execFileSync(command, args, { cwd, encoding: 'utf8' })
-        },
-        spawn,
-        environment: { npm_execpath: '/npm/bin/npm-cli.js' }
-      })
+      await runModuleTestCli(
+        ['affected', '--base', base, '--head', head, '--coverage-changed', base],
+        {
+          cwd,
+          execute: (command: string, args: string[]) => {
+            if (command === 'codegraph') throw new Error('CodeGraph unavailable in CI')
+            return execFileSync(command, args, { cwd, encoding: 'utf8' })
+          },
+          spawn,
+          environment: { npm_execpath: '/npm/bin/npm-cli.js' }
+        }
+      )
       const args = spawn.mock.calls[0]?.[1]
       expect(args).toContain(`--coverage.include=${changed}`)
       expect(args).not.toContain('--coverage.changed')
@@ -739,11 +759,11 @@ describe('module test impact commands', () => {
       diff: 'R100\0src/renderer/src/stores/session-store-persistence-merge.ts\0src/renderer/src/stores/renamed.ts\0',
       include: 'src/renderer/src/stores/renamed.ts'
     }
-  ])('scopes coverage for $name', ({ diff, include }) => {
+  ])('scopes coverage for $name', async ({ diff, include }) => {
     const spawn = vi.fn(() => ({ status: 0 }))
     const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
     try {
-      runModuleTestCli(
+      await runModuleTestCli(
         ['affected', '--base', 'base', '--head', 'head', '--coverage-changed', 'base'],
         {
           execute: (command: string, args: string[]) => {
@@ -762,7 +782,7 @@ describe('module test impact commands', () => {
     }
   })
 
-  it.each(['same', 'different'])('keeps coverage pinned with a %s baseline', (baseline) => {
+  it.each(['same', 'different'])('keeps coverage pinned with a %s baseline', async (baseline) => {
     const base = '1'.repeat(40)
     const head = '2'.repeat(40)
     const coverageBase = baseline === 'same' ? base : '3'.repeat(40)
@@ -786,7 +806,7 @@ describe('module test impact commands', () => {
     )
 
     expect(
-      runModuleTestCli(
+      await runModuleTestCli(
         ['affected', '--base', base, '--head', head, '--coverage-changed', coverageBase],
         {
           cwd: '/repo',

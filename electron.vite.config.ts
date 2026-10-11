@@ -1,3 +1,4 @@
+import { windowsSigningBuildDefines } from './scripts/windows-signing-policy.mjs'
 import { createRequire } from 'node:module'
 import { resolve } from 'path'
 import { nativeLocaleAssets } from './scripts/native-locale-assets'
@@ -19,6 +20,7 @@ export default defineConfig(({ command }) => ({
     plugins: [nativeLocaleAssets()],
     define: {
       __OPEN_SCIENCE_NATIVE_LOCALE_DIRECTORY__: JSON.stringify('native-locales'),
+      ...windowsSigningBuildDefines(process.env),
       ...wsl2BuildDefines(process.platform, command === 'serve', process.env)
     },
     build: {
@@ -34,8 +36,8 @@ export default defineConfig(({ command }) => ({
       commonjsOptions: {
         include: [
           /node_modules/,
-          /packages[\\/](?:connector-(?:core|mcp-client)|diagnostics|skills)[\\/]dist/,
-          /packages[\\/]notebook-analysis[\\/]dist/
+          /packages[\\/](?:connector-(?:core|mcp-client)|compute|diagnostics|skills|specialists)[\\/]dist/,
+          /packages[\\/](?:notebook-analysis|environment|reproducibility)[\\/]dist/
         ]
       },
       rollupOptions: {
@@ -58,9 +60,15 @@ export default defineConfig(({ command }) => ({
             // file: links resolve outside node_modules and need explicit CJS prebundling.
             include: [
               '@aipoch/connector-mcp-client/oauth-redirect',
+              '@aipoch/compute',
               '@aipoch/diagnostics',
               '@aipoch/skills/document',
-              '@aipoch/notebook-analysis/contracts'
+              '@aipoch/notebook-analysis/contracts',
+              '@aipoch/environment/contracts',
+              '@aipoch/specialists',
+              '@aipoch/reproducibility/contracts',
+              '@aipoch/reproducibility/comparison',
+              '@aipoch/reproducibility/execution-context'
             ],
             entries: [
               '*.html',
@@ -111,8 +119,8 @@ export default defineConfig(({ command }) => ({
       commonjsOptions: {
         include: [
           /node_modules/,
-          /packages[\\/](?:connector-(?:core|mcp-client)|diagnostics|skills)[\\/]dist/,
-          /packages[\\/]notebook-analysis[\\/]dist/
+          /packages[\\/](?:connector-(?:core|mcp-client)|compute|diagnostics|skills|specialists)[\\/]dist/,
+          /packages[\\/](?:notebook-analysis|environment|reproducibility)[\\/]dist/
         ]
       },
       rollupOptions: {

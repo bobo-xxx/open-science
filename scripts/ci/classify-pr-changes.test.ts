@@ -489,12 +489,12 @@ describe('pull request change classification', () => {
     ['Windows runtime', 'src/main/windows.ts'],
     ['Shell search scope', 'src/main/notebook/shell-search-scope.ts'],
     ['PowerShell search parser', 'src/main/notebook/powershell-search-parser.ts'],
-    ['PowerShell', 'src/main/notebook/micromamba-cache-powershell.test.ts'],
+    ['PowerShell', 'packages/environment/src/micromamba-cache-powershell.test.ts'],
     ['path handling', 'src/main/acp/workspace-path.ts'],
-    ['ACL behavior', 'src/main/notebook/micromamba-cache-acl.integration.test.ts'],
-    ['Windows wheel recovery', 'src/main/notebook/pip-wheel-evidence.ts'],
-    ['Windows wheel regression', 'src/main/notebook/pip-wheel-evidence.test.ts'],
-    ['Windows install evidence', 'src/main/notebook/pip-install-evidence.test.ts'],
+    ['ACL behavior', 'packages/environment/src/micromamba-cache-acl.integration.test.ts'],
+    ['Windows wheel recovery', 'packages/environment/src/pip-wheel-evidence.ts'],
+    ['Windows wheel regression', 'packages/environment/src/pip-wheel-evidence.test.ts'],
+    ['Windows install evidence', 'packages/environment/src/pip-install-evidence.test.ts'],
     ['storage', 'src/main/storage/ipc.ts'],
     ['session persistence', 'src/main/session-persistence/ipc.ts'],
     ['delegated process ownership', 'src/main/delegation/process-ownership.ts'],
@@ -521,12 +521,14 @@ describe('pull request change classification', () => {
 
   it('requires a live CDN bundle when the immutable runtime version changes', () => {
     const plan = classifyChanges([
-      { path: 'src/main/notebook/runtime-paths.ts', status: 'modified' }
+      { path: 'packages/environment/src/runtime-paths.ts', status: 'modified' }
     ])
 
     expect(plan.roots).toEqual(expect.arrayContaining(['main_runtime', 'runtime_bundle']))
     expect(plan.lanes).toContain('runtime_bundle')
-    expect(plan.reasonChains).toContain('src/main/notebook/runtime-paths.ts -> runtime_bundle')
+    expect(plan.reasonChains).toContain(
+      'packages/environment/src/runtime-paths.ts -> runtime_bundle'
+    )
   })
 
   it('does not add focused Windows lanes for platform-neutral Main changes', () => {
@@ -727,6 +729,8 @@ describe('pull request change classification', () => {
     'e2e/playwright.accessibility.config.ts',
     'e2e/vite.browser-test.config.ts',
     'scripts/ci/change-impact.json',
+    'scripts/windows-signing-policy.mjs',
+    'scripts/windows-signing-policy.test.ts',
     '.github/workflows/pr-gate.yml'
   ])('selects the declared full plan for global gate input %s', (path) => {
     const plan = classifyChanges([{ path, status: 'modified' }])
@@ -777,6 +781,7 @@ describe('pull request change classification', () => {
     'src/main/notebook/windows-shell.ts',
     'packages/notebook-code-risk/src/index.ts',
     'src/main/notebook/runtime-service.ts',
+    'src/main/notebook/environment-resources.ts',
     'src/shared/tool-detail-sanitizer.ts',
     'src/shared/renderer-contract-catalog.ts',
     'src/shared/renderer-contracts/settings-preferences.ts'

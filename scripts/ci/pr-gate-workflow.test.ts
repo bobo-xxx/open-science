@@ -947,7 +947,8 @@ describe('PR Gate workflow', () => {
       ({ name }) => name === 'Enforce selected static checks'
     )
 
-    expect(workflow.jobs.static['timeout-minutes']).toBe(20)
+    // All-package isolation measured about 17 minutes before the existing static checks.
+    expect(workflow.jobs.static['timeout-minutes']).toBe(30)
     expect(actionlint).toMatchObject({
       id: 'actionlint',
       'continue-on-error': true
@@ -1734,11 +1735,12 @@ describe('PR Gate workflow', () => {
       'src/main/file-save.test.ts',
       'src/main/notebook/file-evidence-publication.integration.test.ts',
       'src/main/compute/compute-submission-evidence-recovery.integration.test.ts',
-      'src/main/specialist/repository.test.ts',
-      'src/main/notebook/micromamba-cache-powershell.test.ts',
-      'src/main/notebook/micromamba-cache-acl.integration.test.ts'
+      'packages/specialists/src/repository.test.ts',
+      'packages/environment/src/micromamba-cache-powershell.test.ts',
+      'packages/environment/src/micromamba-cache-acl.integration.test.ts'
     ]) {
       expect(runtime?.run).toContain(testFile)
+      expect(existsSync(testFile), `Missing Windows test: ${testFile}`).toBe(true)
     }
 
     const nativeMac = workflow.jobs.macos_e2e.steps?.find(
@@ -1812,18 +1814,19 @@ describe('PR Gate workflow', () => {
       'src/main/acp/workspace-path.test.ts',
       'src/main/file-save.test.ts',
       'src/main/notebook/run-document-data-paths.test.ts',
-      'src/main/notebook/runtime-paths.test.ts',
+      'packages/environment/src/runtime-paths.test.ts',
       'src/main/session-persistence/conversation-export.test.ts',
       'src/main/session-persistence/data-path-roundtrip.test.ts',
       'src/main/settings/notebook-runtime-settings.test.ts',
       'src/main/settings/preferences.test.ts',
       'src/main/settings/shell-path.test.ts',
-      'src/main/specialist/repository.test.ts',
+      'packages/specialists/src/repository.test.ts',
       'src/main/storage/data-path.test.ts',
       'src/main/storage/normalize-legacy-paths.test.ts',
       'src/main/storage/path-presence.test.ts'
     ]) {
       expect(path?.run).toContain(testFile)
+      expect(existsSync(testFile), `Missing Windows test: ${testFile}`).toBe(true)
     }
     expect(path?.run).toContain('--maxWorkers=1')
     expect(path?.run).toContain('--testTimeout=30000')
@@ -2100,18 +2103,18 @@ it('derives Ubuntu package exclusions from trusted policy before either test mod
   )
 })
 
-it('gates independent Notebook tarballs using trusted directional selection', () => {
+it('gates independent package tarballs using trusted directional selection', () => {
   const job = Object.values(workflow.jobs).find((job) => job.name === 'Static checks')!
   const steps = job.steps!
   const selector = steps.find(
     (step) => step.name === 'Select independent package verification from trusted policy'
   )!
-  const check = steps.find((step) => step.id === 'notebook_packages')!
+  const check = steps.find((step) => step.id === 'package_verification')!
   expect(selector.uses).toBe('./.github/actions/select-package-tests')
   expect(selector.with?.['trusted-base']).toBe('${{ needs.preflight.outputs.trusted_base }}')
   expect(steps.indexOf(selector)).toBeLessThan(steps.indexOf(check))
-  expect(check.run).toBe('npm run check:notebook-packages -- --ci')
+  expect(check.run).toBe('npm run check:packages -- --ci')
   const gate = steps.find((step) => step.name === 'Enforce selected static checks')!
-  expect(gate.env?.NOTEBOOK_PACKAGES_OUTCOME).toBe('${{ steps.notebook_packages.outcome }}')
-  expect(gate.run).toContain('check notebook_packages "$NOTEBOOK_PACKAGES_OUTCOME"')
+  expect(gate.env?.PACKAGE_VERIFICATION_OUTCOME).toBe('${{ steps.package_verification.outcome }}')
+  expect(gate.run).toContain('check package_verification "$PACKAGE_VERIFICATION_OUTCOME"')
 })

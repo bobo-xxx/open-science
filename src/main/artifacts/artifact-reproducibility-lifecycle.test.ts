@@ -17,8 +17,8 @@ import type {
   ArtifactReproducibilityCheckState
 } from '../../shared/artifact-reproducibility'
 import type { NotebookProcessSandbox } from '../notebook/process-sandbox'
-import { CHILD_UNCONFIRMED } from '../notebook/provisioner-runtime'
-import { ReproducibilityCleanupError } from './artifact-reproducibility-execution'
+import { CHILD_UNCONFIRMED } from '@aipoch/environment'
+import { ReproducibilityCleanupError } from '@aipoch/reproducibility'
 import { withReproducibilityNotebookLifecycle } from './reproducibility-notebook-lifecycle'
 import { SessionDeletionOwner } from '../session-deletion/owner'
 import {

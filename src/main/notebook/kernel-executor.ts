@@ -22,7 +22,7 @@ import { tmpdir } from 'node:os'
 import { delimiter, dirname, join } from 'node:path'
 import { diagnoseKernelExit } from './kernel-exit-diagnostics'
 import { kernelExecutableReadRoot } from './kernel-executable-read-root'
-import { resolveExternalRLibrary } from './external-r-library'
+import { resolveExternalRLibrary } from '@aipoch/environment'
 import { createInterface, type Interface } from 'node:readline'
 import { Transform, type TransformCallback } from 'node:stream'
 
@@ -50,7 +50,7 @@ import {
   buildNotebookKernelEnvironment,
   normalizeRProcessLocale,
   environmentPathRoots
-} from './process-environment'
+} from '@aipoch/environment'
 import {
   NotebookRuntimeAccessCancelledError,
   type NotebookProcessSandbox,
@@ -64,7 +64,7 @@ import {
   notebookWorkloadCacheEnv,
   notebookWorkloadCacheRoot,
   prepareNotebookWorkloadCache
-} from './notebook-workload-cache-paths'
+} from '@aipoch/environment'
 import {
   condaActivatedPath,
   DEFAULT_R_ENV,
@@ -73,7 +73,7 @@ import {
   rBin,
   rScriptBin,
   resolveEnvName
-} from './runtime-paths'
+} from '@aipoch/environment'
 import { boundedRuntimeDiagnostic } from '@aipoch/diagnostics/node'
 import type {
   NotebookSessionNamespaceRequest,
@@ -113,7 +113,7 @@ import type {
   KernelProcessReceipt,
   KernelProcessSpawnIntent
 } from './kernel-process-lifecycle.windows-posix'
-import { readProcessStartToken } from './operation-recovery'
+import { readProcessStartToken } from '@aipoch/environment'
 
 // Driver-internal process kind. 'python'/'r' are the data kernels selected by the agent-facing
 // NotebookLanguage; 'repl' is the control-plane Node kernel reached only via the control path. The
@@ -1420,6 +1420,8 @@ class NotebookKernelExecutor implements NotebookExecutor {
       child = spawn(spawnExecutable, spawnArgs, {
         cwd: spawnCwd,
         env: effectiveSpawnEnv,
+        // The desktop's Node backend has no console to inherit; hide the outer host too.
+        windowsHide: true,
         // Persistent kernels own a private POSIX process group. This gives teardown a stable OS-level
         // container that remains addressable even when the loop leader exits before its descendants.
         // Windows descendants are contained by the sandbox host's kill-on-close Job Object and the

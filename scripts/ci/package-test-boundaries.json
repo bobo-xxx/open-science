@@ -48,6 +48,30 @@
     {
       "root": "packages/journal-catalog",
       "dependencies": []
+    },
+    {
+      "root": "packages/environment",
+      "dependencies": ["packages/diagnostics"]
+    },
+    {
+      "root": "packages/compute",
+      "dependencies": ["packages/diagnostics"]
+    },
+    {
+      "root": "packages/literature-discovery",
+      "dependencies": ["packages/literature-citations"]
+    },
+    {
+      "root": "packages/specialists",
+      "dependencies": []
+    },
+    {
+      "root": "packages/reproducibility",
+      "dependencies": ["packages/environment", "packages/diagnostics", "packages/notebook-analysis"]
+    },
+    {
+      "root": "packages/literature-screening",
+      "dependencies": []
     }
   ]
 }
