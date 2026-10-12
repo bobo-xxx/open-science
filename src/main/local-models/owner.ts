@@ -5,9 +5,9 @@ import { lstat, mkdir, rename, rmdir, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { LOCAL_MODEL_NOT_INSTALLED, type LocalModelSnapshot } from '../../shared/local-models'
-import { DownloadChecksumError, resilientDownload } from '../net/resilient-download'
+import { DownloadChecksumError, resilientDownload } from '@aipoch/resilient-download'
 import { netFetchStandard } from '../network-fetch'
-import { readFileWithinLimit, writeDurableJsonFile } from '../storage/durable-json-file'
+import { readFileWithinLimit, writeDurableJsonFile } from '@aipoch/durable-files'
 import { acquireDataRootWriter } from '../storage/migration-state'
 import { resolveDataRoot } from '../storage-root'
 import { PDF_TABLE_MODEL_REVISIONS, type LocalModelRevision } from './catalog'
@@ -297,7 +297,7 @@ export const createLocalModelOwner = (dependencies: Dependencies = {}): LocalMod
               expectedSha256: asset.sha256,
               expectedSize: asset.size,
               signal: controller.signal,
-              deps: { fetchImpl: netFetchStandard },
+              fetchImpl: netFetchStandard,
               onProgress: (progress: NonNullable<LocalModelSnapshot['downloadProgress']>) => {
                 const transferred = completed + progress.transferred
                 const total = snapshot.downloadBytes

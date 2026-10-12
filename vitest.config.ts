@@ -208,6 +208,12 @@ export default defineConfig({
       ? 1
       : resolveVitestMaxWorkers(undefined, process.env.OPEN_SCIENCE_TEST_MAX_WORKERS),
     projects: [
+      ...(packageTestExcludePatterns(process.env).includes('packages/resilient-download/**')
+        ? []
+        : ['packages/resilient-download/vitest.config.ts']),
+      ...(packageTestExcludePatterns(process.env).includes('packages/durable-files/**')
+        ? []
+        : ['packages/durable-files/vitest.config.ts']),
       // Standalone package configuration owns its setup, concurrency and native shell tests.
       ...(packageTestExcludePatterns(process.env).includes('packages/compute/**')
         ? []
@@ -219,6 +225,8 @@ export default defineConfig({
           exclude: [
             ...VITEST_EXCLUDE_PATTERNS,
             'packages/compute/**',
+            'packages/durable-files/**',
+            'packages/resilient-download/**',
             ...VITEST_ARCHITECTURE_TEST_GLOBS,
             ...VITEST_DATABASE_TEST_GLOBS,
             ...VITEST_PROCESS_TEST_GLOBS
@@ -230,7 +238,12 @@ export default defineConfig({
         test: {
           name: 'architecture',
           include: [...VITEST_ARCHITECTURE_TEST_GLOBS],
-          exclude: [...VITEST_EXCLUDE_PATTERNS, 'packages/compute/**'],
+          exclude: [
+            ...VITEST_EXCLUDE_PATTERNS,
+            'packages/compute/**',
+            'packages/durable-files/**',
+            'packages/resilient-download/**'
+          ],
           isolate: false,
           fileParallelism: false,
           maxWorkers: 1,
@@ -242,7 +255,12 @@ export default defineConfig({
         test: {
           name: 'process',
           include: [...VITEST_PROCESS_TEST_GLOBS],
-          exclude: [...VITEST_EXCLUDE_PATTERNS, 'packages/compute/**'],
+          exclude: [
+            ...VITEST_EXCLUDE_PATTERNS,
+            'packages/compute/**',
+            'packages/durable-files/**',
+            'packages/resilient-download/**'
+          ],
           isolate: true,
           fileParallelism: false,
           maxWorkers: 1
@@ -253,7 +271,12 @@ export default defineConfig({
         test: {
           name: 'database',
           include: [...VITEST_DATABASE_TEST_GLOBS],
-          exclude: [...VITEST_EXCLUDE_PATTERNS, 'packages/compute/**'],
+          exclude: [
+            ...VITEST_EXCLUDE_PATTERNS,
+            'packages/compute/**',
+            'packages/durable-files/**',
+            'packages/resilient-download/**'
+          ],
           isolate: true,
           fileParallelism: false,
           maxWorkers: 1,

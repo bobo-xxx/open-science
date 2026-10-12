@@ -377,3 +377,131 @@ it('every module plan excludes unrelated upstream package tests', async () => {
   }
   expect(violations).toEqual([])
 })
+
+it('selects durable file consumers downstream without testing unchanged prerequisites', async () => {
+  const { createAffectedTestPlan, createModuleTestPlan, executeModuleTestPlan } =
+    await import('./module-test-impact.mjs')
+  const graph = { status: 'not-used', testFiles: [] }
+  const cases = [
+    [
+      'packages/durable-files/src/index.ts',
+      ['packages/durable-files', 'packages/skills', 'packages/specialists']
+    ],
+    ['packages/skills/src/specialist-package-adapter.ts', ['packages/skills']],
+    ['packages/specialists/src/repository.ts', ['packages/specialists']],
+    ['src/main/settings/document-store.ts', []],
+    ['src/main/artifacts/repository.ts', []],
+    ['packages/journal-catalog/src/index.ts', ['packages/journal-catalog']]
+  ] as const
+  for (const [path, selected] of cases) {
+    const packagePlan = createPackageTestPlan([path], registry)
+    expect([...packagePlan.selected].sort(), path).toEqual([...selected].sort())
+    const plan = createAffectedTestPlan([{ path, status: 'modified' }], graph)
+    expect(plan.mode, path).toBe('selective')
+    for (const entry of registry.packages) {
+      const included = plan.testFiles.some((test: string) => test.startsWith(entry.root + '/'))
+      expect(included, `${path} -> ${entry.root}`).toBe(selected.includes(entry.root as never))
+    }
+  }
+  const durable = createAffectedTestPlan(
+    [{ path: 'packages/durable-files/src/durable-json-file.ts', status: 'modified' }],
+    graph
+  )
+  expect(durable.testFiles).toEqual(
+    expect.arrayContaining([
+      'packages/durable-files/src/durable-json-file.test.ts',
+      'packages/skills/src/specialist-package-adapter.test.ts',
+      'packages/specialists/src/repository.test.ts',
+      'src/main/settings/document-store.test.ts',
+      'src/main/session-persistence/repository.test.ts',
+      'src/main/artifacts/artifact-save-crash.integration.test.ts'
+    ])
+  )
+  for (const id of ['main_storage', 'skill_package', 'specialist_package']) {
+    expect(
+      createModuleTestPlan(id).testFiles.filter((test: string) =>
+        test.startsWith('packages/durable-files/')
+      ),
+      id
+    ).toEqual([])
+  }
+  // The executor forwards the exact filters to Vitest; upstream builds are a separate step.
+  const invocations: string[][] = []
+  executeModuleTestPlan(durable, {
+    environment: {},
+    spawn: (_command: string, args: string[]) => {
+      invocations.push(args)
+      return { status: 0 }
+    }
+  })
+  expect(invocations.flat()).toContain('packages/durable-files/src/durable-json-file.test.ts')
+})
+
+it('routes download package changes downstream and host adapters without unchanged package units', async () => {
+  const { createAffectedTestPlan, executeModuleTestPlan } = await import('./module-test-impact.mjs')
+  const graph = { status: 'not-used', testFiles: [] }
+  const packageRoot = 'packages/resilient-download'
+  for (const path of [
+    `${packageRoot}/src/resilient-download.ts`,
+    `${packageRoot}/src/index.ts`,
+    `${packageRoot}/src/types.ts`,
+    `${packageRoot}/src/errors.ts`,
+    `${packageRoot}/src/download-speed.ts`
+  ]) {
+    expect(createPackageTestPlan([path], registry).selected, path).toEqual([packageRoot])
+    const plan = createAffectedTestPlan([{ path, status: 'modified' }], graph)
+    expect(plan.mode).toBe('selective')
+    expect(plan.testFiles).toEqual(
+      expect.arrayContaining([
+        `${packageRoot}/src/resilient-download.test.ts`,
+        `${packageRoot}/src/transport.test.ts`,
+        'src/main/update/downloader.test.ts',
+        'src/main/local-models/download.test.ts',
+        'src/main/local-models/owner.test.ts',
+        'src/main/notebook/environment-download.contract.test.ts',
+        'src/main/notebook/windows-runtime-download.contract.test.ts',
+        'src/main/session-package/transfer.test.ts'
+      ])
+    )
+    expect(plan.capabilityOverlays).toEqual(
+      expect.arrayContaining(['windows_sensitive', 'notebook_network_sandbox'])
+    )
+    for (const entry of registry.packages)
+      expect(
+        plan.testFiles.some((file) => file.startsWith(entry.root + '/')),
+        `${path} -> ${entry.root}`
+      ).toBe(entry.root === packageRoot)
+  }
+  for (const [path, test] of [
+    ['src/main/update/downloader.ts', 'src/main/update/downloader.test.ts'],
+    ['src/main/local-models/download.ts', 'src/main/local-models/download.test.ts'],
+    [
+      'src/main/notebook/environment-download.ts',
+      'src/main/notebook/environment-download.contract.test.ts'
+    ],
+    [
+      'src/main/notebook/windows-runtime-manager.ts',
+      'src/main/notebook/windows-runtime-download.contract.test.ts'
+    ],
+    ['src/main/session-package/transfer.ts', 'src/main/session-package/transfer.test.ts']
+  ]) {
+    const plan = createAffectedTestPlan([{ path, status: 'modified' }], graph)
+    expect(plan.mode).toBe('selective')
+    expect(plan.testFiles).toContain(test)
+    for (const entry of registry.packages)
+      expect(
+        plan.testFiles.some((file) => file.startsWith(entry.root + '/')),
+        `${path} -> ${entry.root}`
+      ).toBe(false)
+    const invocations: string[][] = []
+    executeModuleTestPlan(plan, {
+      environment: {},
+      spawn: (_command: string, args: string[]) => {
+        invocations.push(args)
+        return { status: 0 }
+      }
+    })
+    expect(invocations.flat()).toContain(test)
+    expect(invocations.flat().some((value) => value.startsWith(packageRoot + '/'))).toBe(false)
+  }
+})

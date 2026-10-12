@@ -9,12 +9,13 @@ import {
   symlinkSync
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, normalize } from 'node:path'
 import { parse } from 'yaml'
 import { executeModuleTestPlan } from './module-test-impact.mjs'
 import { describe, expect, it } from 'vitest'
 import {
   createPackageTestPlan,
+  verificationFamilies,
   packageTestExcludePatterns,
   notebookPackageVerificationPlan,
   environmentPackageVerificationPlan,
@@ -153,7 +154,8 @@ it('uses only trusted registry data, includes renames/deletions and preserves sy
           BASE_SHA: base,
           HEAD_SHA: head,
           TRUSTED_BASE_SHA: base,
-          PACKAGE_SELECTION_ENABLED: enabled
+          PACKAGE_SELECTION_ENABLED: enabled,
+          PACKAGE_VERIFICATION: 'true'
         }
       })
       return readFileSync(githubEnv, 'utf8')
@@ -194,7 +196,11 @@ it('applies exclusions to real Vitest discovery across inherited projects while 
       'packages/core/src/core.integration.test.ts',
       'packages/compute/src/compute.test.ts',
       'packages/compute/src/compute.architecture.test.ts',
-      'packages/compute/src/compute.integration.test.ts'
+      'packages/compute/src/compute.integration.test.ts',
+      'packages/durable-files/src/publication.test.ts',
+      'packages/durable-files/src/publication.architecture.test.ts',
+      'packages/durable-files/src/publication.integration.test.ts',
+      'packages/resilient-download/src/transport.test.ts'
     ]) {
       const file = join(fixture, path)
       mkdirSync(join(file, '..'), { recursive: true })
@@ -203,6 +209,14 @@ it('applies exclusions to real Vitest discovery across inherited projects while 
     writeFileSync(
       join(fixture, 'packages/compute/vitest.config.ts'),
       `export default {root: ${JSON.stringify(join(fixture, 'packages/compute'))}, test: {name:'compute',include:['src/**/*.test.ts']}}`
+    )
+    writeFileSync(
+      join(fixture, 'packages/durable-files/vitest.config.ts'),
+      `export default {root: ${JSON.stringify(join(fixture, 'packages/durable-files'))}, test: {name:'durable-files',include:['src/**/*.test.ts']}}`
+    )
+    writeFileSync(
+      join(fixture, 'packages/resilient-download/vitest.config.ts'),
+      `export default {root: ${JSON.stringify(join(fixture, 'packages/resilient-download'))}, test: {name:'resilient-download',include:['src/**/*.test.ts']}}`
     )
     const list = (portable: string, excluded = [core]): Array<{ file: string }> =>
       JSON.parse(
@@ -229,25 +243,34 @@ it('applies exclusions to real Vitest discovery across inherited projects while 
           }
         )
       )
-    expect(list('1', [core, 'packages/compute']).map(({ file }) => file)).toEqual([
-      join(fixture, 'src/host.test.ts')
-    ])
-    // A trusted baseline predating Compute must still discover the new package, exactly once.
+    expect(
+      list('1', [
+        core,
+        'packages/compute',
+        'packages/durable-files',
+        'packages/resilient-download'
+      ]).map(({ file }) => normalize(file))
+    ).toEqual([join(fixture, 'src/host.test.ts')])
+    // A trusted baseline predating these standalone packages must still discover the new package, exactly once.
     expect(
       list('1')
-        .map(({ file }) => file)
+        .map(({ file }) => normalize(file))
         .sort()
     ).toEqual(
       [
         'src/host.test.ts',
         'packages/compute/src/compute.test.ts',
         'packages/compute/src/compute.architecture.test.ts',
-        'packages/compute/src/compute.integration.test.ts'
+        'packages/compute/src/compute.integration.test.ts',
+        'packages/durable-files/src/publication.test.ts',
+        'packages/durable-files/src/publication.architecture.test.ts',
+        'packages/durable-files/src/publication.integration.test.ts',
+        'packages/resilient-download/src/transport.test.ts'
       ]
         .map((file) => join(fixture, file))
         .sort()
     )
-    expect(list('0')).toHaveLength(7)
+    expect(list('0')).toHaveLength(11)
   } finally {
     rmSync(fixture, { recursive: true, force: true })
   }
@@ -296,9 +319,9 @@ it.each(['dependencies', 'unavailable'] as const)(
       ).toBe(0)
       const report = JSON.parse(readFileSync(join(cwd, 'result.json'), 'utf8'))
       expect(report.numPassedTests).toBe(3)
-      expect(report.testResults.map(({ name }: { name: string }) => name).sort()).toEqual(
-        [core, providers, mcp].map((root) => join(cwd, root, 'contract.test.ts')).sort()
-      )
+      expect(
+        report.testResults.map(({ name }: { name: string }) => normalize(name)).sort()
+      ).toEqual([core, providers, mcp].map((root) => join(cwd, root, 'contract.test.ts')).sort())
     } finally {
       rmSync(cwd, { recursive: true, force: true })
     }
@@ -466,3 +489,98 @@ it.each([
     expect(plan.testFiles.some((file) => file.startsWith('packages/reproducibility/'))).toBe(false)
   }
 )
+
+describe('installed-consumer input selection', () => {
+  const actual = JSON.parse(readFileSync('scripts/ci/package-test-boundaries.json', 'utf8'))
+  const select = (paths: string[]): ReturnType<typeof createPackageTestPlan> =>
+    createPackageTestPlan(paths, actual, { verification: true })
+  it.each([
+    'src/main/application-events.ts',
+    'docs/package-workflows.md',
+    'README.md',
+    '.github/workflows/source-regression.yml',
+    'scripts/ci/windows-test-sequencer.test.ts',
+    'scripts/ci/package-test-impact.test.ts',
+    'scripts/package-verification-plan.test.ts',
+    'scripts/ci/module-test-impact.mjs',
+    'test/config/vite.browser-test.config.test.ts',
+    'e2e/session-diagnostics.spec.ts',
+    'electron.vite.config.ts',
+    'vite.web.config.ts'
+  ])('does not install packages for unrelated input %s', (path) => {
+    expect(select([path]).selected).toEqual([])
+    expect(select([path]).excluded).toHaveLength(actual.packages.length)
+  })
+  it('does not install packages for the complete scheduled-regression repair from PR 3478', () => {
+    expect(
+      select([
+        'e2e/reproducibility-preview.spec.ts',
+        'e2e/session-diagnostics.spec.ts',
+        'e2e/vite.browser-test.config.ts',
+        'scripts/ci/module-test-impact.mjs',
+        'scripts/ci/module-test-impact.test.ts',
+        'scripts/ci/package-test-impact.test.ts',
+        'scripts/ci/windows-test-sequencer.test.ts',
+        'scripts/ci/windows-test-sequencer.ts',
+        'scripts/electron-vite-config.test.ts',
+        'scripts/runtime-archives.mjs',
+        'scripts/runtime-archives.test.ts',
+        'src/main/agents/completion-gate.execute-control.integration.test.ts',
+        'src/main/delegation/production-composition.test.ts',
+        'src/main/notebook/runtime-service.test.ts',
+        'src/main/session-package/service.test.ts',
+        'test/config/vite.browser-test.config.test.ts'
+      ]).selected
+    ).toEqual([])
+  })
+  it('keeps mixed package/host edits directional and only builds upstream prerequisites', async () => {
+    const { packageVerificationPlan } = await import('../package-verification-plan.mjs')
+    const plan = select(['src/main/application-events.ts', 'packages/pdf-translation/src/index.ts'])
+    expect(plan.selected).toEqual(['packages/pdf-translation'])
+    expect(packageVerificationPlan(actual, plan.selected, plan.excluded)).toEqual({
+      builds: ['packages/pdf-structure', 'packages/pdf-translation'],
+      tests: ['packages/pdf-translation']
+    })
+    expect(select(['packages/pdf-structure/src/index.ts']).selected).toEqual([
+      'packages/pdf-structure',
+      'packages/pdf-translation'
+    ])
+  })
+  it.each([
+    'package.json',
+    'package-lock.json',
+    '.npmrc',
+    '.nvmrc',
+    'tsconfig.packages.json',
+    'vitest.config.ts',
+    'scripts/package-verification-plan.mjs',
+    'scripts/check-packages.mjs',
+    'scripts/build-dev-packages.mjs',
+    'scripts/ci/package-test-boundaries.json',
+    'scripts/ci/package-test-impact.mjs',
+    'scripts/ci/npm-ci.mjs',
+    '.github/actions/verify-packages/action.yml',
+    '.github/actions/select-package-tests/action.yml',
+    'packages/new-package/src/index.ts',
+    'unknown/input.bin',
+    'scripts/unknown-build-helper.mjs',
+    'scripts/ci/unknown-build-helper.mjs'
+  ])('retains every package for shared or unknown verification input %s', (path) => {
+    expect(select([path]).excluded).toEqual([])
+  })
+  it.each(verificationFamilies)(
+    'selects consumers of $script without unrelated packages',
+    ({ script, packages }) => {
+      const plan = select([`scripts/${script.replace(':', '-')}.mjs`])
+      expect(plan.selected).toEqual(
+        expect.arrayContaining(packages.map((name: string) => `packages/${name}`))
+      )
+      expect(plan.excluded.length).toBeGreaterThan(0)
+    }
+  )
+  it('does not let verification rules narrow portable test or ownership policy', () => {
+    expect(
+      createPackageTestPlan(['scripts/ci/windows-test-sequencer.test.ts'], actual).excluded
+    ).toEqual([])
+  })
+})
