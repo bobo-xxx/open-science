@@ -298,7 +298,8 @@ describe('release and scheduled workflow topology', () => {
       'build',
       'package-smoke',
       'notarize-mac',
-      'cli-artifacts'
+      'cli-artifacts',
+      'linux-cli-packages'
     ])
     expect(release.jobs['cli-artifacts'].needs).toEqual(['build', 'package-smoke', 'notarize-mac'])
     expect(release.jobs['publish-npm']).toBeUndefined()
@@ -741,7 +742,9 @@ if ($artifactSaveBase -eq $artifactSaveCommit) {
     // successful; the reporter inspects the nested conclusions instead.
     const advisory = name === 'nightly.yml' ? " || steps.advisory.outputs.ok != 'true'" : ''
     expect(script.env?.CONCLUSION).toBe(
-      `\${{ (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')${advisory}) && 'failure' || 'success' }}`
+      name === 'source-regression.yml'
+        ? "${{ needs.regression.result == 'success' && needs.packages.result == 'success' && needs.portable.result == 'success' && needs.portable_report.result == 'success' && 'success' || 'failure' }}"
+        : `\${{ (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')${advisory}) && 'failure' || 'success' }}`
     )
     if (name === 'nightly.yml') {
       const detect = step(report, 'Detect advisory job failures')

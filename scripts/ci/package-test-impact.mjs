@@ -5,8 +5,24 @@ import { fileURLToPath } from 'node:url'
 
 export const packageTestRegistryPath = 'scripts/ci/package-test-boundaries.json'
 const rootPattern = /^packages\/[a-z0-9][a-z0-9-]*$/
-const globalInput =
-  /^(?:package(?:-lock)?\.json$|\.npmrc$|\.nvmrc$|(?:vitest|vite|electron|tsconfig)[^/]*|test\/|scripts\/|\.github\/|patches\/|build\/|resources\/)/
+// These inputs can change package compilation, discovery or the trusted package-test graph.
+// Keep this list explicit: unrelated scripts and regression data must not fan out every package.
+const packageGlobalInput =
+  /^(?:package(?:-lock)?\.json$|\.npmrc$|\.nvmrc$|(?:vitest|vite|electron|tsconfig)[^/]*|test\/config\/|patches\/|build\/|resources\/|scripts\/(?:build-dev-packages|check-packages|check-package-isolation|check-(?:connector|diagnostics|environment|notebook)-packages|package-verification-plan)(?:\.[^/]+)?$|scripts\/ci\/(?:npm-ci|package-test-|module-test-impact\.)|\.github\/actions\/select-package-tests\/|\.github\/workflows\/(?:package-test-policy-dry-run|pr-gate)\.yml$)/
+
+// Fixture records and unrelated scripts are test evidence for another lane. They do not alter
+// the independently published package contracts, so changing them must not run every package.
+const packageExemptInput = /^(?:test\/fixtures\/|scripts\/)/
+
+// These packages run through module/host contracts and dedicated platform or CLI lanes.
+// They are downstream of independent libraries, never inputs to those libraries' suites.
+export const dedicatedPackageTestRoots = [
+  'packages/notebook-network-sandbox',
+  'packages/open-science',
+  'packages/credential-identity-probe-native',
+  'packages/process-tree-native',
+  'packages/safe-file-publisher-native'
+]
 
 // These are consumer scenarios, not another dependency graph. Prerequisites come from the registry.
 export const verificationFamilies = [
@@ -32,7 +48,9 @@ export const verificationFamilies = [
       'literature-citations',
       'journal-catalog',
       'literature-discovery',
-      'literature-screening'
+      'literature-screening',
+      'literature-library',
+      'literature-reading'
     ]
   }
 ]
@@ -41,7 +59,7 @@ export const verificationFamilies = [
 const verificationSharedInput =
   /^(?:package(?:-lock)?\.json$|\.npmrc$|\.nvmrc$|vitest[^/]*|tsconfig[^/]*|patches\/|scripts\/(?:(?:check-packages|package-verification-plan|build-dev-packages|build-packages)\.mjs$|ci\/(?:package-test-boundaries\.json$|(?:package-test-impact|npm-ci)\.mjs$))|\.github\/actions\/(?:select-package-tests|verify-packages)\/)/
 const verificationUnrelatedInput =
-  /^(?:src\/|docs\/|e2e\/|\.github\/|test\/config\/|scripts\/runtime-archives\.mjs$|scripts\/ci\/windows-test-sequencer\.ts$|scripts\/ci\/(?:module-|classify-pr-|evaluate-pr-|check-module-|audit-module-|consumer-retirement)|(?:electron|vite\.)[^/]*|[^/]+\.md$)|\.test\.[cm]?[jt]sx?$/
+  /^(?:src\/|docs\/|e2e\/|\.github\/|test\/(?:config|fixtures)\/|scripts\/runtime-archives\.mjs$|scripts\/ci\/windows-test-sequencer\.ts$|scripts\/ci\/(?:module-|classify-pr-|evaluate-pr-|check-module-|audit-module-|consumer-retirement)|(?:electron|vite\.)[^/]*|[^/]+\.md$)|\.test\.[cm]?[jt]sx?$/
 
 function verificationPaths(paths, roots) {
   return paths.flatMap((path) => {
@@ -153,7 +171,17 @@ export function createPackageTestPlan(paths, registry, { verification = false } 
     if (owner) {
       changed.add(owner)
       reasons.push(`${path} -> ${owner}`)
-    } else if (globalInput.test(path) || !/^(?:src\/|docs\/|[^/]+\.md$)/.test(path)) {
+    } else if (packageGlobalInput.test(path)) {
+      return {
+        selected: roots,
+        excluded: [],
+        reasons: [`${path} -> package compilation, discovery or policy input -> all package tests`]
+      }
+    } else if (dedicatedPackageTestRoots.some((root) => path.startsWith(root + '/'))) {
+      reasons.push(`${path} -> dedicated module/host lane -> independent package suites excluded`)
+    } else if (!verification && packageExemptInput.test(path)) {
+      reasons.push(`${path} -> non-package test or script input -> package unit tests excluded`)
+    } else if (!/^(?:src\/|docs\/|[^/]+\.md$)/.test(path)) {
       return {
         selected: roots,
         excluded: [],

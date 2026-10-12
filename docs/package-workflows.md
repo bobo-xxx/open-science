@@ -22,7 +22,18 @@ npm run check:packages -- --ci
 ```
 
 Explicit package names select exactly those consumers, plus prerequisite builds. Ordinary PR updates
-run affected package unit tests and host integration tests; installed tarball verification runs in
+run bounded affected package unit tests and host integration tests on separate Ubuntu runners.
+PR Gate uses four host shards and two package shards; `packages/` test files run only in the package
+group, while host, CLI and repository-policy tests run in the host group. Both groups retain the
+trusted package/module selection and feed one blocking coverage aggregate. Pure host changes omit
+package runners entirely; package fixture readers and shared runtime/build inputs still select
+package checks. Full portable plans defer to scheduled/manual Source Regression on both PRs and
+merge queue. Its complete acceptance runs the same separate host/package groups without exclusions.
+Selected test failures, timeouts and cancellations block the gate. A selective runner whose plan
+unexpectedly expands to full fails with `--require-selective`; it never silently restarts full.
+Full-suite failures can first appear after merge. CI policy changes still use the trusted base policy.
+
+Installed tarball verification runs in
 **merge queue** as a separate blocking job. Static checks no longer install or execute package tarballs;
 CLI/SDK, Node 22 compatibility and published-runtime checks have their own job with unchanged selection.
 
@@ -46,6 +57,12 @@ The **Package test policy dry-run** is manual-only; policy and actual Vitest dis
 also run through the ordinary test suites. Queue, scheduled and manual installation checks reuse
 `.github/actions/verify-packages` and the production dispatcher.
 
+PR Gate treats package sources, package metadata, package compilation inputs and the package-test
+policy as global package inputs. Unrelated `scripts/**` changes and root regression fixture data
+are excluded from unchanged package units; fixture changes still select their declared reader
+suites through module-impact fixture routing. Unknown paths and incomplete trusted evidence keep
+the complete package baseline.
+
 The dispatcher reuses the Connector, Diagnostics, Environment, Compute, Notebook, Skills and
 PDF/Literature verifiers.
 Prerequisites need compilation; only selected packages need their own unit suites. Installed
@@ -60,3 +77,11 @@ archive is an environment failure, not evidence that a package contract is broke
 exit codes are written to `test-results/package-verification.json` and uploaded by CI. The manually
 triggered **Package test policy dry-run** executes the same dispatcher on Ubuntu/Node 24; `packages=all`
 selects every registered package explicitly. This is the first place to debug this lane.
+
+## Package and host test layers
+
+PRs run changed package suites and bounded host adapter/contracts; downstream suites and more distant
+host consumers remain blocking in merge queue. `test:affected -- --tier pr` explains/exercises the PR
+selection; the default remains the complete affected queue selection. Full portable Ubuntu regression
+runs in Source Regression, with a focused manual `portable` mode. Run
+`node scripts/ci/audit-package-consumers.mjs HEAD` for per-package host dependency evidence.

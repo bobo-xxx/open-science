@@ -449,7 +449,11 @@ ci(review): unify automated AI reviews
   its squash subject must retain the PR title's Conventional Commit format. Do not update a branch
   merely because `main` advanced; update it for conflicts or a maintainer request.
 - PR commits retain policy/CI Integrity, CodeQL (GitHub default setup, not a repository
-  workflow), AI review, static checks and portable tests on Ubuntu. Desktop changes run the Windows
+  workflow), AI review, static checks and selective portable tests on Ubuntu.
+  PRs and merge queue run affected host/package tests separately and skip unaffected packages.
+  Failed selected checks block merging; full portable suites run in scheduled/manual Source
+  Regression instead. See [Package workflows](docs/package-workflows.md) for selection details.
+  Desktop changes run the Windows
   mainline E2E journeys on one test runner, selected from the changed modules and their declared
   consumers: projects/sessions, conversation/approval, files/previews, Notebook analysis, and native
   Windows behavior. The Notebook journey uploads CSV data, runs real Python through the Agent/MCP
@@ -477,8 +481,7 @@ ci(review): unify automated AI reviews
   Platform-sensitive changes add focused Darwin sandbox, process/delegation, window/second-launch
   and Notebook checks in that same job. Selected native checks must succeed; skipped is not success.
   Queue does not repeat Windows business E2E or complete Mac business/presentation suites. Existing
-  selected Windows core checks remain blocking. Full portable fallback still applies to unknown
-  owners, destructive changes and global CI inputs.
+  selected Windows core checks remain blocking.
 - The platform policy uses the existing `macosProfile` values (`smoke` or `expanded`). An expanded
   queue plan selects the short core lane plus native checks on one runner. Manual `macos-smoke`,
   `source-regressions` and `e2e` runs retain their explicitly selected suites for early platform
@@ -566,14 +569,16 @@ Source Regression; manual callers without an explicit capacity input retain comp
 ### Independent package tests
 
 Register independent packages and their dependencies in `scripts/ci/package-test-boundaries.json`.
-Ubuntu PR tests skip unchanged upstream packages while retaining host integration coverage;
-shared changes or uncertain evidence retain all package tests. Local `npm test` stays complete.
+Ubuntu PR tests run changed packages and bounded host adapter/contracts; merge queue retains downstream
+package and host integration coverage. Use `npm run test:affected:explain -- --base origin/main --head HEAD
+--tier pr` (or `--tier queue`) to inspect each layer; `queue` remains the local default.
+Shared changes or uncertain evidence retain all package tests. Local `npm test` stays complete.
 Registry changes require CI owner review.
 
 Installed package checks run selectively in merge queue and fully in scheduled Source Regression.
 Use the manual package dry-run for focused diagnostics; see [Package workflows](docs/package-workflows.md).
 
-For pure registered-package edits, `test:affected` can further omit host tests added only
+For pure registered-package edits, the default `queue` tier can further omit host tests added only
 by downstream module expansion. It preserves directly declared owner/contract/consumer
 evidence, downstream package suites, CodeGraph-selected tests and platform capabilities.
 Exclusion requires complete dependency evidence in the merge base, PR head and actual
@@ -614,8 +619,8 @@ change before proposing registration cleanup that depends on it.
 New explicit ownership cannot hide existing inferred test coverage. Unknown policy metadata and
 coverage reductions fail the check; owner approval alone does not waive these invariants.
 Module moves and consolidation must preserve surviving ownership, interfaces, test evidence and
-routing obligations, including consumer edges; they retain full PR validation. Deliberate
-reductions require a separate CI policy change, not a registration-only PR. Trusted selection may
+routing obligations, including consumer edges. Deliberate reductions require a separate CI policy
+change, not a registration-only PR. Trusted selection may
 accept additive evidence in existing module shards: it reads candidate Git blobs as JSON, verifies
 preserved policy/evidence against the merge base, and adds evidence to the trusted manifest without
 dropping newer mainline registrations. Changed records select their module evidence, including new
@@ -629,6 +634,20 @@ test evidence and routing obligations retained, and every reachable or uncertain
 registered in the new owner. The original shared owner keeps its full-validation marker
 and surviving evidence. This is not a general exception for shared files or package edits;
 merge the protected policy before proposing the registration split.
+Host owners under `src/main/` and `src/renderer/` may split into new modules in a
+registration-only revision with unchanged source and tests. Trusted Integrity verifies that each
+new owner takes paths from exactly one surviving non-full owner, preserves moved interfaces,
+platform capabilities and downstream routing, and retains every reachable or uncertain test from
+the old execution plan. Explicit contracts, non-host evidence and explicit tests without a
+provable old source dependency follow the split as well. Moved owner tests keep their owner
+classification in the new module; tests still reaching the remaining owner, or with incomplete
+or unproven old source evidence, must also remain registered there. Original owners containing shared/preload/package sources, full owners (before or after the split), existing-module transfers and
+mixed source/policy edits do not qualify. Host build scripts and test harnesses may remain on the original owner; only main/renderer source paths can transfer. An old consumer registration may follow a verified split
+only when complete evidence proves its old dependency and no dependency on the remaining owner;
+uncertain and already-unproven host consumers stay registered. Original contracts and consumer-edge protections remain
+in force. Merge this protected policy before proposing a registration split that depends on it.
+The split still receives full PR validation; ordinary selective runs acquire no extra graph scan.
+
 The exact consumer-evidence guard also retains entries when a dependency cone is incomplete
 (for example, a generated native addon or computed import). Absence from a static graph alone
 must not demand removal that trusted Integrity cannot verify. Fully resolved obsolete consumers

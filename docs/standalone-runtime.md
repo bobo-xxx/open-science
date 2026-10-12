@@ -16,6 +16,43 @@ contracts, caller leases, permission prompts and navigation revocation remain in
 requests travel back to Electron for dialogs, notifications and rendering. This is one business
 implementation, with transport and native adapters, rather than two server implementations.
 
+## Install with Homebrew (macOS/Linux)
+
+The [AIPOCH tap](https://github.com/aipoch/homebrew-tap) installs the standalone CLI on
+macOS Apple Silicon/Intel and glibc Linux ARM64/x64:
+
+```bash
+brew install aipoch/tap/open-science
+open-science start --no-open
+open-science status --json
+open-science url
+open-science stop
+```
+
+The Formula includes the pinned Node, backend and Web UI; no installed Node, npm or
+Electron is required. Python/R, Linux credential storage and sandbox prerequisites below
+still apply. Installation does not start a service. The desktop Cask remains separate:
+`brew install --cask open-science`.
+
+CLI and desktop retain their existing data and credential rules, including the
+`~/.open-science` default. Use `--config-root /absolute/path` to select another profile.
+If a desktop/npm launcher precedes Homebrew in PATH, check `type -a open-science` and use
+`"$(brew --prefix aipoch/tap/open-science)/bin/open-science"` explicitly.
+Homebrew can skip the global command link when the same-name desktop Cask is installed;
+use the explicit Formula path in that case as well.
+If an existing npm installation owns Homebrew's `bin/open-science`, installation
+reports a link conflict. Remove it with its own installer, or use
+`brew install --skip-link aipoch/tap/open-science` and the explicit Formula path above.
+Use that same install command to upgrade an unlinked installation; `brew upgrade`
+tries to link the command again.
+Avoid overwriting another installer's command link.
+
+Stop the selected profile before upgrading, then run `brew update` and
+`brew upgrade --formula aipoch/tap/open-science`. Start it again using the same profile.
+macOS Cellar path changes may require Keychain authorization again. Stop the runtime
+before `brew uninstall --formula aipoch/tap/open-science`; uninstall retains research
+data and credentials. See the tap README for checksum maintenance and installation/upgrade CI.
+
 ## Install the standalone Release archive
 
 Stable Releases attach `open-science-<version>-<target>.tar.gz` for `darwin-arm64`,
@@ -78,6 +115,54 @@ Start with one target, then use `target=all` to verify the complete set. It uplo
 only; it never publishes a Release, npm package or tag. Unsigned dry-runs do not certify production
 signing, notarization or historical Keychain access. Linux CI additionally exercises the real installed
 Web/Notebook, cancellation, recovery and shutdown paths; the model is a deterministic Agent fixture.
+
+## Linux CLI distribution packages
+
+Linux CLI packages are named `open-science-cli` and are separate from the Electron
+desktop Debian package. They include the same backend, Web UI and private Node as
+the standalone archive. Download the package for your architecture and verify it
+against `CLI-PACKAGE-SHA256SUMS.txt` from the same Release:
+
+```bash
+# Debian/Ubuntu (amd64 or arm64)
+sudo apt install ./open-science-cli_<version>_<architecture>.deb
+# Fedora (x86_64 or aarch64)
+sudo dnf install ./open-science-cli-<version>-1.<architecture>.rpm
+
+open-science-cli start --no-open
+open-science-cli status --json
+open-science-cli stop
+```
+
+The package owns `/opt/open-science-cli` and `/usr/bin/open-science-cli`. It also
+registers `open-science` with the OS alternatives manager at priority 90. The desktop
+Debian candidate retains priority 100, and manual alternatives choices are preserved.
+Use `open-science-cli` explicitly when both packages are installed. Unmanaged system
+commands cause installation to fail; user PATH entries can still shadow system commands.
+The package does not adopt or remove manually extracted archives or user launchers.
+
+Stop **all profiles started by this package** before upgrade or removal. Package hooks
+refuse to replace/remove the payload when a process is executing a binary from it;
+do not start another profile during the package transaction. No system service is
+created or automatically started. `sudo apt remove open-science-cli` (including purge)
+and `sudo dnf remove open-science-cli` preserve research data and credentials. Shared
+Python/R environments and other installations are not removed.
+
+The native validation targets Ubuntu 24.04 and Fedora 44 on x64/arm64. ELF dependency
+metadata includes the actual library/ABI requirements; other distributions and older
+glibc systems are not certified. The OS vault, D-Bus, Python/R and sandbox setup below
+still applies. There is no AIPOCH apt/dnf repository: download the next version and
+install that local file to upgrade. This does not imply inclusion in distro repositories.
+
+`CLI-PACKAGE-PROVENANCE.json` records the original archive checksum and source commit.
+A supplemental package backfill preserves the original Release archives, tag and
+`SHA256SUMS.txt`; its packages are covered by the separate CLI package checksum file.
+Future stable Releases additionally include packages in the main checksum/attestation set.
+
+Maintainers can run **Runtime distribution dry-run** with `distribution=linux-packages`,
+`source_release=v<version>` and a Linux target (or `all`). It verifies original Release
+attestations, repacks without rebuilding, exercises real installs and uploads Actions
+artifacts only. It does not modify Releases, tags or repositories.
 
 ## Build and start
 
