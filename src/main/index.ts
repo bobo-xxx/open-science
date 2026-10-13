@@ -1,4 +1,6 @@
-import { stringifyRpcJson } from './rpc-json'
+import { DesktopBackendStartupError } from './backend-startup'
+import { recoverDesktopBackendStartup } from './backend-startup-recovery'
+import { createDesktopRecoveryEventBuffer } from './desktop-recovery-event-buffer'
 import { createDesktopRuntimeRecovery } from './desktop-runtime-recovery'
 import { DESKTOP_RUNTIME_RECOVERY_CHANNELS } from '../shared/desktop-runtime-recovery'
 import { deliverDesktopEvent } from './desktop-event-delivery'
@@ -461,8 +463,7 @@ async function startDesktop(): Promise<void> {
         reject(error: Error): void
       }
     | undefined
-  let bufferedEventBytes = 0
-  let bufferedEvents: { channel: string; payload: unknown }[] = []
+  const recoveryEvents = createDesktopRecoveryEventBuffer()
   const native = createDesktopNativeHandler((id) => relay?.documentFor(id), isApplicationWindow)
   let state: DatabaseStartupState = { phase: 'checking' }
   let ready = false
@@ -547,6 +548,7 @@ async function startDesktop(): Promise<void> {
   }
   startupDiagnostics?.phase('launch-node-runtime')
   const launch = await startOrAttachDesktopBackend({
+    onStatus: (status) => bootstrapLog.info('backend startup status', status),
     configRoot,
     profilePath,
     version: app.getVersion(),
@@ -643,13 +645,11 @@ async function startDesktop(): Promise<void> {
       onEvent: ({ channel, payload }) => {
         if (attached !== client) return
         if (recovery?.state().phase === 'reconciling') {
-          const eventBytes = Buffer.byteLength(stringifyRpcJson({ channel, payload }))
-          if (bufferedEvents.length >= 2048 || bufferedEventBytes + eventBytes > 16 * 1024 * 1024) {
-            reconcileWait?.reject(new Error('Desktop recovery event budget exceeded.'))
-            return
+          try {
+            recoveryEvents.push({ channel, payload })
+          } catch (error) {
+            reconcileWait?.reject(error as Error)
           }
-          bufferedEventBytes += eventBytes
-          bufferedEvents.push({ channel, payload })
           return
         }
         deliverRuntimeEvent({ channel, payload })
@@ -707,8 +707,7 @@ async function startDesktop(): Promise<void> {
       signal.throwIfAborted()
       deliverRuntimeEvent({ channel: 'locale:changed', payload: locale })
       deliverRuntimeEvent({ channel: 'settings:changed', payload: settings })
-      bufferedEvents = []
-      bufferedEventBytes = 0
+      recoveryEvents.clear()
       const epoch = recovery!.state().epoch
       await new Promise<void>((resolve, reject) => {
         const windows = BrowserWindow.getAllWindows().filter(
@@ -756,9 +755,11 @@ async function startDesktop(): Promise<void> {
       })
       // Old snapshot failures are repaired; new replay failures must remain invalidated.
       staleWindows.clear()
-      for (const event of bufferedEvents) deliverRuntimeEvent(event)
-      bufferedEvents = []
-      bufferedEventBytes = 0
+      await recoveryEvents.drain({
+        load: candidate.loadSessionForEvent,
+        deliver: deliverRuntimeEvent,
+        signal
+      })
       candidate.notificationView('window-created')
       refreshAppTrayNavigation(tray)
     },
@@ -832,29 +833,45 @@ async function startDesktop(): Promise<void> {
       if (waiting.pending.size === 0) waiting.resolve()
     }
   )
-  ipcMainHandle(DESKTOP_RUNTIME_RECOVERY_CHANNELS.quit, async (event) => {
+  let disconnectedQuit: Promise<void> | undefined
+  const quitDisconnected = (): Promise<void> =>
+    (disconnectedQuit ??= Promise.resolve()
+      .then(async () => {
+        recovery.setClosing(true)
+        const result = await dialog.showMessageBox({
+          type: 'warning',
+          buttons: [translate('Cancel'), translate('Quit app')],
+          defaultId: 0,
+          cancelId: 0,
+          message: translate('Quit while disconnected?'),
+          detail: translate(
+            'Unsaved changes may be lost. Submitted operations may have completed. The backend will not be stopped.'
+          )
+        })
+        if (result.response !== 1) {
+          // Match ordinary quit cancellation: a no-tray desktop must retain a reachable window.
+          if (process.platform !== 'darwin' && !tray && getMainWindow()?.isDestroyed())
+            showMainWindow?.()
+          return
+        }
+        client?.close()
+        app.exit(0)
+      })
+      .finally(() => {
+        disconnectedQuit = undefined
+        recovery.setClosing(false)
+      }))
+  ipcMainHandle(DESKTOP_RUNTIME_RECOVERY_CHANNELS.quit, (event) => {
     requireRecoveryFrame(event)
-    if (recovery!.state().phase === 'connected' && !staleWindows.has(event.sender.id)) {
+    if (
+      !disconnectedQuit &&
+      recovery.state().phase === 'connected' &&
+      !staleWindows.has(event.sender.id)
+    ) {
       app.quit()
       return
     }
-    recovery!.setClosing(true)
-    const result = await dialog.showMessageBox({
-      type: 'warning',
-      buttons: [translate('Cancel'), translate('Quit app')],
-      defaultId: 0,
-      cancelId: 0,
-      message: translate('Quit while disconnected?'),
-      detail: translate(
-        'Unsaved changes may be lost. Submitted operations may have completed. The backend will not be stopped.'
-      )
-    })
-    if (result.response !== 1) {
-      recovery!.setClosing(false)
-      return
-    }
-    client?.close()
-    app.exit(0)
+    return quitDisconnected().catch(reportError)
   })
   cleanupStartupClient = () => client!.quit()
   if (startupQuitRequested) {
@@ -945,6 +962,21 @@ async function startDesktop(): Promise<void> {
   let work: DesktopShutdownWork | undefined
   let admission: Promise<unknown> = Promise.resolve()
   app.removeListener('before-quit', holdStartupQuit)
+  app.on('before-quit', (event) => {
+    // Preserve committed teardown; an idle disconnected shell must also be quittable without a window.
+    if (updateCommitted || plannedRelaunch) return
+    const state = recovery.state()
+    if (currentApplicationShutdownTrigger() === 'system' && state.phase !== 'connected') {
+      // OS shutdown cannot wait for consent or an unreachable backend, including an open quit dialog.
+      event.preventDefault()
+      client?.close()
+      app.exit(0)
+      return
+    }
+    if (!disconnectedQuit && (state.phase === 'connected' || state.closing)) return
+    event.preventDefault()
+    void quitDisconnected().catch(reportError)
+  })
   const lifecycle = installAppLifecycle({
     app,
     createInitialWindow: !headless,
@@ -1112,6 +1144,10 @@ void startDesktop().catch(async (error: unknown) => {
   } catch (cleanupError) {
     bootstrapLog.error('startup backend cleanup failed', diagnosticErrorFields(cleanupError))
     await flushLogs()
+  }
+  if (error instanceof DesktopBackendStartupError) {
+    await recoverDesktopBackendStartup(error)
+    return
   }
   dialog.showErrorBox(APP_NAME, message)
   app.exit(1)

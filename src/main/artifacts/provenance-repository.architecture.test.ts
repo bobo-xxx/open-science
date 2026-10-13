@@ -612,6 +612,13 @@ describe('Artifact Provenance repository architecture', () => {
     )
     expect(module.testFiles.consumer).toEqual(
       expect.arrayContaining([
+        'src/main/desktop-runtime-session-size.integration.test.ts',
+        'src/main/notebook-payload.integration.test.ts',
+        'src/main/web-service/session-payload.integration.test.ts'
+      ])
+    )
+    expect(module.testFiles.consumer).toEqual(
+      expect.arrayContaining([
         'src/main/storage/wsl-npm-migration.integration.test.ts',
         'src/main/composition/notebook-environment.test.ts',
         'src/main/literature/command-owner.test.ts',
@@ -989,7 +996,8 @@ describe('Artifact Provenance repository architecture', () => {
         'src/renderer/src/pages/literature/literature-localization.render.test.tsx',
         'src/main/notebook/environment-capture.contract.test.ts',
         'src/main/desktop-runtime-backpressure.integration.test.ts',
-        'src/main/desktop-runtime-transport-diagnostics.test.ts'
+        'src/main/desktop-runtime-transport-diagnostics.test.ts',
+        'src/main/node-entry.test.ts'
       ])
     )
     expect(module.capabilityOverlays).toEqual(

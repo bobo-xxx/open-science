@@ -1103,6 +1103,13 @@ describe('Settings backend ownership architecture', () => {
     )
     expect(manifest.modules.settings_service_facade.testFiles.consumer).toEqual(
       expect.arrayContaining([
+        'src/main/desktop-runtime-session-size.integration.test.ts',
+        'src/main/notebook-payload.integration.test.ts',
+        'src/main/web-service/session-payload.integration.test.ts'
+      ])
+    )
+    expect(manifest.modules.settings_service_facade.testFiles.consumer).toEqual(
+      expect.arrayContaining([
         'src/main/composition/notebook-environment.test.ts',
         'src/main/acp/backend-generation-owner.test.ts',
         'src/main/acp/runtime-provider-session-composition.test.ts',
@@ -1142,7 +1149,15 @@ describe('Settings backend ownership architecture', () => {
         'src/main/composition/reviewer.test.ts',
         'src/main/desktop-runtime-transport.integration.test.ts',
         'src/main/desktop-runtime-backpressure.integration.test.ts',
-        'src/main/desktop-runtime-transport-diagnostics.test.ts'
+        'src/main/desktop-runtime-transport-diagnostics.test.ts',
+        'src/main/node-entry.test.ts'
+      ])
+    )
+    expect(manifest.modules.settings_backend_resolution.testFiles.consumer).toEqual(
+      expect.arrayContaining([
+        'src/main/desktop-runtime-session-size.integration.test.ts',
+        'src/main/notebook-payload.integration.test.ts',
+        'src/main/web-service/session-payload.integration.test.ts'
       ])
     )
     expect(manifest.modules.settings_backend_resolution.testFiles.consumer).toEqual(
@@ -1615,7 +1630,9 @@ describe('Settings backend ownership architecture', () => {
         'src/renderer/src/pages/literature/literature-localization.render.test.tsx',
         ...(manifest.modules.settings_proxy_runtime?.testFiles.owner ?? []),
         'src/main/desktop-runtime-backpressure.integration.test.ts',
-        'src/main/desktop-runtime-transport-diagnostics.test.ts'
+        'src/main/desktop-runtime-transport-diagnostics.test.ts',
+        'src/main/node-entry.test.ts',
+        'src/main/runtime-network-node.integration.test.ts'
       ])
     )
     expect(

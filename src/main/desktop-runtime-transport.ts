@@ -1,39 +1,41 @@
-import type { DatabaseStartupOwner } from './database/database-startup-owner'
-import {
-  desktopLifecycleRequestSchema,
-  type DesktopLifecycleRequest
-} from './desktop-runtime-lifecycle'
-import type { OfficePreviewRuntimeState } from '../shared/office-preview'
-import type { MarketplaceDownloadProgress } from '../shared/specialist-marketplace'
-import type { ArtifactReproducibilityCheckState } from '../shared/artifact-reproducibility'
-import type { UploadTransferProgress } from '../shared/uploads'
-import {
-  desktopNativeResponseSchema,
-  desktopNotificationActionSchema,
-  desktopNotificationViewSchema,
-  desktopUploadProgressSchema,
-  withDesktopCaller,
-  parseDesktopNativeResult,
-  type DesktopNativeOperation
-} from './desktop-native-contract'
+import { createLogger } from '@aipoch/diagnostics/node'
+import { RUNTIME_PAYLOAD_CAPABILITY } from '../shared/runtime-payload-transfer'
+import { runtimePayloadTransfers } from './runtime-payload-transfers'
 import { randomUUID } from 'node:crypto'
 import { WebSocket } from 'ws'
 import { z } from 'zod'
+import { toApplicationCommandErrorEnvelope } from '../shared/application-command-contract'
+import type { ArtifactReproducibilityCheckState } from '../shared/artifact-reproducibility'
+import type { OfficePreviewRuntimeState } from '../shared/office-preview'
+import type { MarketplaceDownloadProgress } from '../shared/specialist-marketplace'
+import type { UploadTransferProgress } from '../shared/uploads'
 import {
   WEB_RPC_PROTOCOL_VERSION,
   webRpcRequestSchema,
   type WebRpcResponse
 } from '../shared/web-rpc-contract'
-import { toApplicationCommandErrorEnvelope } from '../shared/application-command-contract'
-import type { ApplicationCommandByNameDispatcher } from './application-command-composition'
 import { createApplicationCommandClient } from './application-command-client'
+import type { ApplicationCommandByNameDispatcher } from './application-command-composition-contract'
 import type { ApplicationEventSource } from './application-events'
 import { createCallerContext, type CallerContext } from './caller-context'
+import type { DatabaseStartupOwner } from './database/database-startup-owner'
 import { listenForDesktop } from './desktop-connection'
+import {
+  desktopNativeResponseSchema,
+  desktopNotificationActionSchema,
+  desktopNotificationViewSchema,
+  desktopUploadProgressSchema,
+  parseDesktopNativeResult,
+  withDesktopCaller,
+  type DesktopNativeOperation
+} from './desktop-native-contract'
+import {
+  desktopLifecycleRequestSchema,
+  type DesktopLifecycleRequest
+} from './desktop-runtime-lifecycle'
 import { parseRpcJson, stringifyRpcJson } from './rpc-json'
 import { InternalWebEventStream } from './web-service/internal-web-event-stream'
-import { createLogger } from '@aipoch/diagnostics/node'
-import { createDesktopFrameSender } from './desktop-frame-sender'
+import { createWebSocketFrameSender } from './websocket-frame-sender'
 
 const logger = createLogger('desktop-runtime-transport')
 
@@ -56,6 +58,10 @@ const requestSchema = z.discriminatedUnion('kind', [
   desktopNativeResponseSchema,
   desktopNotificationActionSchema,
   desktopNotificationViewSchema,
+  webRpcRequestSchema.extend({
+    kind: z.literal('session-event-read'),
+    id: z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+  }),
   webRpcRequestSchema.extend({
     kind: z.literal('host-invoke'),
     id: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
@@ -143,9 +149,10 @@ export async function startDesktopRuntimeTransport(options: {
         signal?: AbortSignal
       ) => Promise<unknown>)
     | undefined
-  const senders = new WeakMap<WebSocket, ReturnType<typeof createDesktopFrameSender>>()
-  const send = (socket: WebSocket, frame: string, onSent?: () => void): void =>
+  const senders = new WeakMap<WebSocket, ReturnType<typeof createWebSocketFrameSender>>()
+  const send = (socket: WebSocket, frame: string, onSent?: () => void): void => {
     senders.get(socket)?.send(frame, onSent)
+  }
   const unsubscribe = options.events.subscribe((event) => {
     const frame = stream.publish(event)
     if (active) send(active, frame)
@@ -154,7 +161,7 @@ export async function startDesktopRuntimeTransport(options: {
     const listener = await listenForDesktop(options.version, (socket) => {
       senders.set(
         socket,
-        createDesktopFrameSender(socket, (failure) => {
+        createWebSocketFrameSender(socket, (failure) => {
           logger.warn('desktop runtime transport terminated', failure)
         })
       )
@@ -327,6 +334,7 @@ export async function startDesktopRuntimeTransport(options: {
             socket,
             stringifyRpcJson({
               kind: 'bootstrap',
+              rpcCapabilities: [RUNTIME_PAYLOAD_CAPABILITY],
               pid: process.pid,
               ...(options.startup ? { startup: options.startup.getState() } : {}),
               rpcProtocolVersion: WEB_RPC_PROTOCOL_VERSION,
@@ -492,16 +500,19 @@ export async function startDesktopRuntimeTransport(options: {
           })
           return
         }
-        if (request.kind === 'host-invoke') {
+        if (request.kind === 'host-invoke' || request.kind === 'session-event-read') {
           pending.add(request.id)
           void (async () => {
             try {
-              if (!options.hostCommands) throw new Error('Desktop host commands are unavailable.')
+              const eventRead = request.kind === 'session-event-read'
+              const dispatcher = eventRead ? commands : options.hostCommands
+              if (!dispatcher) throw new Error('Desktop host commands are unavailable.')
               const result = await client.invoke(
-                options.hostCommands,
-                request.channel,
+                dispatcher,
+                eventRead ? 'sessions:load-one' : request.channel,
                 hostCaller,
-                request.args
+                request.args,
+                request
               )
               respond({
                 protocolVersion: WEB_RPC_PROTOCOL_VERSION,
@@ -564,7 +575,7 @@ export async function startDesktopRuntimeTransport(options: {
         }
         pending.add(request.id)
         void client
-          .invoke(commands, request.channel, caller, request.args)
+          .invoke(commands, request.channel, caller, request.args, request)
           .then(
             (result) =>
               respond({
@@ -606,6 +617,7 @@ export async function startDesktopRuntimeTransport(options: {
       close: async () => {
         unsubscribe()
         await listener.close()
+        await runtimePayloadTransfers.settleReleased()
       }
     }
   } catch (error) {
