@@ -163,6 +163,8 @@
     "The update status could not be confirmed. Closing this window does not stop installation.": "L’état de la mise à jour n’a pas pu être confirmé. Fermer cette fenêtre n’arrête pas l’installation."
   },
   "renderer": {
+    "Preparing to receive package…": "Préparation de la réception du paquet…",
+    "Unable to prepare browser import. Resolve the startup error and try again.": "Impossible de préparer l’importation depuis le navigateur. Corrigez l’erreur de démarrage et réessayez.",
     "Update preparation failed": "Échec de la préparation de la mise à jour",
     "The app is still open. Resolve the problem and try again, or cancel to continue working.": "L’application reste ouverte. Résolvez le problème et réessayez, ou annulez pour continuer à travailler.",
     "Select one or more options": "Sélectionnez une ou plusieurs options",
@@ -7617,6 +7619,10 @@
     "Body areas are unavailable on rotated pages.": "Les zones de texte principal ne sont pas disponibles sur les pages pivotées.",
     "You can configure up to 32 pages.": "Vous pouvez configurer jusqu’à 32 pages.",
     "Native reading order will be used for your next message.": "L’ordre de lecture natif sera utilisé pour votre prochain message.",
+    "Waiting for browser…": "En attente du navigateur…",
+    "Receiving package…": "Réception du paquet…",
+    "Cancel transfer": "Annuler le transfert",
+    "Transfer cancelled": "Transfert annulé",
     "Sign in to continue this conversation": "Se connecter pour poursuivre cette conversation",
     "The agent requires authentication. Open Model settings and sign in to your provider, then retry. Your conversation and draft are preserved.": "L’Agent nécessite une authentification. Ouvrez les paramètres du modèle, connectez-vous à votre fournisseur, puis réessayez. Votre conversation et votre brouillon sont conservés.",
     "Check package": "Vérifier le paquet",
@@ -7639,6 +7645,11 @@
     "Dismissed: {{total}}": "Écartées : {{total}}",
     "Current status unavailable: {{total}}": "Statut actuel indisponible : {{total}}",
     "Historical result; current library status is unavailable.": "Résultat historique ; le statut actuel dans la bibliothèque est indisponible.",
+    "You can cancel the download at any time.": "Vous pouvez annuler le téléchargement à tout moment.",
+    "Review what’s new, then download the update.": "Consultez les nouveautés, puis téléchargez la mise à jour.",
+    "Please wait for the app to close and reopen.": "Veuillez attendre la fermeture puis la réouverture de l’application.",
+    "Ready to restart; running tasks will be checked.": "Prêt à redémarrer ; les tâches en cours seront vérifiées.",
+    "Cannot cancel; the app will reopen automatically.": "Annulation impossible ; l’application se rouvrira seule.",
     "Some PDF glyphs have no reliable text representation. Compare the original page.": "Certains glyphes du PDF n’ont pas de représentation textuelle fiable. Comparez avec la page d’origine.",
     "Some PDF text has no reliable Unicode mapping. The extracted text is retained; compare it with the original page.": "Certains passages du PDF n’ont pas de correspondance Unicode fiable. Le texte extrait est conservé ; comparez-le à la page d’origine.",
     "Some table structures are unreliable. Original images and text are retained without cell assignments.": "La structure de certains tableaux est peu fiable. Les images et les textes d’origine sont conservés sans être affectés aux cellules."
