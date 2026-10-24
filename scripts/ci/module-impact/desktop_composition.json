@@ -26,9 +26,11 @@
     "src/main/composition/session-authority.ts",
     "src/main/composition/session-foundation.ts",
     "src/main/composition/session-packages.ts",
+    "src/main/composition/session-projection.test.ts",
     "src/main/composition/session-projection.ts",
     "src/main/composition/session-surfaces.ts",
     "src/main/composition/settings-bootstrap.ts",
+    "src/main/composition/settings-bootstrap.test.ts",
     "src/main/composition/settings-effects.ts",
     "src/main/composition/side-chat.ts",
     "src/main/composition/specialists.ts",
@@ -272,6 +274,7 @@
   "consumerModules": ["main_web_service"],
   "testFiles": {
     "owner": [
+      "src/main/composition/settings-bootstrap.test.ts",
       "src/main/composition/project-lifecycle.test.ts",
       "src/main/composition/notebook-environment.test.ts",
       "src/main/composition/session-packages.test.ts",
@@ -379,7 +382,8 @@
       "src/main/desktop-update-integration.test.ts",
       "src/main/runtime-network-node.test.ts",
       "src/main/legacy-service-termination.test.ts",
-      "src/main/composition/document-reading.architecture.test.ts"
+      "src/main/composition/document-reading.architecture.test.ts",
+      "src/main/composition/session-projection.test.ts"
     ],
     "contract": [
       "src/preload/index.test.ts",
