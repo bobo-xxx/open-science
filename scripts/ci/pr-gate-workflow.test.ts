@@ -1527,9 +1527,7 @@ describe('PR Gate workflow', () => {
         node_version: '${{ steps.node.outputs.node-version }}'
       })
       expect(producer.steps?.filter(({ run }) => run === 'npm run build:e2e')).toHaveLength(1)
-      expect(producer.steps?.filter(({ run }) => run === 'npm run build:web')).toHaveLength(
-        platform === 'macos' ? 1 : 0
-      )
+      expect(producer.steps?.some(({ run }) => /npm run build:web\b/.test(run ?? ''))).toBe(false)
       const upload = producer.steps?.find(({ id }) => id === 'upload')
       expect(upload?.['continue-on-error']).not.toBe(true)
       expect(upload?.with).toMatchObject({
@@ -1671,6 +1669,21 @@ describe('PR Gate workflow', () => {
     expect(commands.indexOf('[string]::IsNullOrWhiteSpace($env:E2E_GREP)')).toBeLessThan(
       commands.indexOf('npm run test:e2e --')
     )
+  })
+
+  it('runs lossless file identity and preview transport regressions on Windows', () => {
+    const step = workflow.jobs.windows_core.steps?.find(
+      ({ name }) => name === 'Test Windows-specific behavior'
+    )
+    for (const file of [
+      'bounded-file-io',
+      'managed-preview-resources',
+      'managed-preview-ipc',
+      'managed-preview-protocol'
+    ]) {
+      expect(step?.run).toContain(`src/main/${file}.test.ts`)
+    }
+    expect(step?.run).not.toContain('--testNamePattern')
   })
 
   it('budgets the complete Windows E2E path beyond dependency and build setup', () => {
