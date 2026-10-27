@@ -1771,10 +1771,12 @@ describe('LiteratureLibraryPage', () => {
       )
       useNavigationStore.setState({ pendingLiteratureCollectionId: collection.id })
       render(<LiteratureLibraryPage />)
-      await screen.findByRole('button', { name: 'Smart trial 0' })
+      // Scope role queries to the relevant row instead of computing names for 100 rows.
+      const first = (await screen.findByText('Smart trial 0')).closest('tr')!
       await act(async () => {})
-      const first = screen.getByRole('button', { name: 'Smart trial 0' }).closest('tr')!
-      const second = screen.getByRole('button', { name: 'Smart trial 1' }).closest('tr')!
+      const second = screen.getByText('Smart trial 1').closest('tr')!
+      expect(within(first).getByRole('button', { name: 'Smart trial 0' })).toBeTruthy()
+      expect(within(second).getByRole('button', { name: 'Smart trial 1' })).toBeTruthy()
       delayReads = true
       await act(async () => {
         window.dispatchEvent(new Event('focus'))
@@ -1819,10 +1821,12 @@ describe('LiteratureLibraryPage', () => {
         stalePanel({ kind: 'collection', id: collection.id, smart: view })
       })
       if (refreshFailed) {
-        await screen.findByText(
-          'Decision saved, but results could not be refreshed. Reload the collection to see the latest results.'
-        )
-        fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+        const notice = (
+          await screen.findByText(
+            'Decision saved, but results could not be refreshed. Reload the collection to see the latest results.'
+          )
+        ).closest('section')!
+        fireEvent.click(within(notice).getByRole('button', { name: 'Retry' }))
         await waitFor(() =>
           expect(
             screen.queryByText(
@@ -1833,7 +1837,9 @@ describe('LiteratureLibraryPage', () => {
         expect(transact.mock.calls.filter(([c]) => c.action === 'override')).toHaveLength(1)
       } else {
         expect(
-          within(screen.getByRole('button', { name: /^Smart trials/ })).getByText('99')
+          within(
+            screen.getByText('Smart trials', { selector: 'button span' }).closest('button')!
+          ).getByText('99')
         ).toBeTruthy()
       }
       expect(screen.queryByText('1 selected')).toBeNull()
@@ -3241,6 +3247,41 @@ describe('LiteratureLibraryPage', () => {
     expect(screen.queryByRole('dialog')).toBeNull()
     reveal.mockRestore()
   })
+
+  it.each([false, true])(
+    'omits empty publication details while retaining identifiers: %s',
+    async (hasIdentifier) => {
+      get.mockResolvedValue({
+        ...libraryItem,
+        item: {
+          ...libraryItem.item,
+          issuedYear: undefined,
+          issuedText: '',
+          containerTitle: '',
+          language: '',
+          typeFields: {},
+          url: '',
+          identifiers: hasIdentifier ? libraryItem.item.identifiers : []
+        }
+      })
+      useNavigationStore.getState().openLiteratureItem(libraryItem.id, 'user')
+      render(<LiteratureLibraryPage />)
+      const detail = within(await screen.findByRole('dialog'))
+      expect(detail.getAllByText('Journal article')).toHaveLength(1)
+      expect(detail.queryByText('Reference type')).toBeNull()
+      expect(Boolean(detail.queryByText('Publication metadata'))).toBe(hasIdentifier)
+      if (hasIdentifier)
+        expect(detail.getByRole('link', { name: 'DOI: 10.0000/example' })).not.toBeNull()
+      expect(
+        detail
+          .getByRole('button', { name: 'Manage Tags' })
+          .compareDocumentPosition(detail.getByRole('heading', { name: libraryItem.item.title })) &
+          Node.DOCUMENT_POSITION_FOLLOWING
+      ).toBeTruthy()
+      expect(detail.getByRole('button', { name: 'References' })).not.toBeNull()
+      expect(detail.getByRole('button', { name: 'Cited by' })).not.toBeNull()
+    }
+  )
 
   it('offers stored metadata sources from reference details', async () => {
     get.mockResolvedValue(libraryItem)
@@ -6423,7 +6464,7 @@ describe('LiteratureLibraryPage', () => {
       within(dialog)
         .getAllByText('Journal article')
         .filter((element) => !element.className.includes('sr-only'))
-    ).toHaveLength(2)
+    ).toHaveLength(1)
     expect(within(dialog).getByText('Open Research Press')).not.toBeNull()
 
     const headings = within(dialog)
@@ -6527,7 +6568,7 @@ describe('LiteratureLibraryPage', () => {
     expect(authors.className).not.toContain('truncate')
     expect(authors.className).toContain('line-clamp-5')
     expect(authors.closest('section')?.parentElement?.className).toContain('overflow-y-auto')
-    expect(within(dialog).getAllByText('Review')).toHaveLength(2)
+    expect(within(dialog).getAllByText('Review')).toHaveLength(1)
   })
 
   it('collapses an overflowing author list until the reader expands it', async () => {
