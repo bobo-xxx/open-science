@@ -446,6 +446,7 @@
       "paths": [
         "e2e/launch-environment.spec.ts",
         "e2e/message-tool-layout-stability.spec.ts",
+        "e2e/message-tool-collapse-scroll.spec.ts",
         "e2e/workspace-project-switcher.spec.ts",
         "e2e/workspace-conversation.spec.ts",
         "e2e/workspace-files.spec.ts",
@@ -1028,6 +1029,21 @@
     {
       "paths": ["test/fixtures/pdf-figure-selections/*.json"],
       "tests": ["src/renderer/src/pages/workspace/previews/renderers/pdf-figure-selections.test.ts"]
+    },
+    {
+      "paths": [
+        "test/fixtures/docx-table-styles.ts",
+        "test/fixtures/docx-report.md",
+        "test/fixtures/docx-report.docx"
+      ],
+      "tests": [
+        "src/renderer/src/pages/workspace/previews/docx-table-styles.test.ts",
+        "src/main/skills/docx-generation.test.ts"
+      ]
+    },
+    {
+      "paths": ["test/docx-generation/*.py"],
+      "tests": ["src/main/skills/docx-generation.test.ts"]
     }
   ]
 }
