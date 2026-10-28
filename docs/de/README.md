@@ -51,7 +51,7 @@ AIPOCH Open-Science unterstützt rechen- und datenintensive Forschung in zahlrei
 
 Abgeschlossene Forschungssitzungen können außerdem als portable `.science`-Pakete zur Prüfung, Übergabe und Archivierung exportiert werden, einschließlich ausgewählter Gesprächsverzweigungen, Dateiversionen, Notebook-Aufzeichnungen und Verifikationsevidenz.
 
-> 💡 **[AIPOCH Open-Science v1.0.4 veröffentlicht](https://github.com/aipoch/open-science/releases/latest)** _(zuletzt aktualisiert im Oktober 2026)_. Dieser Patch verkleinert CLI- und Desktop-Downloads deutlich und stellt die Recherchewerkzeuge der eigenständigen CLI über einen lokalen MCP-Server bereit. Außerdem werden abgeschlossene Zwischennachrichten und Werkzeuggruppen eingeklappt, manuelle Crossref-Prüfungen auf Rücknahmen und Korrekturen ergänzt, Artefakte aus autorisierten Ordnern importiert, Repositorys im GitHub-Skills-Import gespeichert, strukturierte Überspringen-Aktionen auf Fragenkarten hinzugefügt und Fehler in Notebooks, Einstellungen, Sitzungspaketen und Replay behoben. Vollständige Details finden Sie in den [Versionshinweisen zu v1.0.4](../../release-notes/1.0.4/de.md).
+> 💡 **[AIPOCH Open-Science v1.0.5 veröffentlicht](https://github.com/aipoch/open-science/releases/latest)** _(zuletzt aktualisiert im Oktober 2026)_. Dieser Patch erweitert wissenschaftliche Recherche-Werkzeuge um native Quell-APIs und offizielle Dateiauffindung, ergänzt eine Lesefortschritts-Verfolgung für Literaturreferenzen mit Filterung und Massenaktualisierung, bringt den Export und Import von Sitzungspaketen in die Weboberfläche und bindet die Lebensdauer lokaler Dienste an explizite Haltebindungen. Außerdem kommen manuelle Update-Einstiegspunkte mit Aufdecken des Installers und ein Link zur Sicherheitsrichtlinie in den Einstellungen hinzu; Fehler bei Netzwerkberechtigungen, in der OpenCode-2.x-Kompatibilität, bei der Werkzeugerkennung von Notebooks unter macOS und bei Startwartezeiten von Notebooks unter Windows wurden behoben. Vollständige Details finden Sie in den [Versionshinweisen zu v1.0.5](../../release-notes/1.0.5/de.md).
 
 <p align="center">
  <img width="1920" height="1140" alt="AIPOCH Open-Science Hero-Banner: Science, Open to All — eine quelloffene, modellunabhängige und selbst gehostete Forschungsumgebung für wissenschaftliche KI" src="../images/readme/open-science-banner.png" />
@@ -224,19 +224,39 @@ Wenn Sie AIPOCH Open-Science in Ihrer Forschung verwenden, können Sie den Prepr
 
 ## Benchmark-Ergebnisse
 
-Dies sind historische Ergebnisse aus Berichten von August bis Oktober 2026, keine neue Auswertung der aktuellen Version.
+AstaBench, ASI-Bench und BiomniBench-DA sind eigenständige Benchmark-Familien mit unterschiedlichen Aufgaben, Datensätzen und Bewertungsmethoden; ihre Ergebnisse werden getrennt ausgewiesen und sind nicht direkt vergleichbar.
 
-Quellberichte: [29. September](https://hwtgofuh6ud.feishu.cn/wiki/Kl5cwupToi901BkEaQacM1V2n7e), [12. Oktober](https://hwtgofuh6ud.feishu.cn/wiki/XZSbw7L87ibjQUk98qJcuqFUnKh) (Zugriffsberechtigung kann erforderlich sein).
+### 🏆 AstaBench — Gleichauf beim höchsten angezeigten LitQA2-Test-Wert: 90.67% Recall@30
 
-### 🏆 AstaBench LitQA2-FullText-Search — 10/10 Zielpublikationen gefunden
+AIPOCH Open-Science erreichte mit **gpt-6-astra** in einer lokalen Auswertung auf dem offiziellen Test-Datensatz mit 75 Fragen von LitQA2-FullText-Search **90.67% Recall@30 (68/75)**. Unter den 27 Ergebnissen der Berichtsmomentaufnahme vom 26. Oktober liegt dieser lokale Test-Wert **gleichauf mit dem höchsten angezeigten Recall@30**, den Asta Paper Finder und Asta v0 ebenfalls mit 90.67% erreichten. Es war eine lokale Auswertung auf dem offiziellen Test-Datensatz, keine offizielle Ranglisteneinreichung oder Platzierung.
 
-AIPOCH Open-Science erreichte mit **DeepSeek v4-flash (max)**, Spezialisten für Literaturrecherche und Skills **100% recall@30** auf den zehn offiziellen Validierungsfragen: Jede gesuchte Publikation erschien unter den ersten 30 Ergebnissen. Der Wert liegt über den drei im Bericht aufgeführten öffentlichen Validierungsergebnissen und **20 Prozentpunkte** über dem höchsten Vergleichswert von **80%**. Der Bericht dokumentiert drei lokale Wiederholungen und damit die Publikationssuche für diese wissenschaftlichen Fragen.
+**ScholarQA-CS2:** AIPOCH Open-Science erreichte mit **deepseek-v4-flash** einen **Gesamtwert von 0.9289/1** über **100 Validation-Fragen**. Der höchste im Bericht aufgeführte offizielle Test-Referenzwert von **0.9192** stammt aus einem anderen Fragensatz; die beiden Ergebnisse bilden daher keine direkte Rangfolge.
 
-![AIPOCH Open-Science: 100% recall@30 und 10/10 Treffer auf der AstaBench-LitQA2-Validierungsmenge; Test und Validierung verwenden unterschiedliche Fragen](../images/readme/astabench-litqa2.png)
+![AIPOCH Open-Science im AstaBench-Überblick: 90.67% Recall@30 auf dem LitQA2-Test-Datensatz und ein Gesamtwert von 0.9289 auf ScholarQA-CS2 Validation; lokale Ergebnisse und offizielle Referenzen werden getrennt dargestellt](../images/readme/astabench-literature-research-overview.jpg)
 
-Die Grafik enthält Test- und Validierungseinträge; die Reihenfolge ist rein numerisch. Recall@30 misst das Auffinden der Zielpublikation, nicht die Richtigkeit wissenschaftlicher Antworten.
+<details>
+<summary><strong>Ergebnisvergleich für LitQA2-FullText-Search</strong></summary>
 
-### 🏆 ASI-Bench B1–B4 — Höchste angezeigte Werte in allen vier aufgeführten Vergleichen
+![AIPOCH Open-Science erreicht 90.67% Recall@30 auf dem LitQA2-Test-Datensatz mit 75 Fragen, gleichauf mit dem höchsten angezeigten Wert der Berichtsmomentaufnahme; dies war keine offizielle Ranglisteneinreichung](../images/readme/astabench-litqa2-test.jpg)
+
+Der lokale Durchlauf fand am 23. Oktober 2026 statt. Die Grafik enthält ein lokales Test-Ergebnis von AIPOCH Open-Science und 26 offizielle Referenzeinträge. Gleiche Werte erhalten gleich lange Balken; die Zeilenreihenfolge löst Gleichstände nicht auf. Die lokalen Kosten von AIPOCH wurden nicht einheitlich erfasst, daher lässt die Grafik keinen Vergleich der Kosteneffizienz zu.
+
+Eine frühere lokale Auswertung mit **DeepSeek v4-flash (max)** ergab **100% Recall@30 (10/10)** auf dem separaten Validation-Teilsatz mit zehn Fragen; für dieses Ergebnis wurden drei lokale Wiederholungen berichtet. Test und Validation verwenden unterschiedliche Fragen und werden getrennt ausgewiesen.
+
+</details>
+
+<details>
+<summary><strong>Validation- und Test-Referenzen für ScholarQA-CS2</strong></summary>
+
+![AIPOCH Open-Science erreicht einen Gesamtwert von 0.9289 auf dem ScholarQA-CS2-Validation-Datensatz mit 100 Fragen; offizielle Test-Referenzen verwenden andere Fragen und bilden keine direkte Rangfolge](../images/readme/astabench-scholarqa-cs2.jpg)
+
+Die Grafik trennt ein lokales Validation-Ergebnis von 41 offiziellen Test-Referenzen. Ein zusätzlicher Validation-Wert von 0.7905 mit `gpt-5.6-sol` wurde im Berichtstext erwähnt, fehlte jedoch in der Quelltabelle; die Anzahl der Fragen wurde nicht angegeben.
+
+</details>
+
+Recall@30 misst, ob die Zielpublikation unter den ersten 30 eingereichten Ergebnissen erscheint, nicht die Richtigkeit wissenschaftlicher Antworten. Der ScholarQA-CS2-Wert ist ein zusammengesetztes Maß für die Antwortqualität und nicht der Anteil vollständig richtig beantworteter Fragen.
+
+### 🏆 ASI-Bench B1–B4 — Höchste angezeigte Werte in allen vier Vergleichen des Berichts
 
 AIPOCH Open-Science erzielte mit **GPT-6 (gpt-6-astra / xhigh)**, Fachspezialisten und Skills in ASI-Bench B1, B2, B3 und B4 **79.35, 56.11, 59.67 und 59.46 Punkte** — jeweils den höchsten angezeigten Wert der im Bericht erfassten Vergleiche. Die vier Bedingungen prüfen **das Ausführen eines vollständigen Plans, das Organisieren eines Arbeitsablaufs, die selbstständige Methodenwahl und autonome Forschung mit ablenkenden Hintergrundinformationen**.
 
@@ -246,7 +266,7 @@ Die lokalen Codex-Vergleichswerte mit demselben Modell und derselben angegebenen
 
 Die lokalen Durchläufe nutzten seed31415. Bei AIPOCH wurden in B1 59 Aufgaben gewertet; eine wurde wegen des im Bericht beschriebenen Bewertungsfehlers ausgeschlossen. B3/B4 verwendeten v0.32.0 und einen Ersatzbewerter. Öffentliche Referenzen unterscheiden sich in Aufgabeninstanzen, Konfiguration und Bewertung; der B2-Abstand von 0.02 Punkten ist nur ein numerischer Unterschied.
 
-### 🏆 Höchster Wert im zusammengestellten BiomniBench-DA-Public-50-Vergleich — 79.05
+### 🏆 BiomniBench-DA Public 50 — Höchster angezeigter Wert im zusammengestellten Vergleich: 79.05
 
 AIPOCH Open-Science erreichte mit **gpt-5.6-sol (xhigh)** in einer internen Bewertung der als BiomniBench-DA Public 50 bezeichneten 50 Aufgaben **79.05**, den höchsten angezeigten Wert im zusammengestellten Vergleich. Der Wert ist das gleich gewichtete Mittel aus **81.04** des Gemini-3.1-Pro-Bewerters und **77.06** des DeepSeek-v4-pro-Bewerters und beschreibt die biomedizinische Datenanalyse dieser Konfiguration. Siehe den [Bewertungsbericht](https://aipoch.com/blog/open-science-biomnibench-da).
 
@@ -254,7 +274,7 @@ AIPOCH Open-Science erreichte mit **gpt-5.6-sol (xhigh)** in einer internen Bewe
 
 Der Vergleich mischt Einträge mit unterschiedlicher Bewerterabdeckung und ist keine offizielle Rangfolge unter einheitlichen Bewertungsbedingungen.
 
-**Bewertungsumfang:** Dies sind selbst berichtete lokale/interne Ergebnisse. Spitzenwerte in den aufgeführten Vergleichen belegen weder einen offiziellen ersten Rang noch statistisch signifikante Verbesserungen.
+**Bewertungsumfang:** Es handelt sich um selbst berichtete lokale/interne Ergebnisse auf den angegebenen Datensätzen und Teilmengen aus Berichten von August bis Oktober 2026; die Auswertungen wurden für die aktuelle Version nicht wiederholt. Ein lokaler Durchlauf auf einem offiziellen Test-Datensatz bedeutet weder eine offizielle Ranglisteneinreichung noch eine Platzierung. Referenzwerte sind historische Momentaufnahmen aus Berichten und keine Live-Ranglisten; Validation- und Test-Ergebnisse sind nicht direkt vergleichbar. Unterschiede bei Aufgabeninstanzen, Modellkonfigurationen, Bewerterabdeckung und Kostenerfassung schränken systemübergreifende Vergleiche ein. Numerische Gleichstände oder Abstände belegen keine statistisch signifikanten Verbesserungen.
 
 ## Kernkompetenzen
 

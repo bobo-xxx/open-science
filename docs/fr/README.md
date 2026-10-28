@@ -51,7 +51,7 @@ AIPOCH Open-Science prend en charge la recherche computationnelle et intensive e
 
 Les sessions de recherche terminées peuvent également être exportées sous forme de paquets `.science` portables pour la revue, la transmission et l’archivage, avec les branches de conversation, versions de fichiers, enregistrements Notebook et preuves de vérification sélectionnés.
 
-> 💡 **[AIPOCH Open-Science v1.0.4 publié](https://github.com/aipoch/open-science/releases/latest)** _(dernière mise à jour en octobre 2026)_. Ce correctif réduit nettement la taille des téléchargements de la CLI et de l’application de bureau, et expose les outils de recherche de la CLI autonome par l’intermédiaire d’un serveur MCP local. Il replie aussi les messages intermédiaires et groupes d’outils terminés, ajoute des vérifications manuelles de rétractation et de correction via Crossref, importe des artefacts depuis des dossiers autorisés, enregistre des dépôts dans le processus d’import GitHub Skills, ajoute des actions structurées pour ignorer une question et corrige des problèmes liés aux notebooks, aux paramètres, aux paquets de session et au rejeu. Consultez les [notes de version v1.0.4](../../release-notes/1.0.4/fr.md) pour tous les détails.
+> 💡 **[AIPOCH Open-Science v1.0.5 publié](https://github.com/aipoch/open-science/releases/latest)** _(dernière mise à jour en octobre 2026)_. Ce correctif enrichit les connecteurs scientifiques avec des API de source natives et une découverte officielle des fichiers, ajoute le suivi du statut de lecture des références de la bibliothèque Literature avec filtrage et mises à jour en masse, permet d’exporter et d’importer les paquets de session dans l’interface Web, et lie la durée de vie du service local à des demandes explicites de maintien. Il ajoute aussi des points d’entrée manuels de mise à jour avec révélation de l’installateur, un lien vers la politique de sécurité dans les paramètres, et corrige les autorisations réseau, la compatibilité OpenCode 2.x, la découverte des outils de notebooks sous macOS et les délais de démarrage des notebooks sous Windows. Consultez les [notes de version v1.0.5](../../release-notes/1.0.5/fr.md) pour tous les détails.
 
 <p align="center">
  <img width="1920" height="1140" alt="Bannière AIPOCH Open-Science : Science, Open to All — un banc de travail de recherche en IA scientifique open source, indépendant des modèles et auto-hébergé" src="../images/readme/open-science-banner.png" />
@@ -223,19 +223,39 @@ Si vous utilisez AIPOCH Open-Science dans vos recherches, vous pouvez citer la p
 
 ## Performances aux benchmarks
 
-Il s’agit de résultats historiques rapportés d’août à octobre 2026, et non d’une nouvelle évaluation de la version actuelle.
+AstaBench, ASI-Bench et BiomniBench-DA sont des familles de benchmarks distinctes, avec des tâches, des jeux de données et des méthodes de notation différents ; leurs résultats sont présentés séparément et ne sont pas directement comparables.
 
-Rapports sources: [29 septembre](https://hwtgofuh6ud.feishu.cn/wiki/Kl5cwupToi901BkEaQacM1V2n7e), [12 octobre](https://hwtgofuh6ud.feishu.cn/wiki/XZSbw7L87ibjQUk98qJcuqFUnKh) (une autorisation d’accès peut être nécessaire).
+### 🏆 AstaBench — Meilleur score LitQA2 Test affiché ex æquo : 90.67% de Recall@30
 
-### 🏆 AstaBench LitQA2-FullText-Search — 10/10 articles cibles retrouvés
+AIPOCH Open-Science a obtenu **90.67% de Recall@30 (68/75)** lors d’une évaluation locale sur le jeu Test officiel de 75 questions de LitQA2-FullText-Search avec **gpt-6-astra**. Parmi les 27 résultats inclus dans l’instantané du rapport du 26 octobre, ce score Test local **partage le meilleur Recall@30 affiché**, également obtenu par Asta Paper Finder et Asta v0 à 90.67%. Il s’agissait d’une évaluation locale sur le jeu Test officiel, et non d’une soumission à un classement officiel ou d’une place dans celui-ci.
 
-AIPOCH Open-Science a obtenu **100% de recall@30** sur les dix requêtes de validation officielles avec **DeepSeek v4-flash (max)**, des spécialistes de la recherche bibliographique et des compétences. Chaque article cible figurait parmi les 30 premiers résultats. Ce score dépasse les trois résultats publics de validation cités dans le rapport, de **20 points de pourcentage** par rapport au meilleur résultat de référence de **80%**. Trois répétitions locales ont été rapportées, montrant la localisation des articles pour cet ensemble de questions scientifiques.
+**ScholarQA-CS2 :** AIPOCH Open-Science a obtenu avec **deepseek-v4-flash** un **score composite de 0.9289/1** sur **100 questions de Validation**. La référence Test officielle la plus élevée citée dans le rapport, **0.9192**, provient d’un autre jeu de questions ; les deux résultats ne constituent donc pas un classement comparatif direct.
 
-![AIPOCH Open-Science obtient 100% de recall@30 et 10/10 articles cibles sur la validation AstaBench LitQA2 ; test et validation utilisent des questions différentes](../images/readme/astabench-litqa2.png)
+![Synthèse AstaBench d’AIPOCH Open-Science : 90.67% de Recall@30 sur LitQA2 Test et score composite de 0.9289 sur ScholarQA-CS2 Validation ; les résultats locaux sont séparés des références officielles](../images/readme/astabench-literature-research-overview.jpg)
 
-La figure comprend des résultats de test et de validation ; leur ordre est uniquement numérique. Recall@30 mesure la recherche de l'article cible, pas l'exactitude des réponses scientifiques.
+<details>
+<summary><strong>Comparaison des résultats de LitQA2-FullText-Search</strong></summary>
 
-### 🏆 ASI-Bench B1–B4 — Meilleurs scores affichés dans les quatre comparaisons présentées
+![AIPOCH Open-Science obtient 90.67% de Recall@30 sur le jeu LitQA2 Test de 75 questions, partageant le meilleur score affiché dans l’instantané du rapport ; ce résultat n’a pas été soumis à un classement officiel](../images/readme/astabench-litqa2-test.jpg)
+
+L’exécution locale a eu lieu le 23 octobre 2026. Le graphique présente un résultat Test local d’AIPOCH Open-Science et 26 enregistrements de référence officiels. Des scores égaux conservent des barres de même longueur et l’ordre des lignes ne départage pas les ex æquo. Les coûts locaux d’AIPOCH n’ont pas été comptabilisés de manière uniforme ; le graphique ne permet donc pas de comparer le rapport coût-efficacité.
+
+Une évaluation locale antérieure avec **DeepSeek v4-flash (max)** a obtenu **100% de Recall@30 (10/10)** sur le jeu Validation distinct de dix questions ; trois répétitions locales ont été rapportées pour ce résultat. Les résultats Test et Validation portent sur des questions différentes et sont présentés séparément.
+
+</details>
+
+<details>
+<summary><strong>Références Validation et Test de ScholarQA-CS2</strong></summary>
+
+![AIPOCH Open-Science obtient un score composite de 0.9289 sur les 100 questions de ScholarQA-CS2 Validation ; les références Test officielles portent sur d’autres questions et ne constituent pas un classement comparatif direct](../images/readme/astabench-scholarqa-cs2.jpg)
+
+Le graphique sépare un résultat Validation local de 41 références Test officielles. Le texte du rapport mentionne également un score Validation de 0.7905 avec `gpt-5.6-sol`, absent du tableau source et sans indication du nombre de questions.
+
+</details>
+
+Recall@30 mesure si l’article cible apparaît parmi les 30 premiers résultats soumis ; il ne mesure pas l’exactitude des réponses aux questions scientifiques. Le score ScholarQA-CS2 est une mesure composite de la qualité des réponses, et non le pourcentage de questions auxquelles une réponse entièrement correcte a été donnée.
+
+### 🏆 ASI-Bench B1–B4 — Meilleurs scores affichés dans les quatre comparaisons du rapport
 
 AIPOCH Open-Science a obtenu **79.35, 56.11, 59.67 et 59.46** sur ASI-Bench B1, B2, B3 et B4 avec **GPT-6 (gpt-6-astra / xhigh)**, des spécialistes de domaine et des compétences : les valeurs affichées les plus élevées dans les comparaisons respectives retenues par les rapports. Les quatre conditions évaluent **l'exécution d'un plan complet, l'organisation d'un processus de travail, le choix autonome des méthodes et la recherche autonome avec des informations distrayantes**.
 
@@ -245,7 +265,7 @@ Les références locales Codex utilisant le même modèle et le même niveau de 
 
 Les exécutions locales utilisent seed31415. Le score B1 d'AIPOCH couvre 59 tâches ; une a été exclue en raison du problème d'évaluation décrit dans le rapport. B3/B4 utilisent v0.32.0 et un juge de remplacement. Les références publiques diffèrent par les instances, les configurations et l'évaluation ; l'écart B2 de 0.02 point est uniquement numérique.
 
-### 🏆 Meilleur score dans la comparaison compilée BiomniBench-DA Public 50 — 79.05
+### 🏆 BiomniBench-DA Public 50 — Meilleur score affiché dans la comparaison compilée : 79.05
 
 AIPOCH Open-Science a obtenu **79.05** avec **gpt-5.6-sol (xhigh)** lors d'une évaluation interne des 50 tâches désignées BiomniBench-DA Public 50, soit le meilleur score affiché dans la comparaison compilée. Il s'agit de la moyenne à pondération égale de **81.04** pour le juge Gemini 3.1 Pro et **77.06** pour le juge DeepSeek v4-pro, décrivant l'analyse de données biomédicales de cette configuration. Voir le [rapport d'évaluation](https://aipoch.com/blog/open-science-biomnibench-da).
 
@@ -253,7 +273,7 @@ AIPOCH Open-Science a obtenu **79.05** avec **gpt-5.6-sol (xhigh)** lors d'une �
 
 La comparaison mélange différentes couvertures de juges et ne constitue pas un classement officiel sous des conditions d'évaluation uniformes.
 
-**Portée de l'évaluation :** Ces résultats locaux/internes sont déclarés par l'équipe. Arriver en tête des comparaisons présentées n'établit ni une première place officielle ni une amélioration statistiquement significative.
+**Portée de l’évaluation :** Ces résultats locaux/internes ont été déclarés par l’équipe entre août et octobre 2026 pour les jeux de données et partitions indiqués ; les évaluations n’ont pas été répétées pour la version actuelle. Une exécution locale sur un jeu Test officiel n’implique ni soumission ni place dans un classement officiel. Les références sont des instantanés de rapports historiques, et non des classements en temps réel ; les résultats Validation et Test ne sont pas directement comparables. Les différences d’instances de tâches, de configurations de modèles, de couverture des juges et de comptabilisation des coûts limitent les comparaisons entre systèmes. Les égalités ou écarts numériques n’établissent pas d’améliorations statistiquement significatives.
 
 ## Capacités principales
 
