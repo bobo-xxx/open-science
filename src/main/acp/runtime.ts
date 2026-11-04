@@ -551,6 +551,10 @@ class AcpRuntime {
     return this.connectionResources.connection
   }
 
+  get cleanupConfirmed(): boolean {
+    return this.connectionResources.cleanupConfirmed
+  }
+
   private get reconnectBarrier(): Promise<void> | undefined {
     return this.connectionTransitions.barrier
   }
@@ -1302,6 +1306,12 @@ class AcpRuntime {
     await this.connectionClose.requestRetirement()
   }
 
+  // Release physical resources after completed work, retaining events for subscribers and using
+  // the ordinary Session resume path on the next turn. Active workflows defer this transition.
+  requestIdleRelease(): void {
+    if (this.snapshotOwner.status === 'connected') this.connectionTransitions.requestIdleRelease()
+  }
+
   // Applies an active-provider change without interrupting the user. The agent bakes its provider env in
   // at spawn, so a new provider needs a reconnect — but if a prompt is running we defer the reconnect
   // until the session goes idle. Because every provider shares one config dir, the reconnect resumes the
@@ -1315,7 +1325,19 @@ class AcpRuntime {
     _options: AcpRuntimeActivityOptions,
     work: (runtime: AcpRuntimeActivity) => Promise<T>
   ): Promise<T> {
-    return this.generationActivity.withActivity(() => work(this))
+    return this.generationActivity.withActivity(async () => {
+      try {
+        return await work(this)
+      } finally {
+        this.requestIdleRelease()
+      }
+    })
+  }
+
+  // Coordinator admission precedes Runtime prompt startup. Protect that gap from idle release
+  // without blocking provider reconnect, whose barrier the admitted prompt may need to await.
+  withPromptAdmission<T>(work: () => Promise<T>): Promise<T> {
+    return this.generationActivity.withOperation(work)
   }
 
   private withOperationLease<T>(work: () => Promise<T>): Promise<T> {
