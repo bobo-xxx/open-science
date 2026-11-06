@@ -163,18 +163,19 @@ describe('Auto operation completeness against real tool registrations', () => {
         // Strict inputs, allow-once disposition and owner-checked source access are unchanged.
         'artifacts/mcp-server.ts':
           'f44800f59957041e1004ce93a039e47a3c491f958fe429ef5b3fa49ae472b2f0',
+        // Reviewed: Inbox input descriptions and file-validation errors explain correction/retry.
+        // Accepted inputs, pre-save validation, trusted origin and allow-once disposition are unchanged.
         'literature/library-mcp-server.ts':
-          'f6eddd996e4651c56586435e7c0845a437dd7d3b8c18dfe0ff634eb0e8bbefd6',
+          'b50bd708d22d75792dc680915d1b78ea7f8a61b005289497969e21bc62d2b4f8',
         // Reviewed: linked-PDF reading order is resolved automatically from logical structure
         // or layout, with OCR guidance and coverage presentation. Strict inputs, mounted-server checks and
         // single-use authorization are unchanged.
         'literature/mcp-server.ts':
           '7d285b27718e63d53e028b873f6391da842f44acb118fd2c10b80963be5a71eb',
-        // Reviewed: Windows Bioconductor installer guidance, plus non-blank patterns on required
-        // ask_user_question strings that only narrow accepted inputs; handlers and Auto operation
-        // dispositions are unchanged.
+        // Reviewed: the runtime descriptions explain default selection, and failed foreground
+        // Shell executions set the MCP error flag. Input schemas and Auto dispositions are unchanged.
         'notebook/mcp-server.ts':
-          '1bf1a40a68e0bf5fe1fbc8eaf5e06891a0caaf7f710a89e801f8b9df1c2ee63a',
+          '6e2247ab0d1d8ea524ba2190673bca565a8930ce9e912ef8c562a3cc54823120',
         // Reviewed: generate_plan sends progress notifications while awaiting review; the handler
         // call, its result and the Plan operation dispositions are unchanged.
         'session-plan/plan-mcp-server.ts':

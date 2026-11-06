@@ -88,7 +88,33 @@ export function ResearchVideoButton({
     'awaiting-reply': t('Wait for a completed response before generating.'),
     busy: t('Wait for the current response to finish before generating.')
   }
-  const blocked = status.generationBlock ? blockMessages[status.generationBlock] : undefined
+  const preflightMessages: Record<string, string> = {
+    'Select a model in Settings before generating a research film.': t(
+      'Select a model in Settings before generating a research film.'
+    ),
+    'The selected provider credentials are unavailable. Check them in Settings.': t(
+      'The selected provider credentials are unavailable. Check them in Settings.'
+    ),
+    'The selected model is unavailable. Select another model in Settings.': t(
+      'The selected model is unavailable. Select another model in Settings.'
+    ),
+    "This provider isn't compatible with the active agent framework.": t(
+      "This provider isn't compatible with the active agent framework."
+    ),
+    'The selected model input limit cannot fit the research film instructions. Select a model with a larger input limit.':
+      t(
+        'The selected model input limit cannot fit the research film instructions. Select a model with a larger input limit.'
+      ),
+    'Set up the selected agent runtime in Settings before generating a research film.': t(
+      'Set up the selected agent runtime in Settings before generating a research film.'
+    ),
+    'Check the selected model and credentials in Settings before generating a research film.': t(
+      'Check the selected model and credentials in Settings before generating a research film.'
+    )
+  }
+  const blocked = status.generationBlock
+    ? blockMessages[status.generationBlock]
+    : status.preflightError && (preflightMessages[status.preflightError] ?? status.preflightError)
   const triggerState: ResearchVideoTriggerState = {
     label:
       busy || installing || pending
@@ -96,7 +122,10 @@ export function ResearchVideoButton({
         : status.result
           ? t('View research film')
           : t('Generate research film'),
-    disabledReason: !status.result && !busy && !installing && !pending ? blocked : undefined
+    disabledReason:
+      !status.result && !busy && !installing && !pending && status.generationBlock
+        ? blocked
+        : undefined
   }
   const desktop = document.documentElement.getAttribute(WEB_EVENT_SURFACE_ATTRIBUTE) !== 'true'
   useEffect(() => {
@@ -149,11 +178,11 @@ export function ResearchVideoButton({
     setPending(true)
     setError(undefined)
     try {
-      const current = await window.api.researchVideo.status(request)
+      const current = await window.api.researchVideo.status({ ...request, checkReadiness: true })
       if (!live.current) return
       setStatus(current)
       if (current.result && !regenerate) return
-      if (current.generationBlock) return
+      if (current.generationBlock || current.preflightError) return
       if (
         current.progress &&
         !['completed', 'failed', 'cancelled'].includes(current.progress.phase)
@@ -174,6 +203,10 @@ export function ResearchVideoButton({
     setPending(true)
     setError(undefined)
     try {
+      const current = await window.api.researchVideo.status({ ...request, checkReadiness: true })
+      if (!live.current) return
+      setStatus(current)
+      if (current.generationBlock || current.preflightError) return
       const snapshot = await window.api.localModels.install('research-narration')
       if (!live.current) return
       setModel(snapshot)
@@ -405,8 +438,8 @@ export function ResearchVideoButton({
         >
           <div className={`${dialogBodyClassName} min-h-0 overflow-y-auto`} data-workflow-body>
             <div className="space-y-4" data-workflow-content>
-              {blocked && !busy && <ErrorNotice inline level="info" description={blocked} />}
-              {(error || status.error) && (
+              {blocked && !busy && <ErrorNotice inline level="warning" description={blocked} />}
+              {!blocked && (error || status.error) && (
                 <ErrorNotice inline tone="amber" description={error ?? status.error} />
               )}
               {status.result && (
