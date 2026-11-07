@@ -281,8 +281,8 @@ describe.each(['sync', 'async'] as const)('%s installation occupancy', (mode) =>
   it('includes macOS text mappings without accepting similarly prefixed bundles', async () => {
     vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin')
     output(
-      '10 /Applications/Science.app/node\n',
-      'p10\nftxt\nn/Applications/Science.app/node\np11\nftxt\nn/Applications/Science.app\np12\nftxt\nn/Applications/Science.app/Contents/node\np13\nftxt\nn/Applications/Science.app-old/node\n'
+      '10 /Applications/Science.app/node\n14 /Applications/Science.app-old/node\n',
+      'p11\nftxt\nn/Applications/Science.app\np12\nftxt\nn/Applications/Science.app/Contents/node\np13\nftxt\nn/Applications/Science.app-old/node\n'
     )
     expect(await inspect('/Applications/Science.app')).toEqual([10, 11, 12])
   })
@@ -478,6 +478,33 @@ describe('macOS process names', () => {
 
     expect(inspectProcessNames([321])).toEqual(new Map())
     expect(mocks.spawnSync).not.toHaveBeenCalled()
+  })
+})
+
+describe('Windows process names', () => {
+  it('maps blocker PIDs to executable names without failing occupancy diagnostics', () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32')
+    mocks.windows.listWindowsProcesses.mockReturnValue([
+      { pid: 321, ppid: 1, executablePath: 'C:\\Windows\\System32\\sh.exe' },
+      { pid: 45, ppid: 1, executablePath: 'C:\\Apps\\Open-Science\\open-science.exe' },
+      { pid: 99, ppid: 1, executablePath: null }
+    ])
+
+    expect(inspectProcessNames([321, 45, 99, 404])).toEqual(
+      new Map([
+        [321, 'sh.exe'],
+        [45, 'open-science.exe']
+      ])
+    )
+  })
+
+  it('keeps diagnostics empty when the Windows process snapshot is unavailable', () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32')
+    mocks.windows.listWindowsProcesses.mockImplementation(() => {
+      throw new Error('snapshot unavailable')
+    })
+
+    expect(inspectProcessNames([321])).toEqual(new Map())
   })
 })
 
