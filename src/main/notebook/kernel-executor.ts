@@ -1150,7 +1150,12 @@ class NotebookKernelExecutor implements NotebookExecutor {
       loopPath = this.replLoopPath
       // Node otherwise realpaths the main module before loading it. A Windows AppContainer can read
       // the explicitly granted script but cannot enumerate its drive root or unrelated ancestors.
-      args = [...(this.platform === 'win32' ? ['--preserve-symlinks-main'] : []), loopPath]
+      // The sandbox opts into env proxies; keep that runtime advisory out of cell output.
+      args = [
+        '--disable-warning=UNDICI-EHPA',
+        ...(this.platform === 'win32' ? ['--preserve-symlinks-main'] : []),
+        loopPath
+      ]
     } else {
       // Data kernel (python/r). The loop SCRIPT is chosen by kind; the INTERPRETER is either resolved
       // by the Runtime Registry (a managed env bin, or an external/overlay interpreter for BYO) or,
@@ -1433,14 +1438,17 @@ class NotebookKernelExecutor implements NotebookExecutor {
           processKey: kind === 'repl' ? 'repl' : `${kind}:${env}`,
           kernelEpochId
         },
-        ownerToken
+        ownerToken,
+        sandboxed?.processTreeProof
       )
     }
     const kernelExecutable = sandboxed?.executable ?? invocation.executable
     const kernelArgs = sandboxed?.args ?? invocation.args
     const spawnExecutable = ownershipIntent ? process.execPath : kernelExecutable
+    // This Node host inherits the proxy opt-in even for Python/R, and shares the cell's stderr.
     const spawnArgs = ownershipIntent
       ? [
+          '--disable-warning=UNDICI-EHPA',
           this.processHostPath,
           ownershipIntent.path,
           ownershipIntent.record.receiptId,

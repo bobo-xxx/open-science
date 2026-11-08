@@ -36,6 +36,7 @@ import { discussionDraftAnnotations } from './discussion-send-context'
 import { SessionDiscussionSource } from './SessionDiscussionSource'
 import { SessionHeaderMenu } from './SessionHeaderMenu'
 import { SessionInfoPopover } from './SessionInfoPopover'
+import { isImportedSession } from './session-action-menu'
 import { AnnotationTransferSource } from './annotations/AnnotationTransferSource'
 import { useAnnotationDrop } from './annotations/use-annotation-drop'
 import { mentionProjectFile } from './project-file-mention'
@@ -1614,6 +1615,7 @@ const ConversationPanel = ({
                 sourceSession={sourceSession}
                 onOpenSession={sessionTools.openSession}
                 onEdit={sessionTools.editSession}
+                canTogglePin={!isImportedSession(activeSession)}
                 onTogglePin={sessionTools.togglePin}
               />
             ) : (
@@ -2175,50 +2177,53 @@ const ConversationPanel = ({
                       </section>
                     ) : activeSession?.packageOrigin ? (
                       <section
-                        className="relative z-10 rounded-2xl bg-bg-200 p-2"
+                        className="relative z-10 rounded-2xl border border-border-200/70 bg-bg-200 p-2.5"
                         aria-label={t('Imported research history')}
                       >
-                        <div className="flex flex-wrap items-center gap-2">
-                          <SessionDiscussionButton
-                            key={activeSession.id}
-                            projectId={activeSession.projectId}
-                            sessionId={activeSession.id}
-                          />
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            className="px-2 text-xs"
-                            aria-controls="right-panel"
-                            onClick={() => {
-                              usePreviewWorkbenchStore
-                                .getState()
-                                .upsertAndActivateItem(
-                                  createSessionReplayItem(
-                                    activeSession.projectId,
-                                    activeSession.id,
-                                    activeSession.title
-                                  )
-                                )
-                            }}
-                          >
-                            <Play className="size-4" aria-hidden="true" />
-                            {t('View replay')}
-                          </Button>
-                          <ResearchVideoButton
-                            key={`${activeSession.id}:${activeSession.conversationGraph?.frames.find((frame) => frame.id === activeSession.conversationGraph?.rootFrameId)?.activeBranchId ?? ''}`}
-                            projectId={activeSession.projectId}
-                            sessionId={activeSession.id}
-                            branchId={
-                              activeSession.conversationGraph?.frames.find(
-                                (frame) => frame.id === activeSession.conversationGraph?.rootFrameId
-                              )?.activeBranchId
-                            }
-                          />
-                          {sessionForkAvailable() ? (
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
+                            <SessionDiscussionButton
+                              key={activeSession.id}
+                              projectId={activeSession.projectId}
+                              sessionId={activeSession.id}
+                            />
                             <Button
                               variant="outline"
                               size="sm"
                               className="px-2 text-xs"
+                              aria-controls="right-panel"
+                              onClick={() => {
+                                usePreviewWorkbenchStore
+                                  .getState()
+                                  .upsertAndActivateItem(
+                                    createSessionReplayItem(
+                                      activeSession.projectId,
+                                      activeSession.id,
+                                      activeSession.title
+                                    )
+                                  )
+                              }}
+                            >
+                              <Play className="size-4" aria-hidden="true" />
+                              {t('View replay')}
+                            </Button>
+                            <ResearchVideoButton
+                              key={`${activeSession.id}:${activeSession.conversationGraph?.frames.find((frame) => frame.id === activeSession.conversationGraph?.rootFrameId)?.activeBranchId ?? ''}`}
+                              projectId={activeSession.projectId}
+                              sessionId={activeSession.id}
+                              branchId={
+                                activeSession.conversationGraph?.frames.find(
+                                  (frame) =>
+                                    frame.id === activeSession.conversationGraph?.rootFrameId
+                                )?.activeBranchId
+                              }
+                            />
+                          </div>
+                          {sessionForkAvailable() ? (
+                            <Button
+                              variant="default"
+                              size="sm"
+                              className="w-full px-3 text-xs font-semibold sm:w-auto"
                               onClick={() => {
                                 void forkSession(activeSession)
                               }}
