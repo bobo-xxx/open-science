@@ -20,13 +20,14 @@ import { createMessagesModel } from '@aipoch/agent-harness/messages'
 import {
   HARNESS_AUTH_METHOD,
   HARNESS_INSTRUCTIONS,
+  HARNESS_TOOL_LESS,
   HARNESS_OWNER,
   harnessOwnerSchema,
   harnessConfigSchema,
   type HarnessConfig
 } from './config'
 import { connectHarnessMcp } from './mcp'
-import { recognizeInput } from '../../shared/failure/recognizers/input'
+import { classifyFailure } from '../../shared/failure/classify'
 
 // Built-in Agent context accounting. The provider's reported input tokens are the authority; this
 // meter only predicts the next request before dispatch:
@@ -261,7 +262,7 @@ const isContextOverflowResponse = async (
   if (response.status !== 400) return false
   const text = await readErrorPrefix(response, signal)
   return (
-    recognizeInput({ origin: 'provider', status: 400, text })?.reason === 'input/context-overflow'
+    classifyFailure({ origin: 'provider', status: 400, text }).reason === 'input/context-overflow'
   )
 }
 
@@ -357,6 +358,9 @@ export function createHarnessAcpAgent(directory: string): {
       } else await writeFile(bindingFile, JSON.stringify(binding), { flag: 'wx', mode: 0o600 })
       const instructions = params._meta?.[HARNESS_INSTRUCTIONS] ?? ''
       if (typeof instructions !== 'string') throw new Error('Invalid host instructions')
+      const toolLess = params._meta?.[HARNESS_TOOL_LESS] === true
+      if (toolLess && params.mcpServers.length)
+        throw new Error('Tool-less sessions cannot attach MCP servers')
       mcp = await connectHarnessMcp({
         servers: params.mcpServers,
         sessionId: id,
@@ -508,9 +512,12 @@ export function createHarnessAcpAgent(directory: string): {
         model,
         tools: mcp.tools,
         // Original results are already authorized evidence in this exact session; no external access.
-        toolResults: {
-          authorize: async (_args, context) => !context.signal.aborted && context.sessionId === id
-        },
+        toolResults: toolLess
+          ? undefined
+          : {
+              authorize: async (_args, context) =>
+                !context.signal.aborted && context.sessionId === id
+            },
         signal,
         instructions,
         maxSteps: 64,
