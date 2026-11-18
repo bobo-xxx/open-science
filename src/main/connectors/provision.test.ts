@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { mkdtemp, mkdir, readdir, readFile, writeFile, stat, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, open, readdir, readFile, writeFile, stat, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { syncConnectorSkillDocs, syncCustomServerSkillDocs } from './provision'
@@ -48,6 +48,46 @@ describe('syncConnectorSkillDocs', () => {
       'datacite_get_record'
     ]) {
       expect(literature).toContain(`### ${method}`)
+    }
+  })
+
+  it('atomically publishes new bundled content while an open reader keeps the original bytes', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'connector-skill-replacement-'))
+    try {
+      const skills = join(root, 'skills')
+      const directory = join(skills, 'mcp-genes')
+      const path = join(directory, 'SKILL.md')
+      await mkdir(directory, { recursive: true })
+      await writeFile(path, 'original connector document')
+      const reader = await open(path, 'r')
+      let settled = false
+      const publication = syncConnectorSkillDocs(skills, ['genes'])
+        .then(
+          () => undefined,
+          (error: unknown) => error
+        )
+        .finally(() => {
+          settled = true
+        })
+      try {
+        await vi.waitFor(async () => {
+          const staged = (await readdir(root)).some((entry) =>
+            entry.startsWith('.connector-skill-')
+          )
+          expect(staged || settled).toBe(true)
+        })
+        // Windows can forbid replacement while this reader is open. Release it before the bounded
+        // rename retries run out and allow the publication to finish.
+        expect(await reader.readFile('utf8')).toBe('original connector document')
+      } finally {
+        await reader.close()
+      }
+      expect(await publication).toBeUndefined()
+      expect(await readFile(path, 'utf8')).toContain('name: mcp-genes')
+      expect(await readdir(root)).toEqual(['skills'])
+      expect(await readdir(directory)).toEqual(['SKILL.md'])
+    } finally {
+      await rm(root, { recursive: true, force: true })
     }
   })
 })

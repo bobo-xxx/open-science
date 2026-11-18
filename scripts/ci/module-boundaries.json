@@ -10486,6 +10486,7 @@
         "@aipoch/connector-mcp-client",
         "@aipoch/diagnostics",
         "@aipoch/diagnostics/node",
+        "@aipoch/durable-files",
         "@aipoch/skills/document",
         "@aipoch/specialists",
         "@modelcontextprotocol/sdk/client/auth.js",

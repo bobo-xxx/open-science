@@ -1,5 +1,17 @@
-import { lstat, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import {
+  lstat,
+  mkdir,
+  open,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  writeFile
+} from 'node:fs/promises'
+import { dirname, join } from 'node:path'
+import { retryFileReplacement } from '@aipoch/durable-files'
 import { ALL_CONNECTOR_IDS } from './registry'
 import { renderSkillDoc, renderCustomSkillDoc } from './skill-doc'
 import type { CustomSkillDocTool } from './skill-doc'
@@ -36,6 +48,48 @@ const findCaseFoldedAlias = async (
   )
 }
 
+const optionalSkillFile = async <Value>(operation: Promise<Value>): Promise<Value | undefined> => {
+  try {
+    return await operation
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return undefined
+    throw error
+  }
+}
+
+const publishBundledSkillDoc = async (
+  skillsDir: string,
+  path: string,
+  doc: string,
+  signal?: AbortSignal
+): Promise<void> => {
+  const contents = Buffer.from(doc, 'utf8')
+  const existing = await optionalSkillFile(readFile(path, { signal }))
+  signal?.throwIfAborted()
+  // Readers may be copying this projection into a private OpenCode Attempt. Reopening identical
+  // bytes for writing creates a Windows sharing conflict and briefly truncates the source.
+  if (existing?.equals(contents)) return
+
+  const metadata = existing && (await optionalSkillFile(stat(path)))
+  signal?.throwIfAborted()
+  // Stage outside the skills tree, which OpenCode copies recursively, in its app-owned parent.
+  const staging = join(dirname(skillsDir), `.connector-skill-${randomUUID()}.tmp`)
+  const file = await open(staging, 'wx', metadata ? metadata.mode & 0o777 : undefined)
+  try {
+    try {
+      await file.writeFile(contents, { signal })
+    } finally {
+      await file.close()
+    }
+    await retryFileReplacement(() => {
+      signal?.throwIfAborted()
+      return rename(staging, path)
+    })
+  } finally {
+    await rm(staging, { force: true }).catch(() => undefined)
+  }
+}
+
 // Writes skills/mcp-<connector>/SKILL.md for enabled connectors; removes the directory for
 // disabled ones. Claude Code discovers skills as `<name>/SKILL.md` directories, not flat files.
 // Custom-server directories (see syncCustomServerSkillDocs below) live in the same skills dir;
@@ -55,7 +109,7 @@ export async function syncConnectorSkillDocs(
     const dir = join(skillsDir, `mcp-${id}`)
     await mkdir(dir, { recursive: true })
     signal?.throwIfAborted()
-    await writeFile(join(dir, 'SKILL.md'), renderSkillDoc(id), 'utf8')
+    await publishBundledSkillDoc(skillsDir, join(dir, 'SKILL.md'), renderSkillDoc(id), signal)
   }
   signal?.throwIfAborted()
   const existing = await readdir(skillsDir).catch(() => [] as string[])

@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 import { opencodeFramework, type ResolvedAgentBackend } from '../agent-framework'
+import { syncConnectorSkillDocs } from '../connectors/provision'
 import { assertOpenCodeNativeDelegationDisabled } from './opencode-execution'
 import {
   prepareOpenCodeRuntime,
@@ -166,6 +167,36 @@ describe('OpenCode delegated runtime preparation', () => {
         listeners.map((listener) => new Promise<void>((resolve) => listener.close(() => resolve())))
       )
     }
+  })
+
+  it('copies an unchanged Connector Skill while concurrent continuations synchronize the same projection', async () => {
+    const { root, backend } = await fixture()
+    const skillRoot = join(backend.env.XDG_CONFIG_HOME, 'opencode', 'skills')
+    const skillPath = join('mcp-genes', 'SKILL.md')
+    const source = join(skillRoot, skillPath)
+    await syncConnectorSkillDocs(skillRoot, ['genes'])
+    const contents = await readFile(source)
+    const oldTime = new Date('2000-01-01T00:00:00Z')
+    await utimes(source, oldTime, oldTime)
+    const before = await stat(source)
+
+    const attempts = await Promise.allSettled([
+      prepareOpenCodeRuntime(backend, join(root, 'attempt-first')),
+      prepareOpenCodeRuntime(backend, join(root, 'attempt-second')),
+      syncConnectorSkillDocs(skillRoot, ['genes']),
+      syncConnectorSkillDocs(skillRoot, ['genes'])
+    ])
+
+    for (const result of attempts) {
+      if (result.status === 'rejected') throw result.reason
+      if (!result.value) continue
+      prepared.push(result.value)
+      const copy = join(result.value.backend.env.XDG_CONFIG_HOME, 'opencode', 'skills', skillPath)
+      expect(await readFile(copy)).toEqual(contents)
+    }
+    const after = await stat(source)
+    expect(after.mtimeMs).toBe(before.mtimeMs)
+    expect(after.ino).toBe(before.ino)
   })
 
   it('copies warm plugin dependencies without sharing subsequent writes or copying auth', async () => {
