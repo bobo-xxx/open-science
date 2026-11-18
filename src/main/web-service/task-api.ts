@@ -54,6 +54,7 @@ import type {
   TaskAgentRuntime,
   TaskConfigurationOptions,
   TaskDoctorReport,
+  TaskPendingSessionInteraction,
   TaskPlanResponseRequest,
   TaskProject,
   TaskProjectSessionDefaults,
@@ -538,6 +539,28 @@ class HeadlessTaskApi {
       throw new TaskRunnerError('session_not_found', 'Session not found in this project.')
     }
     return this.attachments.stage({ projectId, sessionId }, body)
+  }
+
+  supportsPendingSessionInteractions(): boolean {
+    return this.ports.controls?.listPendingSessionInteractions !== undefined
+  }
+
+  async listPendingSessionInteractions(
+    projectId: string,
+    sessionId: string
+  ): Promise<readonly TaskPendingSessionInteraction[]> {
+    const read = this.ports.controls?.listPendingSessionInteractions
+    if (!read) {
+      throw new TaskRunnerError(
+        'pending_interactions_unavailable',
+        'Pending interaction queries are unavailable.'
+      )
+    }
+    const interactions = await read({ projectId, sessionId })
+    if (!interactions) {
+      throw new TaskRunnerError('session_not_found', 'Session not found in this project.')
+    }
+    return interactions
   }
 
   async getSessionHistory(input: LoadSessionHistoryPageRequest): Promise<TaskSessionHistoryPage> {

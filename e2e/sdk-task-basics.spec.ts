@@ -1,25 +1,26 @@
 import { expect } from '@playwright/test'
 
 import type { OpenScienceClient } from '../packages/open-science/index'
-import { test } from './fixtures/electron-app'
+import { test, type ElectronApp } from './fixtures/electron-app'
+
+async function connect(app: ElectronApp): Promise<OpenScienceClient> {
+  const sdkEntry = '../packages/open-science/index.mjs'
+  const { OpenScienceClient: Client } = (await import(
+    sdkEntry
+  )) as typeof import('../packages/open-science/index')
+  const url = new URL(await app.authenticatedWebUrl())
+  const token = url.searchParams.get('token')
+  if (!token) throw new Error('Missing isolated fixture token')
+  return new Client({ baseUrl: url.origin, token })
+}
 
 test('runs a task with project defaults and reads the same result through a new SDK client', async ({
   app
 }) => {
   test.setTimeout(120_000)
   await app.configureFakeAgent()
-  const sdkEntry = '../packages/open-science/index.mjs'
-  const { OpenScienceClient: Client } = (await import(
-    sdkEntry
-  )) as typeof import('../packages/open-science/index')
-  const connect = async (): Promise<OpenScienceClient> => {
-    const url = new URL(await app.authenticatedWebUrl())
-    const token = url.searchParams.get('token')
-    if (!token) throw new Error('Missing isolated fixture token')
-    return new Client({ baseUrl: url.origin, token })
-  }
 
-  const client = await connect()
+  const client = await connect(app)
   const capabilities = await client.getCapabilities()
   expect(capabilities.taskCapabilities).toEqual(
     expect.arrayContaining([
@@ -49,7 +50,7 @@ test('runs a task with project defaults and reads the same result through a new 
     memoryEnabled: false
   })
 
-  const reconnected = await connect()
+  const reconnected = await connect(app)
   const result = await reconnected.waitForRun(run.id, { timeoutMs: 45_000 })
   expect(result.status).toBe('completed')
   expect(result.output).toBeTruthy()
@@ -80,4 +81,51 @@ test('runs a task with project defaults and reads the same result through a new 
   expect(afterFollowup.messages.flatMap((message) => message.attachments ?? [])).toEqual(
     expect.arrayContaining([expect.objectContaining({ name: 'observations.txt' })])
   )
+
+  const answer = afterFollowup.messages.findLast(
+    (message) => message.role === 'agent' && message.status === 'complete'
+  )
+  if (!answer) throw new Error('Expected a completed answer to review')
+  const review = await reconnected.startSessionReview(result.sessionId, {
+    projectId: project.id,
+    turnMessageId: answer.id,
+    messageBranchId: afterFollowup.messageBranchId
+  })
+  if (!review.started) throw new Error(`Reviewer did not start: ${review.reason}`)
+  await expect
+    .poll(async () => {
+      const current = await reconnected.getSessionReview(result.sessionId, review.reviewId, {
+        projectId: project.id
+      })
+      return current.lifecycle
+    })
+    .toBe('complete')
+})
+
+test('observes an actual permission wait and cancels the Run', async ({ app }) => {
+  await app.configureFakeAgent()
+  const client = await connect(app)
+  const project = await client.createProject({ name: 'SDK interaction verification' })
+  const run = await client.startRun({
+    project: project.id,
+    prompt: 'Request fixture permission.',
+    permissionProfile: 'ask'
+  })
+  try {
+    await expect
+      .poll(() => client.listPendingSessionInteractions(project.id, run.sessionId))
+      .toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: 'permission',
+            status: 'pending',
+            projectId: project.id,
+            sessionId: run.sessionId
+          })
+        ])
+      )
+  } finally {
+    await client.cancelRun(run.id)
+  }
+  expect((await client.waitForRun(run.id, { timeoutMs: 30_000 })).status).toBe('cancelled')
 })

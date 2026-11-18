@@ -302,6 +302,7 @@ describe('OpenScienceClient', () => {
         'listSessions',
         'getSession',
         'getSessionHistory',
+        'listPendingSessionInteractions',
         'stageRunAttachment',
         'getSessionConfiguration',
         'updateSessionConfiguration',

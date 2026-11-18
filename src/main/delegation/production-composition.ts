@@ -96,7 +96,7 @@ type RootDelegatedWorkEvent =
   | Readonly<{ kind: 'unavailable-reason-cleared'; sessionId: string }>
 
 type RootDelegatedWorkControl = Readonly<{
-  pendingPermissions(): readonly AcpPermissionRequest[]
+  pendingPermissions(scope?: SessionKey): readonly AcpPermissionRequest[]
   unavailableReasons?(): Readonly<Record<string, DelegatedWorkUnavailableReason>>
   clearUnavailableReason?(sessionId: string): void
   subscribe(listener: (event: RootDelegatedWorkEvent) => void): () => void
@@ -590,9 +590,13 @@ const createProductionDelegatedWorkComposition = (
   }
 
   const root: RootDelegatedWorkControl = Object.freeze({
-    pendingPermissions: () =>
+    pendingPermissions: (scope?: SessionKey) =>
       Object.freeze(
-        [...permissions.values()].map(({ key, request }) => projectPermission(key, request))
+        [...permissions.values()].flatMap(({ key, request }) =>
+          !scope || (key.projectId === scope.projectId && key.sessionId === scope.sessionId)
+            ? [projectPermission(key, request)]
+            : []
+        )
       ),
     unavailableReasons: () => Object.freeze(Object.fromEntries(unavailableReasons)),
     // Re-enabling Delegation for a Session invalidates the last admission rejection; clearing it

@@ -232,6 +232,14 @@ export type TaskRerunSessionReviewRequest = {
 export type TaskSessionReviewStart =
   { started: true; reviewId: string } | { started: false; reason: ReviewRunNotStartedReason }
 
+export type TaskPendingSessionInteraction = Readonly<
+  { id: string; projectId: string; sessionId: string; status: 'pending' } & (
+    | { kind: 'permission'; isMcp: boolean; delegated: boolean }
+    | { kind: 'question'; fieldCount: number }
+    | { kind: 'compute'; operation: 'call_command' | 'download' | 'submit_job' }
+  )
+>
+
 export type TaskSessionReview = {
   id: string
   projectId: string
@@ -413,6 +421,7 @@ export type TaskApiErrorCode =
   | 'attachment_staging_unavailable'
   | 'attachment_not_found'
   | 'configuration_options_unavailable'
+  | 'pending_interactions_unavailable'
   | 'session_history_cursor_stale'
   | 'submission_conflict'
   | 'submission_unavailable'

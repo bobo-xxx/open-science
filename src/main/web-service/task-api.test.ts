@@ -19,6 +19,7 @@ import {
   type SessionComputeHostAccessMutation
 } from '../compute/session-compute-host-access'
 import { SessionEnabledComputeHostsOwner } from '../compute/session-enabled-hosts-owner'
+import { projectTaskPendingSessionInteractions } from '../tasks/task-control-ports'
 import type { TaskAgentPort, TaskSessionPort } from '../tasks/task-runner'
 import { HeadlessTaskApi } from './task-api'
 
@@ -272,6 +273,82 @@ const createComputePreferenceHarness = (
 }
 
 describe('HeadlessTaskApi adapter', () => {
+  it('observes pending interactions without owner identifiers or private request data', async () => {
+    const projectId = 'project-1'
+    const sessionId = 'session-1'
+    const permission = {
+      requestId: 'private-permission-id',
+      sessionId,
+      toolCallId: 'private-tool-id',
+      rawInput: { command: 'private-command' },
+      title: 'A title with a private path',
+      isMcp: true,
+      options: [{ optionId: 'private-option-id', name: 'Private option', kind: 'allow_once' }]
+    }
+    const query = vi.fn(async (scope: { projectId: string; sessionId: string }) => {
+      if (scope.projectId !== projectId || scope.sessionId !== sessionId) return undefined
+      return projectTaskPendingSessionInteractions(
+        scope,
+        {
+          pendingPermissions: [permission, { ...permission, sessionId: 'another-session' }],
+          pendingElicitations: [
+            {
+              requestId: 'private-question-id',
+              sessionId,
+              toolCallId: 'private-form-tool-id',
+              message: 'Private question',
+              fields: [{ id: 'secret', label: 'Private field', kind: 'text' }]
+            }
+          ]
+        },
+        [{ id: 'private-compute-approval-id', operation: 'submit_job' }]
+      )
+    })
+    const invoke = vi.fn()
+    const api = new HeadlessTaskApi({
+      agent: createAgent(),
+      commands: commandsFrom(invoke),
+      controls: {
+        specialists: { resolve: vi.fn() },
+        listPendingSessionInteractions: query
+      }
+    })
+    const first = await api.listPendingSessionInteractions(projectId, sessionId)
+    expect(first).toEqual([
+      {
+        id: expect.any(String),
+        projectId,
+        sessionId,
+        status: 'pending',
+        kind: 'permission',
+        isMcp: true,
+        delegated: false
+      },
+      {
+        id: expect.any(String),
+        projectId,
+        sessionId,
+        status: 'pending',
+        kind: 'question',
+        fieldCount: 1
+      },
+      {
+        id: expect.any(String),
+        projectId,
+        sessionId,
+        status: 'pending',
+        kind: 'compute',
+        operation: 'submit_job'
+      }
+    ])
+    expect(JSON.stringify(first)).not.toMatch(/private|secret/i)
+    await expect(api.listPendingSessionInteractions(projectId, sessionId)).resolves.toEqual(first)
+    await expect(
+      api.listPendingSessionInteractions('wrong-project', sessionId)
+    ).rejects.toMatchObject({ code: 'session_not_found' })
+    expect(invoke).not.toHaveBeenCalled()
+  })
+
   it('pages complete history by scope without returning hidden or storage records', async () => {
     const message = (id: string, createdAt: number): PersistedChatSession['messages'][number] => ({
       id,

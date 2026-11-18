@@ -105,7 +105,10 @@ import {
   isMigrationPending,
   withDataRootWrite
 } from './storage/migration-state'
-import type { TaskControlPorts } from './tasks/task-control-ports'
+import {
+  projectTaskPendingSessionInteractions,
+  type TaskControlPorts
+} from './tasks/task-control-ports'
 import type { TaskAgentPort } from './tasks/task-runner'
 import type { TrayNavigationSession } from './tray-navigation'
 import { defaultOcrLanguagesForLocale } from '../shared/local-models'
@@ -1006,6 +1009,16 @@ export const createApplicationModules = async (
     },
     taskAgent: agentWorkflows.taskAgent,
     taskControls: {
+      listPendingSessionInteractions: async (scope) => {
+        const ownerProjectId =
+          await sessionAuthority.sessionPersistenceCoordinator.sessionProjectId(scope.sessionId)
+        if (ownerProjectId !== scope.projectId) return undefined
+        return projectTaskPendingSessionInteractions(
+          scope,
+          agentRuntime.runtime.getPendingSessionRequests(scope.projectId, scope.sessionId),
+          computeServices.computeIpcModule.handlers.listPendingSessionApprovals(scope)
+        )
+      },
       specialists: {
         resolve: (reference) =>
           specialistCatalog.specialistService.resolveRunnableByReference(reference)

@@ -141,6 +141,10 @@ export type ComputeHandlers = {
   // Responds to a pending approval request from the renderer with a canonical app-owned scope.
   approvalRespond: (id: string, decision: ComputeApprovalDecision) => void
   approvalReplay: (id: string) => ComputeApprovalRequest | null
+  listPendingSessionApprovals: (scope: {
+    projectId: string
+    sessionId: string
+  }) => Array<Pick<ComputeApprovalRequest, 'id' | 'operation'>>
   approvalReplayPending: () => void
   approvalPauseSession: (sessionId: string) => void
   approvalResumeSession: (sessionId: string) => void

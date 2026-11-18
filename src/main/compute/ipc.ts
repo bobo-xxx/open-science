@@ -565,6 +565,7 @@ const createComputeHandlers = (
     concurrencyManager,
     approvalRespond: (id, decision) => broker.respond(id, decision),
     approvalReplay: (id) => broker.getPending(id),
+    listPendingSessionApprovals: (scope) => broker.listPendingForSession(scope),
     approvalReplayPending: () => broker.replayPending(),
     approvalPauseSession: (sessionId) => broker.pauseSession(sessionId),
     approvalResumeSession: (sessionId) => broker.resumeSession(sessionId),

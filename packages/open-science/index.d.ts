@@ -686,6 +686,14 @@ export type SessionHistoryActivity = {
   promptMessageId?: string
 }
 
+export type PendingSessionInteraction = Readonly<
+  { id: string; projectId: string; sessionId: string; status: 'pending' } & (
+    | { kind: 'permission'; isMcp: boolean; delegated: boolean }
+    | { kind: 'question'; fieldCount: number }
+    | { kind: 'compute'; operation: 'call_command' | 'download' | 'submit_job' }
+  )
+>
+
 export type SessionHistoryPage = {
   projectId: string
   sessionId: string
@@ -787,6 +795,11 @@ export class OpenScienceClient {
   ): ReturnType<OpenScienceClient['getProjectSessionDefaults']>
   listSessions(projectId?: string, options?: RequestOptions): Promise<Session[]>
   getSession(sessionId: string, options?: RequestOptions): Promise<Session>
+  listPendingSessionInteractions(
+    projectId: string,
+    sessionId: string,
+    options?: RequestOptions
+  ): Promise<readonly PendingSessionInteraction[]>
   getSessionHistory(
     projectId: string,
     sessionId: string,

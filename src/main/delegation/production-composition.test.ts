@@ -2742,6 +2742,14 @@ describe('production delegated-work composition', () => {
       ]
     })
     const projected = harness.composition.root.pendingPermissions()[0]
+    const scope = { projectId: harness.session.projectId, sessionId: harness.session.id }
+    expect(harness.composition.root.pendingPermissions(scope)).toEqual([projected])
+    expect(
+      harness.composition.root.pendingPermissions({ ...scope, projectId: 'other-project' })
+    ).toEqual([])
+    expect(
+      harness.composition.root.pendingPermissions({ ...scope, sessionId: 'other-session' })
+    ).toEqual([])
     expect(projected).toMatchObject({
       sessionId: harness.session.id,
       providerToolName: 'WebFetch',

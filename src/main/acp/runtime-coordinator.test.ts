@@ -3377,19 +3377,39 @@ describe('AcpRuntimeCoordinator', () => {
   })
 
   it('recognizes a live session only under its owning project', async () => {
-    const coordinator = new AcpRuntimeCoordinator(
-      (callbacks) =>
-        createFakeRuntime({
-          frameworkId: 'claude-code',
-          sessionIds: ['session-1'],
-          callbacks
-        }).runtime
-    )
+    const created: ReturnType<typeof createFakeRuntime>[] = []
+    const coordinator = new AcpRuntimeCoordinator((callbacks) => {
+      const runtime = createFakeRuntime({
+        frameworkId: 'claude-code',
+        sessionIds: ['session-1'],
+        callbacks
+      })
+      created.push(runtime)
+      return runtime.runtime
+    })
     const session = await coordinator.createSession({ projectId: 'project-1' })
+    const question = {
+      requestId: 'question-1',
+      toolCallId: 'tool-1',
+      sessionId: session.sessionId,
+      message: 'Choose the input set',
+      fields: []
+    }
+    created[0].setStateSilently({
+      pendingElicitations: [question, { ...question, sessionId: 'other-session' }]
+    })
 
     expect(coordinator.hasLiveSession('project-1', session.sessionId)).toBe(true)
     expect(coordinator.hasLiveSession('project-2', session.sessionId)).toBe(false)
     expect(coordinator.liveSessionProjectId(session.sessionId)).toBe('project-1')
+    expect(coordinator.getPendingSessionRequests('project-1', session.sessionId)).toEqual({
+      pendingPermissions: [],
+      pendingElicitations: [question]
+    })
+    expect(coordinator.getPendingSessionRequests('project-2', session.sessionId)).toEqual({
+      pendingPermissions: [],
+      pendingElicitations: []
+    })
 
     await coordinator.deleteSession({ sessionId: session.sessionId })
     expect(coordinator.hasLiveSession('project-1', session.sessionId)).toBe(false)

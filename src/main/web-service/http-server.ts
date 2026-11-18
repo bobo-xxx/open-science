@@ -178,6 +178,8 @@ type WebServerOptions = {
         | 'getSessionPlan'
         | 'getSessionHistory'
         | 'supportsRunAttachments'
+        | 'supportsPendingSessionInteractions'
+        | 'listPendingSessionInteractions'
         | 'stageRunAttachment'
         | 'respondSessionPlan'
         | 'listSessionReviews'
@@ -619,6 +621,7 @@ const readJsonBody = async (
 
 const taskErrorStatus = (error: TaskApiError): number => {
   if (error.code === 'attachment_staging_unavailable') return 503
+  if (error.code === 'pending_interactions_unavailable') return 503
   if (error.code === 'submission_unavailable' || error.code === 'configuration_options_unavailable')
     return 503
   if (error.code === 'submission_conflict' || error.code === 'session_read_only') return 409
@@ -1519,6 +1522,29 @@ const handleTaskApiRequest = async (
         })
         return true
       }
+      const pendingInteractionsMatch = url.pathname.match(
+        /^\/api\/v1\/projects\/([^/]+)\/sessions\/([^/]+)\/pending-interactions$/
+      )
+      if (
+        pendingInteractionsMatch &&
+        request.method === 'GET' &&
+        tasks.listPendingSessionInteractions
+      ) {
+        assertExternalAuthorizationCurrent(externalAuthorization)
+        if (!tasks.supportsPendingSessionInteractions?.()) {
+          throw new TaskApiError(
+            'pending_interactions_unavailable',
+            'Pending interaction queries are unavailable.'
+          )
+        }
+        reply(200, {
+          data: await tasks.listPendingSessionInteractions(
+            decodeURIComponent(pendingInteractionsMatch[1]),
+            decodeURIComponent(pendingInteractionsMatch[2])
+          )
+        })
+        return true
+      }
       const sessionHistoryMatch = url.pathname.match(
         /^\/api\/v1\/projects\/([^/]+)\/sessions\/([^/]+)\/history$/
       )
@@ -1807,7 +1833,11 @@ const startWebHttpServer = async (options: WebServerOptions): Promise<RunningWeb
                 ...(!externalAuthorization && options.tasks.supportsRunAttachments?.()
                   ? ['session-run-attachments']
                   : []),
-                ...(options.tasks.startSessionReview ? ['session-reviews'] : [])
+                ...(options.tasks.startSessionReview ? ['session-reviews'] : []),
+                ...(options.tasks.supportsPendingSessionInteractions?.() &&
+                options.tasks.listPendingSessionInteractions
+                  ? ['session-pending-interactions']
+                  : [])
               ]
             : [],
           rpcProtocolVersion: WEB_RPC_PROTOCOL_VERSION,

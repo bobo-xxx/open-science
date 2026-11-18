@@ -4056,6 +4056,71 @@ describe('startWebHttpServer', () => {
     }
   )
 
+  it('gates SDK pending interaction queries and passes the authenticated Project and Session', async () => {
+    let supported = false
+    const pending = {
+      id: 'interaction-1',
+      projectId: 'project/1',
+      sessionId: 'session/1',
+      kind: 'question' as const,
+      status: 'pending' as const,
+      fieldCount: 2
+    }
+    const listPendingSessionInteractions = vi.fn(async () => [pending])
+    const server = await startTestWebHttpServer({
+      host: '127.0.0.1',
+      port: 0,
+      token: 'test-token',
+      staticRoot: '/unused',
+      rpc: { channels: () => [], invoke: vi.fn() },
+      tasks: {
+        runWithCallerContext,
+        subscribeProgress: vi.fn(() => vi.fn()),
+        listProjects: vi.fn(),
+        createProject: vi.fn(),
+        updateProject: vi.fn(),
+        listSessions: vi.fn(),
+        getSession: vi.fn(),
+        startRun: vi.fn(),
+        getRun: vi.fn(),
+        cancelRun: vi.fn(),
+        listArtifacts: vi.fn(),
+        acquireArtifact: vi.fn(),
+        supportsPendingSessionInteractions: () => supported,
+        listPendingSessionInteractions
+      },
+      bootstrap: {
+        appName: 'Open-Science',
+        appVersion: '0.0.0',
+        configRoot: '/fake/root',
+        platform: 'test',
+        versions: { electron: '1', chrome: '1', node: '1' }
+      }
+    })
+    servers.push(server)
+    const baseUrl = `http://127.0.0.1:${server.port}`
+    const pendingUrl = `${baseUrl}/api/v1/projects/project%2F1/sessions/session%2F1/pending-interactions`
+    const client = new OpenScienceClient({ baseUrl, token: 'test-token' })
+    await expect(
+      client.listPendingSessionInteractions(pending.projectId, pending.sessionId)
+    ).rejects.toMatchObject({ code: 'unsupported_capability' })
+    expect(
+      (await fetch(pendingUrl, { headers: { authorization: 'Bearer test-token' } })).status
+    ).toBe(503)
+    expect(listPendingSessionInteractions).not.toHaveBeenCalled()
+
+    supported = true
+    const response = await fetch(pendingUrl)
+    expect(response.status).toBe(401)
+    await expect(
+      client.listPendingSessionInteractions(pending.projectId, pending.sessionId)
+    ).resolves.toEqual([pending])
+    expect(listPendingSessionInteractions).toHaveBeenCalledExactlyOnceWith(
+      pending.projectId,
+      pending.sessionId
+    )
+  })
+
   it('uses the authenticated SDK review routes and admits an exact retry only once', async () => {
     const review = {
       id: 'review/1',

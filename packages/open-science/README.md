@@ -162,6 +162,18 @@ await client.updateAgentRouting({
 const runtimes = await client.listRuntimes()
 ```
 
+Use `listPendingSessionInteractions(projectId, sessionId)` to see which live interactions need a
+user decision. The `session-pending-interactions` capability covers permission requests,
+provider or application structured questions in the current runtime, and Compute approvals
+for that exact Project and Session. The method returns opaque IDs for polling, kind and safe
+metadata, such as a question's field count or the Compute operation. Requests disappear from
+the list when the owner settles them. An older server returns `unsupported_capability`.
+Complete the interaction in Desktop or Web. Plan First still uses the Plan API.
+
+This list reflects live application owners. Detached waits after a restart and delegated
+structured questions stored only in the Session are outside the current projection. Review
+the Session in Desktop or Web for those interactions.
+
 When the server advertises `session-history`, read a Session's visible conversation with
 `getSessionHistory(projectId, sessionId, { limit: 80 })`. The first page starts at the newest end;
 pass its `beforeCursor` for earlier pages. Each page lists messages and activity summaries in

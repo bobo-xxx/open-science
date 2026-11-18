@@ -62,6 +62,44 @@ const makeJobRequest = (overrides: Partial<SubmitJobApproval> = {}): SubmitJobAp
 })
 
 describe('ComputeApprovalBroker', () => {
+  it('lists only the selected Session and Project approval metadata until the request settles', async () => {
+    const timer = makeTimer()
+    let n = 0
+    const broadcast = vi.fn()
+    const broker = new ComputeApprovalBroker({
+      generateId: () => `approval-${++n}`,
+      broadcast,
+      setTimer: timer.set,
+      clearTimer: timer.clear
+    })
+    const scope = { projectId: 'project-1', sessionId: 'session-1' }
+    const pending = broker.requestWithContext(makeJobRequest(), {
+      ...scope,
+      operation: 'submit_job'
+    })
+    await vi.waitFor(() => expect(broadcast).toHaveBeenCalledTimes(1))
+    const otherProject = broker.requestWithContext(makeDownloadRequest(), {
+      ...scope,
+      projectId: 'project-2',
+      operation: 'download'
+    })
+    const otherSession = broker.requestWithContext(makeRequest(), {
+      ...scope,
+      sessionId: 'session-2',
+      operation: 'call_command'
+    })
+    await vi.waitFor(() => expect(broadcast).toHaveBeenCalledTimes(3))
+    expect(broker.listPendingForSession(scope)).toEqual([
+      { id: 'approval-1', operation: 'submit_job' }
+    ])
+    await broker.respond('approval-1', 'once')
+    await expect(pending).resolves.toBe('once')
+    expect(broker.listPendingForSession(scope)).toEqual([])
+    await broker.respond('approval-2', 'deny')
+    await broker.respond('approval-3', 'deny')
+    await Promise.all([otherProject, otherSession])
+  })
+
   it('broadcasts request and resolves with once decision', async () => {
     const timer = makeTimer()
     let broadcast: ComputeApprovalRequest | undefined

@@ -298,6 +298,23 @@ class AcpRuntimeCoordinator {
     return { ...state, events }
   }
 
+  getPendingSessionRequests(
+    projectId: string,
+    sessionId: string
+  ): Pick<AcpStateSnapshot, 'pendingPermissions' | 'pendingElicitations'> {
+    const owner = this.sessionRuntimes.get(sessionId)
+    const state = owner?.hasLiveSession(projectId, sessionId) ? owner.getState() : undefined
+    return {
+      pendingPermissions: [
+        ...(state?.pendingPermissions ?? []),
+        ...(this.delegatedWork?.pendingPermissions({ projectId, sessionId }) ?? [])
+      ].filter((request) => request.sessionId === sessionId),
+      pendingElicitations: (state?.pendingElicitations ?? []).filter(
+        (request) => request.sessionId === sessionId
+      )
+    }
+  }
+
   private projectState(
     states: Array<{ runtime: AcpRuntime; state: AcpRuntimeState }>
   ): AcpRuntimeState {

@@ -158,6 +158,19 @@ export class ComputeApprovalBroker {
     }
   }
 
+  listPendingForSession({
+    projectId,
+    sessionId
+  }: Pick<ComputeApprovalContext, 'projectId' | 'sessionId'>): Array<
+    Pick<ComputeApprovalRequest, 'id' | 'operation'>
+  > {
+    return Array.from(this.pending.values()).flatMap(({ context, request }) =>
+      context?.projectId === projectId && context.sessionId === sessionId
+        ? [{ id: request.id, operation: request.operation }]
+        : []
+    )
+  }
+
   replayPending(): void {
     const replay = this.deps.replay ?? this.deps.broadcast
     for (const entry of this.pending.values()) replay(entry.request, entry.context)

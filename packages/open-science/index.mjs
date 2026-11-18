@@ -382,6 +382,20 @@ export class OpenScienceClient {
     return this.request(`/api/v1/sessions/${encodeURIComponent(sessionId)}`, options)
   }
 
+  async listPendingSessionInteractions(projectId, sessionId, options) {
+    const deadline = Date.now() + resolveRequestTimeout(this.requestTimeoutMs, options?.timeoutMs)
+    const capabilities = await this.getCapabilities(beforeDeadline(options, deadline))
+    if (!capabilities.taskCapabilities.includes('session-pending-interactions')) {
+      throw new OpenScienceApiError('This server does not support pending interaction queries.', {
+        code: 'unsupported_capability'
+      })
+    }
+    return this.request(
+      `/api/v1/projects/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(sessionId)}/pending-interactions`,
+      beforeDeadline(options, deadline)
+    )
+  }
+
   getSessionHistory(projectId, sessionId, query = {}, options) {
     const params = new URLSearchParams()
     if (query.beforeCursor !== undefined) params.set('beforeCursor', query.beforeCursor)
