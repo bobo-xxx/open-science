@@ -17,6 +17,7 @@ import {
   type SessionFileIndex,
   type SessionMutationRepository
 } from '../session-persistence/coordinator'
+import { readDelegatedQuestionConfirmationAuthority } from '../session-persistence/delegated-question-owner'
 import { createSpecialistService } from '../specialist/service'
 import {
   createDeterministicDelegateExecution,
@@ -28,6 +29,7 @@ import {
 } from './durable-delegated-work'
 import { createTestDurableDelegatedWork as createDurableDelegatedWork } from './durable-delegated-work-test-fixture'
 import { createSessionDelegatedWorkRecords } from './session-record-adapter'
+import type { AuthorizeDelegatedQuestionAtClaim } from './session-records'
 
 const key = { projectId: 'project-1', sessionId: 'session-1' } as const
 const rootPrompt: PersistedChatMessage = {
@@ -217,114 +219,222 @@ function createActiveToolUpdate(): AcpAgentRuntimeUpdate {
 }
 
 describe('Session delegated-work adapter', () => {
-  it('persists delegated question drafts and atomically confirms a same-Frame continuation', async () => {
-    const { coordinator, readSession } = createHarness()
-    const execution = createDeterministicDelegateExecution()
-    const records = createSessionDelegatedWorkRecords(
-      {
-        commands: coordinator,
-        readSession,
-        frameworkId: 'codex',
-        createId: () => 'question-child-branch'
-      },
-      key
-    )
-    const ids = {
-      frame: ['question-child-frame'],
-      attempt: ['question-source-attempt', 'question-answer-attempt'],
-      message: ['question-child-prompt', 'question-source-answer', 'question-answer-prompt'],
-      runtime: ['question-source-runtime', 'question-answer-runtime'],
-      question: ['question-request']
-    }
-    const work = createDurableDelegatedWork({
-      execution,
-      records,
-      createId: (kind) => ids[kind].shift()!
-    })
-    const rootFrameId = createSession().conversationGraph!.rootFrameId
-    const rootCaller: AuthenticatedDelegateCaller = {
-      session: key,
-      frameId: rootFrameId,
-      role: 'main',
-      originMessageId: rootPrompt.id,
-      toolInvocationId: 'delegate-question-child'
-    }
-
-    await work.delegate(
-      rootCaller,
-      { task: 'Ask for the cohort', name: 'Cohort audit' },
-      { wait: false }
-    )
-    await expect.poll(() => execution.controls()).toHaveLength(1)
-    await work.requestUserInput(
-      {
+  it.each(['native', 'trusted', 'stale-proof', 'post-commit-failure', 'native-host-race'] as const)(
+    'confirms a same-Frame delegated question through %s',
+    async (route) => {
+      const { coordinator, readSession } = createHarness()
+      const execution = createDeterministicDelegateExecution()
+      const records = createSessionDelegatedWorkRecords(
+        {
+          commands: coordinator,
+          readSession,
+          frameworkId: 'codex',
+          createId: () => 'question-child-branch'
+        },
+        key
+      )
+      const ids = {
+        frame: ['question-child-frame'],
+        attempt: ['question-source-attempt', 'question-answer-attempt', 'second-answer-attempt'],
+        message: [
+          'question-child-prompt',
+          'question-source-answer',
+          'question-answer-prompt',
+          'second-answer-prompt'
+        ],
+        runtime: ['question-source-runtime', 'question-answer-runtime'],
+        question: ['question-request']
+      }
+      const work = createDurableDelegatedWork({
+        execution,
+        records,
+        createId: (kind) => ids[kind].shift()!
+      })
+      const rootFrameId = createSession().conversationGraph!.rootFrameId
+      const rootCaller: AuthenticatedDelegateCaller = {
         session: key,
-        frameId: 'question-child-frame',
-        role: 'delegate',
-        attemptId: 'question-source-attempt',
-        originMessageId: 'question-child-prompt',
-        toolInvocationId: 'question-request'
-      },
-      {
-        sessionId: key.sessionId,
-        questions: [
+        frameId: rootFrameId,
+        role: 'main',
+        originMessageId: rootPrompt.id,
+        toolInvocationId: 'delegate-question-child'
+      }
+
+      await work.delegate(
+        rootCaller,
+        { task: 'Ask for the cohort', name: 'Cohort audit' },
+        { wait: false }
+      )
+      await expect.poll(() => execution.controls()).toHaveLength(1)
+      await work.requestUserInput(
+        {
+          session: key,
+          frameId: 'question-child-frame',
+          role: 'delegate',
+          attemptId: 'question-source-attempt',
+          originMessageId: 'question-child-prompt',
+          toolInvocationId: 'question-request'
+        },
+        {
+          sessionId: key.sessionId,
+          questions: [
+            {
+              question: 'Which cohort?',
+              options: [{ label: 'Strict' }, { label: 'Broad' }]
+            }
+          ]
+        },
+        'question-request'
+      )
+      await work.updateQuestionDraft(key, {
+        requestId: 'question-request',
+        draftAnswers: [{ questionIndex: 0, value: 'Strict' }],
+        questionIndex: 0
+      })
+      execution.controls()[0].complete('Waiting for the user.')
+      await expect
+        .poll(async () => (await records.snapshot()).records[0].attempts[0].status)
+        .toBe('completed')
+      const reopened = createSessionDelegatedWorkRecords(
+        { commands: coordinator, readSession, frameworkId: 'codex' },
+        key
+      )
+      let failNextSnapshot = false
+      let commitAdmitted = false
+      let commitAdmissions = 0
+      const withCommitAdmission = async <Result>(
+        operation: () => Promise<Result>
+      ): Promise<Result> => {
+        commitAdmissions += 1
+        commitAdmitted = true
+        try {
+          return await operation()
+        } finally {
+          commitAdmitted = false
+        }
+      }
+      const restartedWork = createDurableDelegatedWork({
+        execution,
+        records: {
+          ...reopened,
+          async snapshot() {
+            expect(commitAdmitted).toBe(false)
+            if (failNextSnapshot) {
+              failNextSnapshot = false
+              throw new Error('Post-commit read failed')
+            }
+            return reopened.snapshot()
+          }
+        },
+        createId: (kind) => ids[kind].shift()!
+      })
+      const input = {
+        requestId: 'question-request',
+        answers: [{ questionIndex: 0, value: 'Strict' }]
+      }
+      let winningAttemptId = 'question-answer-attempt'
+      if (route === 'native') {
+        await restartedWork.confirmQuestion(key, input)
+      } else if (route === 'native-host-race') {
+        const authorizeAtClaim = vi.fn<AuthorizeDelegatedQuestionAtClaim>(() => 'authorized')
+        const [native, trusted] = await Promise.allSettled([
+          work.confirmQuestion(key, input),
+          restartedWork.confirmTrustedQuestion(key, { ...input, authorizeAtClaim })
+        ])
+        if (trusted.status !== 'fulfilled') throw trusted.reason
+        if (trusted.value.status === 'claimed') {
+          expect(native).toMatchObject({ status: 'rejected', reason: { code: 'conflict' } })
+          expect(authorizeAtClaim).toHaveBeenCalledOnce()
+          await trusted.value.completion
+          winningAttemptId = trusted.value.continuationAttemptId
+        } else {
+          if (native.status !== 'fulfilled') throw native.reason
+          expect(trusted.value).toEqual({ status: 'unavailable' })
+          expect(authorizeAtClaim).not.toHaveBeenCalled()
+          winningAttemptId = native.value.continuationAttemptId
+        }
+      } else {
+        const authority = readDelegatedQuestionConfirmationAuthority(
+          await readSession(),
+          input.requestId
+        )
+        expect(authority).toMatchObject({
+          session: key,
+          request: { requestId: input.requestId, sourceAttemptId: 'question-source-attempt' },
+          rootFrameId,
+          rootBranchRevision: expect.stringContaining(':1'),
+          executionModel: expect.any(Object)
+        })
+        const authorizeAtClaim = vi.fn<AuthorizeDelegatedQuestionAtClaim>(() => {
+          expect(commitAdmitted).toBe(true)
+          if (route === 'stale-proof') return 'unavailable'
+          failNextSnapshot = route === 'post-commit-failure'
+          return 'authorized'
+        })
+        await expect(
+          restartedWork.confirmTrustedQuestion(key, {
+            ...input,
+            answers: [],
+            authorizeAtClaim,
+            withCommitAdmission
+          })
+        ).resolves.toEqual({ status: 'invalid-decision' })
+        expect(authorizeAtClaim).not.toHaveBeenCalled()
+        expect(commitAdmissions).toBe(0)
+        const claim = await restartedWork.confirmTrustedQuestion(key, {
+          ...input,
+          answers: [{ questionIndex: 0, value: ' Strict ' }],
+          authorizeAtClaim,
+          withCommitAdmission
+        })
+        expect(commitAdmissions).toBe(1)
+        expect(authorizeAtClaim).toHaveBeenCalledExactlyOnceWith(authority, input.answers)
+        if (route === 'stale-proof') {
+          expect(claim).toEqual({ status: 'unavailable' })
+          expect(
+            readDelegatedQuestionConfirmationAuthority(await readSession(), input.requestId)
+          ).toEqual(authority)
+          expect((await reopened.snapshot()).records[0].attempts).toHaveLength(1)
+          return
+        }
+        if (claim.status !== 'claimed') throw new Error('Missing delegated confirmation claim')
+        if (route === 'post-commit-failure') {
+          await expect(claim.completion).rejects.toThrow('Post-commit read failed')
+        } else {
+          await expect(claim.completion).resolves.toBeUndefined()
+        }
+        await expect(work.confirmQuestion(key, input)).rejects.toMatchObject({ code: 'conflict' })
+      }
+
+      await expect(reopened.snapshot()).resolves.toMatchObject({
+        questionRequests: [
           {
-            question: 'Which cohort?',
-            options: [{ label: 'Strict' }, { label: 'Broad' }]
+            requestId: 'question-request',
+            status: 'confirmed',
+            answers: [{ questionIndex: 0, value: 'Strict' }],
+            continuationAttemptId: winningAttemptId
+          }
+        ],
+        records: [
+          {
+            frameId: 'question-child-frame',
+            attempts: [
+              { id: 'question-source-attempt', status: 'completed' },
+              {
+                id: winningAttemptId,
+                status: route === 'post-commit-failure' ? 'error' : 'running'
+              }
+            ]
           }
         ]
-      },
-      'question-request'
-    )
-    await work.updateQuestionDraft(key, {
-      requestId: 'question-request',
-      draftAnswers: [{ questionIndex: 0, value: 'Strict' }],
-      questionIndex: 0
-    })
-    execution.controls()[0].complete('Waiting for the user.')
-    await expect
-      .poll(async () => (await records.snapshot()).records[0].attempts[0].status)
-      .toBe('completed')
-    const reopened = createSessionDelegatedWorkRecords(
-      { commands: coordinator, readSession, frameworkId: 'codex' },
-      key
-    )
-    const restartedWork = createDurableDelegatedWork({
-      execution,
-      records: reopened,
-      createId: (kind) => ids[kind].shift()!
-    })
-    await restartedWork.confirmQuestion(key, {
-      requestId: 'question-request',
-      answers: [{ questionIndex: 0, value: 'Strict' }]
-    })
-
-    await expect(reopened.snapshot()).resolves.toMatchObject({
-      questionRequests: [
-        {
-          requestId: 'question-request',
-          status: 'confirmed',
-          answers: [{ questionIndex: 0, value: 'Strict' }],
-          continuationAttemptId: 'question-answer-attempt'
-        }
-      ],
-      records: [
-        {
-          frameId: 'question-child-frame',
-          attempts: [
-            { id: 'question-source-attempt', status: 'completed' },
-            { id: 'question-answer-attempt', status: 'running' }
-          ]
-        }
-      ]
-    })
-    const durable = await readSession()
-    const rootMessages = durable.conversationGraph!.messages.filter(
-      (message) => message.agentFrameId === rootFrameId
-    )
-    expect(rootMessages.map(({ id }) => id)).toEqual([rootPrompt.id])
-    expect(durable.runtimeContext?.delegatedWork?.messageCommands ?? []).toEqual([])
-  })
+      })
+      const durable = await readSession()
+      const rootMessages = durable.conversationGraph!.messages.filter(
+        (message) => message.agentFrameId === rootFrameId
+      )
+      expect(rootMessages.map(({ id }) => id)).toEqual([rootPrompt.id])
+      expect(durable.runtimeContext?.delegatedWork?.messageCommands ?? []).toEqual([])
+    }
+  )
 
   it('atomically orders concurrent questions admitted through independent adapters', async () => {
     const { coordinator, readSession } = createHarness()

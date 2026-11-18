@@ -17,9 +17,19 @@ type ConfirmationSnapshot<Disclosure, Decision> = Readonly<{
 
 type ConfirmationOwner<Disclosure, Decision, Choice extends string> = {
   kind: string
-  read(scope: InteractionScope): ConfirmationSnapshot<Disclosure, Choice> | undefined
+  read(
+    scope: InteractionScope
+  ):
+    | ConfirmationSnapshot<Disclosure, Choice>
+    | undefined
+    | Promise<ConfirmationSnapshot<Disclosure, Choice> | undefined>
   describeDecision(decision: Decision): readonly [choice: Choice, payload: string]
-  claim(scope: InteractionScope, version: string, decision: Decision): ConfirmationClaim
+  claim(
+    scope: InteractionScope,
+    version: string,
+    decision: Decision,
+    authorizeAtClaim: () => boolean
+  ): ConfirmationClaim | Promise<ConfirmationClaim>
 }
 
 type StoredChallenge<Decision> = {
@@ -66,12 +76,18 @@ class TrustedInteractionDecisions<Disclosure, Decision, Choice extends string = 
     this.serviceGeneration = randomUUID()
   }
 
-  issue(scope: InteractionScope, read: ConfirmationRead): ConfirmationChallenge | undefined {
-    const now = this.now()
+  async issue(
+    scope: InteractionScope,
+    read: ConfirmationRead,
+    isCurrent: () => boolean
+  ): Promise<ConfirmationChallenge | undefined> {
+    const receivedAt = this.now()
+    const generation = this.serviceGeneration
     if (
+      !isCurrent() ||
       !Number.isSafeInteger(read.issuedAt) ||
-      read.issuedAt < now - READ_MAX_AGE_MS ||
-      read.issuedAt > now + READ_MAX_FUTURE_MS
+      read.issuedAt < receivedAt - READ_MAX_AGE_MS ||
+      read.issuedAt > receivedAt + READ_MAX_FUTURE_MS
     ) {
       return undefined
     }
@@ -89,8 +105,16 @@ class TrustedInteractionDecisions<Disclosure, Decision, Choice extends string = 
       ])
     if (!checkSignature(key, readMessage, read.signature)) return undefined
 
-    const snapshot = this.owner.read(scope)
-    if (!snapshot) return undefined
+    const snapshot = await this.owner.read(scope)
+    const now = this.now()
+    if (
+      !snapshot ||
+      !isCurrent() ||
+      now > read.issuedAt + READ_MAX_AGE_MS ||
+      generation !== this.serviceGeneration ||
+      this.getHostKey(read.hostId) !== key
+    )
+      return undefined
 
     for (const [id, stored] of this.challenges) {
       if (stored.challenge.expiresAt <= now) {
@@ -133,7 +157,12 @@ class TrustedInteractionDecisions<Disclosure, Decision, Choice extends string = 
     return challenge
   }
 
-  claim(scope: InteractionScope, proof: SignedConfirmation<Decision>): ConfirmationClaim {
+  async claim(
+    scope: InteractionScope,
+    proof: SignedConfirmation<Decision>,
+    isCurrent: () => boolean
+  ): Promise<ConfirmationClaim> {
+    if (!isCurrent()) return 'unavailable'
     const stored = this.challenges.get(proof.challengeId)
     if (!stored || !sameScope(stored.scope, scope)) return 'unavailable'
     if (stored.challenge.expiresAt <= this.now()) {
@@ -149,12 +178,18 @@ class TrustedInteractionDecisions<Disclosure, Decision, Choice extends string = 
     const message = DECISION_DOMAIN + stored.challenge.envelope + '\n' + payload
     if (!checkSignature(key, message, proof.signature)) return 'invalid-proof'
 
-    // The verified proof and the application owner's pending decision are consumed in the same
-    // synchronous call. Native responses still settle through that owner's normal claim path.
+    // Reserve one operation for this proof. An owner that needs to await admission or retry a
+    // revision check must fence each attempted claim with the same still-current authorization.
     this.challenges.delete(proof.challengeId)
-    if (stored.challenge.expiresAt <= this.now()) return 'unavailable'
+    const generation = this.serviceGeneration
+    const authorizeAtClaim = (): boolean =>
+      isCurrent() &&
+      generation === this.serviceGeneration &&
+      stored.challenge.expiresAt > this.now() &&
+      this.getHostKey(stored.hostId) === key
+    if (!authorizeAtClaim()) return 'unavailable'
     if (!stored.allowedDecisions.includes(choice)) return 'invalid-decision'
-    return this.owner.claim(stored.scope, stored.version, proof.decision)
+    return this.owner.claim(stored.scope, stored.version, proof.decision, authorizeAtClaim)
   }
 }
 

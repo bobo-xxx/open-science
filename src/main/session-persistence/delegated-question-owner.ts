@@ -1,12 +1,18 @@
+import { isDeepStrictEqual } from 'node:util'
 import { resolveActiveConversationMessages } from '../../shared/conversation-graph'
+import { projectAnswerableDelegatedQuestions } from '../../shared/delegated-work-projection'
+import { sanitizeAgentUserChoiceAnswer } from '../../shared/elicitation'
 import type {
   DelegatedWorkAttemptRecord,
-  DelegatedWorkRecord
+  DelegatedWorkRecord,
+  PersistedChatSession
 } from '../../shared/session-persistence'
+import { DelegatedQuestionClaimError } from '../delegation/durable-delegated-work-error'
 import type {
   AdmitQuestionInput,
   ConfirmQuestionInput,
   CreatedChild,
+  DelegatedQuestionConfirmationAuthority,
   SessionKey,
   UpdateQuestionDraftInput
 } from '../delegation/session-records'
@@ -17,6 +23,42 @@ const currentAttempt = (record: DelegatedWorkRecord): DelegatedWorkAttemptRecord
   const attempt = record.attempts.at(-1)
   if (!attempt) throw new Error(`Delegate Frame ${record.agentFrameId} has no Attempt.`)
   return attempt
+}
+
+const readDelegatedQuestionConfirmationAuthority = (
+  session: PersistedChatSession,
+  requestId: string
+): DelegatedQuestionConfirmationAuthority | undefined => {
+  const graph = session.conversationGraph
+  if (!graph || session.archivedAt !== undefined) return undefined
+  const request = projectAnswerableDelegatedQuestions(session).find(
+    (question) => question.requestId === requestId
+  )
+  if (!request) return undefined
+  const rootBranch = graph.branches.find(({ id }) => id === request.rootBranchId)
+  const child = session.runtimeContext?.delegatedWork?.records.find(
+    ({ agentFrameId }) => agentFrameId === request.sourceFrameId
+  )
+  const attempt = child?.attempts.at(-1)
+  const executionModel = attempt?.executionModel ?? child?.attempts[0]?.executionModel
+  if (
+    !rootBranch ||
+    attempt?.id !== request.sourceAttemptId ||
+    !attempt.runtimeSegmentIds.includes(request.sourceRuntimeSegmentId) ||
+    !executionModel ||
+    !graph.messages.some(
+      ({ agentFrameId, role }) => agentFrameId === request.sourceFrameId && role === 'user'
+    )
+  ) {
+    return undefined
+  }
+  return {
+    session: { projectId: session.projectId, sessionId: session.id },
+    request: structuredClone(request),
+    rootFrameId: graph.rootFrameId,
+    rootBranchRevision: `${rootBranch.id}:${rootBranch.createdAt}`,
+    executionModel: structuredClone(executionModel)
+  }
 }
 
 // Owns pending-question admission, draft, confirmation, and cancellation policy while the shared
@@ -112,8 +154,11 @@ class SessionDelegatedQuestionPersistenceOwner {
     return this.store.mutate(
       key,
       input.expectedRevision,
-      (graph, records, _session, _commands, _messagesQuarantined, questions, quarantined) => {
-        if (quarantined) throw new Error('Delegated question owner is quarantined.')
+      (graph, records, session, _commands, _messagesQuarantined, questions, quarantined) => {
+        if (quarantined) {
+          if (input.authorizeAtClaim) throw new DelegatedQuestionClaimError('unavailable')
+          throw new Error('Delegated question owner is quarantined.')
+        }
         const questionIndex = questions.findIndex(
           (request) => request.requestId === input.requestId
         )
@@ -139,6 +184,7 @@ class SessionDelegatedQuestionPersistenceOwner {
           !rootPath.some((message) => message.id === request.rootOriginMessageId) ||
           input.initiatingTurnMessageId !== request.rootOriginMessageId
         ) {
+          if (input.authorizeAtClaim) throw new DelegatedQuestionClaimError('unavailable')
           throw new DelegatedWorkAttemptConflictError()
         }
         if (
@@ -151,6 +197,31 @@ class SessionDelegatedQuestionPersistenceOwner {
         }
         const branch = graph.branches.find((candidate) => candidate.id === frame.activeBranchId)
         if (!branch) throw new Error(`Delegate Branch not found: ${frame.activeBranchId}`)
+        if (input.authorizeAtClaim) {
+          const authority = readDelegatedQuestionConfirmationAuthority(session, request.requestId)
+          if (!authority || !isDeepStrictEqual(authority.executionModel, input.executionModel)) {
+            throw new DelegatedQuestionClaimError('unavailable')
+          }
+          if (
+            input.answers.length !== request.questions.length ||
+            input.answers.some(
+              ({ questionIndex, value }, index) =>
+                questionIndex !== index ||
+                !isDeepStrictEqual(
+                  value,
+                  sanitizeAgentUserChoiceAnswer(request.questions[index], value)
+                )
+            )
+          ) {
+            throw new DelegatedQuestionClaimError('unavailable')
+          }
+          const verdict = input.authorizeAtClaim(authority, structuredClone(input.answers))
+          if (verdict !== 'authorized') {
+            throw new DelegatedQuestionClaimError(
+              verdict === 'invalid-decision' ? verdict : 'unavailable'
+            )
+          }
+        }
         graph.messages.push({
           id: input.messageId,
           role: 'user',
@@ -213,4 +284,4 @@ class SessionDelegatedQuestionPersistenceOwner {
   }
 }
 
-export { SessionDelegatedQuestionPersistenceOwner }
+export { readDelegatedQuestionConfirmationAuthority, SessionDelegatedQuestionPersistenceOwner }

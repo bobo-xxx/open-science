@@ -188,12 +188,20 @@ test('reviews a trusted host key in Desktop and revokes it through local Web', a
   }
 })
 
-test('continues SDK tasks after signed live permission and question decisions', async ({ app }) => {
-  await app.configureFakeAgent()
-  const sdk = await connect(app)
-  expect((await sdk.getCapabilities()).taskCapabilities).toEqual(
-    expect.arrayContaining(['trusted-permission-decisions', 'trusted-question-decisions'])
-  )
+type FixtureSigner = {
+  signDecision(envelope: string, payload: string): string
+  disclose(
+    sessionId: string,
+    kind: 'permission' | 'question',
+    selectId?: string
+  ): Promise<{ interactionId: string; challenge: { id: string; envelope: string } }>
+}
+
+async function registerFixtureSigner(
+  app: ElectronApp,
+  sdk: OpenScienceClient,
+  projectId: string
+): Promise<FixtureSigner> {
   const signer = generateKeyPairSync('ed25519')
   const rawKey = signer.publicKey.export({ format: 'jwk' }).x
   if (!rawKey) throw new Error('Ed25519 public key is missing.')
@@ -203,7 +211,6 @@ test('continues SDK tasks after signed live permission and question decisions', 
     return (await hosts.enroll(await hosts.review({ label: 'Fixture signer', publicKey }))).id
   }, rawKey)
 
-  const project = await sdk.createProject({ name: 'Trusted SDK task fixtures' })
   const signText = (text: string): string =>
     sign(null, Buffer.from(text, 'utf8'), signer.privateKey).toString('base64url')
   const readMessage = (
@@ -213,27 +220,28 @@ test('continues SDK tasks after signed live permission and question decisions', 
     time: number
   ): string =>
     'Open Science trusted interaction read v1\n' +
-    JSON.stringify([kind, project.id, sessionId, interactionId, hostId, time])
+    JSON.stringify([kind, projectId, sessionId, interactionId, hostId, time])
   const signDecision = (envelope: string, payload: string): string =>
     signText('Open Science trusted interaction decision v1\n' + envelope + '\n' + payload)
 
   const disclose = async (
     sessionId: string,
-    kind: 'permission' | 'question'
+    kind: 'permission' | 'question',
+    selectId?: string
   ): Promise<{
     interactionId: string
     challenge: { id: string; envelope: string }
   }> => {
     const poll = async (): Promise<string | undefined> =>
-      (await sdk.listPendingSessionInteractions(project.id, sessionId)).find(
-        (item) => item.kind === kind
+      (await sdk.listPendingSessionInteractions(projectId, sessionId)).find(
+        (item) => item.kind === kind && (!selectId || item.id === selectId)
       )?.id
     await expect.poll(poll).toBeTruthy()
     const interactionId = await poll()
     if (!interactionId) throw new Error('The fixture interaction is no longer pending.')
     const issuedAt = Date.now()
     const challenge = await sdk.createInteractionConfirmationChallenge(
-      project.id,
+      projectId,
       sessionId,
       interactionId,
       kind,
@@ -245,6 +253,18 @@ test('continues SDK tasks after signed live permission and question decisions', 
     )
     return { interactionId, challenge }
   }
+
+  return { signDecision, disclose }
+}
+
+test('continues SDK tasks after signed live permission and question decisions', async ({ app }) => {
+  await app.configureFakeAgent()
+  const sdk = await connect(app)
+  expect((await sdk.getCapabilities()).taskCapabilities).toEqual(
+    expect.arrayContaining(['trusted-permission-decisions', 'trusted-question-decisions'])
+  )
+  const project = await sdk.createProject({ name: 'Trusted SDK task fixtures' })
+  const { disclose, signDecision } = await registerFixtureSigner(app, sdk, project.id)
 
   const permissionRun = await sdk.startRun({
     project: project.id,
@@ -307,4 +327,97 @@ test('continues SDK tasks after signed live permission and question decisions', 
   const result = await sdk.waitForRun(questionRun.id)
   expect(result.status).toBe('completed')
   expect(result.output).toContain('Question answer delivered.')
+})
+
+test('routes signed decisions to the delegated permission and question owners', async ({ app }) => {
+  await app.configureFakeAgent()
+  const sdk = await connect(app)
+  const project = await sdk.createProject({ name: 'Trusted delegated task fixtures' })
+  const { disclose, signDecision } = await registerFixtureSigner(app, sdk, project.id)
+
+  const permissionRun = await sdk.startRun({
+    project: project.id,
+    prompt: 'Run the production delegated permission journey.',
+    permissionProfile: 'ask'
+  })
+  const permission = await disclose(permissionRun.sessionId, 'permission')
+  expect(
+    JSON.parse(Buffer.from(permission.challenge.envelope, 'base64url').toString('utf8'))
+  ).toMatchObject({
+    disclosure: { delegated: { childTitle: 'Request the delegated fixture permission.' } }
+  })
+  const decision = 'option:allow-once'
+  await expect(
+    sdk.submitInteractionConfirmationDecision(
+      project.id,
+      permissionRun.sessionId,
+      permission.interactionId,
+      'permission',
+      {
+        challengeId: permission.challenge.id,
+        decision,
+        signature: signDecision(permission.challenge.envelope, decision)
+      }
+    )
+  ).resolves.toEqual({ status: 'claimed' })
+  expect((await sdk.waitForRun(permissionRun.id)).output).toContain(
+    'Production delegated permission journey completed.'
+  )
+
+  const questionRun = await sdk.startRun({
+    project: project.id,
+    prompt: 'Run the production delegated user question journey.'
+  })
+  expect((await sdk.waitForRun(questionRun.id)).output).toContain(
+    'Production delegated user question is pending.'
+  )
+  const queryPending = async (): Promise<string[]> =>
+    (await sdk.listPendingSessionInteractions(project.id, questionRun.sessionId))
+      .filter(({ kind }) => kind === 'question')
+      .map(({ id }) => id)
+  await expect.poll(queryPending).toHaveLength(2)
+  for (const id of await queryPending()) {
+    const { interactionId, challenge } = await disclose(questionRun.sessionId, 'question', id)
+    const envelope = JSON.parse(Buffer.from(challenge.envelope, 'base64url').toString('utf8'))
+    expect(envelope).toMatchObject({
+      disclosure: { source: 'delegated' },
+      allowedDecisions: ['accept']
+    })
+    const values =
+      envelope.disclosure.sourceName === 'Delegated scope researcher'
+        ? ['Focused', 'Narrative']
+        : ['Footnotes']
+    const answers = values.map((value, index) => ({ fieldId: String(index), value }))
+    const payload = JSON.stringify([
+      'accept',
+      answers.map(({ fieldId, value }) => [fieldId, 'answered', value])
+    ])
+    await expect(
+      sdk.submitInteractionConfirmationDecision(
+        project.id,
+        questionRun.sessionId,
+        interactionId,
+        'question',
+        {
+          challengeId: challenge.id,
+          decision: { action: 'accept', answers },
+          signature: signDecision(challenge.envelope, payload)
+        }
+      )
+    ).resolves.toEqual({ status: 'claimed' })
+  }
+  await expect.poll(queryPending).toEqual([])
+  await expect
+    .poll(async () =>
+      app.page.evaluate(async (sessionId) => {
+        const { sessions } = await window.api.sessions.loadAll()
+        return sessions
+          .find(({ id }) => id === sessionId)
+          ?.runtimeContext?.delegatedWork?.records.map(({ attempts }) => {
+            const attempt = attempts.at(-1)
+            return { status: attempt?.status, ...(attempt?.error ? { error: attempt.error } : {}) }
+          })
+      }, questionRun.sessionId)
+    )
+    .toEqual([{ status: 'completed' }, { status: 'completed' }])
 })

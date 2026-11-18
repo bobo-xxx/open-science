@@ -25,6 +25,10 @@ import type {
   DelegatePermissionResponse,
   DelegatedExecutionModelAdmission
 } from './execution-port'
+import type {
+  DelegatedQuestionConfirmationClaim,
+  TrustedDelegatedQuestionInput
+} from './session-records'
 
 type SessionKey = Readonly<{ projectId: string; sessionId: string }>
 
@@ -78,6 +82,18 @@ type RootDelegatePermissionRequest = Readonly<{
 
 type RootDelegatePermissionResponse = DelegatePermissionResponse &
   Readonly<{ frameId: string; attemptId: string }>
+
+type RootDelegatePermissionLocator = Readonly<
+  Pick<RootDelegatePermissionRequest, 'requestId' | 'frameId' | 'attemptId'>
+>
+type RootDelegatePermissionConfirmationDecision = 'cancel' | `option:${string}`
+type RootDelegatePermissionConfirmationSnapshot = Readonly<{
+  version: string
+  request: RootDelegatePermissionRequest
+  allowedDecisions: readonly RootDelegatePermissionConfirmationDecision[]
+}>
+type RootDelegatePermissionConfirmationClaim =
+  { status: 'claimed'; completion: Promise<void> } | { status: 'unavailable' | 'invalid-decision' }
 
 type RootDelegatePermissionEvent =
   | Readonly<{ kind: 'requested'; request: RootDelegatePermissionRequest }>
@@ -235,6 +251,10 @@ type DurableDelegatedWork = Readonly<{
     session: SessionKey,
     input: Readonly<{ requestId: string; answers: readonly DelegatedQuestionAnswer[] }>
   ): Promise<Readonly<{ requestId: string; continuationAttemptId: string }>>
+  confirmTrustedQuestion(
+    session: SessionKey,
+    input: TrustedDelegatedQuestionInput
+  ): Promise<DelegatedQuestionConfirmationClaim>
   sessionSummary(session: SessionKey): Promise<SessionSubagentSummary>
   readAgentFrame(
     session: SessionKey,
@@ -242,6 +262,17 @@ type DurableDelegatedWork = Readonly<{
   ): Promise<ReadOnlyAgentFrameDetail | undefined>
   rootPermissionRequests(session: SessionKey): Promise<readonly RootDelegatePermissionRequest[]>
   respondToPermission(session: SessionKey, response: RootDelegatePermissionResponse): Promise<void>
+  readTrustedPermission(
+    session: SessionKey,
+    locator: RootDelegatePermissionLocator
+  ): Promise<RootDelegatePermissionConfirmationSnapshot | undefined>
+  claimTrustedPermission(
+    session: SessionKey,
+    locator: RootDelegatePermissionLocator,
+    version: string,
+    decision: RootDelegatePermissionConfirmationDecision,
+    authorizeAtClaim: () => boolean
+  ): Promise<RootDelegatePermissionConfirmationClaim>
   setPermissionProfile(session: SessionKey, profile: PermissionProfileId): Promise<void>
   stopChildren(
     caller: AuthenticatedDelegateCaller,
@@ -318,7 +349,11 @@ export type {
   ParentMessageDelivery,
   ReadOnlyAgentFrameDetail,
   RecoveryOutcome,
+  RootDelegatePermissionConfirmationClaim,
+  RootDelegatePermissionConfirmationDecision,
+  RootDelegatePermissionConfirmationSnapshot,
   RootDelegatePermissionEvent,
+  RootDelegatePermissionLocator,
   RootDelegatePermissionRequest,
   RootDelegatePermissionResponse,
   SessionKey,

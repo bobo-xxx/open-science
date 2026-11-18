@@ -34,12 +34,22 @@ import {
   type RootDelegatePermissionRequest
 } from './durable-delegated-work'
 import type {
+  RootDelegatePermissionConfirmationClaim,
+  RootDelegatePermissionConfirmationDecision,
+  RootDelegatePermissionConfirmationSnapshot
+} from './durable-delegated-work-contract'
+import type {
   DelegatedExecutionModelAdmission,
   DelegateExecution,
   DelegateMessageAcceptanceEvidence
 } from './execution-port'
 import { DelegateExecutionCleanupError } from './execution-port'
-import type { DelegatedWorkRecordCommands, SessionKey } from './session-records'
+import type {
+  DelegatedQuestionConfirmationClaim,
+  DelegatedWorkRecordCommands,
+  SessionKey,
+  TrustedDelegatedQuestionInput
+} from './session-records'
 
 import {
   DelegationSettlementWakeOwner,
@@ -101,6 +111,22 @@ type RootDelegatedWorkControl = Readonly<{
   clearUnavailableReason?(sessionId: string): void
   subscribe(listener: (event: RootDelegatedWorkEvent) => void): () => void
   respondToPermission(response: AcpPermissionResponse): Promise<boolean>
+  readTrustedPermission?(
+    scope: SessionKey,
+    publicId: string
+  ): Promise<
+    | (Omit<RootDelegatePermissionConfirmationSnapshot, 'request'> & {
+        request: AcpPermissionRequest
+      })
+    | undefined
+  >
+  claimTrustedPermission?(
+    scope: SessionKey,
+    publicId: string,
+    version: string,
+    decision: RootDelegatePermissionConfirmationDecision,
+    authorizeAtClaim: () => boolean
+  ): Promise<RootDelegatePermissionConfirmationClaim>
   setPermissionProfile(sessionId: string, profile: PermissionProfileId): Promise<void>
   cancelTurn?(sessionId: string, initiatingTurnMessageId: string): Promise<void>
   stopActiveBranch?(sessionId: string): Promise<void>
@@ -115,6 +141,10 @@ type RootDelegatedWorkControl = Readonly<{
       questionIndex?: number
     }>
   ): Promise<void>
+  confirmTrustedQuestion?(
+    scope: SessionKey,
+    input: TrustedDelegatedQuestionInput
+  ): Promise<DelegatedQuestionConfirmationClaim>
   wakeMessages?(sessionId: string): Promise<void>
   rootExecutionStarted?(sessionId: string, originatingPromptId: string, executionId: string): void
   rootTurnStarted?(
@@ -627,6 +657,27 @@ const createProductionDelegatedWorkComposition = (
       })
       return true
     },
+    async readTrustedPermission(scope, publicId) {
+      const pending = permissions.get(publicId)
+      if (!pending || keyOf(pending.key) !== keyOf(scope)) return undefined
+      const scoped = await works.get(keyOf(scope))
+      const snapshot = await scoped?.work.readTrustedPermission(scope, pending.request)
+      return snapshot && { ...snapshot, request: projectPermission(scope, snapshot.request) }
+    },
+    async claimTrustedPermission(scope, publicId, version, decision, authorizeAtClaim) {
+      const pending = permissions.get(publicId)
+      if (!pending || keyOf(pending.key) !== keyOf(scope)) return { status: 'unavailable' }
+      const scoped = await works.get(keyOf(scope))
+      return (
+        (await scoped?.work.claimTrustedPermission(
+          scope,
+          pending.request,
+          version,
+          decision,
+          authorizeAtClaim
+        )) ?? { status: 'unavailable' }
+      )
+    },
     async setPermissionProfile(sessionId, profile) {
       const scoped = await worksForSession(sessionId)
       await Promise.all(scoped.map(({ key, work }) => work.setPermissionProfile(key, profile)))
@@ -704,6 +755,9 @@ const createProductionDelegatedWorkComposition = (
         return
       }
       await work.confirmQuestion(key, { requestId: input.requestId, answers: input.answers })
+    },
+    async confirmTrustedQuestion(key, input) {
+      return (await workFor(key)).work.confirmTrustedQuestion(key, input)
     },
     async wakeMessages(sessionId) {
       const durableSessions = (await options.sessions.findSessions?.(sessionId)) ?? []

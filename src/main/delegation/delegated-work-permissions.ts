@@ -1,21 +1,47 @@
+import { createHash, randomUUID } from 'node:crypto'
 import { currentAttempt, sameSession } from './delegated-work-record-invariants'
-import type { DelegatedWorkDurableRecords, DurableSnapshot } from './delegated-work-record-types'
 import type {
+  DelegatedWorkDurableRecords,
+  DurableAttempt,
+  DurableChild,
+  DurableSnapshot
+} from './delegated-work-record-types'
+import type {
+  RootDelegatePermissionConfirmationClaim,
+  RootDelegatePermissionConfirmationDecision,
+  RootDelegatePermissionConfirmationSnapshot,
   RootDelegatePermissionEvent,
+  RootDelegatePermissionLocator,
   RootDelegatePermissionRequest,
   RootDelegatePermissionResponse
 } from './durable-delegated-work-contract'
 import { DurableDelegatedWorkError } from './durable-delegated-work-error'
 import type { DelegateExecutionEvent, RunningDelegateExecution } from './execution-port'
 
-type Permission = RootDelegatePermissionRequest & Readonly<{ execution: RunningDelegateExecution }>
+type PermissionExecutionBinding = Readonly<{
+  messageBranchId: string
+  runtimeSegmentId: string
+  promptMessageId: string
+}>
+type Permission = RootDelegatePermissionRequest &
+  Readonly<{
+    execution: RunningDelegateExecution
+    generation: string
+    binding?: PermissionExecutionBinding
+  }>
 type TakenPermissions = Array<[string, Permission]>
+type ActivePermission = Readonly<{
+  key: string
+  permission: Permission
+  child: DurableChild
+  attempt: DurableAttempt
+}>
 
 class RootDelegatePermissionOwner {
   private readonly permissions = new Map<string, Permission>()
 
   constructor(
-    private readonly records: DelegatedWorkDurableRecords,
+    private readonly records: Pick<DelegatedWorkDurableRecords, 'snapshot'>,
     private readonly onEvent?: (event: RootDelegatePermissionEvent) => void
   ) {}
 
@@ -24,7 +50,8 @@ class RootDelegatePermissionOwner {
     attemptId: string,
     childTitle: string,
     execution: RunningDelegateExecution,
-    event: DelegateExecutionEvent
+    event: DelegateExecutionEvent,
+    binding?: PermissionExecutionBinding
   ): void {
     if (event.kind !== 'permission') return
     const key = this.key(frameId, attemptId, event.requestId)
@@ -48,7 +75,17 @@ class RootDelegatePermissionOwner {
         kind,
         ...(scope ? { scope } : {})
       })),
-      execution
+      execution,
+      generation: randomUUID(),
+      ...(binding
+        ? {
+            binding: {
+              messageBranchId: binding.messageBranchId,
+              runtimeSegmentId: binding.runtimeSegmentId,
+              promptMessageId: binding.promptMessageId
+            }
+          }
+        : {})
     })
   }
 
@@ -71,7 +108,7 @@ class RootDelegatePermissionOwner {
 
   restoreAttempt(taken: TakenPermissions): void {
     for (const [key, permission] of taken) {
-      if (!this.permissions.has(key)) this.set(key, permission)
+      if (!this.permissions.has(key)) this.set(key, { ...permission, generation: randomUUID() })
     }
   }
 
@@ -102,25 +139,122 @@ class RootDelegatePermissionOwner {
     response: RootDelegatePermissionResponse
   ): Promise<void> {
     const snapshot = await this.records.snapshot()
+    const active = this.findActive(snapshot, session, response)
+    if (!active) {
+      throw new DurableDelegatedWorkError(
+        'conflict',
+        'permission request is no longer active for the current delegated Attempt'
+      )
+    }
+    await this.deliver(active, response)
+  }
+
+  async readPendingConfirmation(
+    session: DurableSnapshot['session'],
+    locator: RootDelegatePermissionLocator
+  ): Promise<RootDelegatePermissionConfirmationSnapshot | undefined> {
+    const snapshot = await this.records.snapshot()
+    const active = this.findActive(snapshot, session, locator)
+    return active && this.confirmation(snapshot, active)
+  }
+
+  async claimPendingConfirmation(
+    session: DurableSnapshot['session'],
+    locator: RootDelegatePermissionLocator,
+    version: string,
+    decision: RootDelegatePermissionConfirmationDecision,
+    authorizeAtClaim: () => boolean
+  ): Promise<RootDelegatePermissionConfirmationClaim> {
+    const snapshot = await this.records.snapshot()
+    const active = this.findActive(snapshot, session, locator)
+    if (!active) return { status: 'unavailable' }
+    const confirmation = this.confirmation(snapshot, active)
+    if (!confirmation || confirmation.version !== version) return { status: 'unavailable' }
+    if (!confirmation.allowedDecisions.includes(decision)) return { status: 'invalid-decision' }
+
+    const response: RootDelegatePermissionResponse =
+      decision === 'cancel'
+        ? { ...locator, cancelled: true }
+        : { ...locator, optionId: decision.slice('option:'.length) }
+    if (!authorizeAtClaim() || this.permissions.get(active.key) !== active.permission) {
+      return { status: 'unavailable' }
+    }
+    return { status: 'claimed', completion: this.deliver(active, response) }
+  }
+
+  private findActive(
+    snapshot: DurableSnapshot,
+    session: DurableSnapshot['session'],
+    locator: RootDelegatePermissionLocator
+  ): ActivePermission | undefined {
     const child = sameSession(snapshot.session, session)
-      ? snapshot.records.find((candidate) => candidate.frameId === response.frameId)
+      ? snapshot.records.find((candidate) => candidate.frameId === locator.frameId)
       : undefined
     const attempt = child && currentAttempt(child)
-    const key = this.key(response.frameId, response.attemptId, response.requestId)
+    const key = this.key(locator.frameId, locator.attemptId, locator.requestId)
     const permission = this.permissions.get(key)
     if (
       !permission ||
       child?.originBindingState !== 'validated' ||
       !snapshot.originMessageIds.includes(child.originMessageId) ||
       !attempt ||
-      attempt.id !== response.attemptId ||
+      attempt.id !== locator.attemptId ||
       attempt.status !== 'running'
     ) {
-      throw new DurableDelegatedWorkError(
-        'conflict',
-        'permission request is no longer active for the current delegated Attempt'
-      )
+      return undefined
     }
+    return { key, permission, child, attempt }
+  }
+
+  private confirmation(
+    snapshot: DurableSnapshot,
+    { permission, child, attempt }: ActivePermission
+  ): RootDelegatePermissionConfirmationSnapshot | undefined {
+    const binding = permission.binding
+    if (
+      !binding ||
+      child.parentFrameId !== snapshot.rootFrameId ||
+      binding.messageBranchId !== child.messageBranchId ||
+      binding.runtimeSegmentId !== attempt.runtimeSegmentIds.at(-1)
+    ) {
+      return undefined
+    }
+    const request = this.request(permission)
+    const version = createHash('sha256')
+      .update(
+        JSON.stringify([
+          'live-delegated-permission-confirmation-v1',
+          snapshot.session.projectId,
+          snapshot.session.sessionId,
+          snapshot.rootFrameId,
+          snapshot.rootBranchId,
+          snapshot.rootBranchRevision,
+          child.originMessageId,
+          child.parentFrameId,
+          child.messageBranchId,
+          attempt.initiatingTurnMessageId,
+          attempt.startedAt,
+          attempt.runtimeSegmentIds,
+          binding,
+          permission.generation,
+          request
+        ])
+      )
+      .digest('hex')
+    return {
+      version,
+      request,
+      allowedDecisions: [
+        ...request.options.map(({ optionId }) => `option:${optionId}` as const),
+        'cancel'
+      ]
+    }
+  }
+
+  private async deliver(
+    { key, permission }: ActivePermission,
+    response: RootDelegatePermissionResponse
+  ): Promise<void> {
     this.delete(key)
     try {
       await permission.execution.respondToPermission({
@@ -137,7 +271,7 @@ class RootDelegatePermissionOwner {
         currentAttempt(latest).id === response.attemptId &&
         currentAttempt(latest).status === 'running'
       ) {
-        this.set(key, permission)
+        this.restoreAttempt([[key, permission]])
       }
       throw error
     }
@@ -148,9 +282,19 @@ class RootDelegatePermissionOwner {
   }
 
   private request(permission: Permission): RootDelegatePermissionRequest {
-    const { execution: _execution, ...request } = permission
+    const {
+      execution: _execution,
+      generation: _generation,
+      binding: _binding,
+      ...request
+    } = permission
     void _execution
-    return Object.freeze({ ...request, options: Object.freeze([...request.options]) })
+    void _generation
+    void _binding
+    return Object.freeze({
+      ...request,
+      options: Object.freeze(request.options.map((option) => Object.freeze({ ...option })))
+    })
   }
 
   private publish(kind: RootDelegatePermissionEvent['kind'], permission: Permission): void {

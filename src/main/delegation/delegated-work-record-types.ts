@@ -13,6 +13,7 @@ import type {
 } from '../../shared/session-message-contract'
 import type { AuthenticatedDelegateCaller } from './authenticated-delegate-caller'
 import type { DurableDelegateRequest } from './delegate-request-contract'
+import type { AuthorizeDelegatedQuestionAtClaim } from './session-records'
 import type { JsonSchema, JsonValue, StructuredOutputEvidence } from './structured-output'
 
 type DurableResolvedAgent =
@@ -293,6 +294,7 @@ type ConfirmQuestionInput = Readonly<{
   executionModel: ResolvedSubagentModelSnapshot
   startedAt: number
   initiatingTurnMessageId: string
+  authorizeAtClaim?: AuthorizeDelegatedQuestionAtClaim
 }>
 
 type DelegatedWorkDurableRecords = Readonly<{

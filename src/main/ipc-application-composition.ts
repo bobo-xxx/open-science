@@ -27,7 +27,7 @@ import {
   type ComputeApprovalRequest
 } from '../shared/compute'
 import type { PendingElicitationRequest } from '../shared/elicitation'
-import type { SessionSummary } from '../shared/session-persistence'
+import type { DelegatedQuestionAnswer, SessionSummary } from '../shared/session-persistence'
 import { type AppIconPreview, type AppIconVariant } from '../shared/settings'
 import type { UploadTransferProgress } from '../shared/uploads'
 import { LiveElicitationResponseError, type LiveElicitationSnapshot } from './acp/elicitation-owner'
@@ -85,6 +85,8 @@ import {
   createCoreElectronSurfaces,
   createElectronSurfaceAdapter
 } from './desktop-surface-declarations'
+import { DelegatedQuestionClaimError } from './delegation/durable-delegated-work-error'
+import type { DelegatedQuestionConfirmationAuthority } from './delegation/session-records'
 import { LocalePreferenceOwner } from './locale/owner'
 import { createManagedPreviewProtocolHandler } from './managed-preview-handler'
 import { runtimeMetadata } from './runtime-metadata'
@@ -104,6 +106,7 @@ import {
   type NamedElectronSurfaceAdapter
 } from './runtime-electron-wiring'
 import { type SessionDeletion } from './session-persistence/coordinator'
+import { readDelegatedQuestionConfirmationAuthority } from './session-persistence/delegated-question-owner'
 import {
   createWebSessionPersistenceFlush,
   type RendererSessionPersistenceFlushPolicy,
@@ -958,9 +961,9 @@ export const createApplicationModules = async (
               allowedDecisions: snapshot.allowedDecisions
             }
           },
-          claim: (scope, version, decision) => {
+          claim: (scope, version, decision, authorizeAtClaim) => {
             const id = findComputeApprovalId(scope)
-            if (!id) return 'unavailable'
+            if (!id || !authorizeAtClaim()) return 'unavailable'
             const outcome = compute.claimPendingConfirmation(scope, id, version, decision)
             return outcome === 'stale' ? 'unavailable' : outcome
           }
@@ -980,26 +983,50 @@ export const createApplicationModules = async (
         taskInteractionId({ projectId, sessionId }, kind, requestId) === interactionId
     )?.requestId
   }
+  const delegatedPermissionVersion = 'delegated:'
   const trustedPermission = trustedHostKeys
     ? new TrustedInteractionDecisions<AcpPermissionRequest, ConfirmationPermissionDecision>(
         {
           kind: 'permission',
           describeDecision: (decision) => [decision, decision],
-          read: (scope) => {
+          read: async (scope) => {
             const requestId = findLiveRequestId(scope, 'permission')
             if (!requestId) return undefined
-            const snapshot = agentRuntime.runtime.readLivePermissionConfirmation(scope, requestId)
+            const live = agentRuntime.runtime.readLivePermissionConfirmation(scope, requestId)
+            if (live) return { ...live, disclosure: live.request }
+            const delegated = await delegation.delegatedWork.root.readTrustedPermission?.(
+              scope,
+              requestId
+            )
             return (
-              snapshot && {
-                version: snapshot.version,
-                disclosure: snapshot.request,
-                allowedDecisions: snapshot.allowedDecisions
+              delegated && {
+                version: delegatedPermissionVersion + delegated.version,
+                disclosure: delegated.request,
+                allowedDecisions: delegated.allowedDecisions
               }
             )
           },
-          claim: (scope, version, decision) => {
+          claim: async (scope, version, decision, authorizeAtClaim) => {
             const requestId = findLiveRequestId(scope, 'permission')
-            if (!requestId) return 'unavailable'
+            if (!requestId || !authorizeAtClaim()) return 'unavailable'
+            if (version.startsWith(delegatedPermissionVersion)) {
+              const delegated = await delegation.delegatedWork.root.claimTrustedPermission?.(
+                scope,
+                requestId,
+                version.slice(delegatedPermissionVersion.length),
+                decision,
+                authorizeAtClaim
+              )
+              if (delegated?.status === 'claimed') {
+                void delegated.completion.catch((error: unknown) =>
+                  log.warn(
+                    'trusted delegated permission delivery failed',
+                    diagnosticErrorFields(error)
+                  )
+                )
+              }
+              return delegated?.status ?? 'unavailable'
+            }
             const result = agentRuntime.runtime.claimLivePermissionConfirmation(
               scope,
               requestId,
@@ -1016,20 +1043,145 @@ export const createApplicationModules = async (
         trustedHostKeys.resolve
       )
     : undefined
+  const readDelegatedQuestion = async (
+    scope: InteractionScope
+  ): Promise<DelegatedQuestionConfirmationAuthority | undefined> => {
+    const session = await sessionAuthority.sessionPersistenceCoordinator.readSessionSnapshot(
+      scope.projectId,
+      scope.sessionId,
+      { preserveRuntimeState: true }
+    )
+    if (session?.projectId !== scope.projectId || session.id !== scope.sessionId) return undefined
+    const request = session.runtimeContext?.delegatedWork?.questionRequests?.find(
+      ({ requestId }) => taskInteractionId(scope, 'question', requestId) === scope.interactionId
+    )
+    return request && readDelegatedQuestionConfirmationAuthority(session, request.requestId)
+  }
+  const delegatedQuestionVersion = ({
+    request,
+    session,
+    rootFrameId,
+    rootBranchRevision,
+    executionModel
+  }: DelegatedQuestionConfirmationAuthority): string =>
+    'delegated:' +
+    createHash('sha256')
+      .update(
+        JSON.stringify([
+          'delegated-question-confirmation-v1',
+          session,
+          rootFrameId,
+          rootBranchRevision,
+          executionModel,
+          request.requestId,
+          request.canonicalDigest,
+          request.askedAt,
+          request.rootOriginMessageId,
+          request.sourceFrameId,
+          request.sourceAttemptId,
+          request.sourceRuntimeSegmentId,
+          request.sourceMessageBranchId,
+          request.sourceName,
+          request.questions
+        ])
+      )
+      .digest('hex')
+  type DelegatedQuestionDisclosure = {
+    source: 'delegated'
+    sourceName: string
+    questions: Array<
+      DelegatedQuestionConfirmationAuthority['request']['questions'][number] & { fieldId: string }
+    >
+  }
+  const claimDelegatedQuestion = async (
+    scope: InteractionScope,
+    version: string,
+    decision: ConfirmationQuestionDecision,
+    authorizeAtClaim: () => boolean
+  ): Promise<'claimed' | 'invalid-decision' | 'unavailable'> => {
+    if (decision.action !== 'accept') return 'invalid-decision'
+    const authority = await readDelegatedQuestion(scope)
+    if (!authority || delegatedQuestionVersion(authority) !== version || !authorizeAtClaim()) {
+      return 'unavailable'
+    }
+    const answers: DelegatedQuestionAnswer[] = []
+    for (const answer of decision.answers) {
+      if (
+        answer.status === 'skipped' ||
+        (typeof answer.value !== 'string' && !Array.isArray(answer.value))
+      ) {
+        return 'invalid-decision'
+      }
+      const questionIndex = Number(answer.fieldId)
+      if (
+        !Number.isSafeInteger(questionIndex) ||
+        questionIndex < 0 ||
+        String(questionIndex) !== answer.fieldId
+      ) {
+        return 'invalid-decision'
+      }
+      answers.push({ questionIndex, value: answer.value })
+    }
+    const [, payload] = describeQuestionConfirmationDecision(decision)
+    const claim = await delegation.delegatedWork.root.confirmTrustedQuestion?.(scope, {
+      requestId: authority.request.requestId,
+      answers,
+      withCommitAdmission: async (operation) => {
+        const result = await withTrustedInteractionSession(scope, async () => ({
+          value: await operation()
+        }))
+        if (!result) throw new DelegatedQuestionClaimError('unavailable')
+        return result.value
+      },
+      authorizeAtClaim: (current, canonical) => {
+        if (!authorizeAtClaim() || delegatedQuestionVersion(current) !== version)
+          return 'unavailable'
+        const canonicalDecision = describeQuestionConfirmationDecision({
+          action: 'accept',
+          answers: canonical.map(({ questionIndex, value }) => ({
+            fieldId: String(questionIndex),
+            value
+          }))
+        })[1]
+        return canonicalDecision === payload ? 'authorized' : 'invalid-decision'
+      }
+    })
+    if (claim?.status === 'claimed') {
+      void claim.completion.catch((error: unknown) =>
+        log.warn('trusted delegated question continuation failed', diagnosticErrorFields(error))
+      )
+    }
+    return claim?.status ?? 'unavailable'
+  }
   const questionVersion = ({ prompt, request }: LiveElicitationSnapshot): string =>
     createHash('sha256')
       .update(JSON.stringify(['live-acp-question-confirmation-v1', prompt, request]))
       .digest('hex')
   const trustedQuestion = trustedHostKeys
     ? new TrustedInteractionDecisions<
-        PendingElicitationRequest,
+        PendingElicitationRequest | DelegatedQuestionDisclosure,
         ConfirmationQuestionDecision,
         ConfirmationQuestionDecision['action']
       >(
         {
           kind: 'question',
           describeDecision: describeQuestionConfirmationDecision,
-          read: (scope) => {
+          read: async (scope) => {
+            const delegated = await readDelegatedQuestion(scope)
+            if (delegated) {
+              return {
+                version: delegatedQuestionVersion(delegated),
+                disclosure: {
+                  source: 'delegated',
+                  sourceName: delegated.request.sourceName,
+                  questions: delegated.request.questions.map((question, index) => ({
+                    ...question,
+                    fieldId: String(index)
+                  }))
+                },
+                allowedDecisions: ['accept']
+              }
+            }
             const requestId = findLiveRequestId(scope, 'question')
             if (!requestId) return undefined
             const snapshot = agentRuntime.runtime.getLiveElicitation(
@@ -1045,27 +1197,35 @@ export const createApplicationModules = async (
               }
             )
           },
-          claim: (scope, version, decision) => {
-            const requestId = findLiveRequestId(scope, 'question')
-            if (!requestId) return 'unavailable'
-            const [, payload] = describeQuestionConfirmationDecision(decision)
-            let invalidDecision = false
-            try {
-              const resolved = agentRuntime.runtime.respondToLiveElicitation(
-                scope.projectId,
-                scope.sessionId,
-                { requestId, ...decision },
-                (request, canonical, prompt) => {
-                  if (questionVersion({ prompt, request }) !== version) return false
-                  invalidDecision = describeQuestionConfirmationDecision(canonical)[1] !== payload
-                  return !invalidDecision
-                }
-              )
-              return resolved ? 'claimed' : 'unavailable'
-            } catch (error) {
-              if (!(error instanceof LiveElicitationResponseError)) throw error
-              return invalidDecision ? 'invalid-decision' : error.code
+          claim: async (scope, version, decision, authorizeAtClaim) => {
+            if (version.startsWith('delegated:')) {
+              return claimDelegatedQuestion(scope, version, decision, authorizeAtClaim)
             }
+            return (
+              (await withTrustedInteractionSession(scope, () => {
+                const requestId = findLiveRequestId(scope, 'question')
+                if (!requestId) return 'unavailable'
+                const [, payload] = describeQuestionConfirmationDecision(decision)
+                let invalidDecision = false
+                try {
+                  const resolved = agentRuntime.runtime.respondToLiveElicitation(
+                    scope.projectId,
+                    scope.sessionId,
+                    { requestId, ...decision },
+                    (request, canonical, prompt) => {
+                      if (questionVersion({ prompt, request }) !== version) return false
+                      invalidDecision =
+                        describeQuestionConfirmationDecision(canonical)[1] !== payload
+                      return !invalidDecision && authorizeAtClaim()
+                    }
+                  )
+                  return resolved ? 'claimed' : 'unavailable'
+                } catch (error) {
+                  if (!(error instanceof LiveElicitationResponseError)) throw error
+                  return invalidDecision ? 'invalid-decision' : error.code
+                }
+              })) ?? 'unavailable'
+            )
           }
         },
         trustedHostKeys.resolve
@@ -1073,16 +1233,16 @@ export const createApplicationModules = async (
     : undefined
   const withTrustedInteractionSession = async <Result>(
     { projectId, sessionId }: InteractionScope,
-    operation: () => Result
+    operation: () => Result | Promise<Result>
   ): Promise<Result | undefined> => {
     let admitted = false
     try {
-      return await projectLifecycle.archiveCoordinator.withSessionAvailable(
+      return await projectLifecycle.archiveCoordinator.withSessionAvailable<Result>(
         projectId,
         sessionId,
         async () => {
           admitted = true
-          return operation()
+          return await operation()
         }
       )
     } catch (error) {
@@ -1091,17 +1251,25 @@ export const createApplicationModules = async (
     }
   }
   const toConfirmationPort = <Disclosure, Decision, Choice extends string>(
-    owner: TrustedInteractionDecisions<Disclosure, Decision, Choice> | undefined
+    owner: TrustedInteractionDecisions<Disclosure, Decision, Choice> | undefined,
+    holdClaimAdmission = true
   ): ConfirmationPort<Decision> | undefined =>
     owner && {
       issue: (scope, read, isCurrent) =>
-        withTrustedInteractionSession(scope, () =>
-          isCurrent() ? owner.issue(scope, read) : undefined
-        ),
-      claim: async (scope, proof, isCurrent) =>
-        (await withTrustedInteractionSession(scope, () =>
-          isCurrent() ? owner.claim(scope, proof) : 'unavailable'
-        )) ?? 'unavailable',
+        withTrustedInteractionSession(scope, () => owner.issue(scope, read, isCurrent)),
+      claim: async (scope, proof, isCurrent) => {
+        if (holdClaimAdmission) {
+          return (
+            (await withTrustedInteractionSession(scope, () =>
+              owner.claim(scope, proof, isCurrent)
+            )) ?? 'unavailable'
+          )
+        }
+        // Delegated questions wait for a previous Attempt and capacity. Their persistence owner
+        // reacquires admission only for the confirmed decision and the continuation commit.
+        if (!(await withTrustedInteractionSession(scope, () => true))) return 'unavailable'
+        return owner.claim(scope, proof, isCurrent)
+      },
       reset: () => owner.reset()
     }
   const applicationCommandComposition = await registerApplicationCommandComposition({
@@ -1207,7 +1375,7 @@ export const createApplicationModules = async (
     taskControls: {
       trustedCompute: toConfirmationPort(trustedCompute),
       trustedPermission: toConfirmationPort(trustedPermission),
-      trustedQuestion: toConfirmationPort(trustedQuestion),
+      trustedQuestion: toConfirmationPort(trustedQuestion, false),
       listPendingSessionInteractions: async (scope) => {
         const sessions = sessionAuthority.sessionPersistenceCoordinator
         const ownerProjectId = await sessions.sessionProjectId(scope.sessionId)

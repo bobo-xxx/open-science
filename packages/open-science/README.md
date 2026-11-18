@@ -188,7 +188,8 @@ watch starts from the current snapshot. Changes between polls can be coalesced.
 The local trusted-host previews let an enrolled component respond through an isolated signer.
 The server advertises `trusted-compute-decisions`, `trusted-permission-decisions`, and
 `trusted-question-decisions` independently. Permission and question previews cover supported
-requests with a live primary runtime. Use Desktop or Web for delegated or restored waits and
+requests with a live primary runtime, live delegated permissions, and confirmable delegated
+questions on the current Branch. Use Desktop or Web for restored waits and specialized
 application-owned permission requests. The preview protocol uses a fixture host for verification.
 Real external host acceptance is pending. Keep the private key, the user-facing confirmation UI,
 and signing outside the model and Task tool environment.
@@ -248,6 +249,10 @@ Use the request's `allowedDecisions` to select a decision.
   `{ action: 'cancel' }`. An answer has `fieldId` and `value`, with optional `status: 'answered'`.
   For a field that permits skipping, use `{ fieldId, status: 'skipped' }`. Use the displayed option
   order for multi-select values and submit the same answers in the same order as signed.
+- A question disclosure with `source: 'delegated'` names the Subagent and supplies ordered
+  `questions` with stable `fieldId` values. Submit one answer for each field in display order.
+  Delegated questions offer `accept`. Sign multi-select values in the displayed option order
+  and use trimmed text for custom responses.
 
 A `{ status: 'claimed' }` receipt confirms that the application accepted the decision. Follow
 the Task or Compute operation for its subsequent outcome. Desktop, Web, and trusted-host replies

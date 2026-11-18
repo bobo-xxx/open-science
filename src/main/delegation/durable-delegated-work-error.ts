@@ -31,4 +31,15 @@ class DurableDelegatedWorkError extends Error {
   }
 }
 
-export { DELEGATION_DISABLED_MESSAGE, DurableDelegatedWorkError }
+class DelegatedQuestionClaimError extends Error {
+  constructor(readonly code: 'unavailable' | 'invalid-decision') {
+    super(
+      code === 'unavailable'
+        ? 'Delegated question is no longer available.'
+        : 'Invalid delegated question decision.'
+    )
+    this.name = 'DelegatedQuestionClaimError'
+  }
+}
+
+export { DELEGATION_DISABLED_MESSAGE, DelegatedQuestionClaimError, DurableDelegatedWorkError }

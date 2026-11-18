@@ -4400,9 +4400,9 @@ describe('startWebHttpServer', () => {
             allowedDecisions: snapshot.allowedDecisions
           }
         },
-        claim(scope, version, decision) {
+        claim(scope, version, decision, authorizeAtClaim) {
           const id = findApproval(scope)
-          if (!id) return 'unavailable'
+          if (!id || !authorizeAtClaim()) return 'unavailable'
           const outcome = broker.claimPendingConfirmation(scope, id, version, decision)
           return outcome === 'stale' ? 'unavailable' : outcome
         }
@@ -4421,10 +4421,8 @@ describe('startWebHttpServer', () => {
             broker.listPendingForSession(scope)
           ),
         trustedCompute: {
-          issue: async (scope, read, isCurrent) =>
-            isCurrent() ? trusted.issue(scope, read) : undefined,
-          claim: async (scope, proof, isCurrent) =>
-            isCurrent() ? trusted.claim(scope, proof) : 'unavailable',
+          issue: (scope, read, isCurrent) => trusted.issue(scope, read, isCurrent),
+          claim: (scope, proof, isCurrent) => trusted.claim(scope, proof, isCurrent),
           reset: () => trusted.reset()
         }
       }

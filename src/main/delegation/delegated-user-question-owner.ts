@@ -14,10 +14,17 @@ import type {
   DurableDelegatedQuestionRequest,
   DurableResolvedAgent
 } from './delegated-work-record-types'
-import { DurableDelegatedWorkError } from './durable-delegated-work-error'
+import {
+  DelegatedQuestionClaimError,
+  DurableDelegatedWorkError
+} from './durable-delegated-work-error'
 import { terminalizeUnsuccessfulAttempt } from './attempt-runtime-transcript'
 import type { DelegateCapacityReservation } from './execution-port'
-import type { SessionKey } from './session-records'
+import type {
+  DelegatedQuestionConfirmationClaim,
+  SessionKey,
+  TrustedDelegatedQuestionInput
+} from './session-records'
 
 type UpdateQuestionDraftInput = Readonly<{
   requestId: string
@@ -29,6 +36,7 @@ type ConfirmQuestionInput = Readonly<{
   requestId: string
   answers: readonly DelegatedQuestionAnswer[]
 }>
+type ClaimedQuestion = Extract<DelegatedQuestionConfirmationClaim, { status: 'claimed' }>
 
 type DelegatedUserQuestionOwnerOptions = Readonly<{
   records: DelegatedWorkDurableRecords
@@ -213,6 +221,39 @@ class DelegatedUserQuestionOwner {
     session: SessionKey,
     input: ConfirmQuestionInput
   ): Promise<Readonly<{ requestId: string; continuationAttemptId: string }>> {
+    const { requestId, continuationAttemptId, completion } = await this.claimQuestion(
+      session,
+      input
+    )
+    await completion
+    return { requestId, continuationAttemptId }
+  }
+
+  async confirmTrusted(
+    session: SessionKey,
+    input: TrustedDelegatedQuestionInput
+  ): Promise<DelegatedQuestionConfirmationClaim> {
+    if (typeof input.authorizeAtClaim !== 'function') return { status: 'invalid-decision' }
+    try {
+      return await this.claimQuestion(session, input, input)
+    } catch (error) {
+      if (error instanceof DelegatedQuestionClaimError) return { status: error.code }
+      if (
+        error instanceof DurableDelegatedWorkError &&
+        (error.code === 'authorization' || error.code === 'conflict')
+      ) {
+        return { status: 'unavailable' }
+      }
+      throw error
+    }
+  }
+
+  private async claimQuestion(
+    session: SessionKey,
+    input: ConfirmQuestionInput,
+    trust?: Pick<TrustedDelegatedQuestionInput, 'authorizeAtClaim' | 'withCommitAdmission'>
+  ): Promise<ClaimedQuestion> {
+    const authorizeAtClaim = trust?.authorizeAtClaim
     const snapshot = await this.options.records.snapshot()
     if (!sameSession(snapshot.session, session)) {
       throw new DurableDelegatedWorkError('authorization', 'delegated question Session mismatch')
@@ -229,11 +270,20 @@ class DelegatedUserQuestionOwner {
     ) {
       throw new DurableDelegatedWorkError('authorization', 'delegated question branch is inactive')
     }
-    assertQuestionAnswers(request, input.answers)
+    try {
+      assertQuestionAnswers(request, input.answers)
+    } catch (error) {
+      if (authorizeAtClaim && error instanceof DurableDelegatedWorkError) {
+        throw new DelegatedQuestionClaimError('invalid-decision')
+      }
+      throw error
+    }
     const answers = input.answers.map((answer) => ({
       ...answer,
       value: sanitizeAgentUserChoiceAnswer(request.questions[answer.questionIndex], answer.value)!
     }))
+    if (authorizeAtClaim)
+      answers.sort((first, second) => first.questionIndex - second.questionIndex)
     const child = snapshot.records.find(
       (candidate) => candidate.frameId === request.sourceFrameId
     ) as DurableChild | undefined
@@ -275,9 +325,8 @@ class DelegatedUserQuestionOwner {
     const reservation = await this.options.reserve()
     const attemptId = this.options.createId('attempt')
     const message = questionContinuationMessage(request, answers)
-    let committed = false
-    try {
-      await this.options.admission(() =>
+    const commit = (): Promise<void> =>
+      this.options.admission(() =>
         this.options.records.confirmQuestion({
           requestId: request.requestId,
           frameId: latest.frameId,
@@ -289,13 +338,46 @@ class DelegatedUserQuestionOwner {
           resolvedAgent,
           executionModel,
           startedAt: this.options.now(),
-          initiatingTurnMessageId: request.rootOriginMessageId
+          initiatingTurnMessageId: request.rootOriginMessageId,
+          ...(authorizeAtClaim ? { authorizeAtClaim } : {})
         })
       )
-      committed = true
+    try {
+      await (trust?.withCommitAdmission ? trust.withCommitAdmission(commit) : commit())
+    } catch (error) {
+      await reservation.releaseAll()
+      if (authorizeAtClaim || error instanceof DurableDelegatedWorkError) throw error
+      throw new DurableDelegatedWorkError(
+        'conflict',
+        'delegated question changed while confirmation was committed'
+      )
+    }
+    return {
+      status: 'claimed',
+      requestId: request.requestId,
+      continuationAttemptId: attemptId,
+      completion: this.finishConfirmation({
+        frameId: latest.frameId,
+        attemptId,
+        session,
+        reservation,
+        message
+      })
+    }
+  }
+
+  private async finishConfirmation(input: {
+    frameId: string
+    attemptId: string
+    session: SessionKey
+    reservation: DelegateCapacityReservation
+    message: string
+  }): Promise<void> {
+    const { frameId, attemptId, session, reservation, message } = input
+    try {
       const committedSnapshot = await this.options.records.snapshot()
       const continued = committedSnapshot.records.find(
-        (candidate) => candidate.frameId === latest.frameId
+        (candidate) => candidate.frameId === frameId
       ) as DurableChild | undefined
       if (!continued || currentAttempt(continued).id !== attemptId) {
         throw new DurableDelegatedWorkError(
@@ -306,24 +388,17 @@ class DelegatedUserQuestionOwner {
       this.options.launchContinuation({ child: continued, session, reservation, message })
     } catch (error) {
       try {
-        if (committed) {
-          await terminalizeUnsuccessfulAttempt(this.options.records, async () => undefined, {
-            frameId: latest.frameId,
-            attemptId,
-            endedAt: this.options.now(),
-            error
-          })
-        }
+        await terminalizeUnsuccessfulAttempt(this.options.records, async () => undefined, {
+          frameId,
+          attemptId,
+          endedAt: this.options.now(),
+          error
+        })
       } finally {
         await reservation.releaseAll()
       }
-      if (committed || error instanceof DurableDelegatedWorkError) throw error
-      throw new DurableDelegatedWorkError(
-        'conflict',
-        'delegated question changed while confirmation was committed'
-      )
+      throw error
     }
-    return { requestId: request.requestId, continuationAttemptId: attemptId }
   }
 }
 

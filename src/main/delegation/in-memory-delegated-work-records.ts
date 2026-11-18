@@ -6,7 +6,10 @@ import type {
   DurableMessageCommand,
   DurableSnapshot
 } from './delegated-work-record-types'
-import { DurableDelegatedWorkError } from './durable-delegated-work-error'
+import {
+  DelegatedQuestionClaimError,
+  DurableDelegatedWorkError
+} from './durable-delegated-work-error'
 import { canonicalStructuredOutputEqual } from './structured-output'
 
 type SessionKey = DurableSnapshot['session']
@@ -265,6 +268,34 @@ const createInMemoryDelegatedWorkRecords = (input: {
         state.messages.some((message) => message.id === input.userMessageId)
       ) {
         throw new DurableDelegatedWorkError('conflict', 'duplicate question continuation identity')
+      }
+      if (input.authorizeAtClaim) {
+        const executionModel = previous.executionModel ?? child.attempts[0]?.executionModel
+        if (
+          !executionModel ||
+          child.originBindingState !== 'validated' ||
+          child.originMessageId !== request.rootOriginMessageId ||
+          child.messageBranchId !== request.sourceMessageBranchId ||
+          previous.id !== request.sourceAttemptId ||
+          !previous.runtimeSegmentIds.includes(request.sourceRuntimeSegmentId)
+        ) {
+          throw new DelegatedQuestionClaimError('unavailable')
+        }
+        const verdict = input.authorizeAtClaim(
+          structuredClone({
+            session: state.session,
+            request,
+            rootFrameId: state.rootFrameId,
+            rootBranchRevision: state.rootBranchRevision,
+            executionModel
+          }),
+          structuredClone(input.answers)
+        )
+        if (verdict !== 'authorized') {
+          throw new DelegatedQuestionClaimError(
+            verdict === 'invalid-decision' ? verdict : 'unavailable'
+          )
+        }
       }
       child.attempts.push({
         id: input.attemptId,

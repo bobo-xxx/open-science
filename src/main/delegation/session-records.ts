@@ -18,6 +18,35 @@ import type {
 
 type SessionKey = Readonly<{ projectId: string; sessionId: string }>
 
+type DelegatedQuestionConfirmationAuthority = Readonly<{
+  session: SessionKey
+  request: DelegatedQuestionRequest
+  rootFrameId: string
+  rootBranchRevision: string
+  executionModel: ResolvedSubagentModelSnapshot
+}>
+
+type AuthorizeDelegatedQuestionAtClaim = (
+  authority: DelegatedQuestionConfirmationAuthority,
+  answers: readonly DelegatedQuestionAnswer[]
+) => 'authorized' | 'unavailable' | 'invalid-decision'
+
+type TrustedDelegatedQuestionInput = Readonly<{
+  requestId: string
+  answers: readonly DelegatedQuestionAnswer[]
+  authorizeAtClaim: AuthorizeDelegatedQuestionAtClaim
+  withCommitAdmission?: <Result>(operation: () => Promise<Result>) => Promise<Result>
+}>
+
+type DelegatedQuestionConfirmationClaim =
+  | Readonly<{
+      status: 'claimed'
+      requestId: string
+      continuationAttemptId: string
+      completion: Promise<void>
+    }>
+  | Readonly<{ status: 'unavailable' | 'invalid-decision' }>
+
 type CreateChildRecordInput = Readonly<{
   frameId: string
   branchId: string
@@ -102,6 +131,7 @@ type ConfirmQuestionInput = Readonly<{
   executionModel: ResolvedSubagentModelSnapshot
   startedAt: number
   initiatingTurnMessageId: string
+  authorizeAtClaim?: AuthorizeDelegatedQuestionAtClaim
 }>
 
 type AttemptAgentEvent =
@@ -251,6 +281,7 @@ export type {
   AttachDelegatedMessageArtifactsInput,
   AttemptAgentEvent,
   AttemptAgentEventInput,
+  AuthorizeDelegatedQuestionAtClaim,
   ChildRecord,
   CompleteChildTurnInput,
   ConfirmQuestionInput,
@@ -258,6 +289,8 @@ export type {
   CreateChildrenInput,
   CreatedChild,
   CreatedNamedChild,
+  DelegatedQuestionConfirmationAuthority,
+  DelegatedQuestionConfirmationClaim,
   DelegatedWorkAttemptRecord,
   DelegatedWorkRecordCommands,
   SettleMessageInput,
@@ -268,5 +301,6 @@ export type {
   StartPendingMessageTurnInput,
   SubmitStructuredOutputInput,
   TransitionAttemptInput,
+  TrustedDelegatedQuestionInput,
   UpdateQuestionDraftInput
 }

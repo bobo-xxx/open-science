@@ -261,7 +261,7 @@ const createDurableDelegatedWork = (
         resolveHandle(handle)
         markEstablished()
         const unsubscribe = handle.subscribe((event) => {
-          permissionOwner.observe(child.frameId, attempt.id, child.title, handle!, event)
+          permissionOwner.observe(child.frameId, attempt.id, child.title, handle!, event, context)
           if (event.kind !== 'runtime') return
           const { scope: eventScope } = event.update
           if (
@@ -983,6 +983,9 @@ const createDurableDelegatedWork = (
     confirmQuestion(session, input) {
       return questionOwner.confirm(session, input)
     },
+    confirmTrustedQuestion(session, input) {
+      return questionOwner.confirmTrusted(session, input)
+    },
     async sessionSummary(session: SessionKey): Promise<SessionSubagentSummary> {
       const snapshot = await options.records.snapshot()
       if (!sameSession(snapshot.session, session)) return { runningCount: 0, children: [] }
@@ -1016,6 +1019,18 @@ const createDurableDelegatedWork = (
     },
     async respondToPermission(session, response) {
       await permissionOwner.respond(session, response)
+    },
+    readTrustedPermission(session, locator) {
+      return permissionOwner.readPendingConfirmation(session, locator)
+    },
+    claimTrustedPermission(session, locator, version, decision, authorizeAtClaim) {
+      return permissionOwner.claimPendingConfirmation(
+        session,
+        locator,
+        version,
+        decision,
+        authorizeAtClaim
+      )
     },
     async setPermissionProfile(session, profile) {
       const snapshot = await options.records.snapshot()
