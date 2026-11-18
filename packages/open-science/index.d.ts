@@ -800,6 +800,12 @@ export class OpenScienceClient {
     sessionId: string,
     options?: RequestOptions
   ): Promise<readonly PendingSessionInteraction[]>
+  /** Poll the scoped endpoint, yielding the initial snapshot and each observed change. */
+  watchPendingSessionInteractions(
+    projectId: string,
+    sessionId: string,
+    options?: Pick<RequestOptions, 'signal' | 'timeoutMs'> & { pollIntervalMs?: number }
+  ): AsyncGenerator<readonly PendingSessionInteraction[], void, unknown>
   getSessionHistory(
     projectId: string,
     sessionId: string,

@@ -303,6 +303,7 @@ describe('OpenScienceClient', () => {
         'getSession',
         'getSessionHistory',
         'listPendingSessionInteractions',
+        'watchPendingSessionInteractions',
         'stageRunAttachment',
         'getSessionConfiguration',
         'updateSessionConfiguration',
@@ -344,6 +345,117 @@ describe('OpenScienceClient', () => {
         'throwResponseError'
       ].sort()
     )
+  })
+
+  it('watches the scoped snapshot, ignores reordering and reports when waits clear', async () => {
+    const scope = { projectId: 'project/1', sessionId: 'session/2', status: 'pending' }
+    const permission = {
+      ...scope,
+      id: 'permission-1',
+      kind: 'permission',
+      isMcp: false,
+      delegated: false
+    }
+    const question = { ...scope, id: 'question-1', kind: 'question', fieldCount: 1 }
+    const updatedQuestion = { ...question, fieldCount: 2 }
+    const replies = [
+      [],
+      [permission, question],
+      [question, permission],
+      [updatedQuestion, permission],
+      []
+    ]
+    const fetch = vi.fn(async (url: string) => {
+      if (url.endsWith('/api/bootstrap')) {
+        return response(200, { taskCapabilities: ['session-pending-interactions'] })
+      }
+      expect(url).toBe(
+        'http://localhost/api/v1/projects/project%2F1/sessions/session%2F2/pending-interactions'
+      )
+      expect(replies.length).toBeGreaterThan(0)
+      return response(200, { data: replies.shift() })
+    })
+    const client = new OpenScienceClient({
+      baseUrl: 'http://localhost',
+      token: 'test',
+      fetch,
+      sleep: async () => {}
+    })
+    const watcher = client.watchPendingSessionInteractions(scope.projectId, scope.sessionId)
+    await expect(watcher.next()).resolves.toEqual({ value: [], done: false })
+    await expect(watcher.next()).resolves.toEqual({ value: [permission, question], done: false })
+    await expect(watcher.next()).resolves.toEqual({
+      value: [updatedQuestion, permission],
+      done: false
+    })
+    await expect(watcher.next()).resolves.toEqual({ value: [], done: false })
+    await watcher.return(undefined)
+    expect(fetch).toHaveBeenCalledTimes(6)
+  })
+
+  it('stops watching immediately when aborted during the polling interval', async () => {
+    const fetch = vi.fn(async (url: string) =>
+      url.endsWith('/api/bootstrap')
+        ? response(200, { taskCapabilities: ['session-pending-interactions'] })
+        : response(200, { data: [] })
+    )
+    const client = new OpenScienceClient({ baseUrl: 'http://localhost', token: 'test', fetch })
+    const abort = new AbortController()
+    const watcher = client.watchPendingSessionInteractions('project', 'session', {
+      pollIntervalMs: 60_000,
+      signal: abort.signal
+    })
+    await expect(watcher.next()).resolves.toEqual({ value: [], done: false })
+    const next = watcher.next()
+    abort.abort()
+    await expect(next).resolves.toMatchObject({ done: true })
+    expect(fetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('forwards cancellation to an in-flight snapshot request', async () => {
+    let signalRequestStarted: () => void
+    const requestStarted = new Promise<void>((resolve) => {
+      signalRequestStarted = resolve
+    })
+    const fetch = vi.fn(async (url: string, options: RequestInit) => {
+      if (url.endsWith('/api/bootstrap')) {
+        return response(200, { taskCapabilities: ['session-pending-interactions'] })
+      }
+      const signal = options.signal
+      if (!signal) throw new Error('The request must carry a signal.')
+      return new Promise<Response>((_, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+        signalRequestStarted()
+      })
+    })
+    const client = new OpenScienceClient({ baseUrl: 'http://localhost', token: 'test', fetch })
+    const abort = new AbortController()
+    const watcher = client.watchPendingSessionInteractions('project', 'session', {
+      signal: abort.signal
+    })
+    const next = watcher.next()
+    await requestStarted
+    abort.abort()
+    await expect(next).resolves.toMatchObject({ done: true })
+    expect(fetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('ends a watch on a scope error so it can be restarted from a fresh live snapshot', async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(response(200, { taskCapabilities: ['session-pending-interactions'] }))
+      .mockResolvedValueOnce(response(200, { data: [] }))
+      .mockResolvedValueOnce(response(404, { error: { code: 'session_not_found' } }))
+    const client = new OpenScienceClient({
+      baseUrl: 'http://localhost',
+      token: 'test',
+      fetch,
+      sleep: async () => {}
+    })
+    const watcher = client.watchPendingSessionInteractions('project', 'session')
+    await expect(watcher.next()).resolves.toMatchObject({ done: false })
+    await expect(watcher.next()).rejects.toMatchObject({ status: 404 })
+    expect(fetch).toHaveBeenCalledTimes(3)
   })
 
   it('uses versioned endpoints for Doctor, Runtime, Session, Project-default, and Agent-routing reads', async () => {

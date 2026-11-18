@@ -102,7 +102,7 @@ test('runs a task with project defaults and reads the same result through a new 
     .toBe('complete')
 })
 
-test('observes an actual permission wait and cancels the Run', async ({ app }) => {
+test('watches a permission wait appear and clear when the Run is cancelled', async ({ app }) => {
   await app.configureFakeAgent()
   const client = await connect(app)
   const project = await client.createProject({ name: 'SDK interaction verification' })
@@ -111,21 +111,36 @@ test('observes an actual permission wait and cancels the Run', async ({ app }) =
     prompt: 'Request fixture permission.',
     permissionProfile: 'ask'
   })
+  let cancelled = false
+  let cleared = false
   try {
-    await expect
-      .poll(() => client.listPendingSessionInteractions(project.id, run.sessionId))
-      .toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            kind: 'permission',
-            status: 'pending',
-            projectId: project.id,
-            sessionId: run.sessionId
-          })
-        ])
-      )
+    const watch = client.watchPendingSessionInteractions(project.id, run.sessionId, {
+      signal: AbortSignal.timeout(20_000),
+      pollIntervalMs: 100
+    })
+    for await (const snapshot of watch) {
+      if (cancelled && snapshot.length === 0) {
+        cleared = true
+        break
+      }
+      if (
+        !cancelled &&
+        snapshot.some(
+          ({ kind, status, projectId, sessionId }) =>
+            kind === 'permission' &&
+            status === 'pending' &&
+            projectId === project.id &&
+            sessionId === run.sessionId
+        )
+      ) {
+        await client.cancelRun(run.id)
+        cancelled = true
+      }
+    }
+    expect(cancelled).toBe(true)
+    expect(cleared).toBe(true)
   } finally {
-    await client.cancelRun(run.id)
+    if (!cancelled) await client.cancelRun(run.id)
   }
   expect((await client.waitForRun(run.id, { timeoutMs: 30_000 })).status).toBe('cancelled')
 })

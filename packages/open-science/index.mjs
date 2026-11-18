@@ -1,10 +1,10 @@
 /* eslint-disable @typescript-eslint/explicit-function-return-type */
 
 import { Buffer } from 'node:buffer'
+import { setTimeout as delay } from 'node:timers/promises'
 import { findServiceState, readWebToken } from './config-root.mjs'
 
-const defaultSleep = (milliseconds) =>
-  new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds))
+const defaultSleep = (milliseconds, signal) => delay(milliseconds, undefined, { signal })
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
 const PACKAGE_REQUEST_TIMEOUT_MS = 60 * 60 * 1_000
@@ -12,6 +12,7 @@ const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 30_000
 const EVENT_RECONNECT_DELAY_MS = 100
 const MAX_BUFFERED_EVENTS = 1_024
 const MAX_RUN_ATTACHMENT_BYTES = 8 * 1024 * 1024
+const DEFAULT_INTERACTION_POLL_INTERVAL_MS = 1_000
 const TASK_EVENT_STREAM_PROTOCOL_VERSION = 1
 const NORMAL_EVENT_STREAM_CLOSE_CODES = new Set([1000])
 const FAILED_EVENT_STREAM_CLOSE_CODES = new Set([1002, 1003, 1007, 1008, 1009])
@@ -41,6 +42,9 @@ const beforeDeadline = (options, deadline) => {
     throw new OpenScienceApiError('Open-Science operation timed out.', { code: 'timeout' })
   return { ...options, timeoutMs: Math.min(options?.timeoutMs ?? remaining, remaining) }
 }
+
+const pendingSessionInteractionsPath = (projectId, sessionId) =>
+  `/api/v1/projects/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(sessionId)}/pending-interactions`
 
 const createRequestLifecycle = ({ defaultTimeoutMs, signal, timeoutMs }) => {
   signal?.throwIfAborted()
@@ -132,6 +136,10 @@ const wrapResponseBodyLifecycle = (response, lifecycle) => {
 
 const sleepWithSignal = async (sleep, milliseconds, signal) => {
   signal?.throwIfAborted()
+  if (sleep === defaultSleep) {
+    await sleep(milliseconds, signal)
+    return
+  }
   if (!signal) {
     await sleep(milliseconds)
     return
@@ -391,9 +399,45 @@ export class OpenScienceClient {
       })
     }
     return this.request(
-      `/api/v1/projects/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(sessionId)}/pending-interactions`,
+      pendingSessionInteractionsPath(projectId, sessionId),
       beforeDeadline(options, deadline)
     )
+  }
+
+  async *watchPendingSessionInteractions(
+    projectId,
+    sessionId,
+    { pollIntervalMs = DEFAULT_INTERACTION_POLL_INTERVAL_MS, signal, timeoutMs } = {}
+  ) {
+    if (!Number.isInteger(pollIntervalMs) || pollIntervalMs < 1 || pollIntervalMs > 2_147_483_647) {
+      throw new TypeError('pollIntervalMs must be a positive timer interval in milliseconds.')
+    }
+    if (signal?.aborted) return
+
+    const path = pendingSessionInteractionsPath(projectId, sessionId)
+    const options = { signal, timeoutMs }
+    let previous
+    try {
+      let snapshot = await this.listPendingSessionInteractions(projectId, sessionId, options)
+      while (!signal?.aborted) {
+        if (!Array.isArray(snapshot) || snapshot.some((entry) => typeof entry?.id !== 'string')) {
+          throw new OpenScienceApiError('Invalid pending interaction snapshot.', {
+            code: 'invalid_response'
+          })
+        }
+        const fingerprint = JSON.stringify(
+          [...snapshot].sort((left, right) => left.id.localeCompare(right.id))
+        )
+        if (fingerprint !== previous) {
+          previous = fingerprint
+          yield snapshot
+        }
+        await sleepWithSignal(this.sleep, pollIntervalMs, signal)
+        snapshot = await this.request(path, options)
+      }
+    } catch (error) {
+      if (!signal?.aborted) throw error
+    }
   }
 
   getSessionHistory(projectId, sessionId, query = {}, options) {

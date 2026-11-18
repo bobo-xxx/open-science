@@ -170,6 +170,13 @@ metadata, such as a question's field count or the Compute operation. Requests di
 the list when the owner settles them. An older server returns `unsupported_capability`.
 Complete the interaction in Desktop or Web. Plan First still uses the Plan API.
 
+Use `watchPendingSessionInteractions(projectId, sessionId, { signal })` for a stream of
+snapshots. It yields the initial list, then yields again when the list changes, including an
+empty list when all waits clear. The SDK polls the scoped endpoint every second by default.
+Use `pollIntervalMs` to set the interval and `timeoutMs` to set the request deadline. Breaking
+the loop or aborting the signal stops observation. A failed read ends the stream, and a new
+watch starts from the current snapshot. Changes between polls can be coalesced.
+
 This list reflects live application owners. Detached waits after a restart and delegated
 structured questions stored only in the Session are outside the current projection. Review
 the Session in Desktop or Web for those interactions.
