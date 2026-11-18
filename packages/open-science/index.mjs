@@ -440,6 +440,73 @@ export class OpenScienceClient {
     }
   }
 
+  async createComputeConfirmationChallenge(
+    projectId,
+    sessionId,
+    interactionId,
+    { hostId, issuedAt, signature },
+    options
+  ) {
+    const challenge = await this.#postComputeConfirmation(
+      projectId,
+      sessionId,
+      interactionId,
+      'challenge',
+      { hostId, issuedAt, signature },
+      options
+    )
+    if (
+      typeof challenge?.id !== 'string' ||
+      !challenge.id ||
+      !Number.isSafeInteger(challenge.expiresAt) ||
+      challenge.expiresAt <= 0 ||
+      typeof challenge.envelope !== 'string' ||
+      !/^[A-Za-z0-9_-]+$/.test(challenge.envelope)
+    ) {
+      throw new OpenScienceApiError('Invalid Compute confirmation challenge.', {
+        code: 'invalid_response'
+      })
+    }
+    return challenge
+  }
+
+  async submitComputeConfirmationDecision(
+    projectId,
+    sessionId,
+    interactionId,
+    { challengeId, decision, signature },
+    options
+  ) {
+    const receipt = await this.#postComputeConfirmation(
+      projectId,
+      sessionId,
+      interactionId,
+      'decision',
+      { challengeId, decision, signature },
+      options
+    )
+    if (receipt?.status !== 'claimed') {
+      throw new OpenScienceApiError('Invalid Compute confirmation receipt.', {
+        code: 'invalid_response'
+      })
+    }
+    return receipt
+  }
+
+  async #postComputeConfirmation(projectId, sessionId, interactionId, action, body, options) {
+    const deadline = Date.now() + resolveRequestTimeout(this.requestTimeoutMs, options?.timeoutMs)
+    const capabilities = await this.getCapabilities(beforeDeadline(options, deadline))
+    if (!capabilities.taskCapabilities.includes('trusted-compute-decisions')) {
+      throw new OpenScienceApiError('This server does not support trusted Compute confirmations.', {
+        code: 'unsupported_capability'
+      })
+    }
+    return this.request(
+      `${pendingSessionInteractionsPath(projectId, sessionId)}/${encodeURIComponent(interactionId)}/${action}`,
+      { ...beforeDeadline(options, deadline), method: 'POST', body }
+    )
+  }
+
   getSessionHistory(projectId, sessionId, query = {}, options) {
     const params = new URLSearchParams()
     if (query.beforeCursor !== undefined) params.set('beforeCursor', query.beforeCursor)

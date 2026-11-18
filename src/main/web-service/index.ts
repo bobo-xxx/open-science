@@ -233,6 +233,7 @@ const createWebServiceController = (
         try {
           await server.close()
         } finally {
+          tasks.resetTrustedComputeDecisions()
           await removeState(configRoot)
         }
       }

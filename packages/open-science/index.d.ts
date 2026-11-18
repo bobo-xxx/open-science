@@ -694,6 +694,33 @@ export type PendingSessionInteraction = Readonly<
   )
 >
 
+export type ComputeConfirmationDecision = 'deny' | 'once' | 'session' | 'project' | 'global'
+
+export type ComputeConfirmationChallengeRequest = Readonly<{
+  hostId: string
+  /** Unix time in milliseconds used in the isolated signer's read signature. */
+  issuedAt: number
+  /** Unpadded base64url Ed25519 signature. */
+  signature: string
+}>
+
+export type ComputeConfirmationChallenge = Readonly<{
+  id: string
+  /** Unix time in milliseconds. */
+  expiresAt: number
+  /** Base64url-encoded UTF-8 JSON. Preserve this exact string when signing the decision. */
+  envelope: string
+}>
+
+export type ComputeConfirmationProof = Readonly<{
+  challengeId: string
+  decision: ComputeConfirmationDecision
+  /** Unpadded base64url Ed25519 signature from the isolated signer after user confirmation. */
+  signature: string
+}>
+
+export type ComputeConfirmationReceipt = Readonly<{ status: 'claimed' }>
+
 export type SessionHistoryPage = {
   projectId: string
   sessionId: string
@@ -806,6 +833,22 @@ export class OpenScienceClient {
     sessionId: string,
     options?: Pick<RequestOptions, 'signal' | 'timeoutMs'> & { pollIntervalMs?: number }
   ): AsyncGenerator<readonly PendingSessionInteraction[], void, unknown>
+  /** Get the disclosure with a signed read from an enrolled trusted host. Preview. */
+  createComputeConfirmationChallenge(
+    projectId: string,
+    sessionId: string,
+    interactionId: string,
+    request: ComputeConfirmationChallengeRequest,
+    options?: RequestOptions
+  ): Promise<ComputeConfirmationChallenge>
+  /** Submit the isolated host signer's decision. The receipt records the claim. Preview. */
+  submitComputeConfirmationDecision(
+    projectId: string,
+    sessionId: string,
+    interactionId: string,
+    proof: ComputeConfirmationProof,
+    options?: RequestOptions
+  ): Promise<ComputeConfirmationReceipt>
   getSessionHistory(
     projectId: string,
     sessionId: string,

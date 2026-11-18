@@ -1,5 +1,6 @@
 import { composeHandoff } from './composition/handoff'
 import { specialistDesktopCommandGroup } from './specialist/desktop-commands'
+import { generateKeyPairSync } from 'node:crypto'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -47,6 +48,7 @@ import { ManagedPreviewResources } from './managed-preview-resources'
 import { LocalFsService } from './local-fs/service'
 import { HeadlessTaskApi } from './web-service/task-api'
 import type { ManagedPreviewResource, ManagedPreviewRangeResult } from '../shared/preview-resources'
+import { createTrustedHostKeyRegistry } from './tasks/trusted-host-key-registry'
 
 const EMPTY_OWNER = Object.freeze({})
 
@@ -355,6 +357,10 @@ describe('application command composition', () => {
       'tags:set-assignment',
       'tags:snapshot',
       'tags:update',
+      'trusted-hosts:enroll',
+      'trusted-hosts:list',
+      'trusted-hosts:review',
+      'trusted-hosts:revoke',
       'uploads:finalize-session',
       'uploads:recover-draft'
     ])
@@ -364,6 +370,75 @@ describe('application command composition', () => {
     const composition = createApplicationCommandComposition(dependencies())
 
     expect(composition.localWeb.commandNames()).toEqual(expectedLocalWebCommands())
+  })
+
+  it('admits a reviewed trusted host key through local Web and permits Desktop revocation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'open-science-trusted-host-commands-'))
+    const trustedHostKeys = await createTrustedHostKeyRegistry(root)
+    const composition = createApplicationCommandComposition({ ...dependencies(), trustedHostKeys })
+    try {
+      const base = invocation()
+      const publicKey = generateKeyPairSync('ed25519').publicKey.export({ format: 'jwk' }).x!
+      const input = { label: 'Host adapter', publicKey }
+      const review = trustedHostKeys.review(base.callerContext, input)
+      await expect(
+        composition.localWeb.invoke('trusted-hosts:review', { ...base, args: [input] })
+      ).resolves.toEqual(review)
+      await expect(
+        composition.localWeb.invoke('trusted-hosts:enroll', {
+          ...base,
+          args: [{ ...review, fingerprint: '0'.repeat(64) }]
+        })
+      ).rejects.toMatchObject({ code: 'invalid-command-arguments' })
+      expect(trustedHostKeys.list(base.callerContext)).toEqual([])
+
+      for (const blocked of [composition.task, composition.remoteWeb]) {
+        await expect(
+          blocked.invoke('trusted-hosts:enroll', { ...base, args: [review] })
+        ).rejects.toMatchObject({
+          code: 'command-unavailable'
+        })
+      }
+      const automation = createCallerContext({
+        ...base.callerContext,
+        principalKind: 'automation',
+        actionOrigin: 'automation'
+      })
+      await expect(
+        composition.localWeb.invoke('trusted-hosts:enroll', {
+          ...base,
+          callerContext: automation,
+          args: [review]
+        })
+      ).rejects.toThrow('current local user')
+
+      const expiring = new AbortController()
+      const enrollment = composition.localWeb.invoke('trusted-hosts:enroll', {
+        ...base,
+        callerLease: { ...base.callerLease, signal: expiring.signal },
+        args: [review]
+      })
+      queueMicrotask(() => expiring.abort())
+      await expect(enrollment).rejects.toThrow('current local user')
+      expect(trustedHostKeys.list(base.callerContext)).toEqual([])
+
+      await expect(
+        composition.localWeb.invoke('trusted-hosts:enroll', { ...base, args: [review] })
+      ).resolves.toMatchObject(review)
+      const [enrolled] = trustedHostKeys.list(base.callerContext)
+      expect(trustedHostKeys.resolve(enrolled.id)).toBeDefined()
+      await expect(
+        composition.electron.invoke('trusted-hosts:revoke', {
+          ...base,
+          callerContext: createCallerContext({ ...base.callerContext, surface: 'electron' }),
+          args: [enrolled.id]
+        })
+      ).resolves.toBe(true)
+      expect(trustedHostKeys.resolve(enrolled.id)).toBeUndefined()
+    } finally {
+      await composition.dispose()
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('keeps research film generation and export desktop-only without conversation progress', async () => {

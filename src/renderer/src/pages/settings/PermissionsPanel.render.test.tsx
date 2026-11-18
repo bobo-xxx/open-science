@@ -25,6 +25,7 @@ import { i18next } from '@/i18n'
 import { usePermissionGrantsStore } from '@/stores/permission-grants-store'
 import { useSettingsStore } from '@/stores/settings-store'
 import { PermissionsPanel } from './PermissionsPanel'
+import { WEB_CALLER_LOCATION_ATTRIBUTE } from '../../../../shared/web-caller-location'
 
 let container: HTMLDivElement
 let root: Root
@@ -96,6 +97,68 @@ const setPermissionApi = (api: Partial<Window['api']['permissions']>): void => {
 }
 
 describe('PermissionsPanel', () => {
+  it('shows the full trusted host key fingerprint before a separate enrollment action', async () => {
+    setPermissionApi({ list: vi.fn().mockResolvedValue(snapshot) })
+    const review = { label: 'Host adapter', publicKey: 'A'.repeat(43), fingerprint: 'a'.repeat(64) }
+    const enrolled = { ...review, id: 'registration-id', createdAt: 1 }
+    const trustedHosts = {
+      list: vi.fn().mockResolvedValue([]),
+      review: vi.fn().mockResolvedValue(review),
+      enroll: vi.fn().mockResolvedValue(enrolled),
+      revoke: vi.fn().mockResolvedValue(true)
+    }
+    Object.defineProperty(window.api, 'trustedHosts', { value: trustedHosts })
+    document.documentElement.setAttribute(WEB_CALLER_LOCATION_ATTRIBUTE, 'local')
+    const click = async (text: string): Promise<void> => {
+      const button = Array.from(container.querySelectorAll('button')).find(
+        (candidate) => candidate.textContent === text
+      )
+      expect(button).toBeDefined()
+      await act(async () => button!.click())
+    }
+    try {
+      await act(async () => root.render(<PermissionsPanel />))
+      expect(container.textContent).toContain('No trusted hosts registered.')
+      await click('Register host')
+      const panel = Array.from(container.querySelectorAll('section')).find(
+        (section) => section.querySelector('h3')?.textContent === 'Trusted hosts'
+      )!
+      const inputs = panel.querySelectorAll('input')
+      const setInput = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+      await act(async () => {
+        for (const [index, value] of [review.label, review.publicKey].entries()) {
+          setInput?.call(inputs[index], value)
+          inputs[index].dispatchEvent(new Event('input', { bubbles: true }))
+        }
+      })
+      await click('Review host key')
+      expect(panel.textContent).toContain(review.label)
+      expect(panel.textContent).toContain(review.fingerprint)
+      expect(trustedHosts.enroll).not.toHaveBeenCalled()
+      await click('Confirm host registration')
+      expect(trustedHosts.enroll).toHaveBeenCalledWith(review)
+      expect(panel.textContent).toContain(enrolled.id)
+      await click('Revoke host')
+      expect(trustedHosts.revoke).toHaveBeenCalledWith(enrolled.id)
+      expect(panel.textContent).toContain('No trusted hosts registered.')
+    } finally {
+      document.documentElement.removeAttribute(WEB_CALLER_LOCATION_ATTRIBUTE)
+    }
+  })
+
+  it('does not access trusted host management from remote Web', async () => {
+    setPermissionApi({ list: vi.fn().mockResolvedValue(snapshot) })
+    const list = vi.fn()
+    Object.defineProperty(window.api, 'trustedHosts', { value: { list } })
+    document.documentElement.setAttribute(WEB_CALLER_LOCATION_ATTRIBUTE, 'remote')
+    try {
+      await act(async () => root.render(<PermissionsPanel />))
+      expect(container.textContent).not.toContain('Trusted hosts')
+      expect(list).not.toHaveBeenCalled()
+    } finally {
+      document.documentElement.removeAttribute(WEB_CALLER_LOCATION_ATTRIBUTE)
+    }
+  })
   it('explains optional native Windows protection separately from the WSL2 folder switch', async () => {
     setPermissionApi({ list: vi.fn().mockResolvedValue(snapshot) })
     Object.defineProperty(window.api, 'platform', { value: 'win32', configurable: true })

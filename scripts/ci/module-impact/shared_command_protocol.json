@@ -2,6 +2,7 @@
   "ownerPaths": [
     "src/shared/application-command-contract.test.ts",
     "src/shared/application-command-contract.ts",
+    "src/shared/trusted-host-keys.ts",
     "src/shared/local-models.test.ts",
     "src/shared/renderer-contracts/definition.test.ts",
     "src/shared/renderer-contracts/definition.ts"
@@ -12,6 +13,7 @@
     "src/shared/annotations.ts",
     "src/shared/app-config.ts",
     "src/shared/application-command-contract.ts",
+    "src/shared/trusted-host-keys.ts",
     "src/shared/background-result-delivery.ts",
     "src/shared/bookmarks.ts",
     "src/shared/bootstrap.ts",

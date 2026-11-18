@@ -29,6 +29,7 @@ import * as settingsSkills from './renderer-contracts/settings-skills'
 import * as settingsPreferences from './renderer-contracts/settings-preferences'
 import * as specialist from './renderer-contracts/specialist'
 import * as storage from './renderer-contracts/storage'
+import * as trustedHosts from './renderer-contracts/trusted-hosts'
 import * as update from './renderer-contracts/update'
 import * as window from './renderer-contracts/window'
 
@@ -131,6 +132,7 @@ export const RENDERER_API_CONTRACT = composeRendererApiContract(
   projects.scheduleContracts,
   previews.pdfAnnotationsListContracts,
   projects.tagsCreateContracts,
+  trustedHosts.contracts,
   update.updateApplyContracts,
   previews.pdfStructureReadCachedContracts,
   runtime.localModelsGetSnapshotContracts,
@@ -199,6 +201,7 @@ const RENDERER_CAPABILITY_ORDER = Object.freeze([
   'projects',
   'tags',
   'remote-access',
+  'trusted-hosts',
   'reviewer',
   'runtime',
   'sessions',

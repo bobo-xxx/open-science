@@ -7,13 +7,20 @@
     "src/main/tasks/task-runner.test.ts",
     "src/main/tasks/task-runner.ts",
     "src/main/tasks/task-submissions.test.ts",
-    "src/main/tasks/task-submissions.ts"
+    "src/main/tasks/task-submissions.ts",
+    "src/main/tasks/trusted-interaction-decisions.test.ts",
+    "src/main/tasks/trusted-interaction-decisions.ts",
+    "src/main/tasks/trusted-host-key-commands.ts",
+    "src/main/tasks/trusted-host-key-registry.test.ts",
+    "src/main/tasks/trusted-host-key-registry.ts"
   ],
   "interfacePaths": [
     "src/main/tasks/task-control-ports.ts",
     "src/main/tasks/task-run-journal.ts",
     "src/main/tasks/task-runner.ts",
-    "src/main/tasks/task-submissions.ts"
+    "src/main/tasks/task-submissions.ts",
+    "src/main/tasks/trusted-host-key-commands.ts",
+    "src/main/tasks/trusted-host-key-registry.ts"
   ],
   "consumerModules": [],
   "testFiles": {
@@ -21,7 +28,9 @@
       "src/main/tasks/task-control-ports.test.ts",
       "src/main/tasks/task-run-journal.test.ts",
       "src/main/tasks/task-runner.test.ts",
-      "src/main/tasks/task-submissions.test.ts"
+      "src/main/tasks/task-submissions.test.ts",
+      "src/main/tasks/trusted-interaction-decisions.test.ts",
+      "src/main/tasks/trusted-host-key-registry.test.ts"
     ],
     "contract": [
       "src/preload/index.test.ts",

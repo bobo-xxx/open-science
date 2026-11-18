@@ -650,6 +650,10 @@ describe('renderer contract catalog', () => {
       'tags.setAssignment',
       'tags.snapshot',
       'tags.update',
+      'trustedHosts.enroll',
+      'trustedHosts.list',
+      'trustedHosts.review',
+      'trustedHosts.revoke',
       'uploads.finalizeSession',
       'uploads.recoverDraft'
     ])
@@ -765,6 +769,10 @@ describe('renderer contract catalog', () => {
       'tags:set-assignment',
       'tags:snapshot',
       'tags:update',
+      'trusted-hosts:enroll',
+      'trusted-hosts:list',
+      'trusted-hosts:review',
+      'trusted-hosts:revoke',
       'uploads:finalize-session',
       'uploads:recover-draft'
     ])

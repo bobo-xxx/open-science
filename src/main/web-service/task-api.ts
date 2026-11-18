@@ -5,6 +5,7 @@ import type { CliLauncherStatus } from '../../shared/cli'
 import { ApplicationCommandError } from '../../shared/application-command-contract'
 
 import type { AcpRuntimeEvent } from '../../shared/acp'
+import type { ComputeApprovalDecision } from '../../shared/compute'
 import type { ArtifactVersionDescriptor } from '../../shared/artifact-provenance'
 import type {
   FinalizeRunArtifactsRequest,
@@ -77,7 +78,13 @@ import { createApplicationCommandClient } from '../application-command-client'
 import type { ApplicationCommandByNameDispatcher } from '../application-command-composition-contract'
 import { createTaskCallerContext, type CallerContext } from '../caller-context'
 import type { PlanResponseResult } from '../session-plan/plan-service'
-import type { TaskControlPorts } from '../tasks/task-control-ports'
+import type {
+  ConfirmationChallenge,
+  ConfirmationRead,
+  InteractionScope,
+  SignedConfirmation,
+  TaskControlPorts
+} from '../tasks/task-control-ports'
 import { TaskSubmissions } from '../tasks/task-submissions'
 import type { TaskRunJournal } from '../tasks/task-run-journal'
 import {
@@ -561,6 +568,63 @@ class HeadlessTaskApi {
       throw new TaskRunnerError('session_not_found', 'Session not found in this project.')
     }
     return interactions
+  }
+
+  supportsTrustedComputeDecisions(): boolean {
+    return this.ports.controls?.trustedCompute !== undefined
+  }
+
+  resetTrustedComputeDecisions(): void {
+    this.ports.controls?.trustedCompute?.reset()
+  }
+
+  async createComputeConfirmationChallenge(
+    scope: InteractionScope,
+    read: ConfirmationRead
+  ): Promise<ConfirmationChallenge> {
+    const { port, isCurrent } = this.trustedComputePort()
+    const challenge = await port.issue(scope, read, isCurrent)
+    if (!challenge) {
+      throw new TaskRunnerError(
+        'trusted_confirmation_unavailable',
+        'The trusted confirmation request is unavailable.'
+      )
+    }
+    return challenge
+  }
+
+  async submitComputeConfirmationDecision(
+    scope: InteractionScope,
+    proof: SignedConfirmation<ComputeApprovalDecision>
+  ): Promise<{ status: 'claimed' }> {
+    const { port, isCurrent } = this.trustedComputePort()
+    const state = await port.claim(scope, proof, isCurrent)
+    if (state === 'claimed') return { status: 'claimed' }
+    if (state === 'invalid-proof') {
+      throw new TaskRunnerError('invalid_confirmation_proof', 'Invalid confirmation signature.')
+    }
+    if (state === 'invalid-decision') {
+      throw new TaskRunnerError('invalid_request', 'That decision is unavailable for this request.')
+    }
+    throw new TaskRunnerError(
+      'trusted_confirmation_unavailable',
+      'The trusted confirmation request is unavailable.'
+    )
+  }
+
+  private trustedComputePort(): {
+    port: NonNullable<TaskControlPorts['trustedCompute']>
+    isCurrent: () => boolean
+  } {
+    const context = this.currentCallerContext()
+    const port = this.ports.controls?.trustedCompute
+    if (!port || context.location !== 'local' || !context.isAuthorizationCurrent()) {
+      throw new TaskRunnerError(
+        'trusted_compute_decisions_unavailable',
+        'Trusted Compute confirmations require local SDK access.'
+      )
+    }
+    return { port, isCurrent: context.isAuthorizationCurrent }
   }
 
   async getSessionHistory(input: LoadSessionHistoryPageRequest): Promise<TaskSessionHistoryPage> {

@@ -132,6 +132,11 @@ import {
   tagApplicationCommandGroup,
   type TagCommandOwner
 } from './tags/application-commands'
+import {
+  registerTrustedHostKeyCommands,
+  trustedHostKeyCommandGroup
+} from './tasks/trusted-host-key-commands'
+import type { TrustedHostKeyRegistry } from './tasks/trusted-host-key-registry'
 
 type AnyApplicationCommand = ApplicationCommand<string, readonly unknown[], unknown>
 type AnyApplicationCommandGroup = ApplicationCommandGroup<string, readonly AnyApplicationCommand[]>
@@ -171,6 +176,7 @@ type ApplicationCommandCompositionDependencies = Readonly<{
   pdfAnnotations: PdfAnnotationCommandOwner
   dataContent: DataContentApplicationCommandDependencies
   host: Omit<HostApplicationCommandDependencies, 'remoteAccess'>
+  trustedHostKeys?: TrustedHostKeyRegistry
 }>
 
 const ELECTRON_NATIVE_COMMAND_NAMES = Object.freeze([
@@ -403,6 +409,9 @@ const createApplicationCommandModules = (
     ),
     defineApplicationCommandModule([permissionGrantApplicationCommandGroup], (registrar) =>
       registerPermissionGrantApplicationCommands(registrar, dependencies.permissionGrants)
+    ),
+    defineApplicationCommandModule([trustedHostKeyCommandGroup], (registrar) =>
+      registerTrustedHostKeyCommands(registrar, dependencies.trustedHostKeys)
     ),
     defineApplicationCommandModule([tagApplicationCommandGroup], (registrar) =>
       registerTagApplicationCommands(registrar, dependencies.tags)

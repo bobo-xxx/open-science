@@ -69,6 +69,7 @@
     "src/renderer/src/pages/settings/TagsPanel.tsx",
     "src/renderer/src/pages/settings/TokenUsagePanel.render.test.tsx",
     "src/renderer/src/pages/settings/TokenUsagePanel.tsx",
+    "src/renderer/src/pages/settings/TrustedHostsSection.tsx",
     "src/renderer/src/pages/settings/TokenUsageBars.tsx",
     "src/renderer/src/pages/settings/UninstallRuntimeDialog.render.test.tsx",
     "src/renderer/src/pages/settings/UninstallRuntimeDialog.tsx",

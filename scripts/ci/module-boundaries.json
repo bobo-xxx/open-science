@@ -5881,6 +5881,7 @@
         "src/renderer/src/pages/settings/SwitchFrameworkDialog.tsx",
         "src/renderer/src/pages/settings/TagsPanel.tsx",
         "src/renderer/src/pages/settings/TokenUsagePanel.tsx",
+        "src/renderer/src/pages/settings/TrustedHostsSection.tsx",
         "src/renderer/src/pages/settings/TokenUsageBars.tsx",
         "src/renderer/src/pages/settings/UninstallRuntimeDialog.tsx",
         "src/renderer/src/pages/settings/WslLocalShellSection.tsx",
@@ -5942,6 +5943,7 @@
         "src/renderer/src/pages/settings/SwitchFrameworkDialog.tsx": "presentation-adapter",
         "src/renderer/src/pages/settings/TagsPanel.tsx": "presentation-adapter",
         "src/renderer/src/pages/settings/TokenUsagePanel.tsx": "presentation-adapter",
+        "src/renderer/src/pages/settings/TrustedHostsSection.tsx": "presentation-adapter",
         "src/renderer/src/pages/settings/TokenUsageBars.tsx": "presentation-adapter",
         "src/renderer/src/pages/settings/UninstallRuntimeDialog.tsx": "presentation-adapter",
         "src/renderer/src/pages/settings/WslLocalShellSection.tsx": "presentation-adapter",
@@ -8425,17 +8427,22 @@
       "sources": [
         "src/main/tasks/task-control-ports.ts",
         "src/main/tasks/task-run-journal.ts",
-        "src/main/tasks/task-runner.ts"
+        "src/main/tasks/task-runner.ts",
+        "src/main/tasks/trusted-host-key-commands.ts",
+        "src/main/tasks/trusted-host-key-registry.ts"
       ],
       "layer": "application-service",
       "sourceLayers": {
         "src/main/tasks/task-control-ports.ts": "domain-contract",
-        "src/main/tasks/task-run-journal.ts": "repository"
+        "src/main/tasks/task-run-journal.ts": "repository",
+        "src/main/tasks/trusted-host-key-commands.ts": "command-adapter",
+        "src/main/tasks/trusted-host-key-registry.ts": "repository"
       },
       "consumerModules": [],
       "requiredTests": [
         "src/main/tasks/task-run-journal.test.ts",
         "src/main/tasks/task-runner.test.ts",
+        "src/main/tasks/trusted-host-key-registry.test.ts",
         "src/preload/index.test.ts",
         "src/renderer/web/api-installer.test.ts",
         "src/shared/renderer-contract-catalog.test.ts",
@@ -8444,6 +8451,7 @@
       "externalImports": [
         "@aipoch/diagnostics/node",
         "@aipoch/durable-files",
+        "node:crypto",
         "node:fs",
         "node:fs/promises",
         "node:path",

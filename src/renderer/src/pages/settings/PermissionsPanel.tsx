@@ -32,6 +32,7 @@ import { useSettingsStore } from '@/stores/settings-store'
 import { cn } from '@/lib/utils'
 import { RestoreDefaultPermissionsButton } from './RestoreDefaultPermissionsButton'
 import { SettingsIconAction, SettingsRow, SettingsSection } from './SettingsLayout'
+import { TrustedHostsSection } from './TrustedHostsSection'
 
 type ScopeFilter = 'all' | PermissionGrantScope['kind']
 
@@ -625,6 +626,7 @@ const PermissionsPanel = ({
           )}
         </div>
 
+        <TrustedHostsSection />
         <AlertDialog.Root open={confirmFullAccess} onOpenChange={setConfirmFullAccess}>
           <AlertDialog.Portal>
             <AlertDialog.Overlay className={cn(dialogOverlayClassName, 'z-[60]')} />

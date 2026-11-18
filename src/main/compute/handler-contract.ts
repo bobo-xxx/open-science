@@ -42,6 +42,7 @@ import type {
   ResetPasswordComputeHostResult
 } from '../../shared/compute'
 import type { DirListing, DownloadDest, LocalFile } from '../../shared/remote-fs'
+import type { ComputeApprovalBroker, ComputeApprovalScopeKey } from './compute-approval-broker'
 import type { DeleteComputeHostOptions } from './compute-host-deletion-owner'
 import type { ComputeService } from './compute-service'
 import type { ComputeConnectionBroker } from './connection-broker'
@@ -141,10 +142,11 @@ export type ComputeHandlers = {
   // Responds to a pending approval request from the renderer with a canonical app-owned scope.
   approvalRespond: (id: string, decision: ComputeApprovalDecision) => void
   approvalReplay: (id: string) => ComputeApprovalRequest | null
-  listPendingSessionApprovals: (scope: {
-    projectId: string
-    sessionId: string
-  }) => Array<Pick<ComputeApprovalRequest, 'id' | 'operation'>>
+  listPendingSessionApprovals: (
+    scope: ComputeApprovalScopeKey
+  ) => Array<Pick<ComputeApprovalRequest, 'id' | 'operation'>>
+  getPendingConfirmation: ComputeApprovalBroker['getPendingConfirmation']
+  claimPendingConfirmation: ComputeApprovalBroker['claimPendingConfirmation']
   approvalReplayPending: () => void
   approvalPauseSession: (sessionId: string) => void
   approvalResumeSession: (sessionId: string) => void

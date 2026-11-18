@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import type { AcpStateSnapshot } from '../../shared/acp'
-import type { ComputeApprovalRequest } from '../../shared/compute'
+import type { ComputeApprovalDecision, ComputeApprovalRequest } from '../../shared/compute'
 import { projectAnswerableDelegatedQuestions } from '../../shared/delegated-work-projection'
 import {
   projectPersistedSessionWaits,
@@ -11,6 +11,22 @@ import type {
   TaskPendingSessionInteraction,
   TaskSessionRuntimePermission
 } from '../../shared/task-api'
+
+type InteractionScope = Readonly<{
+  projectId: string
+  sessionId: string
+  interactionId: string
+}>
+
+type ConfirmationRead = Readonly<{ hostId: string; issuedAt: number; signature: string }>
+type SignedConfirmation<Decision> = Readonly<{
+  challengeId: string
+  decision: Decision
+  signature: string
+}>
+
+type ConfirmationClaim = 'claimed' | 'unavailable' | 'invalid-proof' | 'invalid-decision'
+type ConfirmationChallenge = Readonly<{ id: string; expiresAt: number; envelope: string }>
 
 type TaskInteractionScope = Pick<TaskPendingSessionInteraction, 'projectId' | 'sessionId'>
 type TaskPendingQuestion = { requestId: string; fieldCount: number }
@@ -23,6 +39,19 @@ type TaskControlPorts = {
     listSpecialists(): Promise<TaskConfigurationOptions['specialists']>
     listComputeHosts(): Promise<TaskConfigurationOptions['computeHosts']>
     runtimePermission(sessionId: string): TaskSessionRuntimePermission | undefined
+  }
+  trustedCompute?: {
+    issue(
+      scope: InteractionScope,
+      read: ConfirmationRead,
+      isCurrent: () => boolean
+    ): Promise<ConfirmationChallenge | undefined>
+    claim(
+      scope: InteractionScope,
+      proof: SignedConfirmation<ComputeApprovalDecision>,
+      isCurrent: () => boolean
+    ): Promise<ConfirmationClaim>
+    reset(): void
   }
   listPendingSessionInteractions?(
     scope: TaskInteractionScope
@@ -46,8 +75,17 @@ const projectDelegatedTaskQuestions = (session: PersistedChatSession): TaskPendi
   })
 }
 
-// Owner IDs are used only to correlate polls while an interaction remains pending. The public
-// projection excludes the inputs, option labels, commands, provider data and answer fields.
+const taskInteractionId = (
+  { projectId, sessionId }: TaskInteractionScope,
+  kind: TaskPendingSessionInteraction['kind'],
+  ownerId: string
+): string =>
+  createHash('sha256')
+    .update(JSON.stringify(['task-pending-interaction-v1', projectId, sessionId, kind, ownerId]))
+    .digest('hex')
+
+// Owner IDs correlate polls and resolve a scoped request. A trusted confirmation uses the complete
+// owner disclosure. The public projection excludes the inputs, option labels, commands, provider data and answer fields.
 const projectTaskPendingSessionInteractions = (
   { projectId, sessionId }: TaskInteractionScope,
   state: Pick<AcpStateSnapshot, 'pendingPermissions' | 'pendingElicitations'>,
@@ -58,9 +96,7 @@ const projectTaskPendingSessionInteractions = (
     kind: TaskPendingSessionInteraction['kind'],
     ownerId: string
   ): TaskInteractionScope & { id: string; status: 'pending' } => ({
-    id: createHash('sha256')
-      .update(JSON.stringify(['task-pending-interaction-v1', projectId, sessionId, kind, ownerId]))
-      .digest('hex'),
+    id: taskInteractionId({ projectId, sessionId }, kind, ownerId),
     projectId,
     sessionId,
     status: 'pending'
@@ -119,5 +155,12 @@ const projectTaskPendingSessionInteractions = (
   return [...pending.values()]
 }
 
-export { projectTaskPendingSessionInteractions }
-export type { TaskControlPorts }
+export { projectTaskPendingSessionInteractions, taskInteractionId }
+export type {
+  ConfirmationChallenge,
+  ConfirmationClaim,
+  ConfirmationRead,
+  InteractionScope,
+  SignedConfirmation,
+  TaskControlPorts
+}

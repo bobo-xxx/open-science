@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from 'node:crypto'
 import { externalComputeMode } from '../../shared/compute'
 import type {
   ComputeApprovalDecision,
@@ -23,6 +24,16 @@ export type ComputeApprovalContext = {
   // distinguishes a deleted host from a later host created with the same SSH alias.
   ownerId?: string
 }
+
+export type ComputeApprovalScopeKey = Pick<ComputeApprovalContext, 'projectId' | 'sessionId'>
+
+export type ComputePendingConfirmation = Readonly<{
+  request: ComputeApprovalRequest
+  version: string
+  allowedDecisions: readonly ComputeApprovalDecision[]
+}>
+
+export type ComputeConfirmationClaim = 'claimed' | 'stale' | 'invalid-decision'
 
 type ComputeApprovalBrokerDeps = {
   // Pushes a pending approval request to the renderer.
@@ -58,6 +69,7 @@ type ComputeApprovalBrokerDeps = {
 
 type PendingComputeApproval = {
   request: ComputeApprovalRequest
+  confirmationId: string
   resolve: (decision: ComputeApprovalDecision) => void
   timer?: ReturnType<typeof setTimeout>
   remainingMs: number
@@ -129,6 +141,7 @@ export class ComputeApprovalBroker {
     return new Promise<ComputeApprovalDecision>((resolve) => {
       const entry: PendingComputeApproval = {
         request,
+        confirmationId: randomUUID(),
         resolve,
         remainingMs: this.timeoutMs,
         providerId,
@@ -161,14 +174,73 @@ export class ComputeApprovalBroker {
   listPendingForSession({
     projectId,
     sessionId
-  }: Pick<ComputeApprovalContext, 'projectId' | 'sessionId'>): Array<
-    Pick<ComputeApprovalRequest, 'id' | 'operation'>
-  > {
+  }: ComputeApprovalScopeKey): Array<Pick<ComputeApprovalRequest, 'id' | 'operation'>> {
     return Array.from(this.pending.values()).flatMap(({ context, request }) =>
       context?.projectId === projectId && context.sessionId === sessionId
         ? [{ id: request.id, operation: request.operation }]
         : []
     )
+  }
+
+  getPendingConfirmation(
+    scope: ComputeApprovalScopeKey,
+    id: string
+  ): ComputePendingConfirmation | undefined {
+    const confirmation = this.pendingConfirmation(scope, id)
+    return confirmation && structuredClone(confirmation)
+  }
+
+  // Validates the server disclosure and claims the same entry Desktop and Web resolve.
+  // Claiming a decision does not imply that the subsequent grant or operation succeeded.
+  claimPendingConfirmation(
+    scope: ComputeApprovalScopeKey,
+    id: string,
+    version: string,
+    decision: ComputeApprovalDecision
+  ): ComputeConfirmationClaim {
+    const confirmation = this.pendingConfirmation(scope, id)
+    if (!confirmation || confirmation.version !== version) return 'stale'
+    if (!confirmation.allowedDecisions.includes(decision)) return 'invalid-decision'
+    return this.settle(id, decision) ? 'claimed' : 'stale'
+  }
+
+  private pendingConfirmation(
+    { projectId, sessionId }: ComputeApprovalScopeKey,
+    id: string
+  ): ComputePendingConfirmation | undefined {
+    const entry = this.pending.get(id)
+    const context = entry?.context
+    if (
+      !entry ||
+      !context ||
+      context.projectId !== projectId ||
+      context.sessionId !== sessionId ||
+      this.globalCancellationActive ||
+      this.cancellingSessions.has(sessionId) ||
+      this.invalidatingProviders.has(entry.providerId) ||
+      entry.signal?.aborted ||
+      entry.remainingMs <= 0 ||
+      (entry.timerStartedAt !== undefined && this.now() >= entry.timerStartedAt + entry.remainingMs)
+    ) {
+      return undefined
+    }
+
+    const request = { ...entry.request, session_id: sessionId }
+    // The native dialog restricts external submissions with file disclosures to one-time approval.
+    const oneTime =
+      request.operation === 'submit_job' &&
+      (externalComputeMode(entry.providerId) ||
+        request.kubernetes ||
+        request.hosted ||
+        request.ray ||
+        request.modal)
+    const allowedDecisions: ComputeApprovalDecision[] = oneTime
+      ? ['once', 'deny']
+      : ['once', 'session', 'project', 'global', 'deny']
+    const version = createHash('sha256')
+      .update(JSON.stringify([entry.confirmationId, context, request, allowedDecisions]))
+      .digest('hex')
+    return { request, version, allowedDecisions }
   }
 
   replayPending(): void {
@@ -333,7 +405,7 @@ export class ComputeApprovalBroker {
 
   // Called from the IPC handler when the renderer responds. Unknown ids are ignored.
   respond(id: string, decision: ComputeApprovalDecision): void {
-    this.settle(id, decision, decision === 'deny' ? 'rejected' : 'resolved')
+    this.settle(id, decision)
   }
 
   pauseSession(sessionId: string): void {
@@ -476,20 +548,23 @@ export class ComputeApprovalBroker {
   private settle(
     id: string,
     decision: ComputeApprovalDecision,
-    state: 'resolved' | 'rejected' | 'expired' | 'cancelled'
-  ): void {
+    state: 'resolved' | 'rejected' | 'expired' | 'cancelled' = decision === 'deny'
+      ? 'rejected'
+      : 'resolved'
+  ): boolean {
     const entry = this.pending.get(id)
-    if (!entry) return
+    if (!entry) return false
+    this.pending.delete(id)
     if (entry.timer !== undefined) this.clearTimer(entry.timer)
     if (entry.signal && entry.abortListener) {
       entry.signal.removeEventListener('abort', entry.abortListener)
     }
-    this.pending.delete(id)
     entry.resolve(decision)
     try {
       this.deps.onSettled?.(id, state)
     } catch {
       // Renderer/event projection cannot roll back the broker decision or keep the call parked.
     }
+    return true
   }
 }

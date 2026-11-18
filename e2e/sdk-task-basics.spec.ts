@@ -1,7 +1,9 @@
 import { expect } from '@playwright/test'
+import { createHash, generateKeyPairSync } from 'node:crypto'
 
 import type { OpenScienceClient } from '../packages/open-science/index'
 import { test, type ElectronApp } from './fixtures/electron-app'
+import { openSettingsPage } from './fixtures/settings-preferences'
 
 async function connect(app: ElectronApp): Promise<OpenScienceClient> {
   const sdkEntry = '../packages/open-science/index.mjs'
@@ -146,4 +148,42 @@ test('watches a permission wait appear and clear when the Run is cancelled', asy
     if (!cancelled) await client.cancelRun(run.id)
   }
   expect((await client.waitForRun(run.id, { timeoutMs: 30_000 })).status).toBe('cancelled')
+})
+
+test('reviews a trusted host key in Desktop and revokes it through local Web', async ({
+  app,
+  browser
+}) => {
+  const page = await app.completeOnboarding()
+  await page.evaluate(() => window.api.locale.setPreference({ preference: 'en' }))
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  const sdk = await connect(app)
+  expect((await sdk.getCapabilities()).taskCapabilities).toContain('trusted-compute-decisions')
+  expect(await sdk.health()).not.toHaveProperty('rpcChannels')
+
+  const { publicKey } = generateKeyPairSync('ed25519')
+  const rawKey = publicKey.export({ format: 'jwk' }).x
+  if (!rawKey) throw new Error('Ed25519 public key is missing.')
+  const fingerprint = createHash('sha256').update(Buffer.from(rawKey, 'base64url')).digest('hex')
+
+  const desktopSettings = await openSettingsPage(page, 'Permissions')
+  await desktopSettings.getByRole('button', { name: 'Register host', exact: true }).click()
+  await desktopSettings.getByRole('textbox', { name: 'Host component name' }).fill('Fixture host')
+  await desktopSettings.getByRole('textbox', { name: 'Ed25519 public key' }).fill(rawKey)
+  await desktopSettings.getByRole('button', { name: 'Review host key' }).click()
+  await expect(desktopSettings.getByText(fingerprint, { exact: true })).toBeVisible()
+  await desktopSettings.getByRole('button', { name: 'Confirm host registration' }).click()
+  await expect(desktopSettings.getByRole('button', { name: 'Revoke Fixture host' })).toBeVisible()
+
+  const web = await browser.newPage()
+  try {
+    await web.goto(await app.authenticatedWebUrl())
+    const webSettings = await openSettingsPage(web, 'Permissions')
+    await expect(webSettings.getByText(fingerprint, { exact: true })).toBeVisible()
+    await webSettings.getByRole('button', { name: 'Revoke Fixture host' }).click()
+    await expect(webSettings.getByText('No trusted hosts registered.')).toBeVisible()
+    await expect(page.evaluate(() => window.api.trustedHosts?.list())).resolves.toEqual([])
+  } finally {
+    await web.close()
+  }
 })

@@ -3,7 +3,7 @@ import { TaskSubmissions } from '../tasks/task-submissions'
 import { parseCliArgs, runTaskCommand } from '../../../packages/open-science/cli.mjs'
 // @ts-expect-error The published ESM entry uses a sibling index.d.ts.
 import { OpenScienceClient } from '../../../packages/open-science/index.mjs'
-import { createHash } from 'node:crypto'
+import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
 import { RemoteSessionPairingManager } from '../remote-access/pairing'
 import { RemoteAccessRepository } from '../remote-access/repository'
 import { requirePairingManager } from '../remote-access/ipc'
@@ -37,8 +37,22 @@ import {
 import { ApplicationEventHub } from '../application-events'
 import { toAcpRuntimeEvent } from '../acp/runtime-events'
 import type { CallerContext } from '../caller-context'
+import {
+  ComputeApprovalBroker,
+  type ComputeApprovalDecision
+} from '../compute/compute-approval-broker'
+import type { ComputeApprovalRequest, ComputeApprovalRequestInfo } from '../../shared/compute'
 import { createLogger, flushLogs, initLogger } from '@aipoch/diagnostics/node'
 import { PermissionApprovalPresence } from '../permission-approval-presence'
+import {
+  projectTaskPendingSessionInteractions,
+  taskInteractionId,
+  type ConfirmationChallenge,
+  type ConfirmationRead,
+  type InteractionScope,
+  type SignedConfirmation
+} from '../tasks/task-control-ports'
+import { TrustedInteractionDecisions } from '../tasks/trusted-interaction-decisions'
 import {
   REMOTE_LOCAL_ONLY_RPC_CHANNELS,
   startWebHttpServer,
@@ -4312,6 +4326,225 @@ describe('startWebHttpServer', () => {
       pending.projectId,
       pending.sessionId
     )
+  })
+
+  it('settles a signed SDK Compute approval once through the native owner', async () => {
+    const session = { projectId: 'project-trusted', sessionId: 'session-trusted' }
+    const ids = { first: 'approval-1', second: 'approval-2' }
+    const hostId = randomUUID()
+    const signer = generateKeyPairSync('ed25519')
+    const signText = (message: string): string =>
+      sign(null, Buffer.from(message, 'utf8'), signer.privateKey).toString('base64url')
+    const signRead = (interactionId: string): ConfirmationRead => {
+      const issuedAt = Date.now()
+      const message =
+        'Open Science trusted interaction read v1\n' +
+        JSON.stringify([
+          'compute-approval',
+          session.projectId,
+          session.sessionId,
+          interactionId,
+          hostId,
+          issuedAt
+        ])
+      return { hostId, issuedAt, signature: signText(message) }
+    }
+    const signDecision = (
+      { id, envelope }: ConfirmationChallenge,
+      decision: ComputeApprovalDecision
+    ): SignedConfirmation<ComputeApprovalDecision> => ({
+      challengeId: id,
+      decision,
+      signature: signText(
+        'Open Science trusted interaction decision v1\n' + envelope + '\n' + decision
+      )
+    })
+    const onSettled = vi.fn()
+    const broker = new ComputeApprovalBroker({
+      generateId: vi.fn().mockReturnValueOnce(ids.first).mockReturnValueOnce(ids.second),
+      broadcast: vi.fn(),
+      onSettled
+    })
+    const input: ComputeApprovalRequestInfo = {
+      operation: 'submit_job',
+      provider_id: 'ssh:test-host',
+      provider_name: 'Test Slurm host',
+      shape: 'scheduler_cluster',
+      intent: 'Compute sample statistics',
+      command_preview: 'python statistics.py',
+      command_full: 'python statistics.py --label "π"',
+      execution_mode: 'slurm',
+      remote_workdir: '/scratch/test-job',
+      timeout_seconds: 30,
+      resources: '--cpus-per-task=1'
+    }
+    const context = { ...session, ownerId: 'host-row-1', operation: input.operation }
+    const findApproval = (scope: InteractionScope): string | undefined =>
+      broker
+        .listPendingForSession(scope)
+        .find(({ id }) => taskInteractionId(scope, 'compute', id) === scope.interactionId)?.id
+    const trusted = new TrustedInteractionDecisions<
+      ComputeApprovalRequest,
+      ComputeApprovalDecision
+    >(
+      {
+        kind: 'compute-approval',
+        read(scope) {
+          const id = findApproval(scope)
+          const snapshot = id && broker.getPendingConfirmation(scope, id)
+          if (!snapshot) return undefined
+          return {
+            disclosure: snapshot.request,
+            version: snapshot.version,
+            allowedDecisions: snapshot.allowedDecisions
+          }
+        },
+        claim(scope, version, decision) {
+          const id = findApproval(scope)
+          if (!id) return 'unavailable'
+          const outcome = broker.claimPendingConfirmation(scope, id, version, decision)
+          return outcome === 'stale' ? 'unavailable' : outcome
+        }
+      },
+      (id) => (id === hostId ? signer.publicKey : undefined)
+    )
+    const tasks = new HeadlessTaskApi({
+      commands: { commandNames: () => [], invoke: vi.fn() },
+      agent: {} as never,
+      controls: {
+        specialists: { resolve: vi.fn() },
+        listPendingSessionInteractions: async (scope) =>
+          projectTaskPendingSessionInteractions(
+            scope,
+            { pendingPermissions: [] },
+            broker.listPendingForSession(scope)
+          ),
+        trustedCompute: {
+          issue: async (scope, read, isCurrent) =>
+            isCurrent() ? trusted.issue(scope, read) : undefined,
+          claim: async (scope, proof, isCurrent) =>
+            isCurrent() ? trusted.claim(scope, proof) : 'unavailable',
+          reset: () => trusted.reset()
+        }
+      }
+    })
+    const server = await startTestWebHttpServer({
+      host: '127.0.0.1',
+      port: 0,
+      token: 'test-web-token',
+      taskToken: 'test-task-token',
+      staticRoot: '/unused',
+      tasks,
+      rpc: { channels: () => [], invoke: vi.fn() },
+      bootstrap: {
+        appName: 'Open-Science',
+        appVersion: 'test',
+        configRoot: '/unused',
+        platform: 'test',
+        versions: { node: 'test' }
+      }
+    })
+    servers.push(server)
+    const baseUrl = `http://127.0.0.1:${server.port}`
+    const token = 'test-task-token'
+    const client = new OpenScienceClient({ baseUrl, token })
+    const sessionArgs = [session.projectId, session.sessionId] as const
+    try {
+      const firstOutcome = broker.requestWithContext(input, context)
+      const interactionId = taskInteractionId(session, 'compute', ids.first)
+      const args = [...sessionArgs, interactionId] as const
+      const challengeUrl = `${baseUrl}/api/v1/projects/${session.projectId}/sessions/${session.sessionId}/pending-interactions/${interactionId}/challenge`
+      const read = signRead(interactionId)
+
+      await expect(client.getCapabilities()).resolves.toMatchObject({
+        taskCapabilities: expect.arrayContaining(['trusted-compute-decisions'])
+      })
+      await expect(client.listPendingSessionInteractions(...sessionArgs)).resolves.toEqual([
+        {
+          ...session,
+          id: interactionId,
+          kind: 'compute',
+          status: 'pending',
+          operation: 'submit_job'
+        }
+      ])
+      const unauthorized = await fetch(challengeUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(read)
+      })
+      expect(unauthorized.status).toBe(401)
+      await expect(
+        client.createComputeConfirmationChallenge(...args, { ...read, signature: 'bad' })
+      ).rejects.toMatchObject({ status: 400, code: 'invalid_request' })
+      await expect(
+        client.createComputeConfirmationChallenge(...args, {
+          ...read,
+          signature: Buffer.alloc(64).toString('base64url')
+        })
+      ).rejects.toMatchObject({ status: 409, code: 'trusted_confirmation_unavailable' })
+
+      const challenge: ConfirmationChallenge = await client.createComputeConfirmationChallenge(
+        ...args,
+        read
+      )
+      expect(JSON.parse(Buffer.from(challenge.envelope, 'base64url').toString('utf8'))).toEqual({
+        ...session,
+        interactionId,
+        kind: 'compute-approval',
+        version: 1,
+        serviceGeneration: expect.any(String),
+        id: challenge.id,
+        hostId,
+        expiresAt: challenge.expiresAt,
+        contentVersion: expect.any(String),
+        disclosure: { ...input, id: ids.first, session_id: session.sessionId },
+        allowedDecisions: ['once', 'session', 'project', 'global', 'deny']
+      })
+      const proof = signDecision(challenge, 'once')
+      await expect(
+        client.submitComputeConfirmationDecision(...args, { ...proof, decision: 'global' })
+      ).rejects.toMatchObject({ status: 403, code: 'invalid_confirmation_proof' })
+      const competing = await Promise.allSettled([
+        client.submitComputeConfirmationDecision(...args, proof),
+        client.submitComputeConfirmationDecision(...args, proof)
+      ])
+      expect(competing).toEqual(
+        expect.arrayContaining([
+          { status: 'fulfilled', value: { status: 'claimed' } },
+          {
+            status: 'rejected',
+            reason: expect.objectContaining({
+              status: 409,
+              code: 'trusted_confirmation_unavailable'
+            })
+          }
+        ])
+      )
+      await expect(firstOutcome).resolves.toBe('once')
+      await expect(client.listPendingSessionInteractions(...sessionArgs)).resolves.toEqual([])
+
+      const secondOutcome = broker.requestWithContext(input, context)
+      const secondId = taskInteractionId(session, 'compute', ids.second)
+      const secondArgs = [...sessionArgs, secondId] as const
+      const secondChallenge: ConfirmationChallenge =
+        await client.createComputeConfirmationChallenge(...secondArgs, signRead(secondId))
+      broker.respond(ids.second, 'deny')
+      await expect(
+        client.submitComputeConfirmationDecision(
+          ...secondArgs,
+          signDecision(secondChallenge, 'once')
+        )
+      ).rejects.toMatchObject({ status: 409, code: 'trusted_confirmation_unavailable' })
+      await expect(secondOutcome).resolves.toBe('deny')
+      expect(onSettled.mock.calls).toEqual([
+        [ids.first, 'resolved'],
+        [ids.second, 'rejected']
+      ])
+    } finally {
+      broker.cancelAll()
+      await tasks.dispose()
+    }
   })
 
   it('uses the authenticated SDK review routes and admits an exact retry only once', async () => {

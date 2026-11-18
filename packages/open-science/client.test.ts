@@ -6,7 +6,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { PUBLIC_TERMINAL_FIXTURE } from './test/fixtures'
 import { connectToOpenScience, OpenScienceClient } from './index.mjs'
-import type { AgentFramework } from './index'
+import type {
+  AgentFramework,
+  ComputeConfirmationChallengeRequest,
+  ComputeConfirmationProof
+} from './index'
 
 const response = (status: number, payload: unknown): Response =>
   new Response(JSON.stringify(payload), {
@@ -304,6 +308,8 @@ describe('OpenScienceClient', () => {
         'getSessionHistory',
         'listPendingSessionInteractions',
         'watchPendingSessionInteractions',
+        'createComputeConfirmationChallenge',
+        'submitComputeConfirmationDecision',
         'stageRunAttachment',
         'getSessionConfiguration',
         'updateSessionConfiguration',
@@ -456,6 +462,124 @@ describe('OpenScienceClient', () => {
     await expect(watcher.next()).resolves.toMatchObject({ done: false })
     await expect(watcher.next()).rejects.toMatchObject({ status: 404 })
     expect(fetch).toHaveBeenCalledTimes(3)
+  })
+
+  it('posts trusted Compute confirmation messages with the exact signed fields', async () => {
+    const capabilities = { taskCapabilities: ['trusted-compute-decisions'] }
+    const challenge = { id: 'challenge-1', expiresAt: 120_000, envelope: 'eyJ2ZXJzaW9uIjoxfQ' }
+    const receipt = { status: 'claimed' }
+    const read: ComputeConfirmationChallengeRequest = {
+      hostId: 'host-1',
+      issuedAt: 1_000,
+      signature: 'test-read-signature'
+    }
+    const proof: ComputeConfirmationProof = {
+      challengeId: challenge.id,
+      decision: 'project',
+      signature: 'test-decision-signature'
+    }
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(response(200, capabilities))
+      .mockResolvedValueOnce(response(200, { data: challenge }))
+      .mockResolvedValueOnce(response(200, capabilities))
+      .mockResolvedValueOnce(response(200, { data: receipt }))
+    const client = new OpenScienceClient({ baseUrl: 'http://localhost', token: 'test', fetch })
+    const scope = ['project/one', 'session #two', 'interaction?three'] as const
+    const interactionUrl =
+      'http://localhost/api/v1/projects/project%2Fone/sessions/session%20%23two/pending-interactions/interaction%3Fthree'
+
+    await expect(client.createComputeConfirmationChallenge(...scope, read)).resolves.toEqual(
+      challenge
+    )
+    await expect(client.submitComputeConfirmationDecision(...scope, proof)).resolves.toEqual(
+      receipt
+    )
+    expect(fetch.mock.calls.map(([url]) => url)).toEqual([
+      'http://localhost/api/bootstrap',
+      `${interactionUrl}/challenge`,
+      'http://localhost/api/bootstrap',
+      `${interactionUrl}/decision`
+    ])
+    for (const [callIndex, body] of [
+      [1, read],
+      [3, proof]
+    ] as const) {
+      expect(fetch.mock.calls[callIndex][1]).toMatchObject({
+        method: 'POST',
+        headers: { authorization: 'Bearer test', 'content-type': 'application/json' },
+        body: JSON.stringify(body)
+      })
+    }
+  })
+
+  it('preflights the trusted Compute capability before POST on older servers', async () => {
+    const fetch = vi.fn(async () =>
+      response(200, { taskCapabilities: ['session-pending-interactions'] })
+    )
+    const client = new OpenScienceClient({ baseUrl: 'http://localhost', token: 'test', fetch })
+
+    await expect(
+      client.createComputeConfirmationChallenge('project', 'session', 'interaction', {
+        hostId: 'host',
+        issuedAt: 1_000,
+        signature: 'signature'
+      })
+    ).rejects.toMatchObject({ code: 'unsupported_capability' })
+    await expect(
+      client.submitComputeConfirmationDecision('project', 'session', 'interaction', {
+        challengeId: 'challenge',
+        decision: 'deny',
+        signature: 'signature'
+      })
+    ).rejects.toMatchObject({ code: 'unsupported_capability' })
+    expect(fetch).toHaveBeenCalledTimes(2)
+    expect(fetch).toHaveBeenCalledWith('http://localhost/api/bootstrap', expect.anything())
+  })
+
+  it('applies one Compute challenge timeout to capability discovery and the signed read', async () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(0)
+    try {
+      const fetch = vi.fn(async () => {
+        now.mockReturnValue(500)
+        return response(200, { taskCapabilities: ['trusted-compute-decisions'] })
+      })
+      const client = new OpenScienceClient({ baseUrl: 'http://localhost', token: 'test', fetch })
+      await expect(
+        client.createComputeConfirmationChallenge(
+          'project',
+          'session',
+          'interaction',
+          { hostId: 'host', issuedAt: 1_000, signature: 'signature' },
+          { timeoutMs: 500 }
+        )
+      ).rejects.toMatchObject({ code: 'timeout' })
+      expect(fetch).toHaveBeenCalledOnce()
+    } finally {
+      now.mockRestore()
+    }
+  })
+
+  it.each([
+    [409, 'trusted_confirmation_unavailable'],
+    [403, 'invalid_confirmation_proof'],
+    [400, 'invalid_request'],
+    [503, 'trusted_compute_decisions_unavailable']
+  ] as const)('preserves a signed decision HTTP %i error', async (status, code) => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(response(200, { taskCapabilities: ['trusted-compute-decisions'] }))
+      .mockResolvedValueOnce(response(status, { error: { code, message: 'Decision rejected.' } }))
+    const client = new OpenScienceClient({ baseUrl: 'http://localhost', token: 'test', fetch })
+
+    await expect(
+      client.submitComputeConfirmationDecision('project', 'session', 'interaction', {
+        challengeId: 'challenge',
+        decision: 'once',
+        signature: 'signature'
+      })
+    ).rejects.toMatchObject({ code, status, message: 'Decision rejected.' })
+    expect(fetch).toHaveBeenCalledTimes(2)
   })
 
   it('uses versioned endpoints for Doctor, Runtime, Session, Project-default, and Agent-routing reads', async () => {

@@ -100,6 +100,140 @@ describe('ComputeApprovalBroker', () => {
     await Promise.all([otherProject, otherSession])
   })
 
+  it('claims a scoped approval once, using the existing grant adapter and native settlement', async () => {
+    const timer = makeTimer()
+    const onSettled = vi.fn()
+    const remember = vi.fn()
+    const resolve = vi.fn().mockResolvedValue(undefined)
+    const broker = new ComputeApprovalBroker({
+      generateId: () => 'approval-1',
+      broadcast: vi.fn(),
+      setTimer: timer.set,
+      clearTimer: timer.clear,
+      permissionGrants: { migrateLegacy: vi.fn(), resolve, remember },
+      onSettled
+    })
+    const scope = { projectId: 'project-1', sessionId: 'session-1' }
+    const input = makeJobRequest({ execution_mode: 'slurm', willPersistUnencrypted: true })
+    const pending = broker.requestWithContext(input, {
+      ...scope,
+      ownerId: 'host-row-1',
+      operation: 'submit_job'
+    })
+    const confirmation = broker.getPendingConfirmation(scope, 'approval-1')!
+    const otherProject = { ...scope, projectId: 'project-2' }
+    const otherSession = { ...scope, sessionId: 'session-2' }
+
+    expect(confirmation.request).toEqual({ id: 'approval-1', ...input, session_id: 'session-1' })
+    expect(confirmation.allowedDecisions).toEqual(['once', 'session', 'project', 'global', 'deny'])
+    expect(broker.getPendingConfirmation(otherProject, 'approval-1')).toBeUndefined()
+    expect(broker.getPendingConfirmation(otherSession, 'approval-1')).toBeUndefined()
+    expect(
+      broker.claimPendingConfirmation(otherProject, 'approval-1', confirmation.version, 'global')
+    ).toBe('stale')
+    expect(
+      broker.claimPendingConfirmation(otherSession, 'approval-1', confirmation.version, 'global')
+    ).toBe('stale')
+    expect(
+      broker.claimPendingConfirmation(scope, 'approval-1', confirmation.version, 'global')
+    ).toBe('claimed')
+    broker.respond('approval-1', 'deny')
+    expect(
+      broker.claimPendingConfirmation(scope, 'approval-1', confirmation.version, 'global')
+    ).toBe('stale')
+    await expect(pending).resolves.toBe('global')
+    expect(remember).toHaveBeenCalledExactlyOnceWith(
+      { ...scope, operation: 'submit_job', providerId: input.provider_id },
+      'global'
+    )
+    expect(onSettled).toHaveBeenCalledExactlyOnceWith('approval-1', 'resolved')
+  })
+
+  it('binds one-time external submissions to the full disclosed input metadata', async () => {
+    const timer = makeTimer()
+    const broadcast = vi.fn()
+    const broker = new ComputeApprovalBroker({
+      generateId: () => 'approval-1',
+      broadcast,
+      setTimer: timer.set,
+      clearTimer: timer.clear
+    })
+    const scope = { projectId: 'project-1', sessionId: 'session-1' }
+    const input = makeJobRequest({
+      provider_id: 'kubernetes:target-1',
+      execution_mode: 'kubernetes',
+      kubernetes: {
+        context: 'lab',
+        namespace: 'test',
+        endpoint: 'https://cluster.example',
+        image: 'analysis:1',
+        transferImage: 'transfer:1',
+        sizeMiB: 128,
+        inputFiles: [{ source: 'input.csv', destination: 'input.csv', sizeBytes: 128, sha256: 'a' }]
+      }
+    })
+    const pending = broker.requestWithContext(input, { ...scope, operation: 'submit_job' })
+    const first = broker.getPendingConfirmation(scope, 'approval-1')!
+    expect(first.allowedDecisions).toEqual(['once', 'deny'])
+    for (const decision of ['session', 'project', 'global'] as const) {
+      expect(broker.claimPendingConfirmation(scope, 'approval-1', first.version, decision)).toBe(
+        'invalid-decision'
+      )
+    }
+    if (first.request.operation !== 'submit_job') throw new Error('Expected a job disclosure')
+    first.request.kubernetes!.inputFiles[0].sha256 = 'untrusted-copy'
+    expect(broker.getPendingConfirmation(scope, 'approval-1')?.request).toMatchObject({
+      kubernetes: { inputFiles: [{ sha256: 'a' }] }
+    })
+    input.kubernetes!.inputFiles[0].sha256 = 'b'
+    const second = broker.getPendingConfirmation(scope, 'approval-1')!
+    expect(second.version).not.toBe(first.version)
+    expect(broker.claimPendingConfirmation(scope, 'approval-1', first.version, 'once')).toBe(
+      'stale'
+    )
+    expect(broker.claimPendingConfirmation(scope, 'approval-1', second.version, 'once')).toBe(
+      'claimed'
+    )
+    await expect(pending).resolves.toBe('once')
+  })
+
+  it('rejects a claim after a native response or the approval deadline', async () => {
+    const timer = makeTimer()
+    const onSettled = vi.fn()
+    let now = 0
+    const broker = new ComputeApprovalBroker({
+      generateId: () => 'approval-1',
+      broadcast: vi.fn(),
+      setTimer: timer.set,
+      clearTimer: timer.clear,
+      timeoutMs: 1_000,
+      now: () => now,
+      onSettled
+    })
+    const scope = { projectId: 'project-1', sessionId: 'session-1' }
+    const context = { ...scope, operation: 'call_command' as const }
+    const answered = broker.requestWithContext(makeRequest(), context)
+    const firstVersion = broker.getPendingConfirmation(scope, 'approval-1')!.version
+    broker.respond('approval-1', 'deny')
+    expect(broker.claimPendingConfirmation(scope, 'approval-1', firstVersion, 'once')).toBe('stale')
+    await expect(answered).resolves.toBe('deny')
+
+    const expired = broker.requestWithContext(makeRequest(), context)
+    const secondVersion = broker.getPendingConfirmation(scope, 'approval-1')!.version
+    expect(broker.claimPendingConfirmation(scope, 'approval-1', firstVersion, 'once')).toBe('stale')
+    now = 1_000
+    expect(broker.getPendingConfirmation(scope, 'approval-1')).toBeUndefined()
+    expect(broker.claimPendingConfirmation(scope, 'approval-1', secondVersion, 'once')).toBe(
+      'stale'
+    )
+    timer.fire()
+    await expect(expired).resolves.toBe('deny')
+    expect(onSettled.mock.calls).toEqual([
+      ['approval-1', 'rejected'],
+      ['approval-1', 'expired']
+    ])
+  })
+
   it('broadcasts request and resolves with once decision', async () => {
     const timer = makeTimer()
     let broadcast: ComputeApprovalRequest | undefined

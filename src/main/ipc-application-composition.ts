@@ -13,9 +13,17 @@ import { composeResearchFilm } from './composition/research-film'
 import { composeImageModel } from './composition/image-model'
 import { createLocalModelApi } from './local-models/owner'
 import { registerLocalModelIpcHandlers } from './desktop-surface-declarations'
-import { type DiagnosticOperation } from '@aipoch/diagnostics/node'
+import {
+  createLogger,
+  diagnosticErrorFields,
+  type DiagnosticOperation
+} from '@aipoch/diagnostics/node'
 import type { ArtifactReproducibilityCheckState } from '../shared/artifact-reproducibility'
-import { externalComputeMode } from '../shared/compute'
+import {
+  externalComputeMode,
+  type ComputeApprovalDecision,
+  type ComputeApprovalRequest
+} from '../shared/compute'
 import type { SessionSummary } from '../shared/session-persistence'
 import { type AppIconPreview, type AppIconVariant } from '../shared/settings'
 import type { UploadTransferProgress } from '../shared/uploads'
@@ -107,11 +115,17 @@ import {
 } from './storage/migration-state'
 import {
   projectTaskPendingSessionInteractions,
+  taskInteractionId,
+  type InteractionScope,
   type TaskControlPorts
 } from './tasks/task-control-ports'
 import type { TaskAgentPort } from './tasks/task-runner'
+import { createTrustedHostKeyRegistry } from './tasks/trusted-host-key-registry'
+import { TrustedInteractionDecisions } from './tasks/trusted-interaction-decisions'
 import type { TrayNavigationSession } from './tray-navigation'
 import { defaultOcrLanguagesForLocale } from '../shared/local-models'
+
+const log = createLogger('application-composition')
 
 export type IpcRegistrationOptions = {
   notificationDelivery?: (
@@ -908,9 +922,63 @@ export const createApplicationModules = async (
     handoff,
     modules
   })
+  const trustedHostKeys = await createTrustedHostKeyRegistry(sessionAuthority.configRoot).catch(
+    (error: unknown) => {
+      log.warn('trusted host registry unavailable', diagnosticErrorFields(error))
+      return undefined
+    }
+  )
+  const { handlers: compute } = computeServices.computeIpcModule
+  const findComputeApprovalId = (scope: InteractionScope): string | undefined =>
+    compute
+      .listPendingSessionApprovals(scope)
+      .find(({ id }) => taskInteractionId(scope, 'compute', id) === scope.interactionId)?.id
+  const trustedCompute = trustedHostKeys
+    ? new TrustedInteractionDecisions<ComputeApprovalRequest, ComputeApprovalDecision>(
+        {
+          kind: 'compute-approval',
+          read: (scope) => {
+            const id = findComputeApprovalId(scope)
+            const snapshot = id && compute.getPendingConfirmation(scope, id)
+            if (!snapshot) return undefined
+            return {
+              version: snapshot.version,
+              disclosure: snapshot.request,
+              allowedDecisions: snapshot.allowedDecisions
+            }
+          },
+          claim: (scope, version, decision) => {
+            const id = findComputeApprovalId(scope)
+            if (!id) return 'unavailable'
+            const outcome = compute.claimPendingConfirmation(scope, id, version, decision)
+            return outcome === 'stale' ? 'unavailable' : outcome
+          }
+        },
+        trustedHostKeys.resolve
+      )
+    : undefined
+  const withTrustedComputeSession = async <Result>(
+    { projectId, sessionId }: InteractionScope,
+    operation: () => Result
+  ): Promise<Result | undefined> => {
+    let admitted = false
+    try {
+      return await projectLifecycle.archiveCoordinator.withSessionAvailable(
+        projectId,
+        sessionId,
+        async () => {
+          admitted = true
+          return operation()
+        }
+      )
+    } catch (error) {
+      if (admitted) throw error
+      return undefined
+    }
+  }
   const applicationCommandComposition = await registerApplicationCommandComposition({
     modules,
-    dependencies: commandDependencies.applicationCommandDependencies,
+    dependencies: { ...commandDependencies.applicationCommandDependencies, trustedHostKeys },
     declareElectronAdapter
   })
   // Reverse disposal must cancel journal writes before commands drain and Compute waits
@@ -1009,6 +1077,21 @@ export const createApplicationModules = async (
     },
     taskAgent: agentWorkflows.taskAgent,
     taskControls: {
+      ...(trustedCompute
+        ? {
+            trustedCompute: {
+              issue: (scope, read, isCurrent) =>
+                withTrustedComputeSession(scope, () =>
+                  isCurrent() ? trustedCompute.issue(scope, read) : undefined
+                ),
+              claim: async (scope, proof, isCurrent) =>
+                (await withTrustedComputeSession(scope, () =>
+                  isCurrent() ? trustedCompute.claim(scope, proof) : 'unavailable'
+                )) ?? 'unavailable',
+              reset: () => trustedCompute.reset()
+            }
+          }
+        : {}),
       listPendingSessionInteractions: async (scope) => {
         const sessions = sessionAuthority.sessionPersistenceCoordinator
         const ownerProjectId = await sessions.sessionProjectId(scope.sessionId)

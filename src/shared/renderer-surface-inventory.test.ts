@@ -284,6 +284,7 @@ const REMOTE_LOCAL_ONLY_CHANNELS: GroupedInventory = {
   'notebook-env': ['cancel', 'provision', 'repair'],
   notebook: ['export-ipynb', 'export-ipynb-all', 'process-monitor', 'terminate-monitored-process'],
   'remote-access': ['probe'],
+  'trusted-hosts': ['enroll', 'list', 'review', 'revoke'],
   sessions: [
     'fork',
     'export-package',

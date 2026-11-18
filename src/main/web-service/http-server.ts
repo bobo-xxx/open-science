@@ -25,6 +25,7 @@ export type {
 } from './external-access-contract'
 
 import { WebSocket, WebSocketServer } from 'ws'
+import { z } from 'zod'
 
 import {
   createLogger,
@@ -79,6 +80,7 @@ import { PublicTaskEventStream } from './public-task-event-stream'
 import { TaskApiError, type HeadlessTaskApi } from './task-api'
 
 const MAX_RPC_BODY_BYTES = 64 * 1024 * 1024
+const MAX_COMPUTE_CONFIRMATION_BODY_BYTES = 4 * 1024
 // Preserve one maximum-size request per logical client while leaving the same amount of capacity
 // for other authenticated clients. Browser uploads use much smaller 8 MiB chunks in normal use.
 const MAX_CLIENT_IN_FLIGHT_RPC_BODY_BYTES = 64 * 1024 * 1024
@@ -232,6 +234,9 @@ type WebServerOptions = {
         | 'supportsRunAttachments'
         | 'supportsPendingSessionInteractions'
         | 'listPendingSessionInteractions'
+        | 'supportsTrustedComputeDecisions'
+        | 'createComputeConfirmationChallenge'
+        | 'submitComputeConfirmationDecision'
         | 'stageRunAttachment'
         | 'respondSessionPlan'
         | 'listSessionReviews'
@@ -640,11 +645,14 @@ const readJsonBody = async (
   request: IncomingMessage,
   response: ServerResponse,
   registry: RequestBodyBudgetRegistry,
-  clientId: string
+  clientId: string,
+  maxBytes = Number.POSITIVE_INFINITY
 ): Promise<unknown> => {
   const declared = declaredContentLength(request)
   let lease: RequestBodyBudgetLease
   try {
+    if (declared !== undefined && declared > maxBytes)
+      throw new RequestBodyBudgetExceededError('request')
     lease = registry.reserve(request, clientId, declared ?? 0)
   } catch (error) {
     if (error instanceof RequestBodyBudgetExceededError) {
@@ -658,6 +666,7 @@ const readJsonBody = async (
     for await (const chunk of request) {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
       size += buffer.length
+      if (size > maxBytes) throw new RequestBodyBudgetExceededError('request')
       if (declared === undefined) registry.increase(lease, buffer.length)
       chunks.push(buffer)
     }
@@ -673,7 +682,13 @@ const readJsonBody = async (
 
 const taskErrorStatus = (error: TaskApiError): number => {
   if (error.code === 'attachment_staging_unavailable') return 503
-  if (error.code === 'pending_interactions_unavailable') return 503
+  if (
+    error.code === 'pending_interactions_unavailable' ||
+    error.code === 'trusted_compute_decisions_unavailable'
+  )
+    return 503
+  if (error.code === 'invalid_confirmation_proof') return 403
+  if (error.code === 'trusted_confirmation_unavailable') return 409
   if (error.code === 'submission_unavailable' || error.code === 'configuration_options_unavailable')
     return 503
   if (error.code === 'submission_conflict' || error.code === 'session_read_only') return 409
@@ -691,6 +706,20 @@ const taskErrorStatus = (error: TaskApiError): number => {
   }
   return 404
 }
+
+const COMPUTE_CONFIRMATION_PATH =
+  /^\/api\/v1\/projects\/([^/]+)\/sessions\/([^/]+)\/pending-interactions\/([a-f0-9]{64})\/(challenge|decision)$/
+const canonicalProofSignature = z.string().regex(/^[A-Za-z0-9_-]{86}$/u)
+const computeConfirmationReadSchema = z.strictObject({
+  hostId: z.uuidv4(),
+  issuedAt: z.int().nonnegative(),
+  signature: canonicalProofSignature
+})
+const computeConfirmationDecisionSchema = z.strictObject({
+  challengeId: z.uuidv4(),
+  decision: z.enum(['deny', 'once', 'session', 'project', 'global']),
+  signature: canonicalProofSignature
+})
 
 const isReviewScopeId = (value: unknown): value is string =>
   typeof value === 'string' && value.length > 0 && value.length <= 512 && value.trim() === value
@@ -1574,6 +1603,50 @@ const handleTaskApiRequest = async (
         })
         return true
       }
+      const computeConfirmation = url.pathname.match(COMPUTE_CONFIRMATION_PATH)
+      if (computeConfirmation && request.method === 'POST') {
+        if (
+          callerContext.location !== 'local' ||
+          !tasks.supportsTrustedComputeDecisions?.() ||
+          !tasks.createComputeConfirmationChallenge ||
+          !tasks.submitComputeConfirmationDecision
+        ) {
+          throw new TaskApiError(
+            'trusted_compute_decisions_unavailable',
+            'Trusted Compute confirmations require local SDK access.'
+          )
+        }
+        const scope = {
+          projectId: decodeURIComponent(computeConfirmation[1]),
+          sessionId: decodeURIComponent(computeConfirmation[2]),
+          interactionId: computeConfirmation[3]
+        }
+        if (
+          [scope.projectId, scope.sessionId].some(
+            (id) => !isReviewScopeId(id) || id === '.' || id === '..' || /[/\\\0]/u.test(id)
+          )
+        ) {
+          throw new TaskApiError('invalid_request', 'Invalid confirmation scope.')
+        }
+        const body = await readJsonBody(
+          request,
+          response,
+          requestBodyBudgetRegistry,
+          requestBodyClientId,
+          MAX_COMPUTE_CONFIRMATION_BODY_BYTES
+        )
+        if (computeConfirmation[4] === 'challenge') {
+          const read = computeConfirmationReadSchema.safeParse(body)
+          if (!read.success) throw new TaskApiError('invalid_request', 'Invalid confirmation read.')
+          reply(200, { data: await tasks.createComputeConfirmationChallenge(scope, read.data) })
+        } else {
+          const proof = computeConfirmationDecisionSchema.safeParse(body)
+          if (!proof.success)
+            throw new TaskApiError('invalid_request', 'Invalid confirmation decision.')
+          reply(200, { data: await tasks.submitComputeConfirmationDecision(scope, proof.data) })
+        }
+        return true
+      }
       const pendingInteractionsMatch = url.pathname.match(
         /^\/api\/v1\/projects\/([^/]+)\/sessions\/([^/]+)\/pending-interactions$/
       )
@@ -1889,6 +1962,12 @@ const startWebHttpServer = async (options: WebServerOptions): Promise<RunningWeb
               ...(options.tasks.supportsPendingSessionInteractions?.() &&
               options.tasks.listPendingSessionInteractions
                 ? ['session-pending-interactions']
+                : []),
+              ...(!externalAuthorization &&
+              options.tasks.supportsTrustedComputeDecisions?.() &&
+              options.tasks.createComputeConfirmationChallenge &&
+              options.tasks.submitComputeConfirmationDecision
+                ? ['trusted-compute-decisions']
                 : [])
             ]
           : []
@@ -1974,7 +2053,9 @@ const startWebHttpServer = async (options: WebServerOptions): Promise<RunningWeb
                     location: 'remote',
                     isAuthorizationCurrent: authorization.isCurrent
                   }
-                : {}
+                : COMPUTE_CONFIRMATION_PATH.test(url.pathname) && request.method === 'POST'
+                  ? { isAuthorizationCurrent: lease.isCurrent }
+                  : {}
             )
             if (
               await handleTaskApiRequest(

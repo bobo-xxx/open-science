@@ -175,8 +175,8 @@ for that exact Project and Session. Current servers also report durable MCP perm
 agent questions and delegated questions that still match the saved Session and active Branch.
 The method returns opaque IDs for polling, kind and metadata such as a question's field count
 or the Compute operation. Requests disappear when their owner settles them. Servers without the
-capability return `unsupported_capability`. Complete the interaction in Desktop or Web. Plan First
-still uses the Plan API.
+capability return `unsupported_capability`. Use Desktop or Web to respond to permission requests
+and structured questions. Plan First uses the Plan API.
 
 Use `watchPendingSessionInteractions(projectId, sessionId, { signal })` for a stream of
 snapshots. It yields the initial list, then yields again when the list changes, including an
@@ -184,6 +184,49 @@ empty list when all waits clear. The SDK polls the scoped endpoint every second 
 Use `pollIntervalMs` to set the interval and `timeoutMs` to set the request deadline. Breaking
 the loop or aborting the signal stops observation. A failed read ends the stream, and a new
 watch starts from the current snapshot. Changes between polls can be coalesced.
+
+Desktop and Web can handle Compute approvals. The local `trusted-compute-decisions` preview also
+lets an enrolled host confirm a Compute approval through an isolated signer. Real host integration
+and acceptance are pending. The SDK transports signed requests. The host owns private key
+isolation, the user-facing approval UI, and signature creation. Keep the private key
+and decision-signing operation outside the model and Task tool environment.
+
+In Desktop or local Web, open Settings → Permissions → Trusted hosts. Enter the component
+name and its 32-byte Ed25519 public key in unpadded base64url. Compare the full SHA-256
+fingerprint with the one shown by the isolated component, then confirm registration. Copy
+the displayed registration ID to the component as its `hostId`. Revoke the key from the same
+settings when it should stop authorizing decisions.
+
+For a pending interaction whose kind is `compute`, use its opaque ID as `interactionId`. The
+enrolled signer signs the first message below using the current Unix time in milliseconds as
+`issuedAt`. Send `{ hostId, issuedAt, signature }` to
+`createComputeConfirmationChallenge(projectId, sessionId, interactionId, request)`. The response
+contains `{ id, expiresAt, envelope }`.
+
+The `envelope` is unpadded base64url-encoded UTF-8 JSON. It contains `version: 1`,
+`kind: 'compute-approval'`, `serviceGeneration`, `id`, `hostId`, `projectId`, `sessionId`,
+`interactionId`, `expiresAt`, `contentVersion`, the native Compute approval `disclosure`, and
+`allowedDecisions`. The trusted host validates its binding to the original request, displays the
+disclosure and available decisions, and collects the user's choice. Its signer then signs the
+second message below with the original `envelope` string and the selected `decision`.
+
+```js
+const readMessage =
+  'Open Science trusted interaction read v1\n' +
+  JSON.stringify(['compute-approval', projectId, sessionId, interactionId, hostId, issuedAt])
+const decisionMessage =
+  'Open Science trusted interaction decision v1\n' + envelope + '\n' + decision
+```
+
+Both signatures are Ed25519 signatures over the exact UTF-8 bytes, encoded as unpadded base64url.
+Pass `{ challengeId: id, decision, signature }` to
+`submitComputeConfirmationDecision(projectId, sessionId, interactionId, proof)`. Decision values
+are `deny`, `once`, `session`, `project`, and `global`, limited to the request's `allowedDecisions`.
+A `{ status: 'claimed' }` receipt confirms that the application accepted the decision. Follow
+the Task or Compute operation for its subsequent outcome. Desktop, Web, and trusted-host replies
+compete for a single claim. A stale, expired, or already answered challenge returns
+`trusted_confirmation_unavailable`. An invalid signature on an active decision returns
+`invalid_confirmation_proof`.
 
 When the server advertises `session-history`, read a Session's visible conversation with
 `getSessionHistory(projectId, sessionId, { limit: 80 })`. The first page starts at the newest end;
