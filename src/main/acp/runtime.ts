@@ -26,6 +26,7 @@ import {
   type AcpCreateSessionRequest,
   type AcpCreateSessionResponse,
   type AcpDeleteSessionRequest,
+  type AcpPermissionRequest,
   type AcpPermissionResponse,
   type AcpPromptRequest,
   type AcpResumeSessionRequest,
@@ -87,7 +88,13 @@ import type {
 } from './connection-resource-owner'
 import type { AcpConnectionTransitionOwner } from './connection-transition-owner'
 import type { AcpContextCompactionWorkflow } from './context-compaction-workflow'
-import type { AcpElicitationOwner } from './elicitation-owner'
+import type {
+  AcpElicitationOwner,
+  AuthorizeLiveElicitation,
+  LiveElicitationResponse,
+  LiveElicitationSnapshot,
+  ResolvedElicitation
+} from './elicitation-owner'
 import type { AcpGenerationActivityOwner } from './generation-activity-owner'
 import type { AcpHandoffContinuityOwner } from './handoff-continuity-owner'
 import { buildLiteratureReferencePrompt } from './literature-reference-prompt'
@@ -97,7 +104,14 @@ import {
   finalizeNativeFollowUpPreparedContent,
   type NativeFollowUpPreparedContent
 } from './native-follow-up-workflow'
-import { type AppPermissionRequest, type RestoredPermissionContinuation } from './permission-broker'
+import type {
+  AppPermissionRequest,
+  PermissionConfirmationClaim,
+  PermissionConfirmationDecision,
+  PermissionConfirmationScope,
+  PermissionConfirmationSnapshot,
+  RestoredPermissionContinuation
+} from './permission-broker'
 import type { AcpPermissionContext } from './permission-context'
 import { HUMAN_PERMISSION_ACTION_ORIGIN } from './permission-context'
 import { requestPlanReviewProviderStop } from './plan-review-provider-stop'
@@ -1919,6 +1933,63 @@ class AcpRuntime {
       }
       return this.permissionContinuations.respond(response)
     }
+    const discardContinuation = this.preparePermissionDenialContinuation(
+      permissionRequest,
+      response
+    )
+    await this.finishPermissionResponse(
+      response.requestId,
+      response.cancelled ? 'cancelled' : response.optionId,
+      () => this.permissionContext.respondToPermission(response, HUMAN_PERMISSION_ACTION_ORIGIN),
+      discardContinuation
+    )
+    return this.getSnapshot()
+  }
+
+  readLivePermissionConfirmation(
+    scope: PermissionConfirmationScope,
+    requestId: string
+  ): PermissionConfirmationSnapshot | undefined {
+    if (!this.hasLiveSession(scope.projectId, scope.sessionId)) return undefined
+    return this.permissionContext.readPendingConfirmation(scope, requestId)
+  }
+
+  claimLivePermissionConfirmation(
+    scope: PermissionConfirmationScope,
+    requestId: string,
+    version: string,
+    decision: PermissionConfirmationDecision
+  ): PermissionConfirmationClaim {
+    if (!this.hasLiveSession(scope.projectId, scope.sessionId)) return { status: 'unavailable' }
+    let responseText: string | undefined
+    let discardContinuation: (() => void) | undefined
+    const claim = this.permissionContext.claimPendingConfirmation(
+      scope,
+      requestId,
+      version,
+      decision,
+      (request, response) => {
+        responseText = response.cancelled ? 'cancelled' : response.optionId
+        discardContinuation = this.preparePermissionDenialContinuation(request, response)
+      }
+    )
+    return claim.status === 'claimed'
+      ? {
+          status: 'claimed',
+          completion: this.finishPermissionResponse(
+            requestId,
+            responseText,
+            () => claim.completion,
+            discardContinuation
+          )
+        }
+      : claim
+  }
+
+  private preparePermissionDenialContinuation(
+    permissionRequest: AcpPermissionRequest | undefined,
+    response: AcpPermissionResponse
+  ): (() => void) | undefined {
     const selectedOption = permissionRequest?.options.find(
       (option) => option.optionId === response.optionId
     )
@@ -1926,61 +1997,64 @@ class AcpRuntime {
       ? this.sessionInteractions.current(permissionRequest.sessionId)
       : undefined
     const promptInteraction = interaction?.kind === 'prompt' ? interaction : undefined
-    const continueAfterProviderCancellation = Boolean(
-      permissionRequest &&
-      !permissionRequest.appOwned &&
-      promptInteraction &&
-      this.getSessionFramework(permissionRequest.sessionId) === 'claude-code' &&
-      !response.cancelled &&
-      selectedOption?.kind.toLowerCase().startsWith('reject_')
-    )
-    if (permissionRequest && promptInteraction && continueAfterProviderCancellation) {
-      const referencedSessions = this.handoffContinuity.copyReferencedSessions(
-        permissionRequest.sessionId
-      )
-      this.appContinuations.set(permissionRequest.sessionId, {
-        condition: 'provider-cancelled',
-        request: {
-          sessionId: permissionRequest.sessionId,
-          text: PERMISSION_DENIED_CONTINUATION_TEXT,
-          ...(promptInteraction.permissionPrompts
-            ? { permissionPrompts: promptInteraction.permissionPrompts }
-            : {}),
-          ...(promptInteraction.memoryEnabled !== undefined
-            ? { memoryEnabled: promptInteraction.memoryEnabled }
-            : {}),
-          suppressUserMessage: true,
-          ...(promptInteraction.promptMessageId
-            ? { provenanceContext: { promptMessageId: promptInteraction.promptMessageId } }
-            : {}),
-          ...(referencedSessions?.length ? { referencedSessions } : {})
-        }
-      })
+    if (
+      !permissionRequest ||
+      permissionRequest.appOwned ||
+      !promptInteraction ||
+      this.getSessionFramework(permissionRequest.sessionId) !== 'claude-code' ||
+      response.cancelled ||
+      !selectedOption?.kind.toLowerCase().startsWith('reject_')
+    ) {
+      return undefined
     }
-
-    try {
-      const handled = await this.permissionContext.respondToPermission(
-        response,
-        HUMAN_PERMISSION_ACTION_ORIGIN
-      )
-      if (!handled && permissionRequest && continueAfterProviderCancellation) {
-        this.appContinuations.delete(permissionRequest.sessionId)
+    const { sessionId } = permissionRequest
+    const referencedSessions = this.handoffContinuity.copyReferencedSessions(sessionId)
+    this.appContinuations.set(sessionId, {
+      condition: 'provider-cancelled',
+      request: {
+        sessionId,
+        text: PERMISSION_DENIED_CONTINUATION_TEXT,
+        ...(promptInteraction.permissionPrompts
+          ? { permissionPrompts: promptInteraction.permissionPrompts }
+          : {}),
+        ...(promptInteraction.memoryEnabled !== undefined
+          ? { memoryEnabled: promptInteraction.memoryEnabled }
+          : {}),
+        suppressUserMessage: true,
+        ...(promptInteraction.promptMessageId
+          ? { provenanceContext: { promptMessageId: promptInteraction.promptMessageId } }
+          : {}),
+        ...(referencedSessions?.length ? { referencedSessions } : {})
       }
+    })
+    return () => {
+      this.appContinuations.delete(sessionId)
+    }
+  }
+
+  private async finishPermissionResponse(
+    requestId: string,
+    responseText: string | undefined,
+    settle: () => Promise<boolean>,
+    discardContinuation?: () => void
+  ): Promise<boolean> {
+    let handled: boolean
+    try {
+      handled = await settle()
+      if (!handled) discardContinuation?.()
       this.pushEvent({
         kind: 'permission',
         level: handled ? 'info' : 'warning',
-        permissionRequestId: response.requestId,
+        permissionRequestId: requestId,
         title: handled ? 'Permission response sent' : 'Permission request not found',
-        text: response.cancelled ? 'cancelled' : response.optionId
+        text: responseText
       })
     } catch (error) {
-      if (permissionRequest && continueAfterProviderCancellation) {
-        this.appContinuations.delete(permissionRequest.sessionId)
-      }
+      discardContinuation?.()
       this.pushEvent({
         kind: 'permission',
         level: 'error',
-        permissionRequestId: response.requestId,
+        permissionRequestId: requestId,
         title: 'Permission approval could not be saved',
         text: error instanceof Error ? error.message : 'The tool call was cancelled.'
       })
@@ -1988,8 +2062,7 @@ class AcpRuntime {
       throw error
     }
     this.emitState()
-
-    return this.getSnapshot()
+    return handled
   }
 
   respondToElicitation(
@@ -1997,6 +2070,25 @@ class AcpRuntime {
     continuePrepared = false
   ): Promise<AcpStateSnapshot> {
     return this.questionContinuations.respond(response, continuePrepared)
+  }
+
+  getLiveElicitation(
+    projectId: string,
+    sessionId: string,
+    requestId: string
+  ): LiveElicitationSnapshot | undefined {
+    if (!this.hasLiveSession(projectId, sessionId)) return undefined
+    return this.elicitationOwner.getLiveRequest(projectId, sessionId, requestId)
+  }
+
+  respondToLiveElicitation(
+    projectId: string,
+    sessionId: string,
+    response: LiveElicitationResponse,
+    authorize: AuthorizeLiveElicitation
+  ): ResolvedElicitation | undefined {
+    if (!this.hasLiveSession(projectId, sessionId)) return undefined
+    return this.elicitationOwner.respondLive(projectId, sessionId, response, authorize)
   }
 
   requestUserInput(input: AgentUserChoiceRequest): Promise<AgentUserChoiceResult> {

@@ -4389,6 +4389,7 @@ describe('startWebHttpServer', () => {
     >(
       {
         kind: 'compute-approval',
+        describeDecision: (decision) => [decision, decision],
         read(scope) {
           const id = findApproval(scope)
           const snapshot = id && broker.getPendingConfirmation(scope, id)

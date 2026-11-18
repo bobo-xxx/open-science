@@ -25,6 +25,8 @@ import {
   resolveCanonicalMcpToolIdentity
 } from '../agent-framework/app-mcp-names'
 
+type PermissionConfirmationPrompt = Readonly<{ version: string; isCurrent: () => boolean }>
+
 type PermissionPolicyContext = {
   // Main-only handoff to the Notebook execution owner's per-code gate. Never read from tool input.
   notebookHostAdmission?: boolean
@@ -49,6 +51,8 @@ type PermissionPolicyContext = {
   promptMessageId?: string
   // Captured by Main from the active interaction, never supplied by the provider.
   interactionSequence?: number
+  // Process-local binding to the prompt, attachment and branch used for signed decisions.
+  confirmationPrompt?: PermissionConfirmationPrompt
 }
 
 const TRUSTED_MCP_TOOL_IDENTITY = Symbol('trusted-mcp-tool-identity')
@@ -526,4 +530,4 @@ export {
   withTrustedMcpToolIdentity,
   withTrustedAutoOperation
 }
-export type { PermissionPolicyContext }
+export type { PermissionConfirmationPrompt, PermissionPolicyContext }

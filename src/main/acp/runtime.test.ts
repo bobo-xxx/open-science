@@ -8133,6 +8133,118 @@ describe('ACP runtime session management', () => {
     )
   })
 
+  it.each(['root', 'delegate', 'legacy'] as const)(
+    'admits private live question decisions only on an owned root Branch (%s)',
+    async (frame) => {
+      const process = new FakeAgentProcess()
+      const fakeAgent = startFakeAgent(process, ['elicitation-session'], {
+        elicitationForPrompt: ({ sessionId }) => ({
+          mode: 'form',
+          sessionId,
+          toolCallId: 'tool-live-question',
+          message: 'Choose an approach',
+          requestedSchema: {
+            type: 'object',
+            properties: { approach: { type: 'string', enum: ['focused', 'expanded'] } },
+            required: ['approach']
+          }
+        })
+      })
+      const coordinator = new AcpRuntimeCoordinator(
+        (callbacks) =>
+          new AcpRuntime({
+            appVersion: '0.1.0',
+            defaultCwd: '/workspace',
+            spawnAgent: () => asAgentProcess(process),
+            callbacks
+          })
+      )
+      const projectId = 'project-1'
+      let turn: Promise<unknown> | undefined
+      try {
+        const { sessionId } = await coordinator.createSession({ cwd: '/workspace', projectId })
+        const branch = {
+          promptMessageId: 'prompt-1',
+          rootFrameId: 'root',
+          agentFrameId: frame,
+          messageBranchId: 'branch-1',
+          messageBranchAncestry: ['branch-1'],
+          messageAncestry: ['prompt-1'],
+          runtimeSegmentId: 'segment-1'
+        }
+        turn = coordinator.sendPrompt({
+          sessionId,
+          text: 'Ask before proceeding',
+          provenanceContext: frame === 'legacy' ? { promptMessageId: 'prompt-1' } : branch
+        })
+        void turn.catch(() => undefined)
+        await vi.waitFor(() =>
+          expect(coordinator.getSnapshot().pendingElicitations).toHaveLength(1)
+        )
+        const [request] = coordinator.getSnapshot().pendingElicitations!
+        const decision = {
+          requestId: request.requestId,
+          action: 'accept' as const,
+          answers: [{ fieldId: 'approach', value: 'focused' }]
+        }
+        const authorize = vi.fn(() => true)
+        expect(
+          coordinator.getLiveElicitation('other-project', sessionId, request.requestId)
+        ).toBeUndefined()
+        expect(
+          coordinator.getLiveElicitation(projectId, 'missing-session', request.requestId)
+        ).toBeUndefined()
+        expect(
+          coordinator.respondToLiveElicitation('other-project', sessionId, decision, authorize)
+        ).toBeUndefined()
+        expect(authorize).not.toHaveBeenCalled()
+
+        const live = coordinator.getLiveElicitation(projectId, sessionId, request.requestId)
+        if (frame === 'root') {
+          expect(live).toMatchObject({
+            request,
+            prompt: {
+              projectId,
+              agentFrameId: frame,
+              messageBranchId: branch.messageBranchId,
+              promptMessageId: branch.promptMessageId,
+              runtimeSegmentId: branch.runtimeSegmentId,
+              attachmentGeneration: expect.any(Number),
+              sequence: expect.any(Number),
+              turnToken: expect.any(String)
+            }
+          })
+          expect(
+            coordinator.respondToLiveElicitation(projectId, sessionId, decision, authorize)
+              ?.detached
+          ).toBe(false)
+          expect(authorize).toHaveBeenCalledExactlyOnceWith(
+            request,
+            { action: decision.action, answers: decision.answers },
+            live?.prompt
+          )
+        } else {
+          expect(live).toBeUndefined()
+          expect(
+            coordinator.respondToLiveElicitation(projectId, sessionId, decision, authorize)
+          ).toBeUndefined()
+          expect(authorize).not.toHaveBeenCalled()
+          await coordinator.respondToElicitation(decision)
+        }
+        await turn
+        expect(fakeAgent.elicitationResponses).toEqual([
+          { action: 'accept', content: { approach: 'focused' } }
+        ])
+        expect(
+          coordinator.getLiveElicitation(projectId, sessionId, request.requestId)
+        ).toBeUndefined()
+      } finally {
+        await coordinator.shutdownForQuit()
+        await turn?.catch(() => undefined)
+      }
+    }
+  )
+
   it.each(
     RESTORED_CONTINUATION_FRAMEWORKS.flatMap(([name, framework, modelRoute, backendId]) =>
       [
@@ -27404,104 +27516,186 @@ describe('ACP runtime session management', () => {
     expect(permissionResponses).toEqual([{ outcome: { outcome: 'selected', optionId: 'reject' } }])
   })
 
-  it('continues a Claude turn with an explicit authorization boundary after permission denial', async () => {
-    const process = new FakeAgentProcess()
-    const continuationGate = createDeferred<PromptResponse>()
-    const prompts: string[] = []
-    let promptIndex = 0
+  it.each(['native', 'trusted'] as const)(
+    'continues a Claude turn after %s permission denial',
+    async (route) => {
+      const process = new FakeAgentProcess()
+      const continuationGate = createDeferred<PromptResponse>()
+      const prompts: string[] = []
+      let promptIndex = 0
 
-    acp
-      .agent({ name: 'claude-rejected-permission-agent' })
-      .onRequest(acp.methods.agent.initialize, () => ({
-        protocolVersion: acp.PROTOCOL_VERSION,
-        agentCapabilities: {
-          loadSession: false,
-          sessionCapabilities: { close: {} }
-        },
-        authMethods: []
-      }))
-      .onRequest(acp.methods.agent.session.new, () => ({ sessionId: 'remote-session-1' }))
-      .onRequest(acp.methods.agent.session.prompt, async (ctx) => {
-        const text = ctx.params.prompt
-          .map((content) => (content.type === 'text' ? content.text : ''))
-          .join('')
-        prompts.push(text)
+      acp
+        .agent({ name: 'claude-rejected-permission-agent' })
+        .onRequest(acp.methods.agent.initialize, () => ({
+          protocolVersion: acp.PROTOCOL_VERSION,
+          agentCapabilities: {
+            loadSession: false,
+            sessionCapabilities: { close: {} }
+          },
+          authMethods: []
+        }))
+        .onRequest(acp.methods.agent.session.new, () => ({ sessionId: 'remote-session-1' }))
+        .onRequest(acp.methods.agent.session.prompt, async (ctx) => {
+          const text = ctx.params.prompt
+            .map((content) => (content.type === 'text' ? content.text : ''))
+            .join('')
+          prompts.push(text)
 
-        if (promptIndex++ === 0) {
-          const response = await ctx.client.request(acp.methods.client.session.requestPermission, {
-            sessionId: ctx.params.sessionId,
-            toolCall: {
-              toolCallId: 'denied-command',
-              title: 'Run command',
-              kind: 'execute',
-              status: 'pending',
-              rawInput: { command: 'ls -la' }
-            },
-            options: [
-              { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
-              { optionId: 'reject-once', name: 'Reject once', kind: 'reject_once' }
-            ]
-          })
-          expect(response).toEqual({
-            outcome: { outcome: 'selected', optionId: 'reject-once' }
-          })
-          return { stopReason: 'cancelled' }
-        }
+          if (promptIndex++ === 0) {
+            const response = await ctx.client.request(
+              acp.methods.client.session.requestPermission,
+              {
+                sessionId: ctx.params.sessionId,
+                toolCall: {
+                  toolCallId: 'denied-command',
+                  title: 'Run command',
+                  kind: 'execute',
+                  status: 'pending',
+                  rawInput: { command: 'ls -la' }
+                },
+                options: [
+                  { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
+                  { optionId: 'reject-once', name: 'Reject once', kind: 'reject_once' }
+                ]
+              }
+            )
+            expect(response).toEqual({
+              outcome: { outcome: 'selected', optionId: 'reject-once' }
+            })
+            return { stopReason: 'cancelled' }
+          }
 
-        return continuationGate.promise
-      })
-      .onNotification(acp.methods.agent.session.cancel, () => {
-        continuationGate.resolve({ stopReason: 'cancelled' })
-      })
-      .onRequest(acp.methods.agent.session.close, () => ({}))
-      .connect(
-        acp.ndJsonStream(
-          Writable.toWeb(process.stdout) as WritableStream<Uint8Array>,
-          Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>
-        )
-      )
-
-    const runtime = new AcpRuntime({
-      appVersion: '0.1.0',
-      defaultCwd: '/workspace',
-      framework: claudeCodeFramework,
-      spawnAgent: () => asAgentProcess(process),
-      callbacks: {
-        onPermissionRequest: (request) => {
-          runtime.respondToPermission({
-            requestId: request.requestId,
-            optionId: 'reject-once'
-          })
-        }
-      }
-    })
-    const session = await runtime.createSession({ cwd: '/workspace' })
-
-    await runtime.sendPrompt({ sessionId: session.sessionId, text: 'inspect the workspace' })
-
-    await vi.waitFor(() => expect(prompts).toHaveLength(2))
-    expect(prompts[1]).toContain('The user explicitly denied this operation')
-    expect(prompts[1]).toContain('You do not have authorization to perform it')
-    expect(prompts[1]).toContain(
-      'Do not retry or approximate the denied operation with a different command, tool, or route'
-    )
-    expect(prompts[1]).toContain('Continue only with independent work that is already permitted')
-    expect(runtime.getSnapshot().events).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          kind: 'tool',
-          toolCallId: 'denied-command',
-          status: 'completed',
-          toolDisposition: 'declined'
+          return continuationGate.promise
         })
-      ])
-    )
-    expect(runtime.getSnapshot().promptInFlightSessionIds).toEqual([session.sessionId])
+        .onNotification(acp.methods.agent.session.cancel, () => {
+          continuationGate.resolve({ stopReason: 'cancelled' })
+        })
+        .onRequest(acp.methods.agent.session.close, () => ({}))
+        .connect(
+          acp.ndJsonStream(
+            Writable.toWeb(process.stdout) as WritableStream<Uint8Array>,
+            Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>
+          )
+        )
 
-    const cancelSnapshot = await runtime.cancelPrompt({ sessionId: session.sessionId })
-    expect(cancelSnapshot.promptInFlightSessionIds).toEqual([session.sessionId])
-    await vi.waitFor(() => expect(runtime.getSnapshot().promptInFlightSessionIds).toEqual([]))
-  })
+      const runtime = new AcpRuntimeCoordinator(
+        (callbacks) =>
+          new AcpRuntime({
+            appVersion: '0.1.0',
+            defaultCwd: '/workspace',
+            framework: claudeCodeFramework,
+            spawnAgent: () => asAgentProcess(process),
+            callbacks
+          })
+      )
+      const projectId = 'project-1'
+      let turn: Promise<unknown> | undefined
+      try {
+        const { sessionId } = await runtime.createSession({ cwd: '/workspace', projectId })
+        const scope = { projectId, sessionId }
+        turn = runtime.sendPrompt({
+          sessionId,
+          text: 'inspect the workspace',
+          ...(route === 'trusted'
+            ? {
+                provenanceContext: {
+                  promptMessageId: 'prompt-1',
+                  rootFrameId: 'root',
+                  agentFrameId: 'root',
+                  messageBranchId: 'branch-1',
+                  messageBranchAncestry: ['branch-1'],
+                  messageAncestry: ['prompt-1'],
+                  runtimeSegmentId: 'segment-1'
+                }
+              }
+            : {})
+        })
+        void turn.catch(() => undefined)
+        await vi.waitFor(() => expect(runtime.getSnapshot().pendingPermissions).toHaveLength(1))
+        const { requestId } = runtime.getSnapshot().pendingPermissions[0]
+        const confirmation = runtime.readLivePermissionConfirmation(scope, requestId)
+        if (route === 'trusted') {
+          expect(
+            runtime.readLivePermissionConfirmation(
+              { ...scope, projectId: 'other-project' },
+              requestId
+            )
+          ).toBeUndefined()
+          expect(confirmation?.allowedDecisions).toEqual([
+            'option:allow-once',
+            'option:reject-once',
+            expect.stringMatching(/^option:open-science:allow-session:/),
+            'cancel'
+          ])
+          expect(
+            runtime.claimLivePermissionConfirmation(
+              scope,
+              requestId,
+              'wrong-version',
+              'option:reject-once'
+            )
+          ).toEqual({ status: 'unavailable' })
+          expect(
+            runtime.claimLivePermissionConfirmation(
+              scope,
+              requestId,
+              confirmation!.version,
+              'option:unoffered'
+            )
+          ).toEqual({ status: 'invalid-decision' })
+          const claim = runtime.claimLivePermissionConfirmation(
+            scope,
+            requestId,
+            confirmation!.version,
+            'option:reject-once'
+          )
+          expect(claim.status).toBe('claimed')
+          expect(
+            runtime.claimLivePermissionConfirmation(
+              scope,
+              requestId,
+              confirmation!.version,
+              'option:reject-once'
+            )
+          ).toEqual({ status: 'unavailable' })
+          expect(runtime.readLivePermissionConfirmation(scope, requestId)).toBeUndefined()
+          if (claim.status === 'claimed') await expect(claim.completion).resolves.toBe(true)
+        } else {
+          expect(confirmation).toBeUndefined()
+          await runtime.respondToPermission({ requestId, optionId: 'reject-once' })
+        }
+        await turn
+
+        await vi.waitFor(() => expect(prompts).toHaveLength(2))
+        expect(prompts[1]).toContain('The user explicitly denied this operation')
+        expect(prompts[1]).toContain('You do not have authorization to perform it')
+        expect(prompts[1]).toContain(
+          'Do not retry or approximate the denied operation with a different command, tool, or route'
+        )
+        expect(prompts[1]).toContain(
+          'Continue only with independent work that is already permitted'
+        )
+        expect(runtime.getSnapshot().events).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              kind: 'tool',
+              toolCallId: 'denied-command',
+              status: 'completed',
+              toolDisposition: 'declined'
+            })
+          ])
+        )
+        expect(runtime.getSnapshot().promptInFlightSessionIds).toEqual([sessionId])
+
+        const cancelSnapshot = await runtime.cancelPrompt({ sessionId })
+        expect(cancelSnapshot.promptInFlightSessionIds).toEqual([sessionId])
+        await vi.waitFor(() => expect(runtime.getSnapshot().promptInFlightSessionIds).toEqual([]))
+      } finally {
+        await runtime.shutdownForQuit()
+        await turn?.catch(() => undefined)
+      }
+    }
+  )
 
   it.each(
     PERMISSION_PROJECTION_FRAMEWORKS.flatMap((route) =>

@@ -1,13 +1,38 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import type { CreateElicitationRequest, ElicitationSchema } from '@agentclientprotocol/sdk'
+import type {
+  CreateElicitationRequest,
+  CreateElicitationResponse,
+  ElicitationSchema
+} from '@agentclientprotocol/sdk'
 
-import { AcpElicitationOwner, validateElicitationAnswers } from './elicitation-owner'
+import {
+  AcpElicitationOwner,
+  validateElicitationAnswers,
+  type AuthorizeLiveElicitation,
+  type LiveElicitationBinding,
+  type LiveElicitationResponse
+} from './elicitation-owner'
 import {
   sanitizeElicitationProjection,
   type ElicitationAnswer,
   type PendingElicitationRequest
 } from '../../shared/elicitation'
+
+const projectId = 'project-1'
+const approvedPrompt = (isCurrent: () => boolean = () => true): LiveElicitationBinding => ({
+  prompt: {
+    projectId,
+    sequence: 1,
+    turnToken: 'turn-1',
+    promptMessageId: 'prompt',
+    agentFrameId: 'root',
+    messageBranchId: 'branch-1',
+    runtimeSegmentId: 'segment-1',
+    attachmentGeneration: 1
+  },
+  isCurrent
+})
 
 describe('AcpElicitationOwner', () => {
   it.each(['single-select', 'multi-select'] as const)(
@@ -92,7 +117,7 @@ describe('AcpElicitationOwner', () => {
           }
         }
       },
-      { sessionId: 'app-session-1' },
+      { sessionId: 'app-session-1', livePrompt: approvedPrompt() },
       { promptMessageId: 'prompt-1' }
     )
 
@@ -106,10 +131,14 @@ describe('AcpElicitationOwner', () => {
         }
       })
     ])
+    expect(owner.getLiveRequest(projectId, 'app-session-1', 'native-choice-1')?.request).toEqual(
+      owner.getPendingRequests()[0]
+    )
 
     owner.dispose()
 
     expect(owner.getPendingRequests()).toEqual([])
+    expect(owner.getLiveRequest(projectId, 'app-session-1', 'native-choice-1')).toBeUndefined()
     expect(onProjection).toHaveBeenCalledTimes(1)
     expect(onProjection).toHaveBeenLastCalledWith(
       expect.anything(),
@@ -161,6 +190,18 @@ describe('AcpElicitationOwner', () => {
       request,
       expect.objectContaining({ state: 'pending', durable: request?.durable })
     )
+
+    const authorize = vi.fn(() => true)
+    expect(owner.getLiveRequest(projectId, 'app-session-1', 'choice-1')).toBeUndefined()
+    expect(
+      owner.respondLive(
+        projectId,
+        'app-session-1',
+        { requestId: 'choice-1', action: 'decline' },
+        authorize
+      )
+    ).toBeUndefined()
+    expect(authorize).not.toHaveBeenCalled()
 
     expect(
       owner.respond({
@@ -776,6 +817,136 @@ describe('AcpElicitationOwner', () => {
   })
 })
 
+describe('Live structured input authorization', () => {
+  const sessionId = 'app-session-1'
+  const requestId = 'elicitation-1'
+  const setup = (): {
+    owner: AcpElicitationOwner
+    onProjection: ReturnType<typeof vi.fn>
+    result: Promise<CreateElicitationResponse>
+    invalidate: () => void
+  } => {
+    const onProjection = vi.fn()
+    let current = true
+    const owner = new AcpElicitationOwner({ createRequestId: () => requestId, onProjection })
+    const result = owner.request(
+      {
+        mode: 'form',
+        sessionId: 'provider-session-1',
+        toolCallId: 'tool-ask-1',
+        message: 'Continue?',
+        requestedSchema: {
+          type: 'object',
+          properties: { answer: { type: 'boolean', title: 'Continue' } },
+          required: ['answer']
+        }
+      },
+      { sessionId, livePrompt: approvedPrompt(() => current) }
+    )
+    return {
+      owner,
+      onProjection,
+      result,
+      invalidate: () => {
+        current = false
+      }
+    }
+  }
+
+  it('discloses only the scoped live form and passes an independently cloned validated decision', async () => {
+    const { owner, onProjection, result } = setup()
+    const request = owner.getLiveRequest(projectId, sessionId, requestId)!.request
+    const copy = owner.getLiveRequest(projectId, sessionId, requestId)!.request
+    copy.fields[0].label = 'Changed by host'
+    expect(owner.getLiveRequest(projectId, sessionId, requestId)?.request).toEqual(request)
+    expect(owner.getLiveRequest(projectId, 'other-session', requestId)).toBeUndefined()
+    expect(owner.getLiveRequest('other-project', sessionId, requestId)).toBeUndefined()
+
+    const decision = { action: 'accept' as const, answers: [{ fieldId: 'answer', value: true }] }
+    const authorize = vi.fn<AuthorizeLiveElicitation>((form, validated, prompt) => {
+      expect(form).toEqual(request)
+      expect(validated).toEqual(decision)
+      expect(prompt).toEqual(approvedPrompt().prompt)
+      expect(onProjection).toHaveBeenCalledOnce()
+      validated.answers![0].value = false
+      return true
+    })
+    expect(
+      owner.respondLive(projectId, 'other-session', { requestId, ...decision }, authorize)
+    ).toBeUndefined()
+    expect(() =>
+      owner.respondLive(projectId, sessionId, { requestId, action: 'accept' }, authorize)
+    ).toThrow(
+      expect.objectContaining({
+        code: 'invalid-decision',
+        message: 'Required structured input is missing'
+      })
+    )
+    expect(authorize).not.toHaveBeenCalled()
+
+    const resolved = owner.respondLive(projectId, sessionId, { requestId, ...decision }, authorize)
+    expect(resolved?.decision).toEqual(decision)
+    expect(resolved?.detached).toBe(false)
+    await expect(result).resolves.toEqual({ action: 'accept', content: { answer: true } })
+    expect(owner.getLiveRequest(projectId, sessionId, requestId)).toBeUndefined()
+    expect(() => owner.respond({ requestId, action: 'cancel' })).toThrow(
+      'Unknown structured input request'
+    )
+    expect(
+      owner.respondLive(projectId, sessionId, { requestId, ...decision }, authorize)
+    ).toBeUndefined()
+    expect(authorize).toHaveBeenCalledOnce()
+  })
+
+  it('leaves the same request available to native UI after a rejected proof or a handoff attempt', async () => {
+    const { owner, onProjection, result } = setup()
+    const authorize = vi.fn(() => false)
+    const handoff = { requestId, action: 'decline' as const, prepareContinuation: true }
+    expect(() => owner.respondLive(projectId, sessionId, handoff, authorize)).toThrow(
+      'Invalid live structured input response'
+    )
+    expect(authorize).not.toHaveBeenCalled()
+
+    expect(() =>
+      owner.respondLive(projectId, sessionId, { requestId, action: 'decline' }, authorize)
+    ).toThrow('Live structured input response was not authorized')
+    expect(authorize).toHaveBeenCalledOnce()
+    expect(onProjection).toHaveBeenCalledOnce()
+    expect(owner.getLiveRequest(projectId, sessionId, requestId)).toBeDefined()
+
+    owner.respond({ requestId, action: 'decline' })
+    await expect(result).resolves.toEqual({ action: 'decline' })
+    expect(
+      owner.respondLive(projectId, sessionId, { requestId, action: 'decline' }, authorize)
+    ).toBeUndefined()
+    expect(authorize).toHaveBeenCalledOnce()
+  })
+
+  it('rechecks the original prompt before committing a host decision', async () => {
+    const { owner, result, invalidate } = setup()
+    const authorize = vi.fn(() => {
+      invalidate()
+      return true
+    })
+    expect(owner.getLiveRequest(projectId, sessionId, requestId)).toBeDefined()
+    expect(() =>
+      owner.respondLive(projectId, sessionId, { requestId, action: 'decline' }, authorize)
+    ).toThrow(
+      expect.objectContaining({
+        code: 'unavailable',
+        message: 'Live structured input request is no longer pending'
+      })
+    )
+    expect(owner.getLiveRequest(projectId, sessionId, requestId)).toBeUndefined()
+    expect(
+      owner.respondLive(projectId, sessionId, { requestId, action: 'decline' }, authorize)
+    ).toBeUndefined()
+    expect(authorize).toHaveBeenCalledOnce()
+    owner.respond({ requestId, action: 'decline' })
+    await expect(result).resolves.toEqual({ action: 'decline' })
+  })
+})
+
 // Exercise the actual ACP promise as well as persistence; detached delivery is covered in runtime.
 describe('choice skip semantics', () => {
   const request: PendingElicitationRequest = {
@@ -882,10 +1053,10 @@ describe('choice skip semantics', () => {
             )
           }
         },
-        { sessionId: request.sessionId },
+        { sessionId: request.sessionId, livePrompt: approvedPrompt() },
         { promptMessageId: 'prompt' }
       )
-      owner.respond({
+      const decision: LiveElicitationResponse = {
         requestId: request.requestId,
         action: scenario === 'decline' ? 'decline' : 'accept',
         answers:
@@ -897,7 +1068,20 @@ describe('choice skip semantics', () => {
                   : skipped[0],
                 { fieldId: 'question_1', value: 'B' }
               ]
-      })
+      }
+      if (scenario === 'legacy') {
+        const authorize = vi.fn(() => true)
+        owner.respondLive(projectId, request.sessionId, decision, authorize)
+        expect(authorize).toHaveBeenCalledExactlyOnceWith(
+          expect.objectContaining({
+            durable: expect.objectContaining({ promptMessageId: 'prompt' })
+          }),
+          { action: 'accept', answers: [skipped[0], { fieldId: 'question_1', value: 'B' }] },
+          approvedPrompt().prompt
+        )
+      } else {
+        owner.respond(decision)
+      }
       const wire = await response
       expect(wire.action).toBe('accept')
       if (!('content' in wire)) throw new Error('Missing choice outcomes')

@@ -45,7 +45,20 @@ import {
 } from '../delegation/execution-port'
 import type { RootDelegatedWorkControl } from '../delegation/production-composition'
 import type { ShutdownStepOutcome } from '../lifecycle-shutdown'
-import { ConversationPermissionGrantStore, type AppPermissionRequest } from './permission-broker'
+import type {
+  AuthorizeLiveElicitation,
+  LiveElicitationResponse,
+  LiveElicitationSnapshot,
+  ResolvedElicitation
+} from './elicitation-owner'
+import {
+  ConversationPermissionGrantStore,
+  type AppPermissionRequest,
+  type PermissionConfirmationClaim,
+  type PermissionConfirmationDecision,
+  type PermissionConfirmationScope,
+  type PermissionConfirmationSnapshot
+} from './permission-broker'
 import { AcpRuntime } from './runtime'
 import {
   retainSessionCreationCleanup,
@@ -2110,6 +2123,35 @@ class AcpRuntimeCoordinator {
     return this.getState()
   }
 
+  readLivePermissionConfirmation(
+    scope: PermissionConfirmationScope,
+    requestId: string
+  ): PermissionConfirmationSnapshot | undefined {
+    return this.sessionRuntimes
+      .get(scope.sessionId)
+      ?.readLivePermissionConfirmation(scope, requestId)
+  }
+
+  claimLivePermissionConfirmation(
+    scope: PermissionConfirmationScope,
+    requestId: string,
+    version: string,
+    decision: PermissionConfirmationDecision
+  ): PermissionConfirmationClaim {
+    const runtime = this.sessionRuntimes.get(scope.sessionId)
+    if (!runtime) return { status: 'unavailable' }
+    const claim = runtime.claimLivePermissionConfirmation(scope, requestId, version, decision)
+    return claim.status === 'claimed'
+      ? {
+          status: 'claimed',
+          completion: claim.completion.finally(() => {
+            if (this.permissionRuntimes.get(requestId) === runtime)
+              this.permissionRuntimes.delete(requestId)
+          })
+        }
+      : claim
+  }
+
   async respondToElicitation(response: ElicitationResponse): Promise<AcpRuntimeState> {
     const sessionId = response.request?.sessionId
     const continuePrepared =
@@ -2130,6 +2172,25 @@ class AcpRuntimeCoordinator {
       this.preparedElicitationContinuations.set(sessionId, response.requestId)
     }
     return this.getState()
+  }
+
+  getLiveElicitation(
+    projectId: string,
+    sessionId: string,
+    requestId: string
+  ): LiveElicitationSnapshot | undefined {
+    return this.sessionRuntimes.get(sessionId)?.getLiveElicitation(projectId, sessionId, requestId)
+  }
+
+  respondToLiveElicitation(
+    projectId: string,
+    sessionId: string,
+    response: LiveElicitationResponse,
+    authorize: AuthorizeLiveElicitation
+  ): ResolvedElicitation | undefined {
+    return this.sessionRuntimes
+      .get(sessionId)
+      ?.respondToLiveElicitation(projectId, sessionId, response, authorize)
   }
 
   getPermissionPrompts(sessionId: string): 'none' | undefined {

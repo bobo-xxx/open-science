@@ -61,6 +61,7 @@ const createFixture = () => {
   })
   const owner = {
     kind: 'compute-approval',
+    describeDecision: (decision: string): readonly [string, string] => [decision, decision],
     read: vi.fn(() => (pending ? { disclosure, version, allowedDecisions } : undefined)),
     claim
   }

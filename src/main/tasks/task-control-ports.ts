@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import type { AcpStateSnapshot } from '../../shared/acp'
 import type { ComputeApprovalDecision, ComputeApprovalRequest } from '../../shared/compute'
 import { projectAnswerableDelegatedQuestions } from '../../shared/delegated-work-projection'
+import type { ElicitationAnswer } from '../../shared/elicitation'
 import {
   projectPersistedSessionWaits,
   type PersistedChatSession
@@ -25,8 +26,30 @@ type SignedConfirmation<Decision> = Readonly<{
   signature: string
 }>
 
+type ConfirmationPermissionDecision = 'cancel' | `option:${string}`
+type ConfirmationQuestionDecision =
+  { action: 'accept'; answers: ElicitationAnswer[] } | { action: 'decline' | 'cancel' }
+type LiveConfirmationKind = 'permission' | 'question'
+type LiveConfirmationProof =
+  | { kind: 'permission'; proof: SignedConfirmation<ConfirmationPermissionDecision> }
+  | { kind: 'question'; proof: SignedConfirmation<ConfirmationQuestionDecision> }
+
 type ConfirmationClaim = 'claimed' | 'unavailable' | 'invalid-proof' | 'invalid-decision'
 type ConfirmationChallenge = Readonly<{ id: string; expiresAt: number; envelope: string }>
+
+type ConfirmationPort<Decision> = {
+  issue(
+    scope: InteractionScope,
+    read: ConfirmationRead,
+    isCurrent: () => boolean
+  ): Promise<ConfirmationChallenge | undefined>
+  claim(
+    scope: InteractionScope,
+    proof: SignedConfirmation<Decision>,
+    isCurrent: () => boolean
+  ): Promise<ConfirmationClaim>
+  reset(): void
+}
 
 type TaskInteractionScope = Pick<TaskPendingSessionInteraction, 'projectId' | 'sessionId'>
 type TaskPendingQuestion = { requestId: string; fieldCount: number }
@@ -40,19 +63,9 @@ type TaskControlPorts = {
     listComputeHosts(): Promise<TaskConfigurationOptions['computeHosts']>
     runtimePermission(sessionId: string): TaskSessionRuntimePermission | undefined
   }
-  trustedCompute?: {
-    issue(
-      scope: InteractionScope,
-      read: ConfirmationRead,
-      isCurrent: () => boolean
-    ): Promise<ConfirmationChallenge | undefined>
-    claim(
-      scope: InteractionScope,
-      proof: SignedConfirmation<ComputeApprovalDecision>,
-      isCurrent: () => boolean
-    ): Promise<ConfirmationClaim>
-    reset(): void
-  }
+  trustedCompute?: ConfirmationPort<ComputeApprovalDecision>
+  trustedPermission?: ConfirmationPort<ConfirmationPermissionDecision>
+  trustedQuestion?: ConfirmationPort<ConfirmationQuestionDecision>
   listPendingSessionInteractions?(
     scope: TaskInteractionScope
   ): Promise<readonly TaskPendingSessionInteraction[] | undefined>
@@ -159,7 +172,12 @@ export { projectTaskPendingSessionInteractions, taskInteractionId }
 export type {
   ConfirmationChallenge,
   ConfirmationClaim,
+  ConfirmationPermissionDecision,
+  ConfirmationPort,
+  ConfirmationQuestionDecision,
   ConfirmationRead,
+  LiveConfirmationKind,
+  LiveConfirmationProof,
   InteractionScope,
   SignedConfirmation,
   TaskControlPorts

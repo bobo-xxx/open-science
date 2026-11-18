@@ -80,8 +80,12 @@ import { createTaskCallerContext, type CallerContext } from '../caller-context'
 import type { PlanResponseResult } from '../session-plan/plan-service'
 import type {
   ConfirmationChallenge,
+  ConfirmationClaim,
+  ConfirmationPort,
   ConfirmationRead,
   InteractionScope,
+  LiveConfirmationKind,
+  LiveConfirmationProof,
   SignedConfirmation,
   TaskControlPorts
 } from '../tasks/task-control-ports'
@@ -574,8 +578,46 @@ class HeadlessTaskApi {
     return this.ports.controls?.trustedCompute !== undefined
   }
 
-  resetTrustedComputeDecisions(): void {
+  resetTrustedConfirmationChallenges(): void {
     this.ports.controls?.trustedCompute?.reset()
+    this.ports.controls?.trustedPermission?.reset()
+    this.ports.controls?.trustedQuestion?.reset()
+  }
+
+  supportsTrustedInteractionDecisions(kind: LiveConfirmationKind): boolean {
+    return kind === 'permission'
+      ? this.ports.controls?.trustedPermission !== undefined
+      : this.ports.controls?.trustedQuestion !== undefined
+  }
+
+  async createInteractionConfirmationChallenge(
+    scope: InteractionScope,
+    kind: LiveConfirmationKind,
+    read: ConfirmationRead
+  ): Promise<ConfirmationChallenge> {
+    const controls = this.ports.controls
+    const port = kind === 'permission' ? controls?.trustedPermission : controls?.trustedQuestion
+    const isCurrent = this.confirmationAuthorization(
+      Boolean(port),
+      'trusted_interaction_decisions_unavailable'
+    )
+    return this.requireConfirmationChallenge(await port?.issue(scope, read, isCurrent))
+  }
+
+  async submitInteractionConfirmationDecision(
+    scope: InteractionScope,
+    input: LiveConfirmationProof
+  ): Promise<{ status: 'claimed' }> {
+    const isCurrent = this.confirmationAuthorization(
+      this.supportsTrustedInteractionDecisions(input.kind),
+      'trusted_interaction_decisions_unavailable'
+    )
+    const controls = this.ports.controls
+    const state =
+      input.kind === 'permission'
+        ? await controls?.trustedPermission?.claim(scope, input.proof, isCurrent)
+        : await controls?.trustedQuestion?.claim(scope, input.proof, isCurrent)
+    return this.confirmationReceipt(state)
   }
 
   async createComputeConfirmationChallenge(
@@ -583,14 +625,7 @@ class HeadlessTaskApi {
     read: ConfirmationRead
   ): Promise<ConfirmationChallenge> {
     const { port, isCurrent } = this.trustedComputePort()
-    const challenge = await port.issue(scope, read, isCurrent)
-    if (!challenge) {
-      throw new TaskRunnerError(
-        'trusted_confirmation_unavailable',
-        'The trusted confirmation request is unavailable.'
-      )
-    }
-    return challenge
+    return this.requireConfirmationChallenge(await port.issue(scope, read, isCurrent))
   }
 
   async submitComputeConfirmationDecision(
@@ -598,7 +633,20 @@ class HeadlessTaskApi {
     proof: SignedConfirmation<ComputeApprovalDecision>
   ): Promise<{ status: 'claimed' }> {
     const { port, isCurrent } = this.trustedComputePort()
-    const state = await port.claim(scope, proof, isCurrent)
+    return this.confirmationReceipt(await port.claim(scope, proof, isCurrent))
+  }
+
+  private requireConfirmationChallenge(
+    challenge: ConfirmationChallenge | undefined
+  ): ConfirmationChallenge {
+    if (challenge) return challenge
+    throw new TaskRunnerError(
+      'trusted_confirmation_unavailable',
+      'The trusted confirmation request is unavailable.'
+    )
+  }
+
+  private confirmationReceipt(state: ConfirmationClaim | undefined): { status: 'claimed' } {
     if (state === 'claimed') return { status: 'claimed' }
     if (state === 'invalid-proof') {
       throw new TaskRunnerError('invalid_confirmation_proof', 'Invalid confirmation signature.')
@@ -613,18 +661,26 @@ class HeadlessTaskApi {
   }
 
   private trustedComputePort(): {
-    port: NonNullable<TaskControlPorts['trustedCompute']>
+    port: ConfirmationPort<ComputeApprovalDecision>
     isCurrent: () => boolean
   } {
-    const context = this.currentCallerContext()
     const port = this.ports.controls?.trustedCompute
-    if (!port || context.location !== 'local' || !context.isAuthorizationCurrent()) {
-      throw new TaskRunnerError(
-        'trusted_compute_decisions_unavailable',
-        'Trusted Compute confirmations require local SDK access.'
-      )
+    const isCurrent = this.confirmationAuthorization(
+      Boolean(port),
+      'trusted_compute_decisions_unavailable'
+    )
+    return { port: port!, isCurrent }
+  }
+
+  private confirmationAuthorization(
+    supported: boolean,
+    code: 'trusted_compute_decisions_unavailable' | 'trusted_interaction_decisions_unavailable'
+  ): () => boolean {
+    const context = this.currentCallerContext()
+    if (!supported || context.location !== 'local' || !context.isAuthorizationCurrent()) {
+      throw new TaskRunnerError(code, 'Trusted confirmations require local SDK access.')
     }
-    return { port, isCurrent: context.isAuthorizationCurrent }
+    return context.isAuthorizationCurrent
   }
 
   async getSessionHistory(input: LoadSessionHistoryPageRequest): Promise<TaskSessionHistoryPage> {

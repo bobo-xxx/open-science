@@ -6,7 +6,7 @@ import type {
 } from '@agentclientprotocol/sdk'
 
 import type { AgentFrameworkId } from '../../shared/settings'
-import type { AcpElicitationOwner } from './elicitation-owner'
+import type { AcpElicitationOwner, LiveElicitationBinding } from './elicitation-owner'
 import type { AcpPermissionContext } from './permission-context'
 
 type AcpClientInteractionOwnerOptions = {
@@ -17,6 +17,10 @@ type AcpClientInteractionOwnerOptions = {
     frameworkForSession: (appSessionId: string) => AgentFrameworkId | undefined
     reviewerFrameworkForSession: (providerSessionId: string) => AgentFrameworkId | undefined
     promptMessageIdForSession: (appSessionId: string) => string | undefined
+    captureLiveElicitationPrompt?: (
+      appSessionId: string,
+      providerSessionId: string
+    ) => LiveElicitationBinding | undefined
   }
   elicitation: Pick<AcpElicitationOwner, 'request'>
   permission: Pick<
@@ -72,9 +76,13 @@ class AcpClientInteractionOwner {
     }
 
     const promptMessageId = this.options.routing.promptMessageIdForSession(sessionId)
+    const livePrompt = this.options.routing.captureLiveElicitationPrompt?.(
+      sessionId,
+      params.sessionId
+    )
     return this.options.elicitation.request(
       params,
-      { sessionId },
+      { sessionId, ...(livePrompt ? { livePrompt } : {}) },
       promptMessageId ? { promptMessageId } : undefined
     )
   }

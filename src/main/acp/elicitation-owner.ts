@@ -25,13 +25,51 @@ import { isRecord } from '../value-guards'
 
 type ElicitationRoute = {
   sessionId: string
+  livePrompt?: LiveElicitationBinding
 }
 
 type PendingElicitation = {
   request: PendingElicitationRequest
   projection: ElicitationProjection
   resolve?: (response: CreateElicitationResponse) => void
+  livePrompt?: LiveElicitationBinding
 }
+
+export type LiveElicitationPrompt = Readonly<{
+  projectId: string
+  sequence: number
+  turnToken: string
+  promptMessageId: string
+  agentFrameId: string
+  messageBranchId: string
+  runtimeSegmentId: string
+  attachmentGeneration: number
+}>
+export type LiveElicitationBinding = Readonly<{
+  prompt: LiveElicitationPrompt
+  isCurrent: () => boolean
+}>
+export type LiveElicitationSnapshot = Readonly<{
+  request: PendingElicitationRequest
+  prompt: LiveElicitationPrompt
+}>
+export type LiveElicitationResponse = Pick<ElicitationResponse, 'requestId' | 'action' | 'answers'>
+export type AuthorizeLiveElicitation = (
+  request: PendingElicitationRequest,
+  decision: ResolvedElicitation['decision'],
+  prompt: LiveElicitationPrompt
+) => boolean
+
+export class LiveElicitationResponseError extends Error {
+  constructor(
+    readonly code: 'invalid-decision' | 'unavailable',
+    message: string
+  ) {
+    super(message)
+  }
+}
+
+class ElicitationAnswerValidationError extends Error {}
 
 export type ResolvedElicitation = {
   request: PendingElicitationRequest
@@ -275,7 +313,7 @@ export const validateElicitationAnswers = (
 ): ElicitationAnswer[] => {
   const candidates = normalizeAgentUserChoiceAnswers(request.fields, answers ?? [])
   if (candidates.length > MAX_ELICITATION_ANSWERS) {
-    throw new Error('Invalid structured input response')
+    throw new ElicitationAnswerValidationError('Invalid structured input response')
   }
   const fields = new Map(request.fields.map((field) => [field.id, field]))
   const seen = new Set<string>()
@@ -291,12 +329,12 @@ export const validateElicitationAnswers = (
           field &&
           isValidElicitationValue(field, answer.value)
     if (!field || seen.has(answer.fieldId) || !valid) {
-      throw new Error('Invalid structured input response')
+      throw new ElicitationAnswerValidationError('Invalid structured input response')
     }
     seen.add(answer.fieldId)
   }
   if (request.fields.some((field) => field.required && !seen.has(field.id))) {
-    throw new Error('Required structured input is missing')
+    throw new ElicitationAnswerValidationError('Required structured input is missing')
   }
   if (questions) {
     for (const question of questions) {
@@ -308,7 +346,7 @@ export const validateElicitationAnswers = (
         (Array.isArray(choice?.value) && choice.value.length === 0) ||
         (custom && typeof custom.value === 'string' && !custom.value.trim())
       ) {
-        throw new Error('Invalid structured input response')
+        throw new ElicitationAnswerValidationError('Invalid structured input response')
       }
     }
   }
@@ -450,7 +488,12 @@ export class AcpElicitationOwner {
     const { request, projection } = prepared
 
     return new Promise((resolve) => {
-      this.pending.set(request.requestId, { request, projection, resolve })
+      this.pending.set(request.requestId, {
+        request,
+        projection,
+        resolve,
+        ...(route.livePrompt ? { livePrompt: route.livePrompt } : {})
+      })
       if (!this.tryPublishProjection(request, projection)) {
         this.pending.delete(request.requestId)
         resolve({ action: 'cancel' })
@@ -520,13 +563,77 @@ export class AcpElicitationOwner {
   respond(response: ElicitationResponse): ResolvedElicitation {
     const pending = this.pending.get(response.requestId)
     if (!pending) throw new Error('Unknown structured input request')
+    return this.resolvePending(pending, response)
+  }
 
+  getLiveRequest(
+    projectId: string,
+    sessionId: string,
+    requestId: string
+  ): LiveElicitationSnapshot | undefined {
+    const live = this.livePending(projectId, sessionId, requestId)
+    return live
+      ? { request: structuredClone(live.pending.request), prompt: live.binding.prompt }
+      : undefined
+  }
+
+  respondLive(
+    projectId: string,
+    sessionId: string,
+    response: LiveElicitationResponse,
+    authorize: AuthorizeLiveElicitation
+  ): ResolvedElicitation | undefined {
+    const live = this.livePending(projectId, sessionId, response.requestId)
+    if (!live) return undefined
+    if (
+      typeof authorize !== 'function' ||
+      (response.action !== 'accept' &&
+        response.action !== 'decline' &&
+        response.action !== 'cancel') ||
+      (response.action !== 'accept' && response.answers !== undefined) ||
+      Object.keys(response).some((key) => !['requestId', 'action', 'answers'].includes(key))
+    ) {
+      throw new LiveElicitationResponseError(
+        'invalid-decision',
+        'Invalid live structured input response'
+      )
+    }
+    return this.resolvePending(live.pending, response, { binding: live.binding, authorize })
+  }
+
+  private livePending(
+    projectId: string,
+    sessionId: string,
+    requestId: string
+  ): { pending: PendingElicitation; binding: LiveElicitationBinding } | undefined {
+    const pending = this.pending.get(requestId)
+    const binding = pending?.livePrompt
+    return pending?.resolve &&
+      pending.request.sessionId === sessionId &&
+      binding?.prompt.projectId === projectId &&
+      binding.isCurrent()
+      ? { pending, binding }
+      : undefined
+  }
+
+  private resolvePending(
+    pending: PendingElicitation,
+    response: LiveElicitationResponse,
+    authority?: { binding: LiveElicitationBinding; authorize: AuthorizeLiveElicitation }
+  ): ResolvedElicitation {
     let protocolResponse: CreateElicitationResponse
     let answers: ElicitationAnswer[] | undefined
     let state: ElicitationProjection['state']
 
     if (response.action === 'accept') {
-      answers = validateElicitationAnswers(pending.request, response.answers)
+      try {
+        answers = validateElicitationAnswers(pending.request, response.answers)
+      } catch (error) {
+        if (authority && error instanceof ElicitationAnswerValidationError) {
+          throw new LiveElicitationResponseError('invalid-decision', error.message)
+        }
+        throw error
+      }
       protocolResponse = {
         action: 'accept',
         content: Object.fromEntries(
@@ -541,6 +648,33 @@ export class AcpElicitationOwner {
       state = response.action === 'decline' ? 'declined' : 'cancelled'
     }
 
+    const decision = { action: response.action, ...(answers ? { answers } : {}) }
+    if (authority) {
+      // Validate the exact decision while the provider still owns this request. No await or
+      // publication can interleave the proof consumption with the shared claim below.
+      const { binding, authorize } = authority
+      if (!binding.isCurrent()) {
+        throw new LiveElicitationResponseError(
+          'unavailable',
+          'Live structured input request is no longer pending'
+        )
+      }
+      if (
+        authorize(structuredClone(pending.request), structuredClone(decision), binding.prompt) !==
+        true
+      ) {
+        throw new LiveElicitationResponseError(
+          'unavailable',
+          'Live structured input response was not authorized'
+        )
+      }
+      if (this.pending.get(response.requestId) !== pending || !binding.isCurrent()) {
+        throw new LiveElicitationResponseError(
+          'unavailable',
+          'Live structured input request is no longer pending'
+        )
+      }
+    }
     this.pending.delete(response.requestId)
     const projection: ElicitationProjection = {
       ...pending.projection,
@@ -552,7 +686,6 @@ export class AcpElicitationOwner {
         : {})
     }
     this.tryPublishProjection(pending.request, projection)
-    const decision = { action: response.action, ...(answers ? { answers } : {}) }
     const outcomes = agentUserChoiceOutcomes(pending.request, decision)
     const questions = resolveAgentUserChoiceQuestions(pending.request.fields)
     if (pending.resolve && questions && outcomes.some((outcome) => outcome.status === 'skipped')) {

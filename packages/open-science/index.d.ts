@@ -694,9 +694,9 @@ export type PendingSessionInteraction = Readonly<
   )
 >
 
-export type ComputeConfirmationDecision = 'deny' | 'once' | 'session' | 'project' | 'global'
+export type InteractionConfirmationKind = 'permission' | 'question'
 
-export type ComputeConfirmationChallengeRequest = Readonly<{
+export type InteractionConfirmationChallengeRequest = Readonly<{
   hostId: string
   /** Unix time in milliseconds used in the isolated signer's read signature. */
   issuedAt: number
@@ -704,7 +704,7 @@ export type ComputeConfirmationChallengeRequest = Readonly<{
   signature: string
 }>
 
-export type ComputeConfirmationChallenge = Readonly<{
+export type InteractionConfirmationChallenge = Readonly<{
   id: string
   /** Unix time in milliseconds. */
   expiresAt: number
@@ -712,14 +712,35 @@ export type ComputeConfirmationChallenge = Readonly<{
   envelope: string
 }>
 
-export type ComputeConfirmationProof = Readonly<{
+type SignedConfirmation<Decision> = Readonly<{
   challengeId: string
-  decision: ComputeConfirmationDecision
+  decision: Decision
   /** Unpadded base64url Ed25519 signature from the isolated signer after user confirmation. */
   signature: string
 }>
 
-export type ComputeConfirmationReceipt = Readonly<{ status: 'claimed' }>
+export type InteractionConfirmationReceipt = Readonly<{ status: 'claimed' }>
+
+export type PermissionConfirmationDecision = 'cancel' | `option:${string}`
+export type PermissionConfirmationProof = SignedConfirmation<PermissionConfirmationDecision>
+
+export type QuestionConfirmationAnswer = Readonly<
+  { fieldId: string } & (
+    | { status?: 'answered'; value: string | number | boolean | string[] }
+    | { status: 'skipped'; value?: never }
+  )
+>
+export type QuestionConfirmationDecision = Readonly<
+  | { action: 'accept'; answers: readonly QuestionConfirmationAnswer[] }
+  | { action: 'decline' | 'cancel' }
+>
+export type QuestionConfirmationProof = SignedConfirmation<QuestionConfirmationDecision>
+
+export type ComputeConfirmationDecision = 'deny' | 'once' | 'session' | 'project' | 'global'
+export type ComputeConfirmationChallengeRequest = InteractionConfirmationChallengeRequest
+export type ComputeConfirmationChallenge = InteractionConfirmationChallenge
+export type ComputeConfirmationProof = SignedConfirmation<ComputeConfirmationDecision>
+export type ComputeConfirmationReceipt = InteractionConfirmationReceipt
 
 export type SessionHistoryPage = {
   projectId: string
@@ -849,6 +870,32 @@ export class OpenScienceClient {
     proof: ComputeConfirmationProof,
     options?: RequestOptions
   ): Promise<ComputeConfirmationReceipt>
+  /** Read a live permission or question disclosure with an enrolled host signature. Preview. */
+  createInteractionConfirmationChallenge(
+    projectId: string,
+    sessionId: string,
+    interactionId: string,
+    kind: InteractionConfirmationKind,
+    request: InteractionConfirmationChallengeRequest,
+    options?: RequestOptions
+  ): Promise<InteractionConfirmationChallenge>
+  /** Submit the isolated host signer's live interaction decision. Preview. */
+  submitInteractionConfirmationDecision(
+    projectId: string,
+    sessionId: string,
+    interactionId: string,
+    kind: 'permission',
+    proof: PermissionConfirmationProof,
+    options?: RequestOptions
+  ): Promise<InteractionConfirmationReceipt>
+  submitInteractionConfirmationDecision(
+    projectId: string,
+    sessionId: string,
+    interactionId: string,
+    kind: 'question',
+    proof: QuestionConfirmationProof,
+    options?: RequestOptions
+  ): Promise<InteractionConfirmationReceipt>
   getSessionHistory(
     projectId: string,
     sessionId: string,

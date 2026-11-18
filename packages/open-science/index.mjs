@@ -46,6 +46,14 @@ const beforeDeadline = (options, deadline) => {
 const pendingSessionInteractionsPath = (projectId, sessionId) =>
   `/api/v1/projects/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(sessionId)}/pending-interactions`
 
+const assertInteractionConfirmationKind = (kind) => {
+  if (kind !== 'permission' && kind !== 'question') {
+    throw new TypeError('Interaction confirmation kind must be permission or question.')
+  }
+}
+
+const confirmationLabel = (kind) => (kind === 'compute' ? 'Compute' : kind)
+
 const createRequestLifecycle = ({ defaultTimeoutMs, signal, timeoutMs }) => {
   signal?.throwIfAborted()
   const resolvedTimeoutMs = resolveRequestTimeout(defaultTimeoutMs, timeoutMs)
@@ -440,17 +448,79 @@ export class OpenScienceClient {
     }
   }
 
-  async createComputeConfirmationChallenge(
-    projectId,
-    sessionId,
-    interactionId,
-    { hostId, issuedAt, signature },
-    options
-  ) {
-    const challenge = await this.#postComputeConfirmation(
+  createComputeConfirmationChallenge(projectId, sessionId, interactionId, request, options) {
+    return this.#createConfirmationChallenge(
       projectId,
       sessionId,
       interactionId,
+      'compute',
+      request,
+      options
+    )
+  }
+
+  submitComputeConfirmationDecision(projectId, sessionId, interactionId, proof, options) {
+    return this.#submitConfirmationDecision(
+      projectId,
+      sessionId,
+      interactionId,
+      'compute',
+      proof,
+      options
+    )
+  }
+
+  async createInteractionConfirmationChallenge(
+    projectId,
+    sessionId,
+    interactionId,
+    kind,
+    request,
+    options
+  ) {
+    assertInteractionConfirmationKind(kind)
+    return this.#createConfirmationChallenge(
+      projectId,
+      sessionId,
+      interactionId,
+      kind,
+      request,
+      options
+    )
+  }
+
+  async submitInteractionConfirmationDecision(
+    projectId,
+    sessionId,
+    interactionId,
+    kind,
+    proof,
+    options
+  ) {
+    assertInteractionConfirmationKind(kind)
+    return this.#submitConfirmationDecision(
+      projectId,
+      sessionId,
+      interactionId,
+      kind,
+      proof,
+      options
+    )
+  }
+
+  async #createConfirmationChallenge(
+    projectId,
+    sessionId,
+    interactionId,
+    kind,
+    { hostId, issuedAt, signature },
+    options
+  ) {
+    const challenge = await this.#postConfirmation(
+      projectId,
+      sessionId,
+      interactionId,
+      kind,
       'challenge',
       { hostId, issuedAt, signature },
       options
@@ -463,46 +533,50 @@ export class OpenScienceClient {
       typeof challenge.envelope !== 'string' ||
       !/^[A-Za-z0-9_-]+$/.test(challenge.envelope)
     ) {
-      throw new OpenScienceApiError('Invalid Compute confirmation challenge.', {
+      throw new OpenScienceApiError(`Invalid ${confirmationLabel(kind)} confirmation challenge.`, {
         code: 'invalid_response'
       })
     }
     return challenge
   }
 
-  async submitComputeConfirmationDecision(
+  async #submitConfirmationDecision(
     projectId,
     sessionId,
     interactionId,
+    kind,
     { challengeId, decision, signature },
     options
   ) {
-    const receipt = await this.#postComputeConfirmation(
+    const receipt = await this.#postConfirmation(
       projectId,
       sessionId,
       interactionId,
+      kind,
       'decision',
       { challengeId, decision, signature },
       options
     )
     if (receipt?.status !== 'claimed') {
-      throw new OpenScienceApiError('Invalid Compute confirmation receipt.', {
+      throw new OpenScienceApiError(`Invalid ${confirmationLabel(kind)} confirmation receipt.`, {
         code: 'invalid_response'
       })
     }
     return receipt
   }
 
-  async #postComputeConfirmation(projectId, sessionId, interactionId, action, body, options) {
+  async #postConfirmation(projectId, sessionId, interactionId, kind, action, body, options) {
     const deadline = Date.now() + resolveRequestTimeout(this.requestTimeoutMs, options?.timeoutMs)
     const capabilities = await this.getCapabilities(beforeDeadline(options, deadline))
-    if (!capabilities.taskCapabilities.includes('trusted-compute-decisions')) {
-      throw new OpenScienceApiError('This server does not support trusted Compute confirmations.', {
-        code: 'unsupported_capability'
-      })
+    if (!capabilities.taskCapabilities.includes(`trusted-${kind}-decisions`)) {
+      throw new OpenScienceApiError(
+        `This server does not support trusted ${confirmationLabel(kind)} confirmations.`,
+        { code: 'unsupported_capability' }
+      )
     }
+    const kindSegment = kind === 'compute' ? '' : `/${kind}`
     return this.request(
-      `${pendingSessionInteractionsPath(projectId, sessionId)}/${encodeURIComponent(interactionId)}/${action}`,
+      `${pendingSessionInteractionsPath(projectId, sessionId)}/${encodeURIComponent(interactionId)}${kindSegment}/${action}`,
       { ...beforeDeadline(options, deadline), method: 'POST', body }
     )
   }

@@ -1,5 +1,5 @@
 import { expect } from '@playwright/test'
-import { createHash, generateKeyPairSync } from 'node:crypto'
+import { createHash, generateKeyPairSync, sign } from 'node:crypto'
 
 import type { OpenScienceClient } from '../packages/open-science/index'
 import { test, type ElectronApp } from './fixtures/electron-app'
@@ -186,4 +186,125 @@ test('reviews a trusted host key in Desktop and revokes it through local Web', a
   } finally {
     await web.close()
   }
+})
+
+test('continues SDK tasks after signed live permission and question decisions', async ({ app }) => {
+  await app.configureFakeAgent()
+  const sdk = await connect(app)
+  expect((await sdk.getCapabilities()).taskCapabilities).toEqual(
+    expect.arrayContaining(['trusted-permission-decisions', 'trusted-question-decisions'])
+  )
+  const signer = generateKeyPairSync('ed25519')
+  const rawKey = signer.publicKey.export({ format: 'jwk' }).x
+  if (!rawKey) throw new Error('Ed25519 public key is missing.')
+  const hostId = await app.page.evaluate(async (publicKey) => {
+    const hosts = window.api.trustedHosts
+    if (!hosts) throw new Error('Trusted host registration is unavailable.')
+    return (await hosts.enroll(await hosts.review({ label: 'Fixture signer', publicKey }))).id
+  }, rawKey)
+
+  const project = await sdk.createProject({ name: 'Trusted SDK task fixtures' })
+  const signText = (text: string): string =>
+    sign(null, Buffer.from(text, 'utf8'), signer.privateKey).toString('base64url')
+  const readMessage = (
+    kind: 'permission' | 'question',
+    sessionId: string,
+    interactionId: string,
+    time: number
+  ): string =>
+    'Open Science trusted interaction read v1\n' +
+    JSON.stringify([kind, project.id, sessionId, interactionId, hostId, time])
+  const signDecision = (envelope: string, payload: string): string =>
+    signText('Open Science trusted interaction decision v1\n' + envelope + '\n' + payload)
+
+  const disclose = async (
+    sessionId: string,
+    kind: 'permission' | 'question'
+  ): Promise<{
+    interactionId: string
+    challenge: { id: string; envelope: string }
+  }> => {
+    const poll = async (): Promise<string | undefined> =>
+      (await sdk.listPendingSessionInteractions(project.id, sessionId)).find(
+        (item) => item.kind === kind
+      )?.id
+    await expect.poll(poll).toBeTruthy()
+    const interactionId = await poll()
+    if (!interactionId) throw new Error('The fixture interaction is no longer pending.')
+    const issuedAt = Date.now()
+    const challenge = await sdk.createInteractionConfirmationChallenge(
+      project.id,
+      sessionId,
+      interactionId,
+      kind,
+      {
+        hostId,
+        issuedAt,
+        signature: signText(readMessage(kind, sessionId, interactionId, issuedAt))
+      }
+    )
+    return { interactionId, challenge }
+  }
+
+  const permissionRun = await sdk.startRun({
+    project: project.id,
+    prompt: 'Request fixture permission.',
+    permissionProfile: 'ask'
+  })
+  const permission = await disclose(permissionRun.sessionId, 'permission')
+  const decision = 'option:allow-once'
+  const permissionProof = {
+    challengeId: permission.challenge.id,
+    decision,
+    signature: signDecision(permission.challenge.envelope, decision)
+  } as const
+  await expect(
+    sdk.submitInteractionConfirmationDecision(
+      project.id,
+      permissionRun.sessionId,
+      permission.interactionId,
+      'permission',
+      permissionProof
+    )
+  ).resolves.toEqual({ status: 'claimed' })
+  await expect(
+    sdk.submitInteractionConfirmationDecision(
+      project.id,
+      permissionRun.sessionId,
+      permission.interactionId,
+      'permission',
+      permissionProof
+    )
+  ).rejects.toMatchObject({ code: 'trusted_confirmation_unavailable' })
+  expect((await sdk.waitForRun(permissionRun.id)).status).toBe('completed')
+
+  const questionRun = await sdk.startRun({
+    project: project.id,
+    prompt: 'Ask a restart verification question. Include four questions.'
+  })
+  const question = await disclose(questionRun.sessionId, 'question')
+  const answers = Array.from({ length: 4 }, (_, index) => ({
+    fieldId: 'question_' + index,
+    value: 'Dataset Alpha'
+  }))
+  const signedPayload = JSON.stringify([
+    'accept',
+    answers.map(({ fieldId, value }) => [fieldId, 'answered', value])
+  ])
+  await expect(
+    sdk.submitInteractionConfirmationDecision(
+      project.id,
+      questionRun.sessionId,
+      question.interactionId,
+      'question',
+      {
+        challengeId: question.challenge.id,
+        decision: { action: 'accept', answers },
+        signature: signDecision(question.challenge.envelope, signedPayload)
+      }
+    )
+  ).resolves.toEqual({ status: 'claimed' })
+  const result = await sdk.waitForRun(questionRun.id)
+  expect(result.status).toBe('completed')
+  expect(result.output).toContain('Question answer delivered.')
 })

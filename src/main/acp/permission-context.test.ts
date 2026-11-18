@@ -84,6 +84,66 @@ const observe = (
 }
 
 describe('ACP permission context', () => {
+  it('requires the current primary session and prompt binding for a signed permission claim', async () => {
+    let active = true
+    let activePrompt = true
+    const captureConfirmationPrompt = vi.fn(() => ({
+      version: 'test-branch-prompt',
+      isCurrent: () => activePrompt
+    }))
+    const context = new AcpPermissionContext({
+      emitPermissionRequest: vi.fn(),
+      routing: permissionRouting({
+        hasActivePrimarySession: () => active,
+        capturePrompt: () => ({ sequence: 1, isCancellationAccepted: () => false }),
+        currentInteractionSequence: () => 1,
+        captureConfirmationPrompt
+      })
+    })
+    const scope = { projectId: 'default-project', sessionId: 'session-1' }
+    const waiting = context.handleProviderRequest(
+      permissionRequest(scope.sessionId, 'shell-call', {
+        title: 'Read a project file',
+        kind: 'read'
+      })
+    )
+    try {
+      await vi.waitFor(() => expect(context.getPendingRequests()).toHaveLength(1))
+      expect(captureConfirmationPrompt).toHaveBeenCalledExactlyOnceWith(
+        scope.sessionId,
+        scope.sessionId
+      )
+      const [pending] = context.getPendingRequests()
+      const confirmation = context.readPendingConfirmation(scope, pending.requestId)!
+      active = false
+      expect(context.readPendingConfirmation(scope, pending.requestId)).toBeUndefined()
+      expect(
+        context.claimPendingConfirmation(
+          scope,
+          pending.requestId,
+          confirmation.version,
+          'option:allow-once'
+        )
+      ).toEqual({ status: 'unavailable' })
+      expect(context.getPendingRequests()).toHaveLength(1)
+      active = true
+      activePrompt = false
+      expect(context.readPendingConfirmation(scope, pending.requestId)).toBeUndefined()
+      expect(
+        context.claimPendingConfirmation(
+          scope,
+          pending.requestId,
+          confirmation.version,
+          'option:allow-once'
+        )
+      ).toEqual({ status: 'unavailable' })
+      expect(context.getPendingRequests()).toHaveLength(1)
+    } finally {
+      context.dispose()
+    }
+    await expect(waiting).resolves.toEqual({ outcome: { outcome: 'cancelled' } })
+  })
+
   const scheduleTools = [
     'list_schedules',
     'create_schedule',

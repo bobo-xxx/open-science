@@ -423,6 +423,7 @@ export type TaskApiErrorCode =
   | 'configuration_options_unavailable'
   | 'pending_interactions_unavailable'
   | 'trusted_compute_decisions_unavailable'
+  | 'trusted_interaction_decisions_unavailable'
   | 'trusted_confirmation_unavailable'
   | 'invalid_confirmation_proof'
   | 'session_history_cursor_stale'

@@ -1,4 +1,5 @@
 import { randomUUID, verify, type KeyObject } from 'node:crypto'
+import type { ElicitationResponse } from '../../shared/elicitation'
 
 import type {
   ConfirmationChallenge,
@@ -14,9 +15,10 @@ type ConfirmationSnapshot<Disclosure, Decision> = Readonly<{
   allowedDecisions: readonly Decision[]
 }>
 
-type ConfirmationOwner<Disclosure, Decision> = {
+type ConfirmationOwner<Disclosure, Decision, Choice extends string> = {
   kind: string
-  read(scope: InteractionScope): ConfirmationSnapshot<Disclosure, Decision> | undefined
+  read(scope: InteractionScope): ConfirmationSnapshot<Disclosure, Choice> | undefined
+  describeDecision(decision: Decision): readonly [choice: Choice, payload: string]
   claim(scope: InteractionScope, version: string, decision: Decision): ConfirmationClaim
 }
 
@@ -49,12 +51,12 @@ const sameScope = (first: InteractionScope, second: InteractionScope): boolean =
   first.interactionId === second.interactionId
 
 // One broker belongs to one profile's running application. Challenges are process-local.
-class TrustedInteractionDecisions<Disclosure, Decision extends string> {
+class TrustedInteractionDecisions<Disclosure, Decision, Choice extends string = Decision & string> {
   private serviceGeneration = randomUUID()
-  private readonly challenges = new Map<string, StoredChallenge<Decision>>()
+  private readonly challenges = new Map<string, StoredChallenge<Choice>>()
 
   constructor(
-    private readonly owner: ConfirmationOwner<Disclosure, Decision>,
+    private readonly owner: ConfirmationOwner<Disclosure, Decision, Choice>,
     private readonly getHostKey: (id: string) => KeyObject | undefined,
     private readonly now: () => number = Date.now
   ) {}
@@ -143,16 +145,32 @@ class TrustedInteractionDecisions<Disclosure, Decision extends string> {
       this.challenges.delete(proof.challengeId)
       return 'unavailable'
     }
-    const message = DECISION_DOMAIN + stored.challenge.envelope + '\n' + proof.decision
+    const [choice, payload] = this.owner.describeDecision(proof.decision)
+    const message = DECISION_DOMAIN + stored.challenge.envelope + '\n' + payload
     if (!checkSignature(key, message, proof.signature)) return 'invalid-proof'
 
     // The verified proof and the application owner's pending decision are consumed in the same
     // synchronous call. Native responses still settle through that owner's normal claim path.
     this.challenges.delete(proof.challengeId)
     if (stored.challenge.expiresAt <= this.now()) return 'unavailable'
-    if (!stored.allowedDecisions.includes(proof.decision)) return 'invalid-decision'
+    if (!stored.allowedDecisions.includes(choice)) return 'invalid-decision'
     return this.owner.claim(stored.scope, stored.version, proof.decision)
   }
 }
 
-export { TrustedInteractionDecisions }
+const describeQuestionConfirmationDecision = ({
+  action,
+  answers
+}: Pick<ElicitationResponse, 'action' | 'answers'>): readonly [typeof action, string] => [
+  action,
+  JSON.stringify([
+    action,
+    answers?.map((answer) =>
+      answer.status === 'skipped'
+        ? [answer.fieldId, 'skipped']
+        : [answer.fieldId, 'answered', answer.value]
+    ) ?? null
+  ])
+]
+
+export { describeQuestionConfirmationDecision, TrustedInteractionDecisions }

@@ -30,10 +30,15 @@ import {
   permissionRequestFingerprint,
   resolveNotebookPermissionContext,
   type AppPermissionRequest,
+  type BeforePermissionSettlement,
+  type PermissionConfirmationClaim,
+  type PermissionConfirmationDecision,
+  type PermissionConfirmationScope,
+  type PermissionConfirmationSnapshot,
   type PermissionWaitHooks,
   type RestoredPermissionContinuation
 } from './permission-broker'
-import type { PermissionPolicyContext } from './permission-policy'
+import type { PermissionConfirmationPrompt, PermissionPolicyContext } from './permission-policy'
 import {
   isMcpToolName,
   isNativeWebFetchCandidate,
@@ -164,6 +169,10 @@ type AcpPermissionContextOptions = {
     ) => RequestPermissionResponse | undefined
     currentFramework: () => AgentFramework
     resolveProjectId: (sessionId: string) => string
+    captureConfirmationPrompt?: (
+      appSessionId: string,
+      providerSessionId: string
+    ) => PermissionConfirmationPrompt | undefined
   }
   conversationGrants?: ConversationPermissionGrantStore
   permissionGrantRegistry?: PermissionGrantRegistry
@@ -479,6 +488,9 @@ class AcpPermissionContext {
     const mcpServerNames =
       reviewerContext?.mcpServerNames ?? routing.mcpServerNamesFor(appSessionId)
     const promptInteraction = routing.capturePrompt(appSessionId)
+    const confirmationPrompt = reviewerContext
+      ? undefined
+      : routing.captureConfirmationPrompt?.(appSessionId, params.sessionId)
     const promptTurn = promptInteraction?.sequence
     const aggregateSnapshot = routing.sessionSnapshot(appSessionId)
     const framework = reviewerContext?.frameworkId ?? aggregateSnapshot?.frameworkId
@@ -639,6 +651,7 @@ class AcpPermissionContext {
         permissionGrantSessionId: this.options.permissionGrantContext?.sessionId,
         promptMessageId: promptInteraction?.promptMessageId,
         interactionSequence: promptInteraction?.sequence,
+        confirmationPrompt,
         permissionPrompts: promptInteraction?.permissionPrompts
       })
       if (piBound && !piBound.isCurrent()) return { outcome: { outcome: 'cancelled' } }
@@ -756,6 +769,35 @@ class AcpPermissionContext {
 
   getPendingRequests(): AcpPermissionRequest[] {
     return this.broker.getPendingRequests()
+  }
+
+  private ownsConfirmationScope({ projectId, sessionId }: PermissionConfirmationScope): boolean {
+    const { routing } = this.options
+    return (
+      routing.hasActivePrimarySession(sessionId) &&
+      routing.resolveProjectId(sessionId) === projectId
+    )
+  }
+
+  readPendingConfirmation(
+    scope: PermissionConfirmationScope,
+    requestId: string
+  ): PermissionConfirmationSnapshot | undefined {
+    return this.ownsConfirmationScope(scope)
+      ? this.broker.readPendingConfirmation(scope, requestId)
+      : undefined
+  }
+
+  claimPendingConfirmation(
+    scope: PermissionConfirmationScope,
+    requestId: string,
+    version: string,
+    decision: PermissionConfirmationDecision,
+    beforeSettlement?: BeforePermissionSettlement
+  ): PermissionConfirmationClaim {
+    return this.ownsConfirmationScope(scope)
+      ? this.broker.claimPendingConfirmation(scope, requestId, version, decision, beforeSettlement)
+      : { status: 'unavailable' }
   }
 
   hasPendingForSession(sessionId: string): boolean {

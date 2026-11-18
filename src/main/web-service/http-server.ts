@@ -78,9 +78,14 @@ import { authenticateRequest, authenticateTaskRequest, persistAuthCookie } from 
 import { InternalWebEventStream } from './internal-web-event-stream'
 import { PublicTaskEventStream } from './public-task-event-stream'
 import { TaskApiError, type HeadlessTaskApi } from './task-api'
+import type {
+  ConfirmationPermissionDecision,
+  LiveConfirmationKind
+} from '../tasks/task-control-ports'
 
 const MAX_RPC_BODY_BYTES = 64 * 1024 * 1024
-const MAX_COMPUTE_CONFIRMATION_BODY_BYTES = 4 * 1024
+const MAX_CONFIRMATION_BODY_BYTES = 4 * 1024
+const MAX_QUESTION_CONFIRMATION_BODY_BYTES = 256 * 1024
 // Preserve one maximum-size request per logical client while leaving the same amount of capacity
 // for other authenticated clients. Browser uploads use much smaller 8 MiB chunks in normal use.
 const MAX_CLIENT_IN_FLIGHT_RPC_BODY_BYTES = 64 * 1024 * 1024
@@ -237,6 +242,9 @@ type WebServerOptions = {
         | 'supportsTrustedComputeDecisions'
         | 'createComputeConfirmationChallenge'
         | 'submitComputeConfirmationDecision'
+        | 'supportsTrustedInteractionDecisions'
+        | 'createInteractionConfirmationChallenge'
+        | 'submitInteractionConfirmationDecision'
         | 'stageRunAttachment'
         | 'respondSessionPlan'
         | 'listSessionReviews'
@@ -684,7 +692,8 @@ const taskErrorStatus = (error: TaskApiError): number => {
   if (error.code === 'attachment_staging_unavailable') return 503
   if (
     error.code === 'pending_interactions_unavailable' ||
-    error.code === 'trusted_compute_decisions_unavailable'
+    error.code === 'trusted_compute_decisions_unavailable' ||
+    error.code === 'trusted_interaction_decisions_unavailable'
   )
     return 503
   if (error.code === 'invalid_confirmation_proof') return 403
@@ -707,10 +716,10 @@ const taskErrorStatus = (error: TaskApiError): number => {
   return 404
 }
 
-const COMPUTE_CONFIRMATION_PATH =
-  /^\/api\/v1\/projects\/([^/]+)\/sessions\/([^/]+)\/pending-interactions\/([a-f0-9]{64})\/(challenge|decision)$/
+const TRUSTED_CONFIRMATION_PATH =
+  /^\/api\/v1\/projects\/([^/]+)\/sessions\/([^/]+)\/pending-interactions\/([a-f0-9]{64})\/(?:(permission|question)\/)?(challenge|decision)$/
 const canonicalProofSignature = z.string().regex(/^[A-Za-z0-9_-]{86}$/u)
-const computeConfirmationReadSchema = z.strictObject({
+const confirmationReadSchema = z.strictObject({
   hostId: z.uuidv4(),
   issuedAt: z.int().nonnegative(),
   signature: canonicalProofSignature
@@ -720,6 +729,35 @@ const computeConfirmationDecisionSchema = z.strictObject({
   decision: z.enum(['deny', 'once', 'session', 'project', 'global']),
   signature: canonicalProofSignature
 })
+
+const permissionConfirmationDecisionSchema = computeConfirmationDecisionSchema.extend({
+  decision: z.custom<ConfirmationPermissionDecision>(
+    (value) =>
+      typeof value === 'string' &&
+      (value === 'cancel' || (value.startsWith('option:') && value.length > 7))
+  )
+})
+const questionAnswerSchema = z.union([
+  z.strictObject({ fieldId: z.string().min(1), status: z.literal('skipped') }),
+  z.strictObject({
+    fieldId: z.string().min(1),
+    status: z.literal('answered').optional(),
+    value: z.union([z.string(), z.number(), z.boolean(), z.array(z.string())])
+  })
+])
+const questionConfirmationDecisionSchema = computeConfirmationDecisionSchema.extend({
+  decision: z.discriminatedUnion('action', [
+    z.strictObject({ action: z.literal('accept'), answers: z.array(questionAnswerSchema) }),
+    z.strictObject({ action: z.literal('decline') }),
+    z.strictObject({ action: z.literal('cancel') })
+  ])
+})
+
+const parseConfirmationDecision = <Result>(schema: z.ZodType<Result>, body: unknown): Result => {
+  const proof = schema.safeParse(body)
+  if (!proof.success) throw new TaskApiError('invalid_request', 'Invalid confirmation decision.')
+  return proof.data
+}
 
 const isReviewScopeId = (value: unknown): value is string =>
   typeof value === 'string' && value.length > 0 && value.length <= 512 && value.trim() === value
@@ -1603,23 +1641,28 @@ const handleTaskApiRequest = async (
         })
         return true
       }
-      const computeConfirmation = url.pathname.match(COMPUTE_CONFIRMATION_PATH)
-      if (computeConfirmation && request.method === 'POST') {
-        if (
-          callerContext.location !== 'local' ||
-          !tasks.supportsTrustedComputeDecisions?.() ||
-          !tasks.createComputeConfirmationChallenge ||
-          !tasks.submitComputeConfirmationDecision
-        ) {
+      const confirmationRoute = url.pathname.match(TRUSTED_CONFIRMATION_PATH)
+      if (confirmationRoute && request.method === 'POST') {
+        const kind = confirmationRoute[4] as LiveConfirmationKind | undefined
+        const supported = kind
+          ? tasks.supportsTrustedInteractionDecisions?.(kind) &&
+            tasks.createInteractionConfirmationChallenge &&
+            tasks.submitInteractionConfirmationDecision
+          : tasks.supportsTrustedComputeDecisions?.() &&
+            tasks.createComputeConfirmationChallenge &&
+            tasks.submitComputeConfirmationDecision
+        if (callerContext.location !== 'local' || !supported) {
           throw new TaskApiError(
-            'trusted_compute_decisions_unavailable',
-            'Trusted Compute confirmations require local SDK access.'
+            kind
+              ? 'trusted_interaction_decisions_unavailable'
+              : 'trusted_compute_decisions_unavailable',
+            'Trusted confirmations require local SDK access.'
           )
         }
         const scope = {
-          projectId: decodeURIComponent(computeConfirmation[1]),
-          sessionId: decodeURIComponent(computeConfirmation[2]),
-          interactionId: computeConfirmation[3]
+          projectId: decodeURIComponent(confirmationRoute[1]),
+          sessionId: decodeURIComponent(confirmationRoute[2]),
+          interactionId: confirmationRoute[3]
         }
         if (
           [scope.projectId, scope.sessionId].some(
@@ -1633,17 +1676,31 @@ const handleTaskApiRequest = async (
           response,
           requestBodyBudgetRegistry,
           requestBodyClientId,
-          MAX_COMPUTE_CONFIRMATION_BODY_BYTES
+          kind === 'question' ? MAX_QUESTION_CONFIRMATION_BODY_BYTES : MAX_CONFIRMATION_BODY_BYTES
         )
-        if (computeConfirmation[4] === 'challenge') {
-          const read = computeConfirmationReadSchema.safeParse(body)
+        if (confirmationRoute[5] === 'challenge') {
+          const read = confirmationReadSchema.safeParse(body)
           if (!read.success) throw new TaskApiError('invalid_request', 'Invalid confirmation read.')
-          reply(200, { data: await tasks.createComputeConfirmationChallenge(scope, read.data) })
+          reply(200, {
+            data: kind
+              ? await tasks.createInteractionConfirmationChallenge!(scope, kind, read.data)
+              : await tasks.createComputeConfirmationChallenge!(scope, read.data)
+          })
         } else {
-          const proof = computeConfirmationDecisionSchema.safeParse(body)
-          if (!proof.success)
-            throw new TaskApiError('invalid_request', 'Invalid confirmation decision.')
-          reply(200, { data: await tasks.submitComputeConfirmationDecision(scope, proof.data) })
+          if (kind === 'permission') {
+            const proof = parseConfirmationDecision(permissionConfirmationDecisionSchema, body)
+            reply(200, {
+              data: await tasks.submitInteractionConfirmationDecision!(scope, { kind, proof })
+            })
+          } else if (kind === 'question') {
+            const proof = parseConfirmationDecision(questionConfirmationDecisionSchema, body)
+            reply(200, {
+              data: await tasks.submitInteractionConfirmationDecision!(scope, { kind, proof })
+            })
+          } else {
+            const proof = parseConfirmationDecision(computeConfirmationDecisionSchema, body)
+            reply(200, { data: await tasks.submitComputeConfirmationDecision!(scope, proof) })
+          }
         }
         return true
       }
@@ -1968,6 +2025,13 @@ const startWebHttpServer = async (options: WebServerOptions): Promise<RunningWeb
               options.tasks.createComputeConfirmationChallenge &&
               options.tasks.submitComputeConfirmationDecision
                 ? ['trusted-compute-decisions']
+                : []),
+              ...(!externalAuthorization &&
+              options.tasks.createInteractionConfirmationChallenge &&
+              options.tasks.submitInteractionConfirmationDecision
+                ? (['permission', 'question'] as const)
+                    .filter((kind) => options.tasks?.supportsTrustedInteractionDecisions?.(kind))
+                    .map((kind) => `trusted-${kind}-decisions`)
                 : [])
             ]
           : []
@@ -2053,7 +2117,7 @@ const startWebHttpServer = async (options: WebServerOptions): Promise<RunningWeb
                     location: 'remote',
                     isAuthorizationCurrent: authorization.isCurrent
                   }
-                : COMPUTE_CONFIRMATION_PATH.test(url.pathname) && request.method === 'POST'
+                : TRUSTED_CONFIRMATION_PATH.test(url.pathname) && request.method === 'POST'
                   ? { isAuthorizationCurrent: lease.isCurrent }
                   : {}
             )

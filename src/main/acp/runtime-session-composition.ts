@@ -8,7 +8,7 @@ import { AcpAppContinuationOwner } from './app-continuation-owner'
 import { AcpClientInteractionOwner } from './client-interaction-owner'
 import { AcpContextUsagePolicy } from './context-usage-policy'
 import { AcpDurableContinuationContextOwner } from './durable-continuation-context-owner'
-import { AcpElicitationOwner } from './elicitation-owner'
+import { AcpElicitationOwner, type LiveElicitationBinding } from './elicitation-owner'
 import { AcpPermissionContext } from './permission-context'
 import type { PiPermissionContext, PiPermissionState } from './pi-permission-correlation'
 import { AcpPermissionWaitOwner } from './permission-wait-owner'
@@ -312,6 +312,12 @@ const composeAcpRuntimeSessionOwners = (options: AcpRuntimeOptions, base: AcpRun
             }
           : undefined
       },
+      captureConfirmationPrompt: (sessionId, providerSessionId) => {
+        const binding = captureLiveRootPrompt(sessionId, providerSessionId)
+        return binding
+          ? { version: JSON.stringify(binding.prompt), isCurrent: binding.isCurrent }
+          : undefined
+      },
       permissionPromptsForSession: (sessionId) =>
         base.sessionInteractions.permissionPromptsForSession(sessionId),
       currentInteractionSequence: (sessionId) =>
@@ -445,6 +451,64 @@ const composeAcpRuntimeSessionOwners = (options: AcpRuntimeOptions, base: AcpRun
     unregisterBridgeSession: (sessionId) =>
       base.connectionResources.unregisterBridgeReviewerSession(sessionId)
   })
+  // The trusted path requires a resolver attached to an admitted root prompt, including its
+  // Branch and provider generation. Legacy and detached forms retain their native routes.
+  const captureLiveRootPrompt = (
+    sessionId: string,
+    providerSessionId: string
+  ): LiveElicitationBinding | undefined => {
+    const entry = sessionRegistry.lookup(sessionId)
+    const attachment = entry?.attachment
+    const projectId = entry?.aggregate.snapshot().projectId
+    const interaction = base.sessionInteractions.current(sessionId)
+    if (
+      !projectId ||
+      attachment?.providerSessionId !== providerSessionId ||
+      interaction?.kind !== 'prompt' ||
+      interaction.permissionPrompts === 'none'
+    ) {
+      return undefined
+    }
+    const context = interaction.provenanceContext
+    if (
+      !context?.agentFrameId ||
+      !context.messageBranchId ||
+      !context.runtimeSegmentId ||
+      context.agentFrameId !== context.rootFrameId ||
+      context.originMessageId !== undefined ||
+      !interaction.promptMessageId ||
+      context.promptMessageId !== interaction.promptMessageId ||
+      !context.messageAncestry?.includes(interaction.promptMessageId) ||
+      context.messageBranchAncestry?.at(-1) !== context.messageBranchId
+    ) {
+      return undefined
+    }
+    const isCurrent = (): boolean => {
+      const selected = sessionRegistry.lookup(sessionId)
+      return (
+        selected?.attachment === attachment &&
+        selected.aggregate.snapshot().projectId === projectId &&
+        base.sessionInteractions.current(sessionId) === interaction &&
+        interaction.provenanceContext === context &&
+        !interaction.signal.aborted &&
+        !base.sessionInteractions.isCancellationAccepted(interaction)
+      )
+    }
+    if (!isCurrent()) return undefined
+    return {
+      prompt: Object.freeze({
+        projectId,
+        sequence: interaction.sequence,
+        turnToken: interaction.turnToken,
+        promptMessageId: interaction.promptMessageId,
+        agentFrameId: context.agentFrameId,
+        messageBranchId: context.messageBranchId,
+        runtimeSegmentId: context.runtimeSegmentId,
+        attachmentGeneration: attachment.generation
+      }),
+      isCurrent
+    }
+  }
   const clientInteractions = new AcpClientInteractionOwner({
     routing: {
       resolveAppSessionId: (sessionId) => sessionRegistry.resolveAppSessionId(sessionId),
@@ -460,7 +524,8 @@ const composeAcpRuntimeSessionOwners = (options: AcpRuntimeOptions, base: AcpRun
       promptMessageIdForSession: (sessionId) => {
         const interaction = base.sessionInteractions.current(sessionId)
         return interaction?.kind === 'prompt' ? interaction.promptMessageId : undefined
-      }
+      },
+      captureLiveElicitationPrompt: captureLiveRootPrompt
     },
     elicitation: elicitationOwner,
     permission: permissionContext

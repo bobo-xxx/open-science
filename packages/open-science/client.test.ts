@@ -9,7 +9,10 @@ import { connectToOpenScience, OpenScienceClient } from './index.mjs'
 import type {
   AgentFramework,
   ComputeConfirmationChallengeRequest,
-  ComputeConfirmationProof
+  ComputeConfirmationProof,
+  InteractionConfirmationChallengeRequest,
+  PermissionConfirmationProof,
+  QuestionConfirmationProof
 } from './index'
 
 const response = (status: number, payload: unknown): Response =>
@@ -310,6 +313,8 @@ describe('OpenScienceClient', () => {
         'watchPendingSessionInteractions',
         'createComputeConfirmationChallenge',
         'submitComputeConfirmationDecision',
+        'createInteractionConfirmationChallenge',
+        'submitInteractionConfirmationDecision',
         'stageRunAttachment',
         'getSessionConfiguration',
         'updateSessionConfiguration',
@@ -580,6 +585,107 @@ describe('OpenScienceClient', () => {
       })
     ).rejects.toMatchObject({ code, status, message: 'Decision rejected.' })
     expect(fetch).toHaveBeenCalledTimes(2)
+  })
+
+  it.each([
+    [
+      'permission',
+      {
+        challengeId: 'challenge',
+        decision: 'option:grant:project',
+        signature: 'signed-option'
+      } satisfies PermissionConfirmationProof
+    ],
+    [
+      'question',
+      {
+        challengeId: 'challenge',
+        decision: {
+          action: 'accept',
+          answers: [
+            { fieldId: 'order', value: ['second', 'first'] },
+            { fieldId: 'visible', status: 'answered', value: true },
+            { fieldId: 'optional', status: 'skipped' }
+          ]
+        },
+        signature: 'signed-answers'
+      } satisfies QuestionConfirmationProof
+    ]
+  ] as const)(
+    'posts %s confirmations without rewriting the signed decision payload',
+    async (kind, proof) => {
+      const capabilities = { taskCapabilities: [`trusted-${kind}-decisions`] }
+      const read: InteractionConfirmationChallengeRequest = {
+        hostId: 'host',
+        issuedAt: 1_000,
+        signature: 'signed-read'
+      }
+      const challenge = {
+        id: proof.challengeId,
+        expiresAt: 120_000,
+        envelope: 'eyJ2ZXJzaW9uIjoxfQ'
+      }
+      const receipt = { status: 'claimed' }
+      const fetch = vi
+        .fn()
+        .mockResolvedValueOnce(response(200, capabilities))
+        .mockResolvedValueOnce(response(200, { data: challenge }))
+        .mockResolvedValueOnce(response(200, capabilities))
+        .mockResolvedValueOnce(response(200, { data: receipt }))
+      const client = new OpenScienceClient({ baseUrl: 'http://localhost', token: 'test', fetch })
+      const scope = ['project one', 'session#two', 'interaction?three'] as const
+      const path = `http://localhost/api/v1/projects/project%20one/sessions/session%23two/pending-interactions/interaction%3Fthree/${kind}`
+
+      await expect(
+        client.createInteractionConfirmationChallenge(...scope, kind, read)
+      ).resolves.toEqual(challenge)
+      await expect(
+        client.submitInteractionConfirmationDecision(...scope, kind, proof)
+      ).resolves.toEqual(receipt)
+      expect(fetch.mock.calls.map(([url]) => url)).toEqual([
+        'http://localhost/api/bootstrap',
+        `${path}/challenge`,
+        'http://localhost/api/bootstrap',
+        `${path}/decision`
+      ])
+      for (const [callIndex, body] of [
+        [1, read],
+        [3, proof]
+      ] as const) {
+        expect(fetch.mock.calls[callIndex][1]).toMatchObject({
+          method: 'POST',
+          body: JSON.stringify(body)
+        })
+      }
+    }
+  )
+
+  it('preflights permission and question confirmation capabilities independently', async () => {
+    const fetch = vi.fn(async () =>
+      response(200, {
+        taskCapabilities: ['trusted-compute-decisions', 'trusted-question-decisions']
+      })
+    )
+    const client = new OpenScienceClient({ baseUrl: 'http://localhost', token: 'test', fetch })
+    const scope = ['project', 'session', 'interaction'] as const
+    const read = { hostId: 'host', issuedAt: 1_000, signature: 'signed-read' }
+    await expect(
+      client.createInteractionConfirmationChallenge(...scope, 'permission', read)
+    ).rejects.toMatchObject({ code: 'unsupported_capability' })
+    await expect(
+      client.submitInteractionConfirmationDecision(...scope, 'permission', {
+        challengeId: 'challenge',
+        decision: 'cancel',
+        signature: 'signature'
+      })
+    ).rejects.toMatchObject({ code: 'unsupported_capability' })
+    await expect(
+      client.createInteractionConfirmationChallenge(...scope, 'question/invalid-route', read)
+    ).rejects.toThrow(TypeError)
+    expect(fetch.mock.calls.map(([url]) => url)).toEqual([
+      'http://localhost/api/bootstrap',
+      'http://localhost/api/bootstrap'
+    ])
   })
 
   it('uses versioned endpoints for Doctor, Runtime, Session, Project-default, and Agent-routing reads', async () => {

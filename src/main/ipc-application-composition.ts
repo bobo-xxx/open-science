@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { composeImageTasks } from './composition/image-tasks'
 import { RestrictedInferenceRunner } from './acp/restricted-inference-runner'
 import { PromptOptimizationService } from './projects/prompt-optimization'
@@ -18,15 +19,18 @@ import {
   diagnosticErrorFields,
   type DiagnosticOperation
 } from '@aipoch/diagnostics/node'
+import type { AcpPermissionRequest } from '../shared/acp'
 import type { ArtifactReproducibilityCheckState } from '../shared/artifact-reproducibility'
 import {
   externalComputeMode,
   type ComputeApprovalDecision,
   type ComputeApprovalRequest
 } from '../shared/compute'
+import type { PendingElicitationRequest } from '../shared/elicitation'
 import type { SessionSummary } from '../shared/session-persistence'
 import { type AppIconPreview, type AppIconVariant } from '../shared/settings'
 import type { UploadTransferProgress } from '../shared/uploads'
+import { LiveElicitationResponseError, type LiveElicitationSnapshot } from './acp/elicitation-owner'
 import { createAcpRuntime } from './acp/runtime-composition'
 import type { ApplicationCommandComposition } from './application-command-composition-contract'
 import { createApplicationEventModule, type ApplicationEventSource } from './application-events'
@@ -116,12 +120,18 @@ import {
 import {
   projectTaskPendingSessionInteractions,
   taskInteractionId,
+  type ConfirmationPermissionDecision,
+  type ConfirmationPort,
+  type ConfirmationQuestionDecision,
   type InteractionScope,
   type TaskControlPorts
 } from './tasks/task-control-ports'
 import type { TaskAgentPort } from './tasks/task-runner'
 import { createTrustedHostKeyRegistry } from './tasks/trusted-host-key-registry'
-import { TrustedInteractionDecisions } from './tasks/trusted-interaction-decisions'
+import {
+  describeQuestionConfirmationDecision,
+  TrustedInteractionDecisions
+} from './tasks/trusted-interaction-decisions'
 import type { TrayNavigationSession } from './tray-navigation'
 import { defaultOcrLanguagesForLocale } from '../shared/local-models'
 
@@ -937,6 +947,7 @@ export const createApplicationModules = async (
     ? new TrustedInteractionDecisions<ComputeApprovalRequest, ComputeApprovalDecision>(
         {
           kind: 'compute-approval',
+          describeDecision: (decision) => [decision, decision],
           read: (scope) => {
             const id = findComputeApprovalId(scope)
             const snapshot = id && compute.getPendingConfirmation(scope, id)
@@ -957,7 +968,110 @@ export const createApplicationModules = async (
         trustedHostKeys.resolve
       )
     : undefined
-  const withTrustedComputeSession = async <Result>(
+  const findLiveRequestId = (
+    { projectId, sessionId, interactionId }: InteractionScope,
+    kind: 'permission' | 'question'
+  ): string | undefined => {
+    const requests = agentRuntime.runtime.getPendingSessionRequests(projectId, sessionId)
+    const candidates =
+      kind === 'permission' ? requests.pendingPermissions : requests.pendingElicitations
+    return candidates?.find(
+      ({ requestId }) =>
+        taskInteractionId({ projectId, sessionId }, kind, requestId) === interactionId
+    )?.requestId
+  }
+  const trustedPermission = trustedHostKeys
+    ? new TrustedInteractionDecisions<AcpPermissionRequest, ConfirmationPermissionDecision>(
+        {
+          kind: 'permission',
+          describeDecision: (decision) => [decision, decision],
+          read: (scope) => {
+            const requestId = findLiveRequestId(scope, 'permission')
+            if (!requestId) return undefined
+            const snapshot = agentRuntime.runtime.readLivePermissionConfirmation(scope, requestId)
+            return (
+              snapshot && {
+                version: snapshot.version,
+                disclosure: snapshot.request,
+                allowedDecisions: snapshot.allowedDecisions
+              }
+            )
+          },
+          claim: (scope, version, decision) => {
+            const requestId = findLiveRequestId(scope, 'permission')
+            if (!requestId) return 'unavailable'
+            const result = agentRuntime.runtime.claimLivePermissionConfirmation(
+              scope,
+              requestId,
+              version,
+              decision
+            )
+            if (result.status === 'claimed') {
+              // Runtime publishes its own delivery or persistence error after the synchronous claim.
+              void result.completion.catch(() => undefined)
+            }
+            return result.status
+          }
+        },
+        trustedHostKeys.resolve
+      )
+    : undefined
+  const questionVersion = ({ prompt, request }: LiveElicitationSnapshot): string =>
+    createHash('sha256')
+      .update(JSON.stringify(['live-acp-question-confirmation-v1', prompt, request]))
+      .digest('hex')
+  const trustedQuestion = trustedHostKeys
+    ? new TrustedInteractionDecisions<
+        PendingElicitationRequest,
+        ConfirmationQuestionDecision,
+        ConfirmationQuestionDecision['action']
+      >(
+        {
+          kind: 'question',
+          describeDecision: describeQuestionConfirmationDecision,
+          read: (scope) => {
+            const requestId = findLiveRequestId(scope, 'question')
+            if (!requestId) return undefined
+            const snapshot = agentRuntime.runtime.getLiveElicitation(
+              scope.projectId,
+              scope.sessionId,
+              requestId
+            )
+            return (
+              snapshot && {
+                version: questionVersion(snapshot),
+                disclosure: snapshot.request,
+                allowedDecisions: ['accept', 'decline', 'cancel']
+              }
+            )
+          },
+          claim: (scope, version, decision) => {
+            const requestId = findLiveRequestId(scope, 'question')
+            if (!requestId) return 'unavailable'
+            const [, payload] = describeQuestionConfirmationDecision(decision)
+            let invalidDecision = false
+            try {
+              const resolved = agentRuntime.runtime.respondToLiveElicitation(
+                scope.projectId,
+                scope.sessionId,
+                { requestId, ...decision },
+                (request, canonical, prompt) => {
+                  if (questionVersion({ prompt, request }) !== version) return false
+                  invalidDecision = describeQuestionConfirmationDecision(canonical)[1] !== payload
+                  return !invalidDecision
+                }
+              )
+              return resolved ? 'claimed' : 'unavailable'
+            } catch (error) {
+              if (!(error instanceof LiveElicitationResponseError)) throw error
+              return invalidDecision ? 'invalid-decision' : error.code
+            }
+          }
+        },
+        trustedHostKeys.resolve
+      )
+    : undefined
+  const withTrustedInteractionSession = async <Result>(
     { projectId, sessionId }: InteractionScope,
     operation: () => Result
   ): Promise<Result | undefined> => {
@@ -976,6 +1090,20 @@ export const createApplicationModules = async (
       return undefined
     }
   }
+  const toConfirmationPort = <Disclosure, Decision, Choice extends string>(
+    owner: TrustedInteractionDecisions<Disclosure, Decision, Choice> | undefined
+  ): ConfirmationPort<Decision> | undefined =>
+    owner && {
+      issue: (scope, read, isCurrent) =>
+        withTrustedInteractionSession(scope, () =>
+          isCurrent() ? owner.issue(scope, read) : undefined
+        ),
+      claim: async (scope, proof, isCurrent) =>
+        (await withTrustedInteractionSession(scope, () =>
+          isCurrent() ? owner.claim(scope, proof) : 'unavailable'
+        )) ?? 'unavailable',
+      reset: () => owner.reset()
+    }
   const applicationCommandComposition = await registerApplicationCommandComposition({
     modules,
     dependencies: { ...commandDependencies.applicationCommandDependencies, trustedHostKeys },
@@ -1077,21 +1205,9 @@ export const createApplicationModules = async (
     },
     taskAgent: agentWorkflows.taskAgent,
     taskControls: {
-      ...(trustedCompute
-        ? {
-            trustedCompute: {
-              issue: (scope, read, isCurrent) =>
-                withTrustedComputeSession(scope, () =>
-                  isCurrent() ? trustedCompute.issue(scope, read) : undefined
-                ),
-              claim: async (scope, proof, isCurrent) =>
-                (await withTrustedComputeSession(scope, () =>
-                  isCurrent() ? trustedCompute.claim(scope, proof) : 'unavailable'
-                )) ?? 'unavailable',
-              reset: () => trustedCompute.reset()
-            }
-          }
-        : {}),
+      trustedCompute: toConfirmationPort(trustedCompute),
+      trustedPermission: toConfirmationPort(trustedPermission),
+      trustedQuestion: toConfirmationPort(trustedQuestion),
       listPendingSessionInteractions: async (scope) => {
         const sessions = sessionAuthority.sessionPersistenceCoordinator
         const ownerProjectId = await sessions.sessionProjectId(scope.sessionId)

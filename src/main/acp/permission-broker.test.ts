@@ -67,6 +67,135 @@ const createPermissionRequest = (sessionId = 'session-1'): RequestPermissionRequ
   ]
 })
 
+const confirmationPrompt = { version: 'test-prompt', isCurrent: (): boolean => true }
+
+describe('live signed permission decision owner', () => {
+  const scope = { projectId: 'project-1', sessionId: 'session-1' }
+
+  it('preserves native option IDs and separate cancellation while taking one winner', async () => {
+    const settlement = vi.fn()
+    const broker = new AcpPermissionBroker(vi.fn(), undefined, undefined, settlement)
+    const request = createPermissionRequest()
+    request.options[0].optionId = 'cancel'
+    request.options.push({ optionId: 'provider-persistent', name: 'Always', kind: 'allow_always' })
+    const waiting = broker.requestPermission(request, {
+      profile: 'ask',
+      projectId: scope.projectId,
+      confirmationPrompt
+    })
+    const [pending] = broker.getPendingRequests()
+    const snapshot = broker.readPendingConfirmation(scope, pending.requestId)!
+    expect(snapshot.allowedDecisions).toEqual(['option:cancel', 'option:reject-once', 'cancel'])
+    expect(
+      broker.claimPendingConfirmation(
+        scope,
+        pending.requestId,
+        snapshot.version,
+        'option:provider-persistent'
+      )
+    ).toEqual({ status: 'invalid-decision' })
+
+    const beforeSettlement = vi.fn(() => {
+      expect(broker.readPendingConfirmation(scope, pending.requestId)).toBeUndefined()
+    })
+    const result = broker.claimPendingConfirmation(
+      scope,
+      pending.requestId,
+      snapshot.version,
+      'option:cancel',
+      beforeSettlement
+    )
+    expect(result.status).toBe('claimed')
+    await expect(
+      broker.respond({ requestId: pending.requestId, optionId: 'reject-once' })
+    ).resolves.toBe(false)
+    if (result.status !== 'claimed')
+      throw new Error('Expected the signed decision to claim the request.')
+    await expect(result.completion).resolves.toBe(true)
+    expect(beforeSettlement).toHaveBeenCalledExactlyOnceWith(pending, {
+      requestId: pending.requestId,
+      optionId: 'cancel'
+    })
+    await expect(waiting).resolves.toEqual({ outcome: { outcome: 'selected', optionId: 'cancel' } })
+    expect(settlement).toHaveBeenCalledOnce()
+  })
+
+  it('rejects replaced content, wrong scope and approvals already settled in the native UI', async () => {
+    const broker = new AcpPermissionBroker(vi.fn())
+    const request = createPermissionRequest()
+    request.toolCall.rawInput = { apiKey: 'old-fixture-secret', command: 'pwd' }
+    const waiting = broker.requestPermission(request, {
+      profile: 'ask',
+      projectId: scope.projectId,
+      confirmationPrompt
+    })
+    const [pending] = broker.getPendingRequests()
+    const snapshot = broker.readPendingConfirmation(scope, pending.requestId)!
+    expect(JSON.stringify(snapshot.request)).not.toContain('old-fixture-secret')
+    expect(
+      broker.readPendingConfirmation({ ...scope, projectId: 'other-project' }, pending.requestId)
+    ).toBeUndefined()
+    expect(
+      broker.readPendingConfirmation({ ...scope, sessionId: 'other-session' }, pending.requestId)
+    ).toBeUndefined()
+
+    pending.rawInput = { apiKey: 'new-fixture-secret', command: 'pwd' }
+    const current = broker.readPendingConfirmation(scope, pending.requestId)!
+    expect(current.request).toEqual(snapshot.request)
+    expect(current.version).not.toBe(snapshot.version)
+    expect(
+      broker.claimPendingConfirmation(
+        scope,
+        pending.requestId,
+        snapshot.version,
+        'option:allow-once'
+      )
+    ).toEqual({ status: 'unavailable' })
+    await expect(
+      broker.respond({ requestId: pending.requestId, optionId: 'reject-once' })
+    ).resolves.toBe(true)
+    expect(
+      broker.claimPendingConfirmation(
+        scope,
+        pending.requestId,
+        current.version,
+        'option:allow-once'
+      )
+    ).toEqual({ status: 'unavailable' })
+    await expect(waiting).resolves.toEqual({
+      outcome: { outcome: 'selected', optionId: 'reject-once' }
+    })
+  })
+
+  it('settles a signed cancel without approving any provider option', async () => {
+    const broker = new AcpPermissionBroker(vi.fn())
+    const request = withTrustedMcpToolIdentity(
+      createPermissionRequest(),
+      'open-science-images/generate_image'
+    )
+    const waiting = broker.requestPermission(request, {
+      profile: 'ask',
+      projectId: scope.projectId,
+      mcpServerNames: ['open-science-images'],
+      confirmationPrompt
+    })
+    const [pending] = broker.getPendingRequests()
+    const snapshot = broker.readPendingConfirmation(scope, pending.requestId)!
+    expect(snapshot.request.mcpIdentity).toBe('open-science-images/generate_image')
+    const result = broker.claimPendingConfirmation(
+      scope,
+      pending.requestId,
+      snapshot.version,
+      'cancel'
+    )
+    expect(result.status).toBe('claimed')
+    await expect(waiting).resolves.toEqual({ outcome: { outcome: 'cancelled' } })
+    expect(
+      broker.claimPendingConfirmation(scope, pending.requestId, snapshot.version, 'cancel')
+    ).toEqual({ status: 'unavailable' })
+  })
+})
+
 it.each(['generate_image', 'edit_image'])('asks once per %s call in Ask mode', async (tool) => {
   const emit = vi.fn()
   const grants = new ConversationPermissionGrantStore()
@@ -2699,7 +2828,8 @@ describe('ACP permission broker', () => {
           profile: 'ask',
           projectId: 'project-1',
           mcpServerNames: ['open-science-notebook'],
-          notebookShellRuntime: 'wsl2-bash'
+          notebookShellRuntime: 'wsl2-bash',
+          confirmationPrompt
         }
       )
 
@@ -2710,10 +2840,22 @@ describe('ACP permission broker', () => {
         'project',
         'global'
       ])
-      await broker.respond({
-        requestId: emitted[0].requestId,
-        optionId: getSessionOptionId(emitted[0])
-      })
+      const scope = { projectId: 'project-1', sessionId: 'session-1' }
+      const requestId = emitted[0].requestId
+      const snapshot = broker.readPendingConfirmation(scope, requestId)!
+      expect(snapshot.request.options).toEqual(emitted[0].options)
+      expect(snapshot.allowedDecisions).toEqual([
+        ...emitted[0].options.map(({ optionId }) => `option:${optionId}`),
+        'cancel'
+      ])
+      const accepted = broker.claimPendingConfirmation(
+        scope,
+        requestId,
+        snapshot.version,
+        `option:${getSessionOptionId(emitted[0])}`
+      )
+      if (accepted.status !== 'claimed') throw new Error('Expected a scoped permission claim.')
+      await expect(accepted.completion).resolves.toBe(true)
       await expect(response).resolves.toEqual({
         outcome: { outcome: 'selected', optionId: 'allow-once' }
       })

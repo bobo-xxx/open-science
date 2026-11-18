@@ -42,6 +42,22 @@ import {
   type PermissionPolicyContext
 } from './permission-policy'
 import { extractProviderToolName } from './runtime-events'
+import { projectPermissionRequest } from './runtime-publication-owner'
+
+type PermissionConfirmationScope = Readonly<{ projectId: string; sessionId: string }>
+type PermissionConfirmationDecision = 'cancel' | `option:${string}`
+type PermissionConfirmationSnapshot = Readonly<{
+  version: string
+  request: AcpPermissionRequest
+  allowedDecisions: readonly PermissionConfirmationDecision[]
+}>
+type PermissionConfirmationClaim =
+  | { status: 'claimed'; completion: Promise<boolean> }
+  | { status: 'unavailable' | 'invalid-decision' }
+type BeforePermissionSettlement = (
+  request: AcpPermissionRequest,
+  response: AcpPermissionResponse
+) => void
 
 type PendingPermission = {
   request: AcpPermissionRequest
@@ -913,13 +929,95 @@ class AcpPermissionBroker {
   // Returns serializable pending requests for runtime snapshots.
   getPendingRequests(): AcpPermissionRequest[] {
     return Array.from(this.pendingRequests.values())
-      .filter(
-        (pending) =>
-          !pending.durableCandidate ||
-          !this.permissionWaitHooks ||
-          pending.durablePersistenceSettled === true
-      )
+      .filter((pending) => this.isPublished(pending))
       .map(({ request }) => request)
+  }
+
+  private isPublished(pending: PendingPermission): boolean {
+    return (
+      !pending.durableCandidate ||
+      !this.permissionWaitHooks ||
+      pending.durablePersistenceSettled === true
+    )
+  }
+
+  readPendingConfirmation(
+    scope: PermissionConfirmationScope,
+    requestId: string
+  ): PermissionConfirmationSnapshot | undefined {
+    const pending = this.pendingRequests.get(requestId)
+    const prompt = pending?.policyContext?.confirmationPrompt
+    if (
+      !pending ||
+      !prompt ||
+      pending.projectId !== scope.projectId ||
+      pending.request.sessionId !== scope.sessionId ||
+      pending.appOwned ||
+      pending.request.delegated ||
+      pending.durableCandidate?.restoredContinuation ||
+      !this.isPublished(pending) ||
+      !this.isPendingCurrent(pending)
+    ) {
+      return undefined
+    }
+
+    try {
+      if (!prompt.isCurrent()) return undefined
+      const fingerprint = permissionRequestFingerprint(pending.request)
+      if (!fingerprint) return undefined
+      // The external human sees the same redacted disclosure as the first-party renderer. The
+      // version also binds the underlying request and exact options, including remembered scope.
+      const request = structuredClone(projectPermissionRequest(pending.request))
+      const allowedDecisions: PermissionConfirmationDecision[] = [
+        ...request.options.map(({ optionId }) => `option:${optionId}` as const),
+        'cancel'
+      ]
+      const version = createHash('sha256')
+        .update(
+          JSON.stringify([
+            'live-acp-permission-confirmation-v1',
+            scope.projectId,
+            scope.sessionId,
+            prompt.version,
+            fingerprint,
+            request,
+            pending.providerAllowOnceOptionId,
+            pending.capability,
+            pending.policyContext?.permissionGrantSessionId
+          ])
+        )
+        .digest('hex')
+      return { version, request, allowedDecisions }
+    } catch {
+      return undefined
+    }
+  }
+
+  claimPendingConfirmation(
+    scope: PermissionConfirmationScope,
+    requestId: string,
+    version: string,
+    decision: PermissionConfirmationDecision,
+    beforeSettlement?: BeforePermissionSettlement
+  ): PermissionConfirmationClaim {
+    const pending = this.pendingRequests.get(requestId)
+    const confirmation = this.readPendingConfirmation(scope, requestId)
+    if (
+      !pending ||
+      confirmation?.version !== version ||
+      this.pendingRequests.get(requestId) !== pending
+    ) {
+      return { status: 'unavailable' }
+    }
+    if (!confirmation.allowedDecisions.includes(decision)) return { status: 'invalid-decision' }
+    const response: AcpPermissionResponse =
+      decision === 'cancel'
+        ? { requestId, cancelled: true }
+        : { requestId, optionId: decision.slice('option:'.length) }
+    return {
+      status: 'claimed',
+      completion: this.respondPending(pending, response, beforeSettlement)
+    }
   }
 
   hasPendingForSession(sessionId: string): boolean {
@@ -1717,12 +1815,21 @@ class AcpPermissionBroker {
       return false
     }
 
+    return this.respondPending(pending, response)
+  }
+
+  private async respondPending(
+    pending: PendingPermission,
+    response: AcpPermissionResponse,
+    beforeSettlement?: BeforePermissionSettlement
+  ): Promise<boolean> {
     this.pendingRequests.delete(response.requestId)
     pending.decisionAuthority ??= 'human'
 
     // Keep the claimed request cancellable until its provider decision is released.
     this.respondingRequests.set(response.requestId, pending)
     try {
+      beforeSettlement?.(pending.request, response)
       if (pending.beforeRespond) {
         const optionId =
           !response.cancelled &&
@@ -2116,4 +2223,13 @@ export {
   resolveNotebookPermissionContext,
   type AppPermissionRequest
 }
-export type { DurablePermissionWaitCandidate, PermissionWaitHooks, RestoredPermissionContinuation }
+export type {
+  BeforePermissionSettlement,
+  DurablePermissionWaitCandidate,
+  PermissionConfirmationClaim,
+  PermissionConfirmationDecision,
+  PermissionConfirmationScope,
+  PermissionConfirmationSnapshot,
+  PermissionWaitHooks,
+  RestoredPermissionContinuation
+}

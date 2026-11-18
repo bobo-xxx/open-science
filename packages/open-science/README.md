@@ -175,8 +175,8 @@ for that exact Project and Session. Current servers also report durable MCP perm
 agent questions and delegated questions that still match the saved Session and active Branch.
 The method returns opaque IDs for polling, kind and metadata such as a question's field count
 or the Compute operation. Requests disappear when their owner settles them. Servers without the
-capability return `unsupported_capability`. Use Desktop or Web to respond to permission requests
-and structured questions. Plan First uses the Plan API.
+capability return `unsupported_capability`. Desktop and Web can respond to pending interactions.
+Plan First uses the Plan API.
 
 Use `watchPendingSessionInteractions(projectId, sessionId, { signal })` for a stream of
 snapshots. It yields the initial list, then yields again when the list changes, including an
@@ -185,11 +185,13 @@ Use `pollIntervalMs` to set the interval and `timeoutMs` to set the request dead
 the loop or aborting the signal stops observation. A failed read ends the stream, and a new
 watch starts from the current snapshot. Changes between polls can be coalesced.
 
-Desktop and Web can handle Compute approvals. The local `trusted-compute-decisions` preview also
-lets an enrolled host confirm a Compute approval through an isolated signer. Real host integration
-and acceptance are pending. The SDK transports signed requests. The host owns private key
-isolation, the user-facing approval UI, and signature creation. Keep the private key
-and decision-signing operation outside the model and Task tool environment.
+The local trusted-host previews let an enrolled component respond through an isolated signer.
+The server advertises `trusted-compute-decisions`, `trusted-permission-decisions`, and
+`trusted-question-decisions` independently. Permission and question previews cover supported
+requests with a live primary runtime. Use Desktop or Web for delegated or restored waits and
+application-owned permission requests. The preview protocol uses a fixture host for verification.
+Real external host acceptance is pending. Keep the private key, the user-facing confirmation UI,
+and signing outside the model and Task tool environment.
 
 In Desktop or local Web, open Settings → Permissions → Trusted hosts. Enter the component
 name and its 32-byte Ed25519 public key in unpadded base64url. Compare the full SHA-256
@@ -197,31 +199,56 @@ fingerprint with the one shown by the isolated component, then confirm registrat
 the displayed registration ID to the component as its `hostId`. Revoke the key from the same
 settings when it should stop authorizing decisions.
 
-For a pending interaction whose kind is `compute`, use its opaque ID as `interactionId`. The
-enrolled signer signs the first message below using the current Unix time in milliseconds as
-`issuedAt`. Send `{ hostId, issuedAt, signature }` to
-`createComputeConfirmationChallenge(projectId, sessionId, interactionId, request)`. The response
-contains `{ id, expiresAt, envelope }`.
+Use the pending interaction's opaque ID as `interactionId`. The enrolled signer signs the read
+message below using the current Unix time in milliseconds as `issuedAt`. The isolated host fetches
+the challenge directly from its authenticated local Open Science service. Send
+`{ hostId, issuedAt, signature }` to
+`createComputeConfirmationChallenge(projectId, sessionId, interactionId, request)` for `compute`, or
+`createInteractionConfirmationChallenge(projectId, sessionId, interactionId, kind, request)` for
+`permission` and `question`. The response contains `{ id, expiresAt, envelope }`.
 
-The `envelope` is unpadded base64url-encoded UTF-8 JSON. It contains `version: 1`,
-`kind: 'compute-approval'`, `serviceGeneration`, `id`, `hostId`, `projectId`, `sessionId`,
-`interactionId`, `expiresAt`, `contentVersion`, the native Compute approval `disclosure`, and
-`allowedDecisions`. The trusted host validates its binding to the original request, displays the
-disclosure and available decisions, and collects the user's choice. Its signer then signs the
-second message below with the original `envelope` string and the selected `decision`.
+The `envelope` is unpadded base64url-encoded UTF-8 JSON. It contains `version: 1`, `kind`,
+`serviceGeneration`, `id`, `hostId`, `projectId`, `sessionId`, `interactionId`, `expiresAt`,
+`contentVersion`, the server's `disclosure`, and `allowedDecisions`. The envelope kind is
+`compute-approval`, `permission`, or `question`. The trusted host verifies the service origin and
+the envelope's binding to the original request, displays the disclosure and available decisions,
+and collects the user's choice. Its signer signs the decision message using the original
+`envelope` string.
 
 ```js
+const envelopeKind = kind === 'compute' ? 'compute-approval' : kind
 const readMessage =
   'Open Science trusted interaction read v1\n' +
-  JSON.stringify(['compute-approval', projectId, sessionId, interactionId, hostId, issuedAt])
+  JSON.stringify([envelopeKind, projectId, sessionId, interactionId, hostId, issuedAt])
+const decisionPayload =
+  kind === 'question'
+    ? JSON.stringify([
+        decision.action,
+        decision.answers?.map((answer) =>
+          answer.status === 'skipped'
+            ? [answer.fieldId, 'skipped']
+            : [answer.fieldId, 'answered', answer.value]
+        ) ?? null
+      ])
+    : decision
 const decisionMessage =
-  'Open Science trusted interaction decision v1\n' + envelope + '\n' + decision
+  'Open Science trusted interaction decision v1\n' + envelope + '\n' + decisionPayload
 ```
 
 Both signatures are Ed25519 signatures over the exact UTF-8 bytes, encoded as unpadded base64url.
 Pass `{ challengeId: id, decision, signature }` to
-`submitComputeConfirmationDecision(projectId, sessionId, interactionId, proof)`. Decision values
-are `deny`, `once`, `session`, `project`, and `global`, limited to the request's `allowedDecisions`.
+`submitComputeConfirmationDecision(projectId, sessionId, interactionId, proof)` or
+`submitInteractionConfirmationDecision(projectId, sessionId, interactionId, kind, proof)`.
+Use the request's `allowedDecisions` to select a decision.
+
+- Compute uses `deny`, `once`, `session`, `project`, or `global`.
+- Permission uses `cancel` or `option:<optionId>`. Use the exact option ID and scope in the
+  disclosure.
+- A structured question uses `{ action: 'accept', answers }`, `{ action: 'decline' }`, or
+  `{ action: 'cancel' }`. An answer has `fieldId` and `value`, with optional `status: 'answered'`.
+  For a field that permits skipping, use `{ fieldId, status: 'skipped' }`. Use the displayed option
+  order for multi-select values and submit the same answers in the same order as signed.
+
 A `{ status: 'claimed' }` receipt confirms that the application accepted the decision. Follow
 the Task or Compute operation for its subsequent outcome. Desktop, Web, and trusted-host replies
 compete for a single claim. A stale, expired, or already answered challenge returns
