@@ -20,7 +20,7 @@ import {
   writeFile
 } from 'node:fs/promises'
 import { createServer } from 'node:http'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { Readable, Writable } from 'node:stream'
 import { macAcceptance } from './macos-acceptance.mjs'
 import { researchPrompt, runResearchAnalysis } from './research-analysis.mjs'
@@ -644,6 +644,82 @@ const controlResultValue = (execution) => {
     throw new Error(`Control REPL returned no display value: ${JSON.stringify(execution)}`)
   }
   return JSON.parse(text)
+}
+
+const submitSlurmFixture = async (sessionId, action) => {
+  const partition = process.env.OPEN_SCIENCE_E2E_SLURM_PARTITION
+  if (partition && !/^[a-zA-Z0-9_.-]+$/.test(partition)) {
+    throw new Error('Invalid fixture Slurm partition.')
+  }
+  const command = [
+    ...(partition ? [`#SBATCH --partition=${partition}`] : []),
+    '#SBATCH --cpus-per-task=1',
+    '#SBATCH --mem=128M',
+    '#SBATCH --time=00:01:00',
+    ...(action === 'cancel'
+      ? ['sleep 45']
+      : [
+          "printf 'sdk-slurm-stdout\\n'",
+          "printf 'sdk-slurm-stderr\\n' >&2",
+          "printf 'sdk-slurm-witness\\n' > witness.txt"
+        ])
+  ].join('\n')
+  const execution = await executeControlCode(
+    sessionId,
+    `
+    const selected = (await host.compute.listHosts()).filter((option) => option.role === 'selected')
+    if (selected.length !== 1) throw new Error('Expected one selected test host.')
+    const target = host.compute.create(selected[0].provider_id)
+    try {
+      const receipt = await target.submitJob('SDK Slurm acceptance', ${JSON.stringify(command)}, {
+        timeoutSeconds: 60,
+        outputs: ['witness.txt']
+      })
+      return { jobId: receipt.job_id }
+    } catch (error) {
+      if (${JSON.stringify(action)} === 'deny' && /denied/i.test(String(error))) {
+        return { denied: true }
+      }
+      throw new Error('The Slurm acceptance submission failed.')
+    }
+  `
+  )
+  const result = controlResultValue(execution)
+  if (result.denied) return 'SDK Slurm submission denied.'
+  if (!result.jobId) throw new Error('Missing persisted Slurm Job ID.')
+  return `SDK Slurm submitted: ${result.jobId}`
+}
+
+const publishSlurmFixture = async (sessionId, jobId) => {
+  const result = controlResultValue(
+    await executeControlCode(
+      sessionId,
+      `
+    const selected = (await host.compute.listHosts()).filter((option) => option.role === 'selected')
+    if (selected.length !== 1) throw new Error('Expected one selected test host.')
+    const target = host.compute.create(selected[0].provider_id)
+    return await target.attachJob(${JSON.stringify(jobId)}).result()
+  `
+    )
+  )
+  const output = result.featured_files?.find((path) => /[/\\]witness\.txt$/.test(path))
+  if (!result.result_final || result.status !== 'success' || !result.local_output_root || !output) {
+    throw new Error('The Slurm acceptance witness was not collected.')
+  }
+  await withMcpClient(sessionId, 'open-science-artifacts', async (client) =>
+    toolResult(
+      'write_artifact_file',
+      await client.callTool({
+        name: 'write_artifact_file',
+        arguments: {
+          filename: 'slurm-witness.txt',
+          source: { kind: 'localPath', path: resolve(result.local_output_root, output) },
+          producerRunId: result.producer_run_id
+        }
+      })
+    )
+  )
+  return 'SDK Slurm witness published.'
 }
 
 const runProductionDelegationRequest = async (sessionId, request, wait) =>
@@ -3060,6 +3136,14 @@ if (process.argv.includes('--version')) {
             if (!run.runId) throw new Error('Python background admission has no runId')
           })
           reply = 'Background execution submitted.'
+        } else if (/Start the SDK Slurm acceptance job: (deny|finish|cancel)\./.test(prompt)) {
+          const action = prompt.match(
+            /Start the SDK Slurm acceptance job: (deny|finish|cancel)\./
+          )[1]
+          reply = await submitSlurmFixture(context.params.sessionId, action)
+        } else if (/Publish the SDK Slurm acceptance witness: ([a-f0-9-]+)\./.test(prompt)) {
+          const jobId = prompt.match(/Publish the SDK Slurm acceptance witness: ([a-f0-9-]+)\./)[1]
+          reply = await publishSlurmFixture(context.params.sessionId, jobId)
         } else if (prompt.includes('Verify SSH background completion delivery.')) {
           const providerId = `ssh:${process.env.COMPUTE_TEST_SSH_ALIAS}`
           await withMcpClient(context.params.sessionId, 'open-science-notebook', async (client) => {
