@@ -3,6 +3,7 @@ import type { AcpStateSnapshot } from '../../shared/acp'
 import type { ComputeApprovalDecision, ComputeApprovalRequest } from '../../shared/compute'
 import { projectAnswerableDelegatedQuestions } from '../../shared/delegated-work-projection'
 import type { ElicitationAnswer } from '../../shared/elicitation'
+import { activeSandboxNetworkApprovals } from '../../shared/sandbox-network-approval'
 import {
   projectPersistedSessionWaits,
   type PersistedChatSession
@@ -158,6 +159,16 @@ const projectTaskPendingSessionInteractions = (
       isMcp: true,
       delegated: permission.delegated
     })
+  }
+  for (const approval of activeSandboxNetworkApprovals(session)) {
+    if (approval.state === 'pending' && approval.decision === undefined) {
+      addDurable({
+        ...identifier('permission', approval.requestId),
+        kind: 'permission',
+        isMcp: false,
+        delegated: false
+      })
+    }
   }
   for (const { requestId, fieldCount } of [
     ...questions,

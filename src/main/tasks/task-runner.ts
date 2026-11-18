@@ -715,6 +715,22 @@ const applyProjectDefaultsPatch = (
   return projectSessionDefaultsSchema.parse(next)
 }
 
+const taskAgentResumeRequest = (session: PersistedChatSession): TaskAgentResumeSessionRequest => ({
+  sessionId: session.id,
+  cwd: session.cwd,
+  projectId: session.projectId,
+  permissionProfile: session.permissionProfile ?? DEFAULT_PERMISSION_PROFILE,
+  previousFrameworkId: session.agentFrameworkId,
+  previousBackendId: session.agentBackendId,
+  previousModel: session.agentModel,
+  providerSessionId: session.providerSessionId,
+  providerContinuityToken: session.providerContinuityToken,
+  memoryEnabled: session.memoryEnabled !== false,
+  ...(session.specialistId ? { specialistId: session.specialistId } : {}),
+  ...(session.specialistBindingPending === true ? { specialistBindingPending: true } : {}),
+  ...(session.agentConfiguration ? { agentConfiguration: session.agentConfiguration } : {})
+})
+
 class TaskRunnerError extends Error {
   constructor(
     readonly code: TaskApiErrorCode,
@@ -959,21 +975,7 @@ class TaskRunner {
     const attachedSessionIds = await this.dependencies.agent.listAttachedSessionIds()
     if (attachedSessionIds.includes(session.id)) return session
 
-    await this.dependencies.agent.resumeSession({
-      sessionId: session.id,
-      cwd: session.cwd,
-      projectId: session.projectId,
-      permissionProfile: session.permissionProfile ?? DEFAULT_PERMISSION_PROFILE,
-      previousFrameworkId: session.agentFrameworkId,
-      previousBackendId: session.agentBackendId,
-      previousModel: session.agentModel,
-      providerSessionId: session.providerSessionId,
-      providerContinuityToken: session.providerContinuityToken,
-      memoryEnabled: session.memoryEnabled !== false,
-      ...(session.specialistId ? { specialistId: session.specialistId } : {}),
-      ...(session.specialistBindingPending === true ? { specialistBindingPending: true } : {}),
-      ...(session.agentConfiguration ? { agentConfiguration: session.agentConfiguration } : {})
-    })
+    await this.dependencies.agent.resumeSession(taskAgentResumeRequest(session))
     return session
   }
 
@@ -3023,7 +3025,7 @@ class TaskRunner {
   }
 }
 
-export { summarizeSession, taskModelCatalog, TaskRunner, TaskRunnerError }
+export { summarizeSession, taskAgentResumeRequest, taskModelCatalog, TaskRunner, TaskRunnerError }
 export type {
   TaskAgentCreateSessionRequest,
   TaskAgentPort,

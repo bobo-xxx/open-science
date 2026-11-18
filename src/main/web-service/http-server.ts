@@ -2118,7 +2118,11 @@ const startWebHttpServer = async (options: WebServerOptions): Promise<RunningWeb
                     isAuthorizationCurrent: authorization.isCurrent
                   }
                 : TRUSTED_CONFIRMATION_PATH.test(url.pathname) && request.method === 'POST'
-                  ? { isAuthorizationCurrent: lease.isCurrent }
+                  ? {
+                      isAuthorizationCurrent: () =>
+                        lease.isCurrent() ||
+                        (response.writableFinished && response.statusCode === 200)
+                    }
                   : {}
             )
             if (

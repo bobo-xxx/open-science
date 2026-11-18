@@ -94,8 +94,9 @@ before changing versions; replacing program files does not reverse data migratio
   running service advertises it. It reads the legacy Web token only for an older service.
   Task credentials cover Task endpoints, Task events, and the compatibility operations used
   by existing SDK methods. Keep the Web credential for first-party UI and lifecycle clients.
-  A Task credential cannot sign in to Web, subscribe to renderer events, shut down the service,
-  or provide a human decision. This HTTP boundary does not isolate processes with access to both files.
+  Use the Web credential for first-party sign-in, renderer events, and lifecycle. A trusted
+  confirmation also requires proof from an enrolled host. Keep the two credential files isolated
+  from processes that should have only one role.
 - **Controls:** Requests use the service's permission profiles, existing grants, and host-owned
   runtime controls. Disabling interactive permission prompts denies requests needing a human; it
   does not erase previously granted authority.
@@ -189,8 +190,11 @@ The local trusted-host previews let an enrolled component respond through an iso
 The server advertises `trusted-compute-decisions`, `trusted-permission-decisions`, and
 `trusted-question-decisions` independently. Permission and question previews cover supported
 requests with a live primary runtime, live delegated permissions, and confirmable delegated
-questions on the current Branch. Use Desktop or Web for restored waits and specialized
-application-owned permission requests. The preview protocol uses a fixture host for verification.
+questions on the current Branch. Supported saved waits include restored structured questions,
+MCP permissions with a recorded provider and model, and Notebook network approvals. Live
+Notebook network approvals depend on the application's existing confirmation availability.
+A standalone service uses a connected Web interface for that availability. Desktop and Web handle
+other application-owned permissions. The preview protocol uses a fixture host for verification.
 Real external host acceptance is pending. Keep the private key, the user-facing confirmation UI,
 and signing outside the model and Task tool environment.
 
@@ -244,7 +248,9 @@ Use the request's `allowedDecisions` to select a decision.
 
 - Compute uses `deny`, `once`, `session`, `project`, or `global`.
 - Permission uses `cancel` or `option:<optionId>`. Use the exact option ID and scope in the
-  disclosure.
+  disclosure. A Notebook network approval may include an evidence revision in the option ID.
+  Keep the complete ID. The approval binds the currently disclosed destination evidence.
+  Remembered grants follow the native host, port, protocol, and scope rules.
 - A structured question uses `{ action: 'accept', answers }`, `{ action: 'decline' }`, or
   `{ action: 'cancel' }`. An answer has `fieldId` and `value`, with optional `status: 'answered'`.
   For a field that permits skipping, use `{ fieldId, status: 'skipped' }`. Use the displayed option

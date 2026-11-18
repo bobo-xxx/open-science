@@ -137,7 +137,9 @@ export {
   INTERRUPTED_TURN_ERROR,
   normalizeSessionAfterRestore,
   projectPersistedSessionWaits,
-  rearmUnacceptedElicitationContinuations
+  rearmUnacceptedElicitationContinuations,
+  resolveRestorableElicitationActivity,
+  resolveRestorablePermissionToolAuthority
 } from './session-persistence/restore'
 export {
   isReviewerCorrectionAttribution,

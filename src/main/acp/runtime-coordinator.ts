@@ -51,6 +51,10 @@ import type {
   LiveElicitationSnapshot,
   ResolvedElicitation
 } from './elicitation-owner'
+import type {
+  RestoredElicitationClaim,
+  RestoredElicitationClaimInput
+} from './durable-continuation-context-owner'
 import {
   ConversationPermissionGrantStore,
   type AppPermissionRequest,
@@ -59,6 +63,10 @@ import {
   type PermissionConfirmationScope,
   type PermissionConfirmationSnapshot
 } from './permission-broker'
+import type {
+  RestoredPermissionConfirmationClaim,
+  RestoredPermissionConfirmationSource
+} from './permission-continuation-workflow'
 import { AcpRuntime } from './runtime'
 import {
   retainSessionCreationCleanup,
@@ -2123,6 +2131,69 @@ class AcpRuntimeCoordinator {
     return this.getState()
   }
 
+  async readLiveSandboxNetworkConfirmation(
+    scope: PermissionConfirmationScope,
+    requestId: string
+  ): Promise<PermissionConfirmationSnapshot | undefined> {
+    return this.sessionRuntimes
+      .get(scope.sessionId)
+      ?.readLiveSandboxNetworkConfirmation(scope, requestId)
+  }
+
+  async claimLiveSandboxNetworkConfirmation(
+    scope: PermissionConfirmationScope,
+    requestId: string,
+    version: string,
+    decision: PermissionConfirmationDecision,
+    authorizeAtClaim: () => boolean
+  ): Promise<RestoredPermissionConfirmationClaim> {
+    const owner = this.sessionRuntimes.get(scope.sessionId)
+    if (!owner) return { status: 'unavailable' }
+    const result = await owner.claimLiveSandboxNetworkConfirmation(
+      scope,
+      requestId,
+      version,
+      decision,
+      authorizeAtClaim
+    )
+    if (result.status === 'claimed' && this.permissionRuntimes.get(requestId) === owner) {
+      this.permissionRuntimes.delete(requestId)
+    }
+    return result
+  }
+
+  async readRestoredPermissionConfirmation(
+    scope: PermissionConfirmationScope,
+    requestId: string,
+    source: RestoredPermissionConfirmationSource
+  ): Promise<PermissionConfirmationSnapshot | undefined> {
+    if (!this.isRestoredInteractionUnowned(scope, requestId, 'permission')) return undefined
+    const owner = this.sessionRuntimes.get(scope.sessionId) ?? this.getActiveRuntime()
+    return owner.readRestoredPermissionConfirmation(scope, requestId, source)
+  }
+
+  async claimRestoredPermissionConfirmation(
+    scope: PermissionConfirmationScope,
+    requestId: string,
+    source: RestoredPermissionConfirmationSource,
+    version: string,
+    decision: PermissionConfirmationDecision,
+    authorizeAtClaim: () => boolean
+  ): Promise<RestoredPermissionConfirmationClaim> {
+    const isCurrent = (): boolean =>
+      authorizeAtClaim() && this.isRestoredInteractionUnowned(scope, requestId, 'permission')
+    if (!isCurrent()) return { status: 'unavailable' }
+    const owner = this.sessionRuntimes.get(scope.sessionId) ?? this.getActiveRuntime()
+    return owner.claimRestoredPermissionConfirmation(
+      scope,
+      requestId,
+      source,
+      version,
+      decision,
+      isCurrent
+    )
+  }
+
   readLivePermissionConfirmation(
     scope: PermissionConfirmationScope,
     requestId: string
@@ -2172,6 +2243,52 @@ class AcpRuntimeCoordinator {
       this.preparedElicitationContinuations.set(sessionId, response.requestId)
     }
     return this.getState()
+  }
+
+  isRestoredInteractionUnowned(
+    { sessionId }: { projectId: string; sessionId: string },
+    requestId: string,
+    kind: 'permission' | 'question'
+  ): boolean {
+    if (
+      this.activePromptRequests.has(sessionId) ||
+      this.activeRootAdmissions.has(sessionId) ||
+      this.pendingSessionAdoptions.has(sessionId) ||
+      this.preparedElicitationContinuations.has(sessionId)
+    ) {
+      return false
+    }
+    return !Array.from(this.runtimes).some((runtime) => {
+      const snapshot = runtime.getSnapshot()
+      const requests =
+        kind === 'question' ? snapshot.pendingElicitations : snapshot.pendingPermissions
+      return (
+        snapshot.promptInFlightSessionIds?.includes(sessionId) ||
+        requests?.some(
+          (request) => request.sessionId === sessionId && request.requestId === requestId
+        )
+      )
+    })
+  }
+
+  forgetPreparedElicitationContinuation(sessionId: string, requestId: string): void {
+    if (this.preparedElicitationContinuations.get(sessionId) === requestId) {
+      this.preparedElicitationContinuations.delete(sessionId)
+    }
+  }
+
+  async claimRestoredElicitation(
+    input: Omit<RestoredElicitationClaimInput, 'isUnowned'>
+  ): Promise<RestoredElicitationClaim> {
+    const isUnowned = (): boolean =>
+      this.isRestoredInteractionUnowned(input, input.requestId, 'question')
+    if (!isUnowned()) return { status: 'unavailable' }
+    const owner = this.sessionRuntimes.get(input.sessionId) ?? this.getActiveRuntime()
+    const result = await owner.claimRestoredElicitation({ ...input, isUnowned })
+    if (result.status === 'claimed' && result.decision.action !== 'cancel') {
+      this.preparedElicitationContinuations.set(input.sessionId, input.requestId)
+    }
+    return result
   }
 
   getLiveElicitation(

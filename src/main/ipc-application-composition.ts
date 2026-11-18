@@ -77,6 +77,10 @@ import {
   composeSpecialistCatalog,
   composeSpecialistPackages
 } from './composition/specialists'
+import {
+  composeTrustedRestoredInteractions,
+  restoredVersionPrefix
+} from './composition/trusted-restored-interactions'
 import { composeStorageStartup } from './composition/storage-startup'
 import { composeUploadStorage } from './composition/upload-storage'
 import { SessionEnabledComputeHostsOwner } from './compute/session-enabled-hosts-owner'
@@ -984,6 +988,7 @@ export const createApplicationModules = async (
     )?.requestId
   }
   const delegatedPermissionVersion = 'delegated:'
+  const sandboxPermissionVersion = 'sandbox-network:'
   const trustedPermission = trustedHostKeys
     ? new TrustedInteractionDecisions<AcpPermissionRequest, ConfirmationPermissionDecision>(
         {
@@ -991,53 +996,89 @@ export const createApplicationModules = async (
           describeDecision: (decision) => [decision, decision],
           read: async (scope) => {
             const requestId = findLiveRequestId(scope, 'permission')
-            if (!requestId) return undefined
+            if (!requestId) return trustedRestored.readPermission(scope)
             const live = agentRuntime.runtime.readLivePermissionConfirmation(scope, requestId)
             if (live) return { ...live, disclosure: live.request }
+            const network = await agentRuntime.runtime.readLiveSandboxNetworkConfirmation(
+              scope,
+              requestId
+            )
+            if (network) {
+              return {
+                version: sandboxPermissionVersion + network.version,
+                disclosure: network.request,
+                allowedDecisions: network.allowedDecisions
+              }
+            }
             const delegated = await delegation.delegatedWork.root.readTrustedPermission?.(
               scope,
               requestId
             )
-            return (
-              delegated && {
-                version: delegatedPermissionVersion + delegated.version,
-                disclosure: delegated.request,
-                allowedDecisions: delegated.allowedDecisions
-              }
-            )
+            return delegated
+              ? {
+                  version: delegatedPermissionVersion + delegated.version,
+                  disclosure: delegated.request,
+                  allowedDecisions: delegated.allowedDecisions
+                }
+              : trustedRestored.readPermission(scope)
           },
           claim: async (scope, version, decision, authorizeAtClaim) => {
-            const requestId = findLiveRequestId(scope, 'permission')
-            if (!requestId || !authorizeAtClaim()) return 'unavailable'
-            if (version.startsWith(delegatedPermissionVersion)) {
-              const delegated = await delegation.delegatedWork.root.claimTrustedPermission?.(
-                scope,
-                requestId,
-                version.slice(delegatedPermissionVersion.length),
-                decision,
-                authorizeAtClaim
-              )
-              if (delegated?.status === 'claimed') {
-                void delegated.completion.catch((error: unknown) =>
-                  log.warn(
-                    'trusted delegated permission delivery failed',
-                    diagnosticErrorFields(error)
+            if (version.startsWith(restoredVersionPrefix)) {
+              return trustedRestored.claimPermission(scope, version, decision, authorizeAtClaim)
+            }
+            return (
+              (await withTrustedInteractionSession(scope, async () => {
+                const requestId = findLiveRequestId(scope, 'permission')
+                if (!requestId || !authorizeAtClaim()) return 'unavailable'
+                if (version.startsWith(sandboxPermissionVersion)) {
+                  const network = await agentRuntime.runtime.claimLiveSandboxNetworkConfirmation(
+                    scope,
+                    requestId,
+                    version.slice(sandboxPermissionVersion.length),
+                    decision,
+                    authorizeAtClaim
                   )
+                  if (network.status === 'claimed') {
+                    void network.completion.catch((error: unknown) =>
+                      log.warn(
+                        'trusted network approval completion failed',
+                        diagnosticErrorFields(error)
+                      )
+                    )
+                  }
+                  return network.status
+                }
+                if (version.startsWith(delegatedPermissionVersion)) {
+                  const delegated = await delegation.delegatedWork.root.claimTrustedPermission?.(
+                    scope,
+                    requestId,
+                    version.slice(delegatedPermissionVersion.length),
+                    decision,
+                    authorizeAtClaim
+                  )
+                  if (delegated?.status === 'claimed') {
+                    void delegated.completion.catch((error: unknown) =>
+                      log.warn(
+                        'trusted delegated permission delivery failed',
+                        diagnosticErrorFields(error)
+                      )
+                    )
+                  }
+                  return delegated?.status ?? 'unavailable'
+                }
+                const result = agentRuntime.runtime.claimLivePermissionConfirmation(
+                  scope,
+                  requestId,
+                  version,
+                  decision
                 )
-              }
-              return delegated?.status ?? 'unavailable'
-            }
-            const result = agentRuntime.runtime.claimLivePermissionConfirmation(
-              scope,
-              requestId,
-              version,
-              decision
+                if (result.status === 'claimed') {
+                  // Runtime publishes its own delivery or persistence error after the synchronous claim.
+                  void result.completion.catch(() => undefined)
+                }
+                return result.status
+              })) ?? 'unavailable'
             )
-            if (result.status === 'claimed') {
-              // Runtime publishes its own delivery or persistence error after the synchronous claim.
-              void result.completion.catch(() => undefined)
-            }
-            return result.status
           }
         },
         trustedHostKeys.resolve
@@ -1183,23 +1224,26 @@ export const createApplicationModules = async (
               }
             }
             const requestId = findLiveRequestId(scope, 'question')
-            if (!requestId) return undefined
+            if (!requestId) return trustedRestored.readQuestion(scope)
             const snapshot = agentRuntime.runtime.getLiveElicitation(
               scope.projectId,
               scope.sessionId,
               requestId
             )
-            return (
-              snapshot && {
-                version: questionVersion(snapshot),
-                disclosure: snapshot.request,
-                allowedDecisions: ['accept', 'decline', 'cancel']
-              }
-            )
+            return snapshot
+              ? {
+                  version: questionVersion(snapshot),
+                  disclosure: snapshot.request,
+                  allowedDecisions: ['accept', 'decline', 'cancel']
+                }
+              : trustedRestored.readQuestion(scope)
           },
           claim: async (scope, version, decision, authorizeAtClaim) => {
             if (version.startsWith('delegated:')) {
               return claimDelegatedQuestion(scope, version, decision, authorizeAtClaim)
+            }
+            if (version.startsWith(restoredVersionPrefix)) {
+              return trustedRestored.claimQuestion(scope, version, decision, authorizeAtClaim)
             }
             return (
               (await withTrustedInteractionSession(scope, () => {
@@ -1250,6 +1294,12 @@ export const createApplicationModules = async (
       return undefined
     }
   }
+  const trustedRestored = composeTrustedRestoredInteractions({
+    sessions: sessionAuthority.sessionPersistenceCoordinator,
+    runtime: agentRuntime.runtime,
+    agent: agentWorkflows.taskAgent,
+    withSessionAvailable: withTrustedInteractionSession
+  })
   const toConfirmationPort = <Disclosure, Decision, Choice extends string>(
     owner: TrustedInteractionDecisions<Disclosure, Decision, Choice> | undefined,
     holdClaimAdmission = true
@@ -1265,8 +1315,8 @@ export const createApplicationModules = async (
             )) ?? 'unavailable'
           )
         }
-        // Delegated questions wait for a previous Attempt and capacity. Their persistence owner
-        // reacquires admission only for the confirmed decision and the continuation commit.
+        // A restored continuation may need to attach its Agent session, and a delegated question
+        // may wait for capacity. Each owner reacquires admission for the exact claim.
         if (!(await withTrustedInteractionSession(scope, () => true))) return 'unavailable'
         return owner.claim(scope, proof, isCurrent)
       },
@@ -1374,7 +1424,7 @@ export const createApplicationModules = async (
     taskAgent: agentWorkflows.taskAgent,
     taskControls: {
       trustedCompute: toConfirmationPort(trustedCompute),
-      trustedPermission: toConfirmationPort(trustedPermission),
+      trustedPermission: toConfirmationPort(trustedPermission, false),
       trustedQuestion: toConfirmationPort(trustedQuestion, false),
       listPendingSessionInteractions: async (scope) => {
         const sessions = sessionAuthority.sessionPersistenceCoordinator

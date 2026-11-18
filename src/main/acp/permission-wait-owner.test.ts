@@ -6,6 +6,7 @@ import {
   type SessionRuntimeContext
 } from '../../shared/session-persistence'
 import { resolveActiveConversationMessages } from '../../shared/conversation-graph'
+import { opencodeTransportProviderId } from '../agent-framework/opencode'
 import type {
   DurablePermissionWaitCandidate,
   RestoredPermissionContinuation
@@ -105,13 +106,265 @@ const createSessions = (
       readSessionRuntimeContext: vi.fn(async () => structuredClone(context)),
       patchSessionRuntimeContext: patches,
       containsMessageOnActiveBranch: vi.fn(async () => containsMessage),
-      loadSessionForContinuation: vi.fn(async () => structuredClone(session))
+      loadSessionForContinuation: vi.fn(async () => structuredClone(session)),
+      readSessionSnapshot: vi.fn(async () => structuredClone(session))
     },
     context: () => context,
     session: () => session,
     patches
   }
 }
+
+const scope = { projectId: 'project-1', sessionId: 'session-1' }
+
+const createRestoredConfirmation = async (): Promise<
+  ReturnType<typeof createSessions> & {
+    owner: AcpPermissionWaitOwner
+    version: string
+    requestId: string
+  }
+> => {
+  const fixture = createSessions()
+  const owner = new AcpPermissionWaitOwner(fixture.sessions)
+  const session = fixture.session()
+  const candidate = createCandidate()
+  const request = {
+    ...candidate.request,
+    isMcp: true,
+    providerToolName: 'mcp__samples__query',
+    mcpIdentity: 'samples/query',
+    options: [
+      ...candidate.request.options,
+      {
+        optionId: 'bind-project',
+        name: 'This project',
+        kind: 'allow_always',
+        scope: 'project' as const
+      }
+    ]
+  }
+  session.agentModel = 'model-a'
+  session.agentFrameworkId = 'codex'
+  session.agentBackendId = 'fixture-backend'
+  session.agentConfiguration = {
+    providerId: 'fixture-provider',
+    model: 'model-a',
+    reasoningEffort: 'medium'
+  }
+  session.activities = [
+    {
+      id: request.toolCallId,
+      kind: 'tool',
+      title: request.title,
+      status: 'pending',
+      promptMessageId: candidate.promptMessageId,
+      sortIndex: 1,
+      eventIds: [],
+      createdAt: 1,
+      updatedAt: 1
+    }
+  ]
+  session.conversationGraph = materializeSessionConversationGraph(session).conversationGraph
+  await owner.persist({ ...candidate, request })
+  const confirmation = await owner.readPendingRestoredConfirmation(scope, request.requestId)
+  if (!confirmation) throw new Error('Expected an authoritative restored MCP permission.')
+  return { ...fixture, owner, version: confirmation.version, requestId: request.requestId }
+}
+
+describe('trusted restored MCP permission wait', () => {
+  it('matches the exact OpenCode transport alias to the saved provider and model', async () => {
+    const fixture = await createRestoredConfirmation()
+    const session = fixture.session()
+    const graph = session.conversationGraph!
+    const providerId = session.agentConfiguration!.providerId
+    const model = session.agentConfiguration!.model
+    if (!providerId || !model) throw new Error('Expected a configured fixture Provider and model.')
+    session.agentFrameworkId = 'opencode'
+    session.conversationGraph = {
+      ...graph,
+      runtimeSegments: graph.runtimeSegments.map((segment) => ({
+        ...segment,
+        frameworkId: 'opencode',
+        model
+      }))
+    }
+    session.agentModel = `${opencodeTransportProviderId(providerId, model)}/${model}`
+    await expect(
+      fixture.owner.readPendingRestoredConfirmation(scope, fixture.requestId)
+    ).resolves.toBeDefined()
+    session.agentModel = `${opencodeTransportProviderId('another-provider', model)}/${model}`
+    await expect(
+      fixture.owner.readPendingRestoredConfirmation(scope, fixture.requestId)
+    ).resolves.toBeUndefined()
+  })
+
+  it('prepares the exact native restored choice and claims the durable wait once', async () => {
+    const { owner, sessions, context, requestId, version } = await createRestoredConfirmation()
+    const read = (await owner.readPendingRestoredConfirmation(scope, requestId))!
+    expect(read.allowedDecisions).toEqual([
+      'option:allow-once',
+      'option:deny',
+      'option:bind-project',
+      'cancel'
+    ])
+    expect(read.request.options.map(({ optionId }) => optionId)).toEqual([
+      'allow-once',
+      'deny',
+      'bind-project'
+    ])
+    expect(sessions.readSessionSnapshot).toHaveBeenLastCalledWith(
+      scope.projectId,
+      scope.sessionId,
+      { preserveRuntimeState: true }
+    )
+    expect(sessions.loadSessionForContinuation).not.toHaveBeenCalled()
+    await expect(
+      owner.prepareRestoredConfirmation(scope, requestId, version, 'option:not-offered')
+    ).resolves.toEqual({ status: 'invalid-decision' })
+    const prepared = await owner.prepareRestoredConfirmation(
+      scope,
+      requestId,
+      version,
+      'option:bind-project'
+    )
+    if (prepared.status !== 'ready') throw new Error('Expected a prepared restored permission.')
+    const nativeDecision = await owner.resolveRestored(
+      prepared.response,
+      scope.projectId,
+      scope.sessionId
+    )
+    expect(prepared.decision).toEqual(nativeDecision)
+    expect(prepared.decision.option).toMatchObject({ optionId: 'bind-project', scope: 'project' })
+    expect(context().permission?.state).toBe('pending')
+    const authorize = vi.fn(() => true)
+    await expect(prepared.claim(authorize)).resolves.toBe('claimed')
+    expect(context().permission?.state).toBe('continuing')
+    await expect(prepared.claim(authorize)).resolves.toBe('unavailable')
+    expect(authorize).toHaveBeenCalledOnce()
+    await owner.rearmContinuation(scope.projectId, scope.sessionId, requestId)
+    expect((await owner.readPendingRestoredConfirmation(scope, requestId))?.version).not.toBe(
+      version
+    )
+  })
+
+  it.each(['revoked', 'branch', 'model', 'request'] as const)(
+    'rejects %s evidence at the persistence fence without consuming the pending wait',
+    async (change) => {
+      const fixture = await createRestoredConfirmation()
+      const { owner, patches, requestId, version } = fixture
+      const prepared = await owner.prepareRestoredConfirmation(scope, requestId, version, 'cancel')
+      if (prepared.status !== 'ready') throw new Error('Expected cancellation to be ready.')
+      expect(prepared.response.cancelled).toBe(true)
+      expect(prepared.decision.option).toBeUndefined()
+      let authorized = true
+      const atWrite = Promise.withResolvers<void>()
+      const continueWrite = Promise.withResolvers<void>()
+      const patch = patches.getMockImplementation()!
+      patches.mockImplementationOnce(async (command) => {
+        atWrite.resolve()
+        await continueWrite.promise
+        return patch(command)
+      })
+      const authorize = vi.fn(() => authorized)
+      const pending = prepared.claim(authorize)
+      await atWrite.promise
+      expect(authorize).not.toHaveBeenCalled()
+      const session = fixture.session()
+      if (change === 'revoked') authorized = false
+      else if (change === 'model') session.agentModel = 'changed-model'
+      else if (change === 'request') {
+        const current = session.runtimeContext!
+        const permission = current.permission!
+        session.runtimeContext = {
+          ...current,
+          permission: {
+            ...permission,
+            request: { ...permission.request, title: 'A different tool operation' }
+          }
+        }
+      } else {
+        const graph = session.conversationGraph!
+        const original = graph.branches[0]
+        graph.branches.push({
+          ...original,
+          id: 'sibling-branch',
+          parentBranchId: original.id,
+          forkMessageId: 'prompt-1'
+        })
+        graph.frames[0].activeBranchId = 'sibling-branch'
+        expect(resolveActiveConversationMessages(graph).some(({ id }) => id === 'prompt-1')).toBe(
+          true
+        )
+      }
+      continueWrite.resolve()
+      await expect(pending).resolves.toBe('unavailable')
+      expect(fixture.context().permission?.state).toBe('pending')
+      expect(authorize).toHaveBeenCalledTimes(change === 'revoked' ? 1 : 0)
+    }
+  )
+
+  it('leaves the signed preparation inert when the native owner wins or a session is unavailable', async () => {
+    const { owner, session, requestId, version } = await createRestoredConfirmation()
+    await expect(
+      owner.readPendingRestoredConfirmation({ ...scope, projectId: 'another-project' }, requestId)
+    ).resolves.toBeUndefined()
+    session().archivedAt = 99
+    await expect(owner.readPendingRestoredConfirmation(scope, requestId)).resolves.toBeUndefined()
+    session().archivedAt = undefined
+    const prepared = await owner.prepareRestoredConfirmation(
+      scope,
+      requestId,
+      version,
+      'option:allow-once'
+    )
+    if (prepared.status !== 'ready') throw new Error('Expected a ready permission preparation.')
+    await owner.beginContinuation(scope.projectId, scope.sessionId, requestId)
+    const authorize = vi.fn(() => true)
+    await expect(prepared.claim(authorize)).resolves.toBe('unavailable')
+    expect(authorize).not.toHaveBeenCalled()
+  })
+
+  it('does not re-open a trusted denial when notification fails after the durable write', async () => {
+    const { sessions, context, requestId, version } = await createRestoredConfirmation()
+    const publish = vi.fn(async () => {
+      throw new Error('renderer was replaced')
+    })
+    const owner = new AcpPermissionWaitOwner(sessions, publish)
+    const prepared = await owner.prepareRestoredConfirmation(
+      scope,
+      requestId,
+      version,
+      'option:deny'
+    )
+    if (prepared.status !== 'ready') throw new Error('Expected a ready permission decision.')
+    expect(prepared.decision).toMatchObject({ denied: true, option: { optionId: 'deny' } })
+    expect(prepared.response.cancelled).toBeUndefined()
+    await expect(prepared.claim(() => true)).resolves.toBe('claimed')
+    expect(publish).toHaveBeenCalledOnce()
+    expect(context().permission?.state).toBe('continuing')
+    await expect(owner.readPendingRestoredConfirmation(scope, requestId)).resolves.toBeUndefined()
+  })
+
+  it('rechecks proof authorization after a durable revision conflict', async () => {
+    const { owner, session, patches, context, requestId, version } =
+      await createRestoredConfirmation()
+    const prepared = await owner.prepareRestoredConfirmation(
+      scope,
+      requestId,
+      version,
+      'option:allow-once'
+    )
+    if (prepared.status !== 'ready') throw new Error('Expected a ready permission decision.')
+    patches.mockImplementationOnce(async (command) => {
+      await command.beforePersist?.(structuredClone(session()))
+      throw Object.assign(new Error('revision conflict'), { code: 'revision-conflict' })
+    })
+    const authorize = vi.fn(() => false).mockReturnValueOnce(true)
+    await expect(prepared.claim(authorize)).resolves.toBe('unavailable')
+    expect(authorize).toHaveBeenCalledTimes(2)
+    expect(context().permission?.state).toBe('pending')
+  })
+})
 
 describe('ACP durable permission wait owner', () => {
   it('atomically hands the restored wait to a fresh pending decision and fences old cleanup', async () => {

@@ -12,7 +12,11 @@ import type { AcpAppContinuationOwner, AcpContinuationOutcome } from './app-cont
 import type { AcpDurableContinuationContextOwner } from './durable-continuation-context-owner'
 import type { RestoredPermissionContinuation } from './permission-broker'
 import type { AcpPermissionContext } from './permission-context'
-import type { AcpPermissionWaitOwner } from './permission-wait-owner'
+import type {
+  AcpPermissionWaitOwner,
+  PreparedRestoredPermissionConfirmation,
+  RestoredPermissionDecision
+} from './permission-wait-owner'
 import type { AcpRuntimeCallbacks } from './runtime-contract'
 import type { AcpRuntimePublicationOwner } from './runtime-publication-owner'
 import type { AcpSessionInteractionOwner } from './session-interaction-owner'
@@ -41,6 +45,13 @@ type PermissionContinuationDependencies = Readonly<{
   ) => Promise<PromptResponse>
   schedule: (sessionId: string) => void
 }>
+
+type RestoredPermissionConfirmationSource = 'mcp' | 'sandbox-network'
+
+type RestoredPermissionConfirmationClaim =
+  { status: 'claimed'; completion: Promise<void> } | { status: 'unavailable' | 'invalid-decision' }
+
+class RestoredPermissionUnavailableError extends Error {}
 
 const errorMessage = (error: unknown): string => {
   try {
@@ -75,6 +86,49 @@ class AcpPermissionContinuationWorkflow {
     if (!activeSession) throw new Error(`ACP session not found: ${restored.sessionId}`)
     const projectId = this.deps.projectId(restored.sessionId)
     const decision = await this.deps.wait.resolveRestored(response, projectId, restored.sessionId)
+    return this.respondPrepared(response, projectId, decision, () =>
+      this.deps.wait.beginContinuation(projectId, restored.sessionId, response.requestId)
+    )
+  }
+
+  async respondTrusted(
+    prepared: PreparedRestoredPermissionConfirmation,
+    authorizeAtClaim: () => boolean
+  ): Promise<RestoredPermissionConfirmationClaim> {
+    const { response, decision } = prepared
+    const restored = response.restored
+    if (!restored || !this.deps.hasActiveSession(restored.sessionId))
+      return { status: 'unavailable' }
+    const projectId = this.deps.projectId(restored.sessionId)
+    const receipt = Promise.withResolvers<void>()
+    const completion = this.respondPrepared(response, projectId, decision, async () => {
+      if ((await prepared.claim(authorizeAtClaim)) !== 'claimed') {
+        throw new RestoredPermissionUnavailableError(
+          'The restored permission confirmation is unavailable.'
+        )
+      }
+      receipt.resolve()
+    }).then(() => undefined)
+    return Promise.race([
+      receipt.promise.then(() => ({ status: 'claimed', completion }) as const),
+      completion.then(
+        () => ({ status: 'unavailable' }) as const,
+        (error: unknown) => {
+          if (error instanceof RestoredPermissionUnavailableError)
+            return { status: 'unavailable' } as const
+          throw error
+        }
+      )
+    ])
+  }
+
+  private async respondPrepared(
+    response: AcpPermissionResponse,
+    projectId: string,
+    decision: RestoredPermissionDecision,
+    claim: () => Promise<unknown>
+  ): Promise<AcpStateSnapshot> {
+    const restored = response.restored!
     const continuation = await this.deps.context.prepare({
       projectId,
       sessionId: restored.sessionId,
@@ -83,7 +137,9 @@ class AcpPermissionContinuationWorkflow {
     })
     const durablePermissionContinuations = this.continuations
     if (durablePermissionContinuations.has(restored.sessionId)) {
-      throw new Error('The restored permission request is already being continued.')
+      throw new RestoredPermissionUnavailableError(
+        'The restored permission request is already being continued.'
+      )
     }
     const permissionContinuation: RestoredPermissionContinuation = {
       projectId,
@@ -100,7 +156,7 @@ class AcpPermissionContinuationWorkflow {
     try {
       // Persist the consumed/non-replayable marker before starting provider work. A process loss or
       // grant failure must never leave a reusable approval without consuming its authority first.
-      await this.deps.wait.beginContinuation(projectId, restored.sessionId, response.requestId)
+      await claim()
       continuationBegan = true
       await this.deps.permission.prepareRestoredDecision(
         decision.permission,
@@ -350,4 +406,8 @@ class AcpPermissionContinuationWorkflow {
   }
 }
 export { AcpPermissionContinuationWorkflow, PERMISSION_DENIED_CONTINUATION_TEXT }
-export type { PermissionContinuationDependencies }
+export type {
+  PermissionContinuationDependencies,
+  RestoredPermissionConfirmationClaim,
+  RestoredPermissionConfirmationSource
+}

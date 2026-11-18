@@ -36,7 +36,8 @@ import {
   type PermissionConfirmationScope,
   type PermissionConfirmationSnapshot,
   type PermissionWaitHooks,
-  type RestoredPermissionContinuation
+  type RestoredPermissionContinuation,
+  type SandboxNetworkPermissionBinding
 } from './permission-broker'
 import type { PermissionConfirmationPrompt, PermissionPolicyContext } from './permission-policy'
 import {
@@ -800,6 +801,32 @@ class AcpPermissionContext {
       : { status: 'unavailable' }
   }
 
+  readSandboxNetworkApproval(
+    binding: SandboxNetworkPermissionBinding
+  ): PermissionConfirmationSnapshot | undefined {
+    return this.ownsConfirmationScope(binding.scope)
+      ? this.broker.readSandboxNetworkApproval(binding)
+      : undefined
+  }
+
+  claimSandboxNetworkApproval(
+    binding: SandboxNetworkPermissionBinding,
+    version: string,
+    decision: PermissionConfirmationDecision,
+    authorizeAtClaim: () => boolean,
+    beforeRespond: (optionId: string | undefined) => Promise<void>
+  ): PermissionConfirmationClaim {
+    return this.ownsConfirmationScope(binding.scope)
+      ? this.broker.claimSandboxNetworkApproval(
+          binding,
+          version,
+          decision,
+          authorizeAtClaim,
+          beforeRespond
+        )
+      : { status: 'unavailable' }
+  }
+
   hasPendingForSession(sessionId: string): boolean {
     return this.broker.hasPendingForSession(sessionId)
   }
@@ -967,6 +994,21 @@ class AcpPermissionContext {
         this.options.routing.permissionPromptsForSession?.(input.sessionId) ??
         this.options.routing.capturePrompt(input.sessionId)?.permissionPrompts
     })
+  }
+
+  requestSandboxNetworkApproval(
+    input: AppPermissionRequest,
+    binding: SandboxNetworkPermissionBinding
+  ): Promise<string | undefined> {
+    return this.broker.requestSandboxNetworkApproval(
+      {
+        ...input,
+        permissionPrompts:
+          this.options.routing.permissionPromptsForSession?.(input.sessionId) ??
+          this.options.routing.capturePrompt(input.sessionId)?.permissionPrompts
+      },
+      binding
+    )
   }
 
   respondToPermission(

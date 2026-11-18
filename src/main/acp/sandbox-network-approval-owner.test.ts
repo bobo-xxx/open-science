@@ -58,6 +58,7 @@ const fixture = (): {
   const sessions: PermissionWaitSessions = {
     readSessionRuntimeContext: async () => structuredClone(context),
     loadSessionForContinuation: async () => structuredClone(session),
+    readSessionSnapshot: async () => structuredClone(session),
     containsMessageOnActiveBranch: async () => true,
     patchSessionRuntimeContext: async (command) => {
       if (context.revision !== command.expectedRevision)
@@ -955,6 +956,366 @@ describe('trusted destination approvals', () => {
         blockReason: 'sensitive-destination'
       }
     }
+  })
+
+  const restorePending = async (
+    f: ReturnType<typeof fixture>,
+    input = exactInput(f)
+  ): Promise<{ projectId: string; sessionId: string; requestId: string }> => {
+    const result = f.owner.request(input, 'prompt-fixture', f.send)
+    const { requestId } = await f.pending()
+    f.broker.abandonAllPending()
+    await result
+    return { projectId: f.session.projectId, sessionId: f.session.id, requestId }
+  }
+
+  it('settles one exact live network wait through the private broker binding', async () => {
+    const f = fixture()
+    const scope = { projectId: f.session.projectId, sessionId: f.session.id }
+    const result = f.owner.request(exactInput(f), 'prompt-fixture', (request, binding) =>
+      f.broker.requestSandboxNetworkApproval(request, binding)
+    )
+    const { requestId } = await f.pending()
+    expect(f.broker.readPendingConfirmation(scope, requestId)).toBeUndefined()
+    expect(await f.owner.readRestoredConfirmation(scope, requestId)).toBeUndefined()
+    const snapshot = (await f.owner.readLiveConfirmation(scope, requestId, f.broker))!
+    expect(snapshot.allowedDecisions).toEqual([
+      'option:allow-once@0',
+      'option:project-allow@0',
+      'option:always-allow@0',
+      'option:deny',
+      'cancel'
+    ])
+    const queued = Promise.withResolvers<void>()
+    const resume = Promise.withResolvers<void>()
+    const patch = f.sessions.patchSessionRuntimeContext.bind(f.sessions)
+    vi.spyOn(f.sessions, 'patchSessionRuntimeContext').mockImplementationOnce(async (command) => {
+      queued.resolve()
+      await resume.promise
+      return patch(command)
+    })
+    const competing = Promise.all([
+      f.owner.claimLiveConfirmation(
+        scope,
+        requestId,
+        snapshot.version,
+        'option:allow-once@0',
+        () => true,
+        f.broker
+      ),
+      f.owner.claimLiveConfirmation(
+        scope,
+        requestId,
+        snapshot.version,
+        'option:allow-once@0',
+        () => true,
+        f.broker
+      )
+    ])
+    await queued.promise
+    try {
+      await expect(f.broker.respond({ requestId, optionId: 'deny' })).resolves.toBe(false)
+      await expect(
+        f.owner.respondRestored({ requestId, optionId: 'deny', restored: scope }, scope.projectId)
+      ).rejects.toThrow('Network approval is live')
+    } finally {
+      resume.resolve()
+    }
+    const claims = await competing
+    expect(claims.map(({ status }) => status).sort()).toEqual(['claimed', 'unavailable'])
+    for (const claim of claims) if (claim.status === 'claimed') await claim.completion
+    await expect(result).resolves.toBe('retry-required')
+  })
+
+  it('rejects a stale live proof during durable admission and keeps native response available', async () => {
+    const f = fixture()
+    const scope = { projectId: f.session.projectId, sessionId: f.session.id }
+    const result = f.owner.request(exactInput(f), 'prompt-fixture', (request, binding) =>
+      f.broker.requestSandboxNetworkApproval(request, binding)
+    )
+    const { requestId } = await f.pending()
+    const snapshot = (await f.owner.readLiveConfirmation(scope, requestId, f.broker))!
+    const patch = f.sessions.patchSessionRuntimeContext.bind(f.sessions)
+    let authorized = true
+    vi.spyOn(f.sessions, 'patchSessionRuntimeContext').mockImplementationOnce(async (command) => {
+      authorized = false
+      return patch(command)
+    })
+    await expect(
+      f.owner.claimLiveConfirmation(
+        scope,
+        requestId,
+        snapshot.version,
+        'option:allow-once@0',
+        () => authorized,
+        f.broker
+      )
+    ).resolves.toEqual({ status: 'unavailable' })
+    expect((await f.owner.readLiveConfirmation(scope, requestId, f.broker))?.version).not.toBe(
+      snapshot.version
+    )
+    await expect(f.broker.respond({ requestId, optionId: 'deny' })).resolves.toBe(true)
+    await expect(result).resolves.toBe('deny')
+  })
+
+  it('cancels the live waiter when its one-shot abort fires during a signed claim', async () => {
+    const f = fixture()
+    const scope = { projectId: f.session.projectId, sessionId: f.session.id }
+    const abort = new AbortController()
+    const result = f.owner.request(
+      { ...exactInput(f), signal: abort.signal },
+      'prompt-fixture',
+      (request, binding) => f.broker.requestSandboxNetworkApproval(request, binding)
+    )
+    const { requestId } = await f.pending()
+    const snapshot = (await f.owner.readLiveConfirmation(scope, requestId, f.broker))!
+    const patch = f.sessions.patchSessionRuntimeContext.bind(f.sessions)
+    vi.spyOn(f.sessions, 'patchSessionRuntimeContext').mockImplementationOnce(async (command) => {
+      abort.abort()
+      return patch(command)
+    })
+    await expect(
+      f.owner.claimLiveConfirmation(
+        scope,
+        requestId,
+        snapshot.version,
+        'option:allow-once@0',
+        () => true,
+        f.broker
+      )
+    ).resolves.toEqual({ status: 'unavailable' })
+    await expect(result).resolves.toBeUndefined()
+    expect(f.broker.getPendingRequests()).toEqual([])
+    expect(f.session.runtimeContext?.networkApprovals?.[0].decision).toBe('deny')
+  })
+
+  it('does not infer live authority from the generic native app-owned request', async () => {
+    const f = fixture()
+    const scope = { projectId: f.session.projectId, sessionId: f.session.id }
+    const result = f.owner.request(exactInput(f), 'prompt-fixture', f.send)
+    const { requestId } = await f.pending()
+    expect(await f.owner.readLiveConfirmation(scope, requestId, f.broker)).toBeUndefined()
+    await f.broker.respond({ requestId, optionId: 'deny' })
+    await expect(result).resolves.toBe('deny')
+  })
+
+  it('rearms the live approval with a fresh version after a claimed grant fails', async () => {
+    const f = fixture()
+    const scope = { projectId: f.session.projectId, sessionId: f.session.id }
+    const result = f.owner.request(exactInput(f), 'prompt-fixture', (request, binding) =>
+      f.broker.requestSandboxNetworkApproval(request, binding)
+    )
+    const { requestId } = await f.pending()
+    const snapshot = (await f.owner.readLiveConfirmation(scope, requestId, f.broker))!
+    f.allowDomain.mockRejectedValueOnce(new Error('Settings unavailable'))
+    const claim = await f.owner.claimLiveConfirmation(
+      scope,
+      requestId,
+      snapshot.version,
+      'option:project-allow@0',
+      () => true,
+      f.broker
+    )
+    if (claim.status !== 'claimed') throw new Error('Expected a durable network claim.')
+    await expect(claim.completion).rejects.toThrow('Settings unavailable')
+    const rearmed = (await f.owner.readLiveConfirmation(scope, requestId, f.broker))!
+    expect(rearmed.version).not.toBe(snapshot.version)
+    expect(rearmed.allowedDecisions).toEqual(snapshot.allowedDecisions)
+    await expect(
+      f.owner.claimLiveConfirmation(
+        scope,
+        requestId,
+        snapshot.version,
+        'option:project-allow@0',
+        () => true,
+        f.broker
+      )
+    ).resolves.toEqual({ status: 'unavailable' })
+    await f.broker.respond({ requestId, optionId: 'deny' })
+    await expect(result).resolves.toBe('deny')
+  })
+
+  it('discloses exact restored evidence and rejects other scopes, live waits and changed evidence', async () => {
+    const f = fixture()
+    const result = f.owner.request(exactInput(f), 'prompt-fixture', f.send)
+    const { requestId } = await f.pending()
+    const scope = { projectId: f.session.projectId, sessionId: f.session.id }
+    expect(await f.owner.readRestoredConfirmation(scope, requestId)).toBeUndefined()
+    f.broker.abandonAllPending()
+    await result
+    expect(
+      await f.owner.readRestoredConfirmation({ ...scope, projectId: 'other' }, requestId)
+    ).toBeUndefined()
+
+    const first = (await f.owner.readRestoredConfirmation(scope, requestId))!
+    expect(first.allowedDecisions).toEqual([
+      'option:allow-once@0',
+      'option:project-allow@0',
+      'option:always-allow@0',
+      'option:deny',
+      'cancel'
+    ])
+    expect(first.request.rawInput).toMatchObject({
+      notebookNetworkApproval: { addresses: ['127.0.0.1'], revision: 0, retryRequired: true }
+    })
+    await expect(
+      f.owner.claimRestoredConfirmation(
+        scope,
+        requestId,
+        first.version,
+        'option:allow-once',
+        () => true
+      )
+    ).resolves.toEqual({ status: 'invalid-decision' })
+
+    const context = f.session.runtimeContext!
+    const approval = context.networkApprovals![0]
+    await f.sessions.patchSessionRuntimeContext({
+      ...scope,
+      expectedRevision: context.revision,
+      patch: {
+        networkApprovals: [
+          { ...approval, evidence: { ...approval.evidence!, revision: 1, addresses: ['10.0.0.2'] } }
+        ]
+      }
+    })
+    await expect(
+      f.owner.claimRestoredConfirmation(
+        scope,
+        requestId,
+        first.version,
+        'option:allow-once@0',
+        () => true
+      )
+    ).resolves.toEqual({ status: 'unavailable' })
+    const second = await f.owner.readRestoredConfirmation(scope, requestId)
+    expect(second?.version).not.toBe(first.version)
+    expect(second?.allowedDecisions).toContain('option:allow-once@1')
+    expect(f.session.runtimeContext?.networkApprovals?.[0].state).toBe('pending')
+  })
+
+  it('rechecks authorization at the durable claim, then settles only one legacy response', async () => {
+    const f = fixture()
+    const { requestId, ...scope } = await restorePending(f, f.input)
+    const confirmation = (await f.owner.readRestoredConfirmation(scope, requestId))!
+    expect(confirmation.allowedDecisions).toEqual([
+      'option:allow-once',
+      'option:always-allow',
+      'option:deny',
+      'cancel'
+    ])
+    const patch = f.sessions.patchSessionRuntimeContext.bind(f.sessions)
+    let authorized = true
+    vi.spyOn(f.sessions, 'patchSessionRuntimeContext').mockImplementationOnce(async (command) => {
+      authorized = false
+      return patch(command)
+    })
+    const claim = (): ReturnType<SandboxNetworkApprovalOwner['claimRestoredConfirmation']> =>
+      f.owner.claimRestoredConfirmation(
+        scope,
+        requestId,
+        confirmation.version,
+        'option:allow-once',
+        () => authorized
+      )
+    await expect(claim()).resolves.toEqual({ status: 'unavailable' })
+    expect(f.session.runtimeContext?.networkApprovals?.[0].state).toBe('pending')
+
+    authorized = true
+    const results = await Promise.all([claim(), claim()])
+    expect(results.map(({ status }) => status).sort()).toEqual(['claimed', 'unavailable'])
+    for (const result of results) {
+      if (result.status === 'claimed') await result.completion
+    }
+    expect(f.session.runtimeContext?.networkApprovals?.[0].state).toBe('continuing')
+    expect(f.allowDomain).not.toHaveBeenCalled()
+  })
+
+  it.each(['pre-grant', 'finalization'] as const)(
+    'reports a broad claim before the grant completes and fences revoked proof during %s',
+    async (phase) => {
+      const f = fixture()
+      const { requestId, ...scope } = await restorePending(f)
+      const confirmation = (await f.owner.readRestoredConfirmation(scope, requestId))!
+      const allowed = Promise.withResolvers<void>()
+      const checked = Promise.withResolvers<void>()
+      f.allowDomain.mockImplementationOnce(async (_hostname, assertCurrent, finalize) => {
+        if (phase === 'finalization') {
+          await assertCurrent?.()
+          checked.resolve()
+        }
+        await allowed.promise
+        if (phase === 'pre-grant') await assertCurrent?.()
+        await finalize?.()
+        return undefined
+      })
+      let authorized = true
+      const claim = await f.owner.claimRestoredConfirmation(
+        scope,
+        requestId,
+        confirmation.version,
+        'option:project-allow@0',
+        () => authorized
+      )
+      if (claim.status !== 'claimed') throw new Error('Expected a durable network claim.')
+      expect(f.session.runtimeContext?.networkApprovals?.[0]).toMatchObject({
+        state: 'continuing',
+        decision: 'project-allow'
+      })
+      if (phase === 'finalization') await checked.promise
+      authorized = false
+      allowed.resolve()
+      await expect(claim.completion).rejects.toThrow()
+      expect(f.session.runtimeContext?.networkApprovals?.[0]).toMatchObject({ state: 'pending' })
+      expect(f.session.runtimeContext?.networkApprovals?.[0].decision).toBeUndefined()
+      expect((await f.owner.readRestoredConfirmation(scope, requestId))?.version).not.toBe(
+        confirmation.version
+      )
+    }
+  )
+
+  it('rejects a signed decision if its branch changes in the persistence queue', async () => {
+    const f = fixture()
+    const { requestId, ...scope } = await restorePending(f)
+    const { version } = (await f.owner.readRestoredConfirmation(scope, requestId))!
+    const patch = f.sessions.patchSessionRuntimeContext.bind(f.sessions)
+    vi.spyOn(f.sessions, 'patchSessionRuntimeContext').mockImplementationOnce(async (command) => {
+      const graph = f.session.conversationGraph!
+      const original = graph.branches[0]
+      graph.branches.push({
+        ...original,
+        id: 'other-branch',
+        parentBranchId: original.id,
+        forkMessageId: 'prompt-fixture'
+      })
+      graph.frames[0].activeBranchId = 'other-branch'
+      return patch(command)
+    })
+    await expect(
+      f.owner.claimRestoredConfirmation(scope, requestId, version, 'option:deny', () => true)
+    ).resolves.toEqual({ status: 'unavailable' })
+    expect(f.session.runtimeContext?.networkApprovals?.[0].state).toBe('pending')
+  })
+
+  it('uses the native Settings owner for a signed project grant with matching evidence', async () => {
+    const f = fixture()
+    const { requestId, ...scope } = await restorePending(f)
+    const { version } = (await f.owner.readRestoredConfirmation(scope, requestId))!
+    const claim = await f.owner.claimRestoredConfirmation(
+      scope,
+      requestId,
+      version,
+      'option:project-allow@0',
+      () => true
+    )
+    if (claim.status !== 'claimed') throw new Error('Expected a durable network claim.')
+    await expect(claim.completion).resolves.toBeUndefined()
+    expect(f.allowDomain).toHaveBeenCalledExactlyOnceWith(
+      '127.0.0.1',
+      expect.any(Function),
+      expect.any(Function)
+    )
+    expect(f.session.runtimeContext?.networkApprovals).toBeUndefined()
   })
 
   it('deduplicates requests and requires a new execution after a once decision', async () => {

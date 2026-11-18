@@ -20,7 +20,11 @@ import type { SessionPersistenceCoordinator } from '../session-persistence/coord
 import { SessionPersistenceStateOwner } from '../session-persistence/state-owner'
 import { loadSessionMutationAuthority, SessionRepository } from '../session-persistence/repository'
 import { initDataRoot } from '../storage-root'
-import { AcpDurableContinuationContextOwner } from './durable-continuation-context-owner'
+import {
+  AcpDurableContinuationContextOwner,
+  readRestoredElicitationConfirmationAuthority,
+  type RestoredElicitationClaimInput
+} from './durable-continuation-context-owner'
 
 const message = (
   id: string,
@@ -99,6 +103,208 @@ const setActivities = (
     synchronizeActiveConversationActivities(session.conversationGraph!, activities, [])
   )
 }
+
+describe('trusted restored elicitation claim', () => {
+  const fixture = (): PersistedChatSession => {
+    const session = createSession([message('prompt-active', 'Choose an approach.')])
+    setActivities(session, [pendingChoice()])
+    return session
+  }
+
+  const trusted = (
+    overrides: Partial<RestoredElicitationClaimInput> = {}
+  ): RestoredElicitationClaimInput => ({
+    projectId: 'project-1',
+    sessionId: 'session-1',
+    requestId: 'choice-1',
+    action: 'accept',
+    answers: [{ fieldId: 'question_0', value: 'Expanded' }],
+    isUnowned: () => true,
+    authorizeAtClaim: () => 'authorized',
+    ...overrides
+  })
+
+  it('discloses only the exact cold pending question on the current root Branch', () => {
+    const session = fixture()
+    const authority = readRestoredElicitationConfirmationAuthority(session, 'choice-1')
+    expect(authority).toMatchObject({
+      scope: { projectId: 'project-1', sessionId: 'session-1' },
+      request: {
+        requestId: 'choice-1',
+        toolCallId: 'tool-choice-1',
+        message: 'Choose an approach'
+      },
+      prompt: { promptMessageId: 'prompt-active', branchId: 'message-branch-pending-session' }
+    })
+    expect(readRestoredElicitationConfirmationAuthority(session, 'other-question')).toBeUndefined()
+    expect(
+      readRestoredElicitationConfirmationAuthority({ ...session, archivedAt: 2 }, 'choice-1')
+    ).toBeUndefined()
+    expect(
+      readRestoredElicitationConfirmationAuthority(
+        {
+          ...session,
+          activeRun: { promptMessageId: 'prompt-active', startedAt: 1 }
+        },
+        'choice-1'
+      )
+    ).toBeUndefined()
+    const pending = pendingChoice()
+    setActivities(session, [
+      pending,
+      pendingChoice({
+        id: 'different-tool',
+        elicitation: {
+          ...pending.elicitation!,
+          durable: { ...pending.elicitation!.durable!, requestId: 'different-request' },
+          state: 'answered',
+          continuationPending: true
+        }
+      })
+    ])
+    expect(readRestoredElicitationConfirmationAuthority(session, 'choice-1')).toBeUndefined()
+  })
+
+  it.each(['accept', 'decline', 'cancel'] as const)(
+    'durably claims %s once and reports publication failure separately',
+    async (action) => {
+      let session = fixture()
+      const owner = new AcpDurableContinuationContextOwner(
+        {
+          loadSessionForContinuation: async () => structuredClone(session),
+          mutateRuntimeSession: async (_scope, mutate) => {
+            session = mutate(structuredClone(session))
+            return structuredClone(session)
+          }
+        },
+        () => {
+          throw new Error('publication failed after commit')
+        }
+      )
+      const authorizeAtClaim = vi.fn<RestoredElicitationClaimInput['authorizeAtClaim']>(
+        () => 'authorized'
+      )
+      const decision = { action, ...(action === 'accept' ? { answers: trusted().answers } : {}) }
+      const initial = readRestoredElicitationConfirmationAuthority(session, 'choice-1')
+      const claim = await owner.claimRestoredElicitation(
+        trusted({ ...decision, answers: decision.answers, authorizeAtClaim })
+      )
+      if (claim.status !== 'claimed') throw new Error('Missing restored question claim')
+      expect(claim.request).toEqual(initial?.request)
+      expect(claim.decision).toEqual(decision)
+      expect(authorizeAtClaim).toHaveBeenCalledExactlyOnceWith(initial, decision)
+      await expect(claim.completion).rejects.toThrow('publication failed after commit')
+      const state =
+        action === 'accept' ? 'answered' : action === 'decline' ? 'declined' : 'cancelled'
+      expect(session.activities?.[0].elicitation).toMatchObject({ state })
+      expect(session.conversationGraph?.activities[0].elicitation).toEqual(
+        session.activities?.[0].elicitation
+      )
+      if (action === 'cancel') expect(session.status).toBe('idle')
+      else expect(session.activities?.[0].elicitation?.continuationPending).toBe(true)
+      await expect(owner.claimRestoredElicitation(trusted({ authorizeAtClaim }))).resolves.toEqual({
+        status: 'unavailable'
+      })
+      expect(authorizeAtClaim).toHaveBeenCalledOnce()
+    }
+  )
+
+  it.each(['form-changed', 'branch-changed', 'live-owner-returned'] as const)(
+    'rechecks %s inside the same durable mutation',
+    async (change) => {
+      const session = fixture()
+      let isUnowned = true
+      const owner = new AcpDurableContinuationContextOwner({
+        loadSessionForContinuation: async () => structuredClone(session),
+        mutateRuntimeSession: async (_scope, mutate) => {
+          const latest = structuredClone(session)
+          if (change === 'form-changed') {
+            const changed = pendingChoice()
+            changed.elicitation!.message = 'A revised question'
+            setActivities(latest, [changed])
+          } else if (change === 'branch-changed') {
+            latest.conversationGraph!.frames[0].activeBranchId = 'other-branch'
+          } else {
+            isUnowned = false
+          }
+          return mutate(latest)
+        }
+      })
+      const authorizeAtClaim = vi.fn<RestoredElicitationClaimInput['authorizeAtClaim']>(
+        () => 'authorized'
+      )
+      await expect(
+        owner.claimRestoredElicitation(trusted({ isUnowned: () => isUnowned, authorizeAtClaim }))
+      ).resolves.toEqual({ status: 'unavailable' })
+      expect(authorizeAtClaim).not.toHaveBeenCalled()
+    }
+  )
+
+  it('leaves the durable request open for the native owner after a refused proof', async () => {
+    const session = fixture()
+    const owner = createOwner(session)
+    await expect(
+      owner.claimRestoredElicitation(trusted({ projectId: 'other-project' }))
+    ).resolves.toEqual({ status: 'unavailable' })
+    await expect(
+      owner.claimRestoredElicitation(
+        trusted({
+          answers: [{ fieldId: 'unknown-field', value: 'Expanded' }]
+        })
+      )
+    ).resolves.toEqual({ status: 'invalid-decision' })
+    await expect(
+      owner.claimRestoredElicitation(
+        trusted({
+          authorizeAtClaim: () => 'unavailable'
+        })
+      )
+    ).resolves.toEqual({ status: 'unavailable' })
+    expect(readRestoredElicitationConfirmationAuthority(session, 'choice-1')).toBeDefined()
+    await owner.prepareElicitation({
+      projectId: session.projectId,
+      sessionId: session.id,
+      requestId: 'choice-1',
+      toolCallId: 'tool-choice-1',
+      action: 'accept',
+      answers: [{ fieldId: 'question_0', value: 'Native answer' }]
+    })
+    await expect(owner.claimRestoredElicitation(trusted())).resolves.toEqual({
+      status: 'unavailable'
+    })
+  })
+
+  it('allows a single durable decision when native and trusted responses race', async () => {
+    const session = fixture()
+    const owner = createOwner(session)
+    const nativeAnswer = [{ fieldId: 'question_0', value: 'Native answer' }]
+    const [native, host] = await Promise.allSettled([
+      owner.prepareElicitation({
+        projectId: session.projectId,
+        sessionId: session.id,
+        requestId: 'choice-1',
+        toolCallId: 'tool-choice-1',
+        action: 'accept',
+        answers: nativeAnswer
+      }),
+      owner.claimRestoredElicitation(trusted())
+    ])
+    if (host.status === 'rejected') throw host.reason
+    if (host.value.status === 'claimed') {
+      await host.value.completion
+      expect(native.status).toBe('rejected')
+    } else {
+      expect(host.value).toEqual({ status: 'unavailable' })
+      expect(native.status).toBe('fulfilled')
+    }
+    expect(session.activities?.[0].elicitation?.answers).toEqual(
+      host.value.status === 'claimed' ? trusted().answers : nativeAnswer
+    )
+    expect(session.conversationGraph?.activities[0].elicitation).toEqual(
+      session.activities?.[0].elicitation
+    )
+  })
+})
 
 describe('AcpDurableContinuationContextOwner', () => {
   it('keeps reset replay pending until cleared and honors an explicit reload without a reset', async () => {

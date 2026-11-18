@@ -4,7 +4,8 @@ import {
 } from '../../shared/notebook-network-settings'
 import type { NetworkApprovalRecordStatus } from '../../shared/sandbox-network-approval'
 import { type NetworkDestinationGrant } from '../../shared/network-destination-grants'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
 import type { AcpPermissionResponse } from '../../shared/acp'
 import {
   activeSandboxNetworkApprovals,
@@ -16,8 +17,16 @@ import {
   type PersistedChatSession,
   type SessionRuntimeContext
 } from '../../shared/session-persistence'
-import type { AppPermissionRequest } from './permission-broker'
+import type {
+  AcpPermissionBroker,
+  AppPermissionRequest,
+  PermissionConfirmationDecision,
+  PermissionConfirmationScope,
+  PermissionConfirmationSnapshot,
+  SandboxNetworkPermissionBinding
+} from './permission-broker'
 import type { PermissionWaitSessions, PublishPermissionWaitSession } from './permission-wait-owner'
+import { projectPermissionRequest } from './runtime-publication-owner'
 
 const assertSnapshot = (context: SessionRuntimeContext, approval: SandboxNetworkApproval): void => {
   if (!approval.evidence) return
@@ -25,16 +34,106 @@ const assertSnapshot = (context: SessionRuntimeContext, approval: SandboxNetwork
   if (!current?.evidence) throw new Error('Network approval changed. Review the current request.')
 }
 
-const persistentDecision = (decision: string | undefined): boolean =>
+const persistentDecision = (
+  decision: string | undefined
+): decision is 'always-allow' | 'project-allow' =>
   decision === 'always-allow' || decision === 'project-allow'
+
+type SandboxNetworkConfirmationClaim =
+  { status: 'claimed'; completion: Promise<void> } | { status: 'unavailable' | 'invalid-decision' }
+
+type NetworkApprovalPatchFence = {
+  beforePersist(session: PersistedChatSession): void
+  onCommitted?: () => void
+}
+
+type NetworkConfirmationFences = {
+  assertPendingContext(context: SessionRuntimeContext): void
+  claim: NetworkApprovalPatchFence
+  assertContinuing(session: PersistedChatSession, context?: SessionRuntimeContext): void
+}
+
+type SandboxNetworkPermissionPort = Pick<
+  AcpPermissionBroker,
+  'readSandboxNetworkApproval' | 'claimSandboxNetworkApproval'
+>
+
+type SendSandboxNetworkPermission = (
+  input: AppPermissionRequest,
+  binding: SandboxNetworkPermissionBinding
+) => Promise<string | undefined>
+
+type LiveSandboxNetworkWait = {
+  abort: AbortController
+  settled: Promise<void>
+  binding: SandboxNetworkPermissionBinding
+  approval: SandboxNetworkApproval
+  isAdmitted(): boolean
+  apply(
+    rawOptionId: string | undefined,
+    authorization: () => boolean,
+    fences?: NetworkConfirmationFences
+  ): Promise<void>
+}
+
+const confirmationUnavailable = new Error('Network confirmation is no longer available.')
+
+const sameApproval = (
+  current: SandboxNetworkApproval | undefined,
+  expected: SandboxNetworkApproval
+): boolean => isDeepStrictEqual(structuredClone(current), structuredClone(expected))
+
+const scopedActiveApproval = (
+  session: PersistedChatSession | undefined,
+  { projectId, sessionId }: PermissionConfirmationScope,
+  requestId: string,
+  context = session?.runtimeContext
+): SandboxNetworkApproval | undefined => {
+  if (
+    !session ||
+    session.projectId !== projectId ||
+    session.id !== sessionId ||
+    session.archivedAt !== undefined ||
+    session.packageOrigin
+  )
+    return undefined
+  return activeSandboxNetworkApprovals({
+    ...materializeSessionConversationGraph(session),
+    runtimeContext: context
+  }).find((approval) => approval.requestId === requestId)
+}
+
+const projectNetworkConfirmation = (
+  approval: SandboxNetworkApproval,
+  projectId: string,
+  revision: number
+): PermissionConfirmationSnapshot => {
+  const request = sandboxNetworkApprovalRequest(approval, true)
+  return {
+    request,
+    version: createHash('sha256')
+      .update(
+        JSON.stringify([
+          'restored-sandbox-network-confirmation-v1',
+          projectId,
+          revision,
+          approval,
+          request
+        ])
+      )
+      .digest('hex'),
+    allowedDecisions: [
+      ...request.options.map(({ optionId }) => `option:${optionId}` as const),
+      'cancel'
+    ]
+  }
+}
 
 // Owns only destination authority. The provider permission slot and its tool replay stay separate.
 export class SandboxNetworkApprovalOwner {
   private readonly exactRequests = new Map<string, Promise<string | undefined>>()
-  private readonly liveRequests = new Map<
-    string,
-    { abort: AbortController; settled: Promise<void> }
-  >()
+  private readonly admittingRequests = new Set<string>()
+  private readonly liveRequests = new Map<string, LiveSandboxNetworkWait>()
   private readonly cancellationStates = new Map<string, { active: boolean }>()
   private readonly globalDecisions = new Map<
     string,
@@ -66,7 +165,7 @@ export class SandboxNetworkApprovalOwner {
   request(
     input: AppPermissionRequest,
     promptMessageId: string | undefined,
-    send: (input: AppPermissionRequest) => Promise<string | undefined>,
+    send: SendSandboxNetworkPermission,
     isCurrent: () => boolean = () => !input.signal?.aborted
   ): Promise<string | undefined> {
     const id = input.networkApproval?.evidence?.recordId
@@ -82,7 +181,7 @@ export class SandboxNetworkApprovalOwner {
   private async requestInternal(
     input: AppPermissionRequest,
     promptMessageId: string | undefined,
-    send: (input: AppPermissionRequest) => Promise<string | undefined>,
+    send: SendSandboxNetworkPermission,
     isCurrent: () => boolean = () => !input.signal?.aborted
   ): Promise<string | undefined> {
     const network = input.networkApproval
@@ -94,8 +193,9 @@ export class SandboxNetworkApprovalOwner {
     const graph = session.conversationGraph
     const frame = graph?.frames.find(({ id }) => id === graph.activeFrameId)
     if (!frame) return undefined
+    const { projectId, ...destination } = network
     const approval: SandboxNetworkApproval = {
-      ...network,
+      ...destination,
       version: 1,
       kind: 'sandbox-network',
       state: 'pending',
@@ -151,93 +251,79 @@ export class SandboxNetworkApprovalOwner {
       if (grant.evidence) input.onNetworkAddressesApproved?.(grant.evidence.addresses)
       return 'allow-once'
     }
-    await this.patch(
-      network.projectId,
-      input.sessionId,
-      (context) => {
-        if ((context.networkApprovals?.length ?? 0) >= 32)
-          throw new Error('Too many pending network approvals.')
-        return [
-          ...(context.networkApprovals ?? []).filter(
-            (entry) => entry.requestId !== approval.requestId
-          ),
-          approval
-        ]
-      },
-      approval,
-      false,
-      current
-    )
-    if (!current() || input.signal?.aborted) {
-      await this.patch(network.projectId, input.sessionId, (context) =>
-        (context.networkApprovals ?? []).filter(({ requestId }) => requestId !== approval.requestId)
+    this.admittingRequests.add(approval.requestId)
+    try {
+      await this.patch(
+        network.projectId,
+        input.sessionId,
+        (context) => {
+          if ((context.networkApprovals?.length ?? 0) >= 32)
+            throw new Error('Too many pending network approvals.')
+          return [
+            ...(context.networkApprovals ?? []).filter(
+              (entry) => entry.requestId !== approval.requestId
+            ),
+            approval
+          ]
+        },
+        approval,
+        false,
+        current
       )
-      return undefined
+      if (!current() || input.signal?.aborted) {
+        await this.patch(network.projectId, input.sessionId, (context) =>
+          (context.networkApprovals ?? []).filter(
+            ({ requestId }) => requestId !== approval.requestId
+          )
+        )
+        return undefined
+      }
+    } finally {
+      this.admittingRequests.delete(approval.requestId)
     }
     // The durable row exists before the broker exposes its request to any client.
     const request = sandboxNetworkApprovalRequest(approval)
     let admitted = false
     const recoveryAbort = new AbortController()
     const settled = Promise.withResolvers<void>()
-    this.liveRequests.set(approval.requestId, { abort: recoveryAbort, settled: settled.promise })
+    const binding: SandboxNetworkPermissionBinding = Object.freeze({
+      scope: Object.freeze({ projectId, sessionId: input.sessionId }),
+      requestId: approval.requestId,
+      isCurrent: () =>
+        current() &&
+        !recoveryAbort.signal.aborted &&
+        this.liveRequests.get(approval.requestId)?.binding === binding
+    })
+    const live: LiveSandboxNetworkWait = {
+      abort: recoveryAbort,
+      settled: settled.promise,
+      approval,
+      binding,
+      isAdmitted: () => admitted,
+      apply: (rawOptionId, authorization, fences) =>
+        this.applyLiveDecision(input, projectId, approval, rawOptionId, authorization, fences)
+    }
+    this.liveRequests.set(approval.requestId, live)
     try {
-      const selected = await send({
-        ...input,
-        signal: input.signal
-          ? AbortSignal.any([input.signal, recoveryAbort.signal])
-          : recoveryAbort.signal,
-        onAdmitted: () => {
-          input.onAdmitted?.()
-          admitted = true
+      const selected = await send(
+        {
+          ...input,
+          signal: input.signal
+            ? AbortSignal.any([input.signal, recoveryAbort.signal])
+            : recoveryAbort.signal,
+          onAdmitted: () => {
+            input.onAdmitted?.()
+            admitted = true
+          },
+          ...request,
+          durable: true,
+          ...(approval.evidence
+            ? { refreshRequest: () => sandboxNetworkApprovalRequest(approval) }
+            : {}),
+          beforeRespond: (rawOptionId) => live.apply(rawOptionId, current)
         },
-        ...request,
-        durable: true,
-        ...(approval.evidence
-          ? { refreshRequest: () => sandboxNetworkApprovalRequest(approval) }
-          : {}),
-        beforeRespond: async (rawOptionId) => {
-          const optionId = rawOptionId?.split('@')[0]
-          if (persistentDecision(optionId)) {
-            await this.grantGlobal(
-              network.projectId,
-              {
-                ...approval,
-                ...(optionId === 'project-allow' ? { decision: 'project-allow' as const } : {})
-              },
-              false,
-              current
-            )
-            return
-          }
-          await this.patch(
-            network.projectId,
-            input.sessionId,
-            (context) => {
-              if (optionId === 'allow-once') assertSnapshot(context, approval)
-              if (
-                context.networkApprovals?.some(
-                  (candidate) =>
-                    candidate.requestId === approval.requestId &&
-                    persistentDecision(candidate.decision)
-                )
-              )
-                throw new Error('Network approval was already answered.')
-              return (context.networkApprovals ?? []).flatMap((candidate) =>
-                candidate.requestId !== approval.requestId
-                  ? [candidate]
-                  : optionId === 'allow-once' &&
-                      !input.signal?.aborted &&
-                      (approval.evidence !== undefined || input.canResume?.() === false)
-                    ? [{ ...candidate, state: 'continuing' as const }]
-                    : approval.evidence
-                      ? [{ ...candidate, state: 'continuing' as const, decision: 'deny' as const }]
-                      : []
-              )
-            },
-            optionId === 'allow-once' ? approval : undefined
-          )
-        }
-      })
+        binding
+      )
       return approval.evidence && selected && selected !== 'deny' ? 'retry-required' : selected
     } finally {
       this.liveRequests.delete(approval.requestId)
@@ -251,6 +337,58 @@ export class SandboxNetworkApprovalOwner {
         )
       }
     }
+  }
+
+  private async applyLiveDecision(
+    input: AppPermissionRequest,
+    projectId: string,
+    approval: SandboxNetworkApproval,
+    rawOptionId: string | undefined,
+    isCurrent: () => boolean,
+    confirmation?: NetworkConfirmationFences
+  ): Promise<void> {
+    const optionId = rawOptionId?.split('@')[0]
+    if (persistentDecision(optionId)) {
+      await this.grantGlobal(
+        projectId,
+        { ...approval, decision: optionId },
+        false,
+        isCurrent,
+        false,
+        confirmation
+      )
+      return
+    }
+    await this.patch(
+      projectId,
+      approval.sessionId,
+      (context) => {
+        confirmation?.assertPendingContext(context)
+        if (optionId === 'allow-once') assertSnapshot(context, approval)
+        if (
+          context.networkApprovals?.some(
+            (candidate) =>
+              candidate.requestId === approval.requestId && persistentDecision(candidate.decision)
+          )
+        )
+          throw new Error('Network approval was already answered.')
+        return (context.networkApprovals ?? []).flatMap((candidate) =>
+          candidate.requestId !== approval.requestId
+            ? [candidate]
+            : optionId === 'allow-once' &&
+                !input.signal?.aborted &&
+                (approval.evidence !== undefined || input.canResume?.() === false)
+              ? [{ ...candidate, state: 'continuing' as const }]
+              : approval.evidence
+                ? [{ ...candidate, state: 'continuing' as const, decision: 'deny' as const }]
+                : []
+        )
+      },
+      optionId === 'allow-once' ? approval : undefined,
+      false,
+      confirmation ? isCurrent : undefined,
+      confirmation?.claim
+    )
   }
 
   async recordStatus(
@@ -284,10 +422,244 @@ export class SandboxNetworkApprovalOwner {
     }
   }
 
+  private async readLiveWait(
+    scope: PermissionConfirmationScope,
+    requestId: string,
+    permissions: SandboxNetworkPermissionPort
+  ): Promise<
+    | {
+        live: LiveSandboxNetworkWait
+        approval: SandboxNetworkApproval
+        revision: number
+        brokerVersion: string
+        snapshot: PermissionConfirmationSnapshot
+      }
+    | undefined
+  > {
+    const live = this.liveRequests.get(requestId)
+    if (
+      !live?.isAdmitted() ||
+      live.binding.scope.projectId !== scope.projectId ||
+      live.binding.scope.sessionId !== scope.sessionId
+    )
+      return undefined
+    const session = await this.sessions?.readSessionSnapshot?.(scope.projectId, scope.sessionId, {
+      preserveRuntimeState: true
+    })
+    const context = session?.runtimeContext
+    const approval = scopedActiveApproval(session, scope, requestId, context)
+    if (
+      !context ||
+      !approval ||
+      !sameApproval(approval, live.approval) ||
+      !live.binding.isCurrent()
+    )
+      return undefined
+    const published = permissions.readSandboxNetworkApproval(live.binding)
+    if (
+      !published ||
+      !isDeepStrictEqual(
+        structuredClone(published.request),
+        structuredClone(projectPermissionRequest(sandboxNetworkApprovalRequest(approval)))
+      )
+    )
+      return undefined
+    return {
+      live,
+      approval,
+      revision: context.revision,
+      brokerVersion: published.version,
+      snapshot: {
+        ...published,
+        version: createHash('sha256')
+          .update(
+            JSON.stringify([
+              'live-sandbox-network-confirmation-v1',
+              scope.projectId,
+              scope.sessionId,
+              context.revision,
+              approval,
+              published
+            ])
+          )
+          .digest('hex')
+      }
+    }
+  }
+
+  async readLiveConfirmation(
+    scope: PermissionConfirmationScope,
+    requestId: string,
+    permissions: SandboxNetworkPermissionPort
+  ): Promise<PermissionConfirmationSnapshot | undefined> {
+    return (await this.readLiveWait(scope, requestId, permissions))?.snapshot
+  }
+
+  async claimLiveConfirmation(
+    scope: PermissionConfirmationScope,
+    requestId: string,
+    version: string,
+    decision: PermissionConfirmationDecision,
+    authorizeAtClaim: () => boolean,
+    permissions: SandboxNetworkPermissionPort
+  ): Promise<SandboxNetworkConfirmationClaim> {
+    const pending = await this.readLiveWait(scope, requestId, permissions)
+    if (!pending || pending.snapshot.version !== version) return { status: 'unavailable' }
+    if (!pending.snapshot.allowedDecisions.includes(decision)) return { status: 'invalid-decision' }
+    const rawOptionId = decision === 'cancel' ? undefined : decision.slice('option:'.length)
+    const current = (): boolean => pending.live.binding.isCurrent() && authorizeAtClaim()
+    return this.acknowledgeConfirmedDecision(
+      scope,
+      pending,
+      rawOptionId,
+      current,
+      async (fences) => {
+        const claim = permissions.claimSandboxNetworkApproval(
+          pending.live.binding,
+          pending.brokerVersion,
+          decision,
+          current,
+          (selected) => {
+            if (selected !== rawOptionId) return Promise.reject(confirmationUnavailable)
+            return pending.live.apply(selected, current, fences)
+          }
+        )
+        if (claim.status !== 'claimed') throw confirmationUnavailable
+        await claim.completion
+      }
+    )
+  }
+
+  private async readPendingConfirmation(
+    scope: PermissionConfirmationScope,
+    requestId: string
+  ): Promise<
+    | {
+        approval: SandboxNetworkApproval
+        revision: number
+        snapshot: PermissionConfirmationSnapshot
+      }
+    | undefined
+  > {
+    const current = this.cancellationGuard(scope.projectId, scope.sessionId)
+    const session = await this.sessions?.readSessionSnapshot?.(scope.projectId, scope.sessionId, {
+      preserveRuntimeState: true
+    })
+    const context = session?.runtimeContext
+    const approval = scopedActiveApproval(session, scope, requestId, context)
+    if (
+      approval?.state !== 'pending' ||
+      approval.decision !== undefined ||
+      !context ||
+      !current() ||
+      this.hasNativeWait(requestId) ||
+      this.globalDecisions.has(requestId)
+    )
+      return undefined
+    return {
+      approval,
+      revision: context.revision,
+      snapshot: projectNetworkConfirmation(approval, scope.projectId, context.revision)
+    }
+  }
+
+  async readRestoredConfirmation(
+    scope: PermissionConfirmationScope,
+    requestId: string
+  ): Promise<PermissionConfirmationSnapshot | undefined> {
+    return (await this.readPendingConfirmation(scope, requestId))?.snapshot
+  }
+
+  async claimRestoredConfirmation(
+    scope: PermissionConfirmationScope,
+    requestId: string,
+    version: string,
+    decision: PermissionConfirmationDecision,
+    authorizeAtClaim: () => boolean
+  ): Promise<SandboxNetworkConfirmationClaim> {
+    const { projectId, sessionId } = scope
+    const isCurrent = this.cancellationGuard(projectId, sessionId, authorizeAtClaim)
+    const pending = await this.readPendingConfirmation(scope, requestId)
+    if (!pending || pending.snapshot.version !== version || !isCurrent())
+      return { status: 'unavailable' }
+    if (!pending.snapshot.allowedDecisions.includes(decision)) return { status: 'invalid-decision' }
+    const rawOptionId = decision === 'cancel' ? undefined : decision.slice('option:'.length)
+    const current = (): boolean => isCurrent() && !this.hasNativeWait(requestId)
+    return this.acknowledgeConfirmedDecision(scope, pending, rawOptionId, current, (fences) =>
+      this.applyRestoredDecision(
+        projectId,
+        pending.approval,
+        rawOptionId?.split('@')[0],
+        current,
+        fences
+      )
+    )
+  }
+
+  private async acknowledgeConfirmedDecision(
+    scope: PermissionConfirmationScope,
+    { approval, revision }: { approval: SandboxNetworkApproval; revision: number },
+    rawOptionId: string | undefined,
+    isCurrent: () => boolean,
+    begin: (fences: NetworkConfirmationFences) => Promise<void>
+  ): Promise<SandboxNetworkConfirmationClaim> {
+    const { requestId } = approval
+    const optionId = rawOptionId?.split('@')[0]
+    const claim = Promise.withResolvers<SandboxNetworkConfirmationClaim>()
+    let acknowledged = false
+    const completion = begin({
+      assertPendingContext: (context) => {
+        const current = context.networkApprovals?.find(
+          (candidate) => candidate.requestId === requestId
+        )
+        if (context.revision !== revision || !sameApproval(current, approval))
+          throw confirmationUnavailable
+      },
+      claim: {
+        beforePersist: (session) => {
+          const current = scopedActiveApproval(session, scope, requestId)
+          if (!isCurrent() || !sameApproval(current, approval)) throw confirmationUnavailable
+        },
+        onCommitted: () => {
+          acknowledged = true
+          claim.resolve({ status: 'claimed', completion })
+        }
+      },
+      assertContinuing: (session, context) => {
+        const current = scopedActiveApproval(session, scope, requestId, context)
+        if (
+          !isCurrent() ||
+          !persistentDecision(optionId) ||
+          !sameApproval(current, { ...approval, state: 'continuing', decision: optionId })
+        )
+          throw confirmationUnavailable
+      }
+    })
+    void completion.then(
+      () => {
+        if (!acknowledged) claim.resolve({ status: 'unavailable' })
+      },
+      (error: unknown) => {
+        if (acknowledged) return
+        if (error === confirmationUnavailable) claim.resolve({ status: 'unavailable' })
+        else claim.reject(error)
+      }
+    )
+    return claim.promise
+  }
+
+  private hasNativeWait(requestId: string): boolean {
+    return this.admittingRequests.has(requestId) || this.liveRequests.has(requestId)
+  }
+
   async respondRestored(response: AcpPermissionResponse, projectId: string): Promise<boolean> {
     if (!this.sessions || !response.restored || response.restored.projectId !== projectId)
       return false
-    const isCurrent = this.cancellationGuard(projectId, response.restored.sessionId)
+    const isCurrent = this.cancellationGuard(
+      projectId,
+      response.restored.sessionId,
+      () => !this.hasNativeWait(response.requestId)
+    )
     const session = await this.sessions.loadSessionForContinuation(
       projectId,
       response.restored.sessionId
@@ -296,7 +668,8 @@ export class SandboxNetworkApprovalOwner {
       ({ requestId }) => requestId === response.requestId
     )
     if (!approval) return false
-    if (approval.state !== 'pending') throw new Error('Network approval was already answered.')
+    if (approval.state !== 'pending' || this.hasNativeWait(response.requestId))
+      throw new Error('Network approval is live or was already answered.')
     const rawOptionId = response.cancelled ? undefined : response.optionId
     const optionId = rawOptionId?.split('@')[0]
     if (
@@ -306,6 +679,17 @@ export class SandboxNetworkApprovalOwner {
       )
     )
       throw new Error('Invalid network approval option.')
+    await this.applyRestoredDecision(projectId, approval, optionId, isCurrent)
+    return true
+  }
+
+  private async applyRestoredDecision(
+    projectId: string,
+    approval: SandboxNetworkApproval,
+    optionId: string | undefined,
+    isCurrent: () => boolean,
+    confirmation?: NetworkConfirmationFences
+  ): Promise<void> {
     if (persistentDecision(optionId)) {
       await this.grantGlobal(
         projectId,
@@ -314,14 +698,17 @@ export class SandboxNetworkApprovalOwner {
           ...(optionId === 'project-allow' ? { decision: 'project-allow' as const } : {})
         },
         true,
-        isCurrent
+        isCurrent,
+        false,
+        confirmation
       )
-      return true
+      return
     }
     await this.patch(
       projectId,
       approval.sessionId,
       (context) => {
+        confirmation?.assertPendingContext(context)
         assertSnapshot(context, approval)
         const current = context.networkApprovals?.find(
           ({ requestId }) => requestId === approval.requestId
@@ -339,9 +726,9 @@ export class SandboxNetworkApprovalOwner {
       },
       optionId === 'allow-once' ? approval : undefined,
       true,
-      isCurrent
+      isCurrent,
+      confirmation?.claim
     )
-    return true
   }
 
   // Called by host Session hydration, without creating a provider connection or replaying a tool.
@@ -448,11 +835,16 @@ export class SandboxNetworkApprovalOwner {
     approval: SandboxNetworkApproval,
     restored = false,
     isCurrent: () => boolean = () => true,
-    recovering = false
+    recovering = false,
+    confirmation?: NetworkConfirmationFences
   ): Promise<void> {
     const previous = this.globalDecisions.get(approval.requestId)
     if (previous && !previous.rollbackFailure)
-      return Promise.reject(new Error('Network approval is already being saved.'))
+      return Promise.reject(
+        confirmation
+          ? confirmationUnavailable
+          : new Error('Network approval is already being saved.')
+      )
     const abort = new AbortController()
     let committed = recovering
     let rollbackFailure: AggregateError | undefined
@@ -464,7 +856,8 @@ export class SandboxNetworkApprovalOwner {
       () => {
         committed = true
       },
-      recovering
+      recovering,
+      confirmation
     )
       .catch((error: unknown) => {
         if (error instanceof AggregateError) rollbackFailure = error
@@ -494,7 +887,8 @@ export class SandboxNetworkApprovalOwner {
     restored: boolean,
     isCurrent: () => boolean,
     markCommitted: () => void,
-    recovering: boolean
+    recovering: boolean,
+    confirmation?: NetworkConfirmationFences
   ): Promise<void> {
     const decision = approval.decision === 'project-allow' ? 'project-allow' : 'always-allow'
     const persist = (
@@ -525,6 +919,7 @@ export class SandboxNetworkApprovalOwner {
         projectId,
         approval.sessionId,
         (context) => {
+          confirmation?.assertPendingContext(context)
           assertSnapshot(context, approval)
           const current = context.networkApprovals?.find(
             ({ requestId }) => requestId === approval.requestId
@@ -539,10 +934,14 @@ export class SandboxNetworkApprovalOwner {
         },
         approval,
         restored,
-        isCurrent
+        isCurrent,
+        confirmation?.claim
       )
     const alreadySettled = new Error('Saved network approval was already settled.')
     let authorityValidated = !recovering
+    let confirmationRemovedRow = false
+    const matchesContinuingConfirmation = (candidate: SandboxNetworkApproval): boolean =>
+      sameApproval(candidate, { ...approval, state: 'continuing', decision })
     try {
       await persist(
         async () => {
@@ -568,6 +967,7 @@ export class SandboxNetworkApprovalOwner {
           if (!isCurrent()) throw new Error('Network approval is no longer current.')
           authorityValidated = true
           if (!recovering) this.assertBound(session, approval)
+          confirmation?.assertContinuing(session, context)
         },
         async () => {
           await this.patch(
@@ -579,7 +979,13 @@ export class SandboxNetworkApprovalOwner {
               ),
             recovering ? undefined : approval,
             recovering ? 'preserve' : restored,
-            isCurrent
+            isCurrent,
+            confirmation && {
+              beforePersist: (session) => confirmation.assertContinuing(session),
+              onCommitted: () => {
+                confirmationRemovedRow = true
+              }
+            }
           )
           if (!isCurrent()) throw new Error('Network approval execution is no longer current.')
           // This synchronous fence is the commit point. Later Stop preserves completed consent.
@@ -599,7 +1005,9 @@ export class SandboxNetworkApprovalOwner {
           approval.sessionId,
           (context) =>
             (context.networkApprovals ?? []).filter(
-              (entry) => entry.requestId !== approval.requestId
+              (entry) =>
+                entry.requestId !== approval.requestId ||
+                (confirmation !== undefined && !matchesContinuingConfirmation(entry))
             ),
           undefined,
           true
@@ -611,25 +1019,26 @@ export class SandboxNetworkApprovalOwner {
           projectId,
           approval.sessionId,
           (context) => {
+            const { decision: _previousDecision, ...retryableApproval } = approval
+            void _previousDecision
             const retry: SandboxNetworkApproval =
               recovering || error instanceof AggregateError
                 ? { ...approval, state: 'continuing', decision }
-                : { ...approval, state: 'pending' }
+                : { ...retryableApproval, state: 'pending' }
             const approvals = context.networkApprovals ?? []
             if (!approvals.some(({ requestId }) => requestId === approval.requestId)) {
+              if (confirmation && !confirmationRemovedRow) return approvals
               if (approvals.length >= 32) throw new Error('Too many pending network approvals.')
               return [...approvals, retry]
             }
             return approvals.map((candidate) => {
               if (
                 candidate.requestId !== approval.requestId ||
-                !persistentDecision(candidate.decision)
+                !persistentDecision(candidate.decision) ||
+                (confirmation !== undefined && !matchesContinuingConfirmation(candidate))
               )
                 return candidate
-              if (persistentDecision(retry.decision)) return retry
-              const { decision: _decision, ...rest } = retry
-              void _decision
-              return rest
+              return retry
             })
           },
           undefined,
@@ -648,7 +1057,8 @@ export class SandboxNetworkApprovalOwner {
     update: (context: SessionRuntimeContext) => readonly SandboxNetworkApproval[],
     authority?: SandboxNetworkApproval,
     restored: boolean | 'preserve' = false,
-    isCurrent?: () => boolean
+    isCurrent?: () => boolean,
+    confirmation?: NetworkApprovalPatchFence
   ): Promise<void> {
     for (let attempt = 0; attempt < 5; attempt++) {
       const context = await this.sessions!.readSessionRuntimeContext(projectId, sessionId)
@@ -668,16 +1078,21 @@ export class SandboxNetworkApprovalOwner {
                 : restored
                   ? 'idle'
                   : 'running',
-          ...(authority
+          ...(authority || confirmation || isCurrent
             ? {
                 beforePersist: (session: PersistedChatSession) => {
-                  if (isCurrent?.() === false)
-                    throw new Error('Network approval execution is no longer current.')
-                  this.assertBound(session, authority)
+                  confirmation?.beforePersist(session)
+                  if (isCurrent?.() === false) {
+                    throw confirmation
+                      ? confirmationUnavailable
+                      : new Error('Network approval execution is no longer current.')
+                  }
+                  if (authority) this.assertBound(session, authority)
                 }
               }
             : {})
         })
+        confirmation?.onCommitted?.()
         await this.publish?.(await this.sessions!.loadSessionForContinuation(projectId, sessionId))
         return
       } catch (error) {

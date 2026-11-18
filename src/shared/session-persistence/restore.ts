@@ -197,7 +197,10 @@ export const rearmUnacceptedElicitationContinuations = (
 const resolveRestorableElicitationWait = (
   session: PersistedChatSession
 ):
-  | { promptMessageId: string; requests: { requestId: string; fieldCount: number }[] }
+  | {
+      promptMessageId: string
+      requests: { requestId: string; activity: PersistedBranchActivity }[]
+    }
   | undefined => {
   const graph = session.conversationGraph
   if (
@@ -244,11 +247,22 @@ const resolveRestorableElicitationWait = (
       flat[0].sortIndex === activity.sortIndex &&
       // Sanitization fixes property order, so JSON equality checks the complete durable payload.
       JSON.stringify(flat[0].elicitation) === JSON.stringify(activity.elicitation)
-    return restorable
-      ? [{ requestId: durable.requestId, fieldCount: activity.elicitation!.fields.length }]
-      : []
+    return restorable ? [{ requestId: durable.requestId, activity: authority }] : []
   })
   return requests.length > 0 ? { promptMessageId: prompt.id, requests } : undefined
+}
+
+export const resolveRestorableElicitationActivity = (
+  session: PersistedChatSession,
+  requestId: string
+): PersistedBranchActivity | undefined => {
+  try {
+    return resolveRestorableElicitationWait(session)?.requests.find(
+      (request) => request.requestId === requestId
+    )?.activity
+  } catch {
+    return undefined
+  }
 }
 
 export const projectPersistedSessionWaits = (
@@ -269,7 +283,11 @@ export const projectPersistedSessionWaits = (
     ...(request
       ? { permission: { requestId: request.requestId, delegated: request.delegated !== undefined } }
       : {}),
-    questions: elicitation?.requests ?? []
+    questions:
+      elicitation?.requests.map(({ requestId, activity }) => ({
+        requestId,
+        fieldCount: activity.elicitation!.fields.length
+      })) ?? []
   }
 }
 

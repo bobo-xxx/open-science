@@ -89,6 +89,10 @@ import type {
 import type { AcpConnectionTransitionOwner } from './connection-transition-owner'
 import type { AcpContextCompactionWorkflow } from './context-compaction-workflow'
 import type {
+  RestoredElicitationClaim,
+  RestoredElicitationClaimInput
+} from './durable-continuation-context-owner'
+import type {
   AcpElicitationOwner,
   AuthorizeLiveElicitation,
   LiveElicitationResponse,
@@ -136,7 +140,9 @@ import type { AcpRuntimeArtifactOptions, AcpRuntimeOptions } from './runtime-con
 import { composeAcpRuntimeContinuations } from './runtime-continuation-composition'
 import {
   PERMISSION_DENIED_CONTINUATION_TEXT,
-  type AcpPermissionContinuationWorkflow
+  type AcpPermissionContinuationWorkflow,
+  type RestoredPermissionConfirmationClaim,
+  type RestoredPermissionConfirmationSource
 } from './permission-continuation-workflow'
 import type { AcpQuestionContinuationWorkflow } from './question-continuation-workflow'
 import { composeAcpRuntimeLifecycleOwners } from './runtime-lifecycle-composition'
@@ -1946,6 +1952,79 @@ class AcpRuntime {
     return this.getSnapshot()
   }
 
+  async readLiveSandboxNetworkConfirmation(
+    scope: PermissionConfirmationScope,
+    requestId: string
+  ): Promise<PermissionConfirmationSnapshot | undefined> {
+    if (!this.hasLiveSession(scope.projectId, scope.sessionId)) return undefined
+    return this.sandboxNetworkApprovalOwner.readLiveConfirmation(
+      scope,
+      requestId,
+      this.permissionContext
+    )
+  }
+
+  async claimLiveSandboxNetworkConfirmation(
+    scope: PermissionConfirmationScope,
+    requestId: string,
+    version: string,
+    decision: PermissionConfirmationDecision,
+    authorizeAtClaim: () => boolean
+  ): Promise<RestoredPermissionConfirmationClaim> {
+    if (!this.hasLiveSession(scope.projectId, scope.sessionId)) return { status: 'unavailable' }
+    const claim = await this.sandboxNetworkApprovalOwner.claimLiveConfirmation(
+      scope,
+      requestId,
+      version,
+      decision,
+      authorizeAtClaim,
+      this.permissionContext
+    )
+    if (claim.status === 'claimed') this.emitState()
+    return claim
+  }
+
+  async readRestoredPermissionConfirmation(
+    scope: PermissionConfirmationScope,
+    requestId: string,
+    source: RestoredPermissionConfirmationSource
+  ): Promise<PermissionConfirmationSnapshot | undefined> {
+    return source === 'sandbox-network'
+      ? this.sandboxNetworkApprovalOwner.readRestoredConfirmation(scope, requestId)
+      : this.permissionWaitOwner.readPendingRestoredConfirmation(scope, requestId)
+  }
+
+  async claimRestoredPermissionConfirmation(
+    scope: PermissionConfirmationScope,
+    requestId: string,
+    source: RestoredPermissionConfirmationSource,
+    version: string,
+    decision: PermissionConfirmationDecision,
+    authorizeAtClaim: () => boolean
+  ): Promise<RestoredPermissionConfirmationClaim> {
+    if (source === 'sandbox-network') {
+      const claim = await this.sandboxNetworkApprovalOwner.claimRestoredConfirmation(
+        scope,
+        requestId,
+        version,
+        decision,
+        authorizeAtClaim
+      )
+      if (claim.status === 'claimed') this.emitState()
+      return claim
+    }
+    if (!this.hasLiveSession(scope.projectId, scope.sessionId)) return { status: 'unavailable' }
+    const prepared = await this.permissionWaitOwner.prepareRestoredConfirmation(
+      scope,
+      requestId,
+      version,
+      decision
+    )
+    return prepared.status === 'ready'
+      ? this.permissionContinuations.respondTrusted(prepared, authorizeAtClaim)
+      : prepared
+  }
+
   readLivePermissionConfirmation(
     scope: PermissionConfirmationScope,
     requestId: string
@@ -2070,6 +2149,12 @@ class AcpRuntime {
     continuePrepared = false
   ): Promise<AcpStateSnapshot> {
     return this.questionContinuations.respond(response, continuePrepared)
+  }
+
+  claimRestoredElicitation(
+    input: RestoredElicitationClaimInput
+  ): Promise<RestoredElicitationClaim> {
+    return this.durableContinuationContext.claimRestoredElicitation(input)
   }
 
   getLiveElicitation(
@@ -2199,7 +2284,8 @@ class AcpRuntime {
       return this.sandboxNetworkApprovalOwner.request(
         input,
         scope.promptMessageId,
-        (request) => this.permissionContext.requestAppPermission(request),
+        (request, binding) =>
+          this.permissionContext.requestSandboxNetworkApproval(request, binding),
         () =>
           !input.signal?.aborted &&
           this.sessionInteractions.current(input.sessionId) === scope &&

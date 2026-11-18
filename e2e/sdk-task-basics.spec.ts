@@ -3,6 +3,8 @@ import { createHash, generateKeyPairSync, sign } from 'node:crypto'
 
 import type { OpenScienceClient } from '../packages/open-science/index'
 import { test, type ElectronApp } from './fixtures/electron-app'
+import { createProject } from './certification/helpers'
+import { submitPromptViaUi } from './fixtures/conversation'
 import { openSettingsPage } from './fixtures/settings-preferences'
 
 async function connect(app: ElectronApp): Promise<OpenScienceClient> {
@@ -193,7 +195,8 @@ type FixtureSigner = {
   disclose(
     sessionId: string,
     kind: 'permission' | 'question',
-    selectId?: string
+    selectId?: string,
+    client?: OpenScienceClient
   ): Promise<{ interactionId: string; challenge: { id: string; envelope: string } }>
 }
 
@@ -227,20 +230,21 @@ async function registerFixtureSigner(
   const disclose = async (
     sessionId: string,
     kind: 'permission' | 'question',
-    selectId?: string
+    selectId?: string,
+    client = sdk
   ): Promise<{
     interactionId: string
     challenge: { id: string; envelope: string }
   }> => {
     const poll = async (): Promise<string | undefined> =>
-      (await sdk.listPendingSessionInteractions(projectId, sessionId)).find(
+      (await client.listPendingSessionInteractions(projectId, sessionId)).find(
         (item) => item.kind === kind && (!selectId || item.id === selectId)
       )?.id
     await expect.poll(poll).toBeTruthy()
     const interactionId = await poll()
     if (!interactionId) throw new Error('The fixture interaction is no longer pending.')
     const issuedAt = Date.now()
-    const challenge = await sdk.createInteractionConfirmationChallenge(
+    const challenge = await client.createInteractionConfirmationChallenge(
       projectId,
       sessionId,
       interactionId,
@@ -421,3 +425,85 @@ test('routes signed decisions to the delegated permission and question owners', 
     )
     .toEqual([{ status: 'completed' }, { status: 'completed' }])
 })
+
+for (const kind of ['permission', 'question'] as const) {
+  test(`claims a signed restored ${kind} after restarting the app`, async ({ app }) => {
+    await app.completeOnboarding()
+    const original = await app.configureFakeAgent()
+    const projectId = await createProject(original, 'Trusted restart ' + kind)
+    const oldSdk = await connect(app)
+    const signer = await registerFixtureSigner(app, oldSdk, projectId)
+    const prompt =
+      kind === 'permission'
+        ? 'Request restart verification permission.'
+        : 'Ask a restart verification question. Include four questions.'
+    await submitPromptViaUi(original, prompt)
+    const pendingSession = async (): Promise<string | undefined> =>
+      original.evaluate(
+        async ({ projectId, kind }) => {
+          const { sessions } = await window.api.sessions.loadAll()
+          return sessions.find(
+            (session) =>
+              session.projectId === projectId &&
+              (kind === 'permission'
+                ? session.runtimeContext?.permission?.state === 'pending'
+                : session.activities?.some(({ elicitation }) => elicitation?.state === 'pending'))
+          )?.id
+        },
+        { projectId, kind }
+      )
+    await expect.poll(pendingSession).toBeTruthy()
+    const sessionId = await pendingSession()
+    if (!sessionId) throw new Error('Expected the fixture decision to be durable before restart.')
+
+    const restarting = app.restart()
+    const quit = original.getByRole('button', { name: 'Quit', exact: true })
+    await quit
+      .waitFor({ state: 'visible', timeout: 5_000 })
+      .then(() => quit.click())
+      .catch(() => undefined)
+    await restarting
+    const sdk = await connect(app)
+
+    const { interactionId, challenge } = await signer.disclose(sessionId, kind, undefined, sdk)
+    const envelope = JSON.parse(Buffer.from(challenge.envelope, 'base64url').toString('utf8'))
+    expect(envelope.contentVersion).toMatch(/^restored:/u)
+    if (kind === 'permission') {
+      const decision = 'option:allow-once'
+      await expect(
+        sdk.submitInteractionConfirmationDecision(projectId, sessionId, interactionId, kind, {
+          challengeId: challenge.id,
+          decision,
+          signature: signer.signDecision(challenge.envelope, decision)
+        })
+      ).resolves.toEqual({ status: 'claimed' })
+    } else {
+      const answers = Array.from({ length: 4 }, (_, index) => ({
+        fieldId: 'question_' + index,
+        value: 'Dataset Alpha'
+      }))
+      const payload = JSON.stringify([
+        'accept',
+        answers.map(({ fieldId, value }) => [fieldId, 'answered', value])
+      ])
+      await expect(
+        sdk.submitInteractionConfirmationDecision(projectId, sessionId, interactionId, kind, {
+          challengeId: challenge.id,
+          decision: { action: 'accept', answers },
+          signature: signer.signDecision(challenge.envelope, payload)
+        })
+      ).resolves.toEqual({ status: 'claimed' })
+    }
+    const finalText =
+      kind === 'permission' ? 'Permission approval delivered.' : 'Question answer delivered.'
+    await expect
+      .poll(
+        async () =>
+          (await sdk.getSessionHistory(projectId, sessionId)).messages.some((message) =>
+            message.content.includes(finalText)
+          ),
+        { timeout: 40_000 }
+      )
+      .toBe(true)
+  })
+}

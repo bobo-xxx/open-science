@@ -8,7 +8,11 @@ import {
   resolveMessageBranchPath,
   type PersistedConversationGraph
 } from '../../shared/conversation-graph'
-import type { ElicitationAnswer, PendingElicitationRequest } from '../../shared/elicitation'
+import type {
+  ElicitationAnswer,
+  ElicitationResponse,
+  PendingElicitationRequest
+} from '../../shared/elicitation'
 import type { HistoryReplayDescriptor } from '../../shared/history-replay-contract'
 import {
   buildSessionHistoryReplay,
@@ -16,6 +20,7 @@ import {
 } from '../../shared/session-history-replay'
 import {
   rearmUnacceptedElicitationContinuations,
+  resolveRestorableElicitationActivity,
   sanitizeSessionReferences,
   type PersistedChatSession
 } from '../../shared/session-persistence'
@@ -46,12 +51,146 @@ type DurableElicitationContinuationPreparation = Readonly<{
   historyReplay?: SessionHistoryReplay
 }>
 
+type RestoredElicitationConfirmationAuthority = Readonly<{
+  scope: { projectId: string; sessionId: string }
+  request: PendingElicitationRequest
+  prompt: { frameId: string; branchId: string; promptMessageId: string; runtimeSegmentId: string }
+}>
+
+type RestoredElicitationDecision = Pick<ElicitationResponse, 'action' | 'answers'>
+type RestoredElicitationClaimInput = RestoredElicitationDecision &
+  Readonly<{
+    projectId: string
+    sessionId: string
+    requestId: string
+    isUnowned: () => boolean
+    authorizeAtClaim: (
+      authority: RestoredElicitationConfirmationAuthority,
+      canonicalDecision: RestoredElicitationDecision
+    ) => 'authorized' | 'unavailable' | 'invalid-decision'
+  }>
+type RestoredElicitationClaim =
+  | Readonly<{
+      status: 'claimed'
+      request: PendingElicitationRequest
+      decision: RestoredElicitationDecision
+      completion: Promise<void>
+    }>
+  | Readonly<{ status: 'unavailable' | 'invalid-decision' }>
+
+type PreparedElicitationCommit = {
+  preparation: DurableElicitationContinuationPreparation
+  completion: Promise<void>
+}
+
+type ElicitationCommitGuard = (session: PersistedChatSession) => void
+
+class RestoredElicitationClaimError extends Error {
+  constructor(readonly code: 'unavailable' | 'invalid-decision') {
+    super(
+      code === 'unavailable'
+        ? 'Restored question is no longer available.'
+        : 'Invalid restored question decision.'
+    )
+  }
+}
+
 type DurableContinuationReplay = {
   descriptor: HistoryReplayDescriptor
   supportsImageInput: boolean
 }
 
 type PublishDurableContinuationSession = (session: PersistedChatSession) => Promise<void> | void
+
+const canonicalRequest = (
+  sessionId: string,
+  authority: {
+    activityId: string
+    message: string
+    fields: PendingElicitationRequest['fields']
+    durable: NonNullable<PendingElicitationRequest['durable']>
+    promptMessageId: string
+  }
+): PendingElicitationRequest => ({
+  requestId: authority.durable.requestId,
+  sessionId,
+  toolCallId: authority.activityId,
+  message: authority.message,
+  fields: structuredClone(authority.fields),
+  durable: { ...structuredClone(authority.durable), promptMessageId: authority.promptMessageId }
+})
+
+// Derives persisted evidence from a read-only snapshot. Runtime ownership is checked separately.
+const readRestoredElicitationConfirmationAuthority = (
+  session: PersistedChatSession,
+  requestId: string
+): RestoredElicitationConfirmationAuthority | undefined => {
+  const graph = session.conversationGraph
+  if (
+    session.status !== 'waiting-for-user' ||
+    session.activeRun ||
+    session.promptPreparation ||
+    session.packageOrigin ||
+    session.archivedAt !== undefined ||
+    !graph ||
+    graph.activeFrameId !== graph.rootFrameId
+  ) {
+    return undefined
+  }
+  const frame = graph.frames.find(({ id, kind }) => id === graph.rootFrameId && kind === 'root')
+  const activity = resolveRestorableElicitationActivity(session, requestId)
+  const elicitation = activity?.elicitation
+  if (
+    !frame ||
+    !activity ||
+    !elicitation?.durable ||
+    elicitation.respondedAt !== undefined ||
+    elicitation.answers !== undefined ||
+    graph.activities.some(
+      (candidate) =>
+        candidate.agentFrameId === frame.id &&
+        candidate.messageBranchId === frame.activeBranchId &&
+        candidate.promptMessageId === activity.promptMessageId &&
+        (candidate.elicitation?.continuationPending || candidate.elicitation?.continuationRecovery)
+    ) ||
+    !graph.runtimeSegments.some(
+      ({ id, agentFrameId }) => id === activity.runtimeSegmentId && agentFrameId === frame.id
+    )
+  ) {
+    return undefined
+  }
+  return {
+    scope: { projectId: session.projectId, sessionId: session.id },
+    request: canonicalRequest(session.id, {
+      activityId: activity.id,
+      message: elicitation.message,
+      fields: elicitation.fields,
+      durable: elicitation.durable,
+      promptMessageId: activity.promptMessageId
+    }),
+    prompt: {
+      frameId: frame.id,
+      branchId: frame.activeBranchId,
+      promptMessageId: activity.promptMessageId,
+      runtimeSegmentId: activity.runtimeSegmentId
+    }
+  }
+}
+
+const canonicalRestoredDecision = (
+  request: PendingElicitationRequest,
+  { action, answers }: RestoredElicitationDecision
+): RestoredElicitationDecision => {
+  if (action === 'accept') {
+    try {
+      return { action, answers: validateElicitationAnswers(request, answers) }
+    } catch {
+      throw new RestoredElicitationClaimError('invalid-decision')
+    }
+  }
+  if (answers === undefined && (action === 'decline' || action === 'cancel')) return { action }
+  throw new RestoredElicitationClaimError('invalid-decision')
+}
 
 const isActivityVisibleOnBranch = (
   graph: PersistedConversationGraph,
@@ -154,14 +293,72 @@ class AcpDurableContinuationContextOwner {
     if (input.replacePreviousAnswer) {
       return this.prepareElicitationRevision(session, { ...input, replay })
     }
-    if (input.action === 'cancel') {
-      return this.endElicitation(session, input)
+    const committed =
+      input.action === 'cancel'
+        ? await this.endElicitation(session, input)
+        : await this.commitElicitationAnswer(session, input, replay)
+    await committed.completion
+    return committed.preparation
+  }
+
+  async claimRestoredElicitation(
+    input: RestoredElicitationClaimInput
+  ): Promise<RestoredElicitationClaim> {
+    if (!this.sessions?.mutateRuntimeSession || !input.isUnowned()) return { status: 'unavailable' }
+    const session = await this.sessions.loadSessionForContinuation(input.projectId, input.sessionId)
+    if (session.projectId !== input.projectId || session.id !== input.sessionId)
+      return { status: 'unavailable' }
+    const disclosed = readRestoredElicitationConfirmationAuthority(session, input.requestId)
+    if (!disclosed || !input.isUnowned()) return { status: 'unavailable' }
+    try {
+      const decision = canonicalRestoredDecision(disclosed.request, input)
+      const assertAtClaim: ElicitationCommitGuard = (latest) => {
+        const authority = readRestoredElicitationConfirmationAuthority(latest, input.requestId)
+        if (!authority || !isDeepStrictEqual(authority, disclosed) || !input.isUnowned()) {
+          throw new RestoredElicitationClaimError('unavailable')
+        }
+        const verdict = input.authorizeAtClaim(authority, structuredClone(decision))
+        if (verdict !== 'authorized') {
+          throw new RestoredElicitationClaimError(
+            verdict === 'invalid-decision' ? verdict : 'unavailable'
+          )
+        }
+        if (!input.isUnowned()) throw new RestoredElicitationClaimError('unavailable')
+      }
+      const command = {
+        projectId: input.projectId,
+        sessionId: input.sessionId,
+        requestId: input.requestId,
+        toolCallId: disclosed.request.toolCallId,
+        ...decision
+      }
+      const committed =
+        decision.action === 'cancel'
+          ? await this.endElicitation(session, command, assertAtClaim)
+          : await this.commitElicitationAnswer(session, command, undefined, assertAtClaim)
+      return {
+        status: 'claimed',
+        request: committed.preparation.request,
+        decision,
+        completion: committed.completion
+      }
+    } catch (error) {
+      if (error instanceof RestoredElicitationClaimError) return { status: error.code }
+      throw error
     }
+  }
+
+  private async commitElicitationAnswer(
+    session: PersistedChatSession,
+    input: Parameters<AcpDurableContinuationContextOwner['prepareElicitation']>[0],
+    replay: DurableContinuationReplay | undefined,
+    assertAtClaim?: ElicitationCommitGuard
+  ): Promise<PreparedElicitationCommit> {
     const saved = input.retryContinuation || input.continuePrepared
     if (saved) this.assertRetry(session, input)
     const authority = this.resolvePendingElicitation(session, input, saved)
     const continuation = this.prepareFromSession(session, authority.promptMessageId, replay)
-    const request = this.canonicalRequest(session.id, authority)
+    const request = canonicalRequest(session.id, authority)
     // Commit the decision and adopt legacy transcript ownership in the same Main mutation.
     if (!this.sessions?.mutateRuntimeSession) {
       throw new Error('Durable elicitation response authority is not available.')
@@ -169,6 +366,7 @@ class AcpDurableContinuationContextOwner {
     const answers =
       input.action === 'accept' ? validateElicitationAnswers(request, input.answers) : undefined
     const commit = this.sessions.mutateRuntimeSession(input, (latest) => {
+      assertAtClaim?.(latest)
       if (saved) this.assertRetry(latest, input)
       const current = this.resolvePendingElicitation(latest, input, saved)
       if (!isDeepStrictEqual(current, authority)) {
@@ -231,12 +429,21 @@ class AcpDurableContinuationContextOwner {
       }
       throw error
     })
-    await this.publishSessionUpdated?.(structuredClone(committed))
+    return this.preparedElicitationCommit(committed, { ...continuation, request })
+  }
 
+  private preparedElicitationCommit(
+    session: PersistedChatSession,
+    preparation: DurableElicitationContinuationPreparation
+  ): PreparedElicitationCommit {
     return {
-      ...continuation,
-      request: this.canonicalRequest(session.id, authority)
+      preparation,
+      completion: this.publishElicitationCommit(session)
     }
+  }
+
+  private async publishElicitationCommit(session: PersistedChatSession): Promise<void> {
+    await this.publishSessionUpdated?.(structuredClone(session))
   }
 
   async rearmElicitation(input: {
@@ -276,13 +483,15 @@ class AcpDurableContinuationContextOwner {
 
   private async endElicitation(
     session: PersistedChatSession,
-    input: Parameters<AcpDurableContinuationContextOwner['prepareElicitation']>[0]
-  ): Promise<DurableElicitationContinuationPreparation> {
+    input: Parameters<AcpDurableContinuationContextOwner['prepareElicitation']>[0],
+    assertAtClaim?: ElicitationCommitGuard
+  ): Promise<PreparedElicitationCommit> {
     if (!this.sessions?.mutateRuntimeSession) {
       throw new Error('Durable elicitation response authority is not available.')
     }
     const authority = this.resolvePendingElicitation(session, input, true)
     const ended = await this.sessions.mutateRuntimeSession(input, (latest) => {
+      assertAtClaim?.(latest)
       const current = this.resolvePendingElicitation(latest, input, true)
       if (!isDeepStrictEqual(current, authority)) {
         throw new Error('Durable elicitation changed before its wait was ended.')
@@ -343,8 +552,9 @@ class AcpDurableContinuationContextOwner {
         resumeRecovery: undefined
       }
     })
-    await this.publishSessionUpdated?.(structuredClone(ended))
-    return { request: this.canonicalRequest(session.id, authority) }
+    return this.preparedElicitationCommit(ended, {
+      request: canonicalRequest(session.id, authority)
+    })
   }
 
   private resolvePendingElicitation(
@@ -414,7 +624,7 @@ class AcpDurableContinuationContextOwner {
   ): Promise<DurableElicitationContinuationPreparation> {
     const authority = this.resolveElicitationRevision(session, input.requestId)
     const toolCallId = `ask-user-question-revision-${randomUUID()}`
-    const originalRequest = this.canonicalRequest(session.id, {
+    const originalRequest = canonicalRequest(session.id, {
       ...authority,
       activityId: toolCallId
     })
@@ -522,26 +732,6 @@ class AcpDurableContinuationContextOwner {
     }
   }
 
-  private canonicalRequest(
-    sessionId: string,
-    authority: {
-      activityId: string
-      message: string
-      fields: PendingElicitationRequest['fields']
-      durable: NonNullable<PendingElicitationRequest['durable']>
-      promptMessageId: string
-    }
-  ): PendingElicitationRequest {
-    return {
-      requestId: authority.durable.requestId,
-      sessionId,
-      toolCallId: authority.activityId,
-      message: authority.message,
-      fields: structuredClone(authority.fields),
-      durable: { ...structuredClone(authority.durable), promptMessageId: authority.promptMessageId }
-    }
-  }
-
   private revisionPromptContent(
     request: PendingElicitationRequest,
     action: 'accept' | 'decline',
@@ -623,9 +813,12 @@ class AcpDurableContinuationContextOwner {
   }
 }
 
-export { AcpDurableContinuationContextOwner }
+export { AcpDurableContinuationContextOwner, readRestoredElicitationConfirmationAuthority }
 export type {
   DurableContinuationPreparation,
   DurableContinuationSessions,
-  DurableElicitationContinuationPreparation
+  DurableElicitationContinuationPreparation,
+  RestoredElicitationClaim,
+  RestoredElicitationClaimInput,
+  RestoredElicitationConfirmationAuthority
 }

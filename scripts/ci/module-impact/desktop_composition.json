@@ -42,6 +42,7 @@
     "src/main/composition/session-projection.test.ts",
     "src/main/composition/session-projection.ts",
     "src/main/composition/session-surfaces.ts",
+    "src/main/composition/trusted-restored-interactions.ts",
     "src/main/composition/settings-bootstrap.ts",
     "src/main/composition/settings-bootstrap.test.ts",
     "src/main/composition/settings-effects.ts",

@@ -59,9 +59,22 @@ type BeforePermissionSettlement = (
   response: AcpPermissionResponse
 ) => void
 
+// Main-only identity carried from the dedicated destination-approval owner. The broker uses
+// object identity; renderer fields or a generic app-owned request cannot reconstruct it.
+type SandboxNetworkPermissionBinding = Readonly<{
+  scope: PermissionConfirmationScope
+  requestId: string
+  isCurrent(): boolean
+}>
+
 type PendingPermission = {
   request: AcpPermissionRequest
   appOwned?: true
+  sandboxNetworkWait?: {
+    binding: SandboxNetworkPermissionBinding
+    version: string
+    signal?: AbortSignal
+  }
   refreshRequest?: () => AcpPermissionRequest
   beforeRespond?: (optionId: string | undefined) => Promise<void>
   decisionAuthority?: PermissionDiagnostic['authority']
@@ -1020,6 +1033,56 @@ class AcpPermissionBroker {
     }
   }
 
+  readSandboxNetworkApproval(
+    binding: SandboxNetworkPermissionBinding
+  ): PermissionConfirmationSnapshot | undefined {
+    const pending = this.pendingRequests.get(binding.requestId)
+    if (
+      !pending ||
+      pending.sandboxNetworkWait?.binding !== binding ||
+      !binding.isCurrent() ||
+      !this.isPendingCurrent(pending)
+    )
+      return undefined
+    const request = structuredClone(projectPermissionRequest(pending.request))
+    return {
+      version: pending.sandboxNetworkWait.version,
+      request,
+      allowedDecisions: [
+        ...request.options.map(({ optionId }) => `option:${optionId}` as const),
+        'cancel'
+      ]
+    }
+  }
+
+  claimSandboxNetworkApproval(
+    binding: SandboxNetworkPermissionBinding,
+    version: string,
+    decision: PermissionConfirmationDecision,
+    authorizeAtClaim: () => boolean,
+    beforeRespond: (optionId: string | undefined) => Promise<void>
+  ): PermissionConfirmationClaim {
+    const pending = this.pendingRequests.get(binding.requestId)
+    const snapshot = this.readSandboxNetworkApproval(binding)
+    if (
+      !pending ||
+      snapshot?.version !== version ||
+      !authorizeAtClaim() ||
+      this.pendingRequests.get(binding.requestId) !== pending ||
+      !binding.isCurrent()
+    )
+      return { status: 'unavailable' }
+    if (!snapshot.allowedDecisions.includes(decision)) return { status: 'invalid-decision' }
+    const response: AcpPermissionResponse =
+      decision === 'cancel'
+        ? { requestId: binding.requestId, cancelled: true }
+        : { requestId: binding.requestId, optionId: decision.slice('option:'.length) }
+    return {
+      status: 'claimed',
+      completion: this.respondPending(pending, response, undefined, beforeRespond)
+    }
+  }
+
   hasPendingForSession(sessionId: string): boolean {
     return Array.from(this.pendingRequests.values()).some(
       ({ request }) => request.sessionId === sessionId
@@ -1236,6 +1299,28 @@ class AcpPermissionBroker {
   // General app-owned requests keep their decision semantics in the calling module while sharing
   // the broker's renderer projection, response validation, and Session cancellation lifecycle.
   requestAppPermission(input: AppPermissionRequest): Promise<string | undefined> {
+    return this.openAppPermission(input)
+  }
+
+  requestSandboxNetworkApproval(
+    input: AppPermissionRequest,
+    binding: SandboxNetworkPermissionBinding
+  ): Promise<string | undefined> {
+    if (
+      !input.beforeRespond ||
+      input.networkApproval?.projectId !== binding.scope.projectId ||
+      input.sessionId !== binding.scope.sessionId ||
+      input.requestId !== binding.requestId ||
+      !binding.isCurrent()
+    )
+      return Promise.resolve(undefined)
+    return this.openAppPermission(input, binding)
+  }
+
+  private openAppPermission(
+    input: AppPermissionRequest,
+    sandboxNetworkBinding?: SandboxNetworkPermissionBinding
+  ): Promise<string | undefined> {
     if (input.signal?.aborted) return Promise.resolve(undefined)
     const requestId = input.requestId ?? randomUUID()
     const request: AcpPermissionRequest = {
@@ -1255,6 +1340,15 @@ class AcpPermissionBroker {
         requestId,
         request,
         appOwned: true,
+        ...(sandboxNetworkBinding
+          ? {
+              sandboxNetworkWait: {
+                binding: sandboxNetworkBinding,
+                version: randomUUID(),
+                signal: input.signal
+              }
+            }
+          : {}),
         durablePersisted: input.durable === true,
         beforeRespond: input.beforeRespond,
         refreshRequest: input.refreshRequest,
@@ -1821,7 +1915,8 @@ class AcpPermissionBroker {
   private async respondPending(
     pending: PendingPermission,
     response: AcpPermissionResponse,
-    beforeSettlement?: BeforePermissionSettlement
+    beforeSettlement?: BeforePermissionSettlement,
+    sandboxNetworkBeforeRespond?: (optionId: string | undefined) => Promise<void>
   ): Promise<boolean> {
     this.pendingRequests.delete(response.requestId)
     pending.decisionAuthority ??= 'human'
@@ -1830,14 +1925,19 @@ class AcpPermissionBroker {
     this.respondingRequests.set(response.requestId, pending)
     try {
       beforeSettlement?.(pending.request, response)
-      if (pending.beforeRespond) {
+      const beforeRespond = sandboxNetworkBeforeRespond ?? pending.beforeRespond
+      if (beforeRespond) {
         const optionId =
           !response.cancelled &&
           pending.request.options.some((option) => option.optionId === response.optionId)
             ? response.optionId
             : undefined
-        await pending.beforeRespond(optionId)
+        await beforeRespond(optionId)
         if (pending.settled) return true
+        if (sandboxNetworkBeforeRespond && !pending.sandboxNetworkWait?.binding.isCurrent()) {
+          this.settlePending(pending, { outcome: { outcome: 'cancelled' } }, 'cancelled')
+          return true
+        }
       }
       if (response.cancelled || !response.optionId) {
         const persistence = this.persistLiveSettlement(pending)
@@ -1957,6 +2057,15 @@ class AcpPermissionBroker {
       // A durable app decision that failed to commit still owns its live wait. Keep it actionable
       // and do not release privileged work as if the human had denied the request.
       if (pending.beforeRespond && !pending.settled) {
+        const networkWait = pending.sandboxNetworkWait
+        if (sandboxNetworkBeforeRespond && networkWait && !networkWait.binding.isCurrent()) {
+          // The abort listener could not find this request while its settlement reserved the map
+          // slot. Do not rearm a waiter after that one-shot signal has already fired.
+          if (networkWait.signal?.aborted) await pending.beforeRespond(undefined).catch(() => {})
+          this.settlePending(pending, { outcome: { outcome: 'cancelled' } }, 'cancelled')
+          throw error
+        }
+        if (pending.sandboxNetworkWait) pending.sandboxNetworkWait.version = randomUUID()
         if (pending.refreshRequest) {
           pending.request = pending.refreshRequest()
           this.emitPermissionRequest(pending.request)
@@ -2230,6 +2339,7 @@ export type {
   PermissionConfirmationDecision,
   PermissionConfirmationScope,
   PermissionConfirmationSnapshot,
+  SandboxNetworkPermissionBinding,
   PermissionWaitHooks,
   RestoredPermissionContinuation
 }

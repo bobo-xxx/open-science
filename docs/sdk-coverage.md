@@ -27,16 +27,20 @@ the scope where the operation will execute.
 | Manage research resources                 | Partial Project, Connector, Credential, Literature methods                                                    | Each resource's application owner                                                                          | Expand by operation and record evidence before claiming coverage |
 
 Pending interaction snapshots include live permission, question and Compute approval metadata.
-The same methods report durable MCP permission waits, agent questions and delegated questions when
-their saved Session and Branch still support a response.
+The same methods report durable MCP permission waits, agent questions, delegated questions, and
+Notebook network approval metadata when the saved Session and Branch still support a response.
 
 The trusted Compute decision preview claims a request through the native Compute approval
 owner. Check job state separately after a claim. The live permission and question previews use
 the same signed challenge envelope and validate the attached provider, prompt, and Branch before
 the existing owner claims a decision. A delegated permission uses the current Subagent Attempt
 and its exact disclosed grant choices. A delegated question uses the Session persistence transaction
-that records the answer and its continuation Attempt. Desktop and Web handle restored and specialized
-application waits. Qualification of a real host is tracked separately.
+that records the answer and its continuation Attempt. Supported restored waits use the saved
+Session, Branch, and request version at the owner’s persistence boundary. After an accepted
+restored question or MCP permission, the application uses its existing reattachment and continuation
+workflow. Notebook network confirmation keeps the original approval admission and Settings grant
+rules. Its authority fence rechecks the precise evidence during persistence. Qualification of a real
+host is tracked separately.
 
 First-release acceptance uses Desktop and standalone artifacts at the same revision on Windows
 x64, macOS ARM64 and x64, and Linux ARM64 and x64. Real Slurm acceptance is a separate run
