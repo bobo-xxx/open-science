@@ -6,7 +6,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { mkdtemp, readFile, rm, writeFile, readdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { delimiter, join, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
 import { verifyRuntimeSignatures } from './verify-runtime-signatures.mjs'
 import { currentRuntimeTarget } from '../packages/open-science/runtime-package.mjs'
@@ -136,11 +136,11 @@ console.log('Native dependencies load in ordinary Node');
     }
   }
   await checkNoElectron(join(prefix, 'node_modules'))
-  if (process.platform === 'linux' && process.env.OPEN_SCIENCE_NPM_LIVE_TEST === '1') {
+  if (process.env.OPEN_SCIENCE_NPM_LIVE_TEST === '1') {
     const env = {
       ...process.env,
       DISPLAY: '',
-      PATH: `${join(prefix, 'node_modules/.bin')}:${process.env.PATH}`,
+      PATH: [join(prefix, 'node_modules/.bin'), process.env.PATH].filter(Boolean).join(delimiter),
       OPEN_SCIENCE_TEST_PACKAGE: installed,
       OPEN_SCIENCE_TEST_FAKE_AGENT: join(root, 'e2e/fixtures/fake-opencode.mjs'),
       OPEN_SCIENCE_WEB_PORT: '0'

@@ -156,9 +156,13 @@ jobs:
           done
       - name: Verify native npm installation
         if: ${{ !inputs.verify_desktop_only && runner.os != 'Linux' && (inputs.distribution == 'npm' || inputs.include_npm) }}
+        env:
+          OPEN_SCIENCE_NPM_LIVE_TEST: ${{ inputs.source_sha == '' && '1' || '0' }}
         run: npm run test:npm-installed
       - name: Verify extracted standalone archive
         if: ${{ !inputs.verify_desktop_only && runner.os != 'Linux' && inputs.distribution == 'archive' }}
+        env:
+          OPEN_SCIENCE_ARCHIVE_LIVE_TEST: '1'
         run: npm run test:runtime-archive-installed
       - name: Verify headless Linux install and real Notebook lifecycle
         if: ${{ !inputs.verify_desktop_only && runner.os == 'Linux' }}

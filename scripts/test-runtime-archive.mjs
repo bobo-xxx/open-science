@@ -100,7 +100,7 @@ console.log('PASS bundled Node and native dependencies');
     assert.equal(error.stderr, '')
   }
   console.log('PASS extracted CLI from path with spaces without host Node/npm/Electron')
-  if (process.platform === 'linux' && process.env.OPEN_SCIENCE_ARCHIVE_LIVE_TEST === '1') {
+  if (process.env.OPEN_SCIENCE_ARCHIVE_LIVE_TEST === '1') {
     const result = await exec(node, [join(root, 'scripts/test-backend-installed.mjs')], {
       cwd: temporary,
       timeout: 600_000,
