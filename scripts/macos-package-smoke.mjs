@@ -221,7 +221,7 @@ const launchAndProbe = async ({ executable, expectedVersion, env, userDataRoot }
     }
     await verifyPackagedSdk({
       resourceRoot: join(executable, '..', '..', 'Resources'),
-      ...service,
+      configRoot: env.OPEN_SCIENCE_E2E_STORAGE_ROOT,
       expectedVersion
     })
     const shellCertification = JSON.parse(

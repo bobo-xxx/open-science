@@ -5,13 +5,11 @@ import { test, type ElectronApp } from './fixtures/electron-app'
 
 async function connect(app: ElectronApp): Promise<OpenScienceClient> {
   const sdkEntry = '../packages/open-science/index.mjs'
-  const { OpenScienceClient: Client } = (await import(
+  const { connectToOpenScience } = (await import(
     sdkEntry
   )) as typeof import('../packages/open-science/index')
-  const url = new URL(await app.authenticatedWebUrl())
-  const token = url.searchParams.get('token')
-  if (!token) throw new Error('Missing isolated fixture token')
-  return new Client({ baseUrl: url.origin, token })
+  await app.authenticatedWebUrl()
+  return connectToOpenScience({ configRoot: app.isolatedConfigRoot() })
 }
 
 test('runs a task with project defaults and reads the same result through a new SDK client', async ({
@@ -21,6 +19,8 @@ test('runs a task with project defaults and reads the same result through a new 
   await app.configureFakeAgent()
 
   const client = await connect(app)
+  expect(await client.health()).not.toHaveProperty('configRoot')
+  expect((await client.listCitationStyles()).length).toBeGreaterThan(0)
   const capabilities = await client.getCapabilities()
   expect(capabilities.taskCapabilities).toEqual(
     expect.arrayContaining([
@@ -100,6 +100,9 @@ test('runs a task with project defaults and reads the same result through a new 
       return current.lifecycle
     })
     .toBe('complete')
+  const fork = await reconnected.forkSession(project.id, result.sessionId)
+  expect(fork?.projectId).toBe(project.id)
+  expect(fork?.sessionId).not.toBe(result.sessionId)
 })
 
 test('watches a permission wait appear and clear when the Run is cancelled', async ({ app }) => {

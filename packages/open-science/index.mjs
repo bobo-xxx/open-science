@@ -2,7 +2,7 @@
 
 import { Buffer } from 'node:buffer'
 import { setTimeout as delay } from 'node:timers/promises'
-import { findServiceState, readWebToken } from './config-root.mjs'
+import { findServiceState, readTaskToken, readWebToken } from './config-root.mjs'
 
 const defaultSleep = (milliseconds, signal) => delay(milliseconds, undefined, { signal })
 
@@ -1249,9 +1249,18 @@ export const connectToOpenScience = async ({
     accept: async (state) => {
       signal?.throwIfAborted()
       try {
+        const credentialVersion = state.taskCredentialVersion
+        if (credentialVersion !== undefined && credentialVersion !== 1) {
+          throw new OpenScienceApiError(
+            'This Open-Science Task credential format is unsupported.',
+            {
+              code: 'unsupported_capability'
+            }
+          )
+        }
         const candidate = new OpenScienceClient({
           baseUrl: `http://127.0.0.1:${state.port}`,
-          token: await readWebToken(state.configRoot),
+          token: await (credentialVersion === 1 ? readTaskToken : readWebToken)(state.configRoot),
           fetch,
           requestTimeoutMs
         })

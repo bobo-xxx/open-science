@@ -11,6 +11,7 @@ export type WebServiceState = {
   startedAt: string
   appVersion: string
   configRoot: string
+  taskCredentialVersion?: 1
   // True when the web service rides on an already-running instance (e.g. the desktop app), started on
   // demand via a second-instance --serve request. `stop` then only tears down the web service and must
   // never kill that pid — it is the user's app, not a daemon this launch owns. False for a dedicated

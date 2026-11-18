@@ -101,6 +101,7 @@ const makeController = (
     startServer,
     resolveConfigRoot: () => '/fake/root',
     loadWebToken: async () => 'tok-123',
+    loadTaskToken: async () => 'task-tok-456',
     writeState,
     removeState,
     createTaskRunJournal: () => ({
@@ -321,9 +322,16 @@ describe('createWebServiceController', () => {
     expect(result).toEqual({ port: 44100, url: 'http://127.0.0.1:44100/?token=tok-123' })
     expect(h.startServer).toHaveBeenCalledTimes(1)
     expect(h.lastOptions().bootstrap.configRoot).toBe('/fake/root')
+    expect(h.lastOptions().taskToken).toBe('task-tok-456')
     expect(h.writeState).toHaveBeenCalledWith(
       '/fake/root',
-      expect.objectContaining({ pid: 4242, port: 44100, appVersion: '9.9.9', attached: true })
+      expect.objectContaining({
+        pid: 4242,
+        port: 44100,
+        appVersion: '9.9.9',
+        attached: true,
+        taskCredentialVersion: 1
+      })
     )
     expect(h.controller.isRunning()).toBe(true)
     expect(h.controller.runningPort()).toBe(44100)
@@ -342,6 +350,7 @@ describe('createWebServiceController', () => {
       attached: false
     })
     expect(JSON.stringify(log.info.mock.calls)).not.toContain('tok-123')
+    expect(JSON.stringify(log.info.mock.calls)).not.toContain('task-tok-456')
   })
 
   it('is idempotent: a second ensureStarted while running reuses the server (no second start)', async () => {

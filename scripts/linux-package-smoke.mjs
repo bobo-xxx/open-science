@@ -212,7 +212,11 @@ const launchAndProbe = async ({ resourceRoot, expectedVersion, env }) => {
     ) {
       throw new Error(`Unexpected packaged Linux bootstrap: ${JSON.stringify(bootstrap)}`)
     }
-    await verifyPackagedSdk({ resourceRoot, ...service, expectedVersion })
+    await verifyPackagedSdk({
+      resourceRoot,
+      configRoot: env.OPEN_SCIENCE_E2E_STORAGE_ROOT,
+      expectedVersion
+    })
     const shutdown = await fetch(`${service.endpoint}/api/shutdown?${service.auth}`, {
       method: 'POST',
       signal: AbortSignal.timeout(15_000)

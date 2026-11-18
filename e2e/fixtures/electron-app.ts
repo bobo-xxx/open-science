@@ -350,6 +350,7 @@ type NativeMenuProbe = {
 }
 type ElectronApp = {
   addCleanupAudit: (audit: () => Promise<void>) => void
+  isolatedConfigRoot: () => string
   isolatedDataRoot: () => Promise<string>
   captureBrandState: () => Promise<BrandState>
   restartWithBrandFixture: (
@@ -1848,6 +1849,10 @@ class ElectronAppHarness implements ElectronApp {
     if (!target) throw new Error(`No sabotaged delegated handoff exists for ${childName}.`)
     await rm(target, { force: true, recursive: true })
     this.sabotagedDelegatedHandoffs.delete(childName)
+  }
+
+  isolatedConfigRoot(): string {
+    return this.roots.storageRoot
   }
 
   async isolatedDataRoot(): Promise<string> {

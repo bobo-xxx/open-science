@@ -79,3 +79,57 @@ it('still connects to a healthy later candidate after an earlier HTTP rejection'
   expect(client.baseUrl).toBe('http://127.0.0.1:44101')
   expect(fetch).toHaveBeenCalledTimes(2)
 })
+
+it('uses the announced Task credential and ignores stale Task credentials on legacy runtimes', async () => {
+  const modern = join(fixture.home, '.open-science-project')
+  const legacy = join(fixture.home, '.open-science')
+  await writeFile(
+    join(modern, 'web-service.json'),
+    JSON.stringify({
+      pid: process.pid,
+      port: 44100,
+      startedAt: new Date().toISOString(),
+      taskCredentialVersion: 1
+    })
+  )
+  await writeFile(join(modern, 'task-token'), 'modern-task-token')
+  await writeFile(join(legacy, 'task-token'), 'stale-task-token')
+  const fetch = vi.fn(async () => Response.json({}))
+  await connectToOpenScience({ configRoot: modern, fetch })
+  await connectToOpenScience({ configRoot: legacy, fetch })
+  expect(fetch).toHaveBeenNthCalledWith(
+    1,
+    'http://127.0.0.1:44100/api/bootstrap',
+    expect.objectContaining({
+      headers: expect.objectContaining({ authorization: 'Bearer modern-task-token' })
+    })
+  )
+  expect(fetch).toHaveBeenNthCalledWith(
+    2,
+    'http://127.0.0.1:44101/api/bootstrap',
+    expect.objectContaining({
+      headers: expect.objectContaining({ authorization: 'Bearer fixture-token-1' })
+    })
+  )
+})
+
+it('fails closed when the modern Task credential is missing or rejected', async () => {
+  const configRoot = join(fixture.home, '.open-science-project')
+  await writeFile(
+    join(configRoot, 'web-service.json'),
+    JSON.stringify({
+      pid: process.pid,
+      port: 44100,
+      startedAt: new Date().toISOString(),
+      taskCredentialVersion: 1
+    })
+  )
+  const fetch = vi.fn(async () => Response.json({}, { status: 401 }))
+  await expect(connectToOpenScience({ configRoot, fetch })).rejects.toMatchObject({
+    code: 'ENOENT'
+  })
+  expect(fetch).not.toHaveBeenCalled()
+  await writeFile(join(configRoot, 'task-token'), 'rejected-task-token')
+  await expect(connectToOpenScience({ configRoot, fetch })).rejects.toMatchObject({ status: 401 })
+  expect(fetch).toHaveBeenCalledOnce()
+})

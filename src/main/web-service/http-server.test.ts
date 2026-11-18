@@ -3260,6 +3260,199 @@ describe('startWebHttpServer', () => {
     }
   )
 
+  it('isolates Task credentials from browser sessions, renderer events and shutdown', async () => {
+    const staticRoot = await mkdtemp(join(tmpdir(), 'open-science-web-static-'))
+    roots.push(staticRoot)
+    await writeFile(join(staticRoot, 'index.html'), '<!doctype html>')
+    const listProjects = vi.fn().mockResolvedValue([{ id: 'project-1' }])
+    const taskCaller = vi.fn(runWithCallerContext)
+    const onShutdownRequest = vi.fn()
+    const server = await startTestWebHttpServer({
+      host: '127.0.0.1',
+      port: 0,
+      token: 'test-web-token',
+      taskToken: 'test-task-token',
+      staticRoot,
+      onShutdownRequest,
+      rpc: { channels: () => [], invoke: vi.fn() },
+      tasks: {
+        listProjects,
+        runWithCallerContext: taskCaller,
+        subscribeProgress: () => () => undefined
+      } as never,
+      bootstrap: {
+        appName: 'Open-Science',
+        appVersion: '0.0.0',
+        configRoot: '/fake/root',
+        platform: 'test',
+        versions: { electron: '1', chrome: '1', node: '1' }
+      }
+    })
+    servers.push(server)
+    const base = `http://127.0.0.1:${server.port}`
+    const headers = { authorization: 'Bearer test-task-token' }
+
+    const bootstrap = await fetch(`${base}/api/bootstrap`, { headers })
+    expect(bootstrap.status).toBe(200)
+    expect(await bootstrap.json()).toEqual({
+      appName: 'Open-Science',
+      appVersion: '0.0.0',
+      platform: 'test',
+      versions: { electron: '1', chrome: '1', node: '1' },
+      taskCapabilities: ['permission-prompts-none']
+    })
+
+    const projects = await fetch(`${base}/api/v1/projects`, { headers })
+    expect(projects.status).toBe(200)
+    expect(await projects.json()).toEqual({ data: [{ id: 'project-1' }] })
+    expect(listProjects).toHaveBeenCalledOnce()
+    expect(taskCaller).toHaveBeenCalledWith(
+      expect.objectContaining({
+        surface: 'task',
+        principalKind: 'automation',
+        actionOrigin: 'automation'
+      }),
+      expect.any(Function)
+    )
+
+    const [queryLogin, bearerLogin, cookieLogin, queryProjects, shutdown] = await Promise.all([
+      fetch(`${base}/?token=test-task-token`, { redirect: 'manual' }),
+      fetch(`${base}/?token=test-web-token`, { headers, redirect: 'manual' }),
+      fetch(base, { headers: { cookie: 'open_science_web_token=test-task-token' } }),
+      fetch(`${base}/api/v1/projects?token=test-task-token`),
+      fetch(`${base}/api/shutdown`, { method: 'POST', headers })
+    ])
+    expect([
+      queryLogin.status,
+      bearerLogin.status,
+      cookieLogin.status,
+      queryProjects.status
+    ]).toEqual([401, 403, 401, 401])
+    expect(queryLogin.headers.has('set-cookie')).toBe(false)
+    expect(bearerLogin.headers.has('set-cookie')).toBe(false)
+    expect(shutdown.status).toBe(403)
+    expect(onShutdownRequest).not.toHaveBeenCalled()
+
+    const socketBase = base.replace('http:', 'ws:')
+    const publicSocket = new WebSocket(`${socketBase}/api/v1/events?token=test-task-token`)
+    await new Promise<void>((resolve, reject) => {
+      publicSocket.once('open', resolve)
+      publicSocket.once('error', reject)
+    })
+    publicSocket.close()
+
+    const rendererSocket = new WebSocket(`${socketBase}/events?token=test-task-token`)
+    const rendererStatus = new Promise<number | undefined>((resolve, reject) => {
+      rendererSocket.once('unexpected-response', (_request, response) => {
+        response.resume()
+        resolve(response.statusCode)
+      })
+      rendererSocket.once('error', reject)
+      rendererSocket.once('open', () =>
+        reject(new Error('Task credential opened renderer events.'))
+      )
+    })
+    await expect(rendererStatus).resolves.toBe(401)
+  })
+
+  it('limits Task RPC to SDK operations and preserves the browser approval principal', async () => {
+    const staticRoot = await mkdtemp(join(tmpdir(), 'open-science-web-static-'))
+    roots.push(staticRoot)
+    const invoke = vi.fn().mockResolvedValue({ accepted: true })
+    const server = await startTestWebHttpServer({
+      host: '127.0.0.1',
+      port: 0,
+      token: 'test-web-token',
+      taskToken: 'test-task-token',
+      staticRoot,
+      rpc: {
+        channels: () => [
+          'compute:approval-respond',
+          'sessions:import-package',
+          'literature:transact',
+          'literature:search'
+        ],
+        invoke
+      },
+      bootstrap: {
+        appName: 'Open-Science',
+        appVersion: '0.0.0',
+        configRoot: '/fake/root',
+        platform: 'test',
+        versions: { electron: '1', chrome: '1', node: '1' }
+      }
+    })
+    servers.push(server)
+    const base = `http://127.0.0.1:${server.port}`
+    const callRpc = (
+      channel: string,
+      args: readonly unknown[],
+      headers: Record<string, string>,
+      query = ''
+    ): Promise<Response> =>
+      fetch(`${base}/rpc/${encodeURIComponent(channel)}${query}`, {
+        method: 'POST',
+        headers: { ...headers, 'content-type': 'application/json' },
+        body: JSON.stringify({ protocolVersion: WEB_RPC_PROTOCOL_VERSION, args })
+      })
+    const taskHeaders = { authorization: 'Bearer test-task-token' }
+    const approvalArgs = [{ requestId: 'approval-1', decision: 'allow-once' }]
+    for (const [channel, args] of [
+      ['compute:approval-respond', approvalArgs],
+      ['sessions:import-package', [{ projectName: 'New' }, '/backup/session.science']],
+      ['literature:transact', [{ kind: 'import-attachment' }]],
+      ['literature:search', [{ scope: 'remote' }]]
+    ] as const) {
+      const response = await callRpc(channel, args, taskHeaders)
+      expect(response.status, channel).toBe(403)
+      expect(await response.json()).toMatchObject({
+        ok: false,
+        error: { code: 'method_not_found' }
+      })
+    }
+    expect(invoke).not.toHaveBeenCalled()
+
+    const importArgs = [{ projectName: 'New' }, '/backup/session.science', { nonInteractive: true }]
+    const imported = await callRpc('sessions:import-package', importArgs, taskHeaders)
+    expect(imported.status).toBe(200)
+    expect(invoke).toHaveBeenLastCalledWith(
+      'sessions:import-package',
+      expect.objectContaining({
+        principalKind: 'automation',
+        actionOrigin: 'automation',
+        authorities: ['import-local-package-path']
+      }),
+      importArgs
+    )
+    const libraryArgs = [{ scope: 'library', query: 'canopy' }]
+    expect((await callRpc('literature:search', libraryArgs, taskHeaders)).status).toBe(200)
+    expect(invoke).toHaveBeenLastCalledWith(
+      'literature:search',
+      expect.objectContaining({
+        principalKind: 'automation',
+        actionOrigin: 'automation',
+        authorities: []
+      }),
+      libraryArgs
+    )
+
+    const browserLogin = await fetch(`${base}/?token=test-web-token`, { redirect: 'manual' })
+    expect(browserLogin.status).toBe(302)
+    const cookie = browserLogin.headers.get('set-cookie')!.split(';', 1)[0]
+    for (const [headers, query, principalKind] of [
+      [{ authorization: 'Bearer test-web-token' }, '', 'automation'],
+      [{}, '?token=test-web-token', 'automation'],
+      [{ cookie }, '', 'human']
+    ] as const) {
+      await callRpc('compute:approval-respond', approvalArgs, headers, query)
+      expect(invoke).toHaveBeenLastCalledWith(
+        'compute:approval-respond',
+        expect.objectContaining({ principalKind, actionOrigin: principalKind, authorities: [] }),
+        approvalArgs
+      )
+    }
+  })
+
   it('keeps host-management RPC local while preserving the local Web client', async () => {
     const staticRoot = await mkdtemp(join(tmpdir(), 'open-science-web-static-'))
     roots.push(staticRoot)

@@ -90,6 +90,12 @@ before changing versions; replacing program files does not reverse data migratio
 
 - **Scope:** Authenticated control of a local Open-Science service; the client does not provide an
   independent execution sandbox or isolate the service's Agents and tools.
+- **Task credentials:** `connectToOpenScience` reads the separate Task credential when the
+  running service advertises it. It reads the legacy Web token only for an older service.
+  Task credentials cover Task endpoints, Task events, and the compatibility operations used
+  by existing SDK methods. Keep the Web credential for first-party UI and lifecycle clients.
+  A Task credential cannot sign in to Web, subscribe to renderer events, shut down the service,
+  or provide a human decision. This HTTP boundary does not isolate processes with access to both files.
 - **Controls:** Requests use the service's permission profiles, existing grants, and host-owned
   runtime controls. Disabling interactive permission prompts denies requests needing a human; it
   does not erase previously granted authority.

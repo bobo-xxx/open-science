@@ -3,14 +3,14 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-export async function verifyPackagedSdk({ resourceRoot, endpoint, auth, expectedVersion }) {
+export async function verifyPackagedSdk({ resourceRoot, configRoot, expectedVersion }) {
   if (process.env.OPEN_SCIENCE_VERIFY_PACKAGED_SDK !== '1') return
 
-  const token = new URLSearchParams(auth).get('token')
-  assert.ok(token, 'Missing the isolated package smoke credential')
   const entry = pathToFileURL(join(resourceRoot, 'packages/open-science/index.mjs')).href
-  const { OpenScienceClient } = await import(entry)
-  const client = new OpenScienceClient({ baseUrl: endpoint, token, requestTimeoutMs: 15000 })
+  const { connectToOpenScience } = await import(entry)
+  const client = await connectToOpenScience({ configRoot, requestTimeoutMs: 15000 })
+  const bootstrap = await client.health()
+  assert.ok(!Object.hasOwn(bootstrap, 'configRoot'), 'SDK must connect with Task credentials')
   const capabilities = await client.getCapabilities()
   assert.equal(capabilities.appVersion, expectedVersion)
   assert.equal(capabilities.platform, process.platform)

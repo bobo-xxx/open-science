@@ -1067,8 +1067,7 @@ const launchAndProbe = async ({
 
     await verifyPackagedSdk({
       resourceRoot: join(installDirectory, 'resources'),
-      endpoint,
-      auth,
+      configRoot,
       expectedVersion
     })
     if (exerciseNotebookRuntime) await runPackagedNotebookEnvironmentSmoke(endpoint, auth)

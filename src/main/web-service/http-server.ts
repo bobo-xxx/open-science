@@ -73,7 +73,7 @@ import {
   projectPublicTaskProgressEvent,
   projectWebRendererEvent
 } from './application-event-projections'
-import { authenticateRequest, persistAuthCookie } from './auth'
+import { authenticateRequest, authenticateTaskRequest, persistAuthCookie } from './auth'
 import { InternalWebEventStream } from './internal-web-event-stream'
 import { PublicTaskEventStream } from './public-task-event-stream'
 import { TaskApiError, type HeadlessTaskApi } from './task-api'
@@ -122,6 +122,57 @@ export const REMOTE_LOCAL_ONLY_RPC_CHANNELS = new Set(
   )
 )
 
+// These channels back existing SDK methods. Task credentials do not enable arbitrary Web RPC.
+const SDK_COMPATIBILITY_RPC_CHANNELS = new Set([
+  'sessions:fork',
+  'sessions:export-package',
+  'sessions:import-package',
+  'literature:search',
+  'literature:get',
+  'literature:citation-styles',
+  'literature:format-references',
+  'literature:lookup-metadata',
+  'literature:import-records',
+  'literature:transact'
+])
+
+const SDK_LITERATURE_TRANSACTIONS = new Set([
+  'create-item',
+  'set-project-items',
+  'create-collection',
+  'set-collection-item',
+  'set-reading-status',
+  'set-item-lifecycle'
+])
+
+const objectField = (value: unknown, key: string): unknown =>
+  value !== null && typeof value === 'object' && Object.hasOwn(value, key)
+    ? Reflect.get(value, key)
+    : undefined
+
+const isSdkCompatibilityRpcOperation = (channel: string, args: readonly unknown[]): boolean => {
+  switch (channel) {
+    case 'sessions:export-package':
+      return typeof args[1] === 'string' && args[1].trim().length > 0
+    case 'sessions:import-package':
+      return (
+        typeof args[1] === 'string' &&
+        args[1].trim().length > 0 &&
+        objectField(args[2], 'nonInteractive') === true
+      )
+    case 'literature:search':
+      return objectField(args[0], 'scope') === 'library'
+    case 'literature:citation-styles':
+      return objectField(args[0], 'kind') === 'list'
+    case 'literature:transact': {
+      const kind = objectField(args[0], 'kind')
+      return typeof kind === 'string' && SDK_LITERATURE_TRANSACTIONS.has(kind)
+    }
+    default:
+      return SDK_COMPATIBILITY_RPC_CHANNELS.has(channel)
+  }
+}
+
 const MIME_TYPES: Record<string, string> = {
   '.css': 'text/css; charset=utf-8',
   '.html': 'text/html; charset=utf-8',
@@ -142,6 +193,7 @@ type WebServerOptions = {
   host: string
   port: number
   token: string
+  taskToken?: string
   staticRoot: string
   applicationCommands: Pick<ApplicationCommandComposition, 'localWeb' | 'remoteWeb'>
   applicationEvents: ApplicationEventSource
@@ -1676,6 +1728,9 @@ const serveStatic = async (
 }
 
 const startWebHttpServer = async (options: WebServerOptions): Promise<RunningWebServer> => {
+  if (options.taskToken === options.token) {
+    throw new Error('Task and Web credentials must be distinct.')
+  }
   const sockets = new Set<WebSocket>()
   const outboundBudget = createWebSocketFrameBudget()
   const senders = new WeakMap<WebSocket, ReturnType<typeof createWebSocketFrameSender>>()
@@ -1756,11 +1811,24 @@ const startWebHttpServer = async (options: WebServerOptions): Promise<RunningWeb
   ): Promise<void> => {
     try {
       const url = new URL(request.url ?? '/', `http://${request.headers.host ?? '127.0.0.1'}`)
+      const isLocal = request.socket.localAddress === options.host
+      const taskAuthenticated = isLocal && authenticateTaskRequest(request, url, options.taskToken)
       const auth =
-        request.socket.localAddress === options.host
+        isLocal && !taskAuthenticated
           ? authenticateRequest(request, url, options.token)
-          : { ok: false, queryToken: false, localBearer: false }
-      let authorized = auth.ok
+          : { ok: false, queryToken: false, localBearer: false, browserCookie: false }
+      if (
+        taskAuthenticated &&
+        !(url.pathname === '/api/bootstrap' && request.method === 'GET') &&
+        !url.pathname.startsWith('/api/v1/') &&
+        !(url.pathname.startsWith('/rpc/') && request.method === 'POST')
+      ) {
+        json(response, 403, {
+          error: { code: 'forbidden', message: 'This endpoint does not accept Task credentials.' }
+        })
+        return
+      }
+      let authorized = auth.ok || taskAuthenticated
       let externalAuthorization: ExternalWebAccessAuthorization | undefined
       if (!authorized && options.externalAccess) {
         const decision = await options.externalAccess.authorizeHttp(request, response, url)
@@ -1806,6 +1874,28 @@ const startWebHttpServer = async (options: WebServerOptions): Promise<RunningWeb
       }
 
       if (url.pathname === '/api/bootstrap' && request.method === 'GET') {
+        const taskCapabilities = options.tasks
+          ? [
+              'permission-prompts-none',
+              ...(!externalAuthorization && options.tasks.supportsSubmissions?.()
+                ? ['durable-submissions']
+                : []),
+              ...(options.tasks.supportsConfigurationOptions?.() ? ['configuration-options'] : []),
+              ...(options.tasks.getSessionHistory ? ['session-history'] : []),
+              ...(!externalAuthorization && options.tasks.supportsRunAttachments?.()
+                ? ['session-run-attachments']
+                : []),
+              ...(options.tasks.startSessionReview ? ['session-reviews'] : []),
+              ...(options.tasks.supportsPendingSessionInteractions?.() &&
+              options.tasks.listPendingSessionInteractions
+                ? ['session-pending-interactions']
+                : [])
+            ]
+          : []
+        if (taskAuthenticated) {
+          json(response, 200, { ...remoteWebBootstrap(options.bootstrap), taskCapabilities })
+          return
+        }
         const rpcChannels = auth.ok
           ? options.applicationCommands.localWeb.commandNames()
           : options.applicationCommands.remoteWeb.commandNames()
@@ -1820,26 +1910,7 @@ const startWebHttpServer = async (options: WebServerOptions): Promise<RunningWeb
             .update('\0')
             .update(clientPrincipalId)
             .digest('hex'),
-          taskCapabilities: options.tasks
-            ? [
-                'permission-prompts-none',
-                ...(!externalAuthorization && options.tasks.supportsSubmissions?.()
-                  ? ['durable-submissions']
-                  : []),
-                ...(options.tasks.supportsConfigurationOptions?.()
-                  ? ['configuration-options']
-                  : []),
-                ...(options.tasks.getSessionHistory ? ['session-history'] : []),
-                ...(!externalAuthorization && options.tasks.supportsRunAttachments?.()
-                  ? ['session-run-attachments']
-                  : []),
-                ...(options.tasks.startSessionReview ? ['session-reviews'] : []),
-                ...(options.tasks.supportsPendingSessionInteractions?.() &&
-                options.tasks.listPendingSessionInteractions
-                  ? ['session-pending-interactions']
-                  : [])
-              ]
-            : [],
+          taskCapabilities,
           rpcProtocolVersion: WEB_RPC_PROTOCOL_VERSION,
           rpcCapabilities: auth.ok ? WEB_RPC_CAPABILITIES : [RUNTIME_PAYLOAD_CAPABILITY],
           rpcChannels,
@@ -1940,6 +2011,15 @@ const startWebHttpServer = async (options: WebServerOptions): Promise<RunningWeb
           webRpcError(response, 404, 'method_not_found', 'Web RPC method not found.')
           return
         }
+        if (taskAuthenticated && !SDK_COMPATIBILITY_RPC_CHANNELS.has(channel)) {
+          webRpcError(
+            response,
+            403,
+            'method_not_found',
+            'Web RPC method unavailable to Task callers.'
+          )
+          return
+        }
         let body: unknown
         try {
           body = await readJsonBody(
@@ -1992,7 +2072,16 @@ const startWebHttpServer = async (options: WebServerOptions): Promise<RunningWeb
           )
           return
         }
-        if (!auth.ok && REMOTE_LOCAL_ONLY_RPC_CHANNELS.has(channel)) {
+        if (taskAuthenticated && !isSdkCompatibilityRpcOperation(channel, parsed.data.args)) {
+          webRpcError(
+            response,
+            403,
+            'method_not_found',
+            'Web RPC operation unavailable to Task callers.'
+          )
+          return
+        }
+        if (externalAuthorization && REMOTE_LOCAL_ONLY_RPC_CHANNELS.has(channel)) {
           webRpcError(
             response,
             403,
@@ -2003,9 +2092,12 @@ const startWebHttpServer = async (options: WebServerOptions): Promise<RunningWeb
         }
         const callerContext = createWebCallerContext(clientId, {
           authorities:
-            auth.localBearer && channel === 'sessions:import-package'
+            (auth.localBearer || taskAuthenticated) && channel === 'sessions:import-package'
               ? ['import-local-package-path']
               : [],
+          ...(!auth.browserCookie && !externalAuthorization
+            ? { principalKind: 'automation' as const, actionOrigin: 'automation' as const }
+            : {}),
           ...(externalAuthorization
             ? {
                 location: 'remote' as const,
@@ -2032,9 +2124,10 @@ const startWebHttpServer = async (options: WebServerOptions): Promise<RunningWeb
         response.once('close', releaseDisconnectedClient)
         try {
           assertExternalAuthorizationCurrent(externalAuthorization)
-          const dispatcher = auth.ok
-            ? options.applicationCommands.localWeb
-            : options.applicationCommands.remoteWeb
+          const dispatcher =
+            auth.ok || taskAuthenticated
+              ? options.applicationCommands.localWeb
+              : options.applicationCommands.remoteWeb
           const result = await commandClient.invoke(
             dispatcher,
             channel,
@@ -2130,16 +2223,23 @@ const startWebHttpServer = async (options: WebServerOptions): Promise<RunningWeb
     void (async () => {
       try {
         const url = new URL(request.url ?? '/', `http://${request.headers.host ?? '127.0.0.1'}`)
+        const isLocal = request.socket.localAddress === options.host
+        const taskAuthenticated =
+          isLocal &&
+          url.pathname === '/api/v1/events' &&
+          authenticateTaskRequest(request, url, options.taskToken, true)
         const auth =
-          request.socket.localAddress === options.host
+          isLocal && !taskAuthenticated
             ? authenticateRequest(request, url, options.token)
             : { ok: false, queryToken: false }
         const externalAuthorization =
-          !auth.ok && options.externalAccess
+          !auth.ok && !taskAuthenticated && options.externalAccess
             ? await options.externalAccess.authorizeWebSocket(request, url)
             : undefined
         if (
-          (!auth.ok && (!externalAuthorization || !externalAuthorization.isCurrent())) ||
+          (!auth.ok &&
+            !taskAuthenticated &&
+            (!externalAuthorization || !externalAuthorization.isCurrent())) ||
           !['/events', '/api/v1/events'].includes(url.pathname)
         ) {
           socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n')

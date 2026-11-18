@@ -5,7 +5,12 @@ import type { IncomingMessage } from 'node:http'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { authenticateRequest, loadOrCreateWebToken } from './auth'
+import {
+  authenticateRequest,
+  authenticateTaskRequest,
+  loadOrCreateTaskToken,
+  loadOrCreateWebToken
+} from './auth'
 
 const dirs: string[] = []
 
@@ -25,6 +30,45 @@ describe('web authentication', () => {
     expect(first).toHaveLength(43)
     expect(second).toBe(first)
     expect((await readFile(join(dir, 'web-token'), 'utf8')).trim()).toBe(first)
+  })
+
+  it('creates a distinct Task credential without changing the Web credential', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'open-science-task-auth-'))
+    dirs.push(dir)
+    const web = await loadOrCreateWebToken(dir)
+    const task = await loadOrCreateTaskToken(dir)
+    expect(task).toHaveLength(43)
+    expect(task).not.toBe(web)
+    expect(await loadOrCreateTaskToken(dir)).toBe(task)
+    expect((await readFile(join(dir, 'task-token'), 'utf8')).trim()).toBe(task)
+    expect((await readFile(join(dir, 'web-token'), 'utf8')).trim()).toBe(web)
+  })
+
+  it('requires a Task bearer except for a public event handshake', () => {
+    const token = 'task-credential'
+    const host = '127.0.0.1:44100'
+    const endpoint = new URL(`http://${host}/api/v1/events?token=${token}`)
+    expect(authenticateTaskRequest(request({ host }), endpoint, token)).toBe(false)
+    expect(authenticateTaskRequest(request({ host }), endpoint, token, true)).toBe(true)
+    expect(
+      authenticateTaskRequest(
+        request({ host, cookie: `open_science_web_token=${token}` }),
+        new URL(`http://${host}/api/bootstrap`),
+        token
+      )
+    ).toBe(false)
+    expect(
+      authenticateTaskRequest(
+        request({
+          host,
+          origin: 'https://different.example',
+          authorization: `Bearer ${token}`
+        }),
+        endpoint,
+        token,
+        true
+      )
+    ).toBe(false)
   })
 
   it.runIf(process.platform !== 'win32')(

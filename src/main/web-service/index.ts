@@ -12,7 +12,7 @@ import type { TaskControlPorts } from '../tasks/task-control-ports'
 import { FileTaskRunJournal, type TaskRunJournal } from '../tasks/task-run-journal'
 import type { TaskAgentPort, TaskComputePreferencePort } from '../tasks/task-runner'
 import { projectTaskRuntimeEvents } from './application-event-projections'
-import { loadOrCreateWebToken } from './auth'
+import { loadOrCreateTaskToken, loadOrCreateWebToken } from './auth'
 import type { ExternalWebAccess } from './external-access-contract'
 import { startWebHttpServer, type RunningWebServer } from './http-server'
 import { removeWebServiceState, writeWebServiceState, type WebServiceState } from './state-file'
@@ -51,6 +51,7 @@ export type WebServiceControllerDeps = {
   startServer: (options: Parameters<typeof startWebHttpServer>[0]) => Promise<RunningWebServer>
   resolveConfigRoot: () => string
   loadWebToken: (configRoot: string) => Promise<string>
+  loadTaskToken: (configRoot: string) => Promise<string>
   writeState: (configRoot: string, state: Omit<WebServiceState, 'configRoot'>) => Promise<unknown>
   removeState: (configRoot: string) => Promise<void>
   createTaskRunJournal: (configRoot: string) => TaskRunJournal
@@ -101,6 +102,7 @@ const createWebServiceController = (
   const startServer = deps.startServer ?? startWebHttpServer
   const getConfigRoot = deps.resolveConfigRoot ?? resolveConfigRoot
   const loadWebToken = deps.loadWebToken ?? loadOrCreateWebToken
+  const loadTaskToken = deps.loadTaskToken ?? loadOrCreateTaskToken
   const writeState = deps.writeState ?? writeWebServiceState
   const removeState = deps.removeState ?? removeWebServiceState
   const createTaskRunJournal = deps.createTaskRunJournal ?? ((root) => new FileTaskRunJournal(root))
@@ -191,12 +193,14 @@ const createWebServiceController = (
   const start = async (port: number, attached: boolean): Promise<{ port: number; url: string }> => {
     const configRoot = getConfigRoot()
     const token = await loadWebToken(configRoot)
+    const taskToken = await loadTaskToken(configRoot)
     const info = appInfo()
     const server = await startServer({
       host: '127.0.0.1',
       fetchPreview,
       port,
       token,
+      taskToken,
       staticRoot: join(info.appPath, 'out', 'web'),
       applicationCommands: {
         localWeb: applicationCommands.localWeb,
@@ -240,7 +244,8 @@ const createWebServiceController = (
         port: server.port,
         startedAt: new Date().toISOString(),
         appVersion: info.appVersion,
-        attached
+        attached,
+        taskCredentialVersion: 1
       })
     } catch (error) {
       await closeRunning()

@@ -5,15 +5,16 @@ import { dirname, join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 
 const TOKEN_FILE = 'web-token'
+const TASK_TOKEN_FILE = 'task-token'
 const COOKIE_NAME = 'open_science_web_token'
 
 const hasErrorCode = (error: unknown, code: string): boolean =>
   error instanceof Error && 'code' in error && error.code === code
 
-const newWebToken = (): string => randomBytes(32).toString('base64url')
+const newToken = (): string => randomBytes(32).toString('base64url')
 
-const loadOrCreateWebToken = async (configRoot: string): Promise<string> => {
-  const tokenPath = join(configRoot, TOKEN_FILE)
+const loadOrCreateToken = async (configRoot: string, filename: string): Promise<string> => {
+  const tokenPath = join(configRoot, filename)
   await mkdir(dirname(tokenPath), { recursive: true })
 
   for (;;) {
@@ -23,7 +24,7 @@ const loadOrCreateWebToken = async (configRoot: string): Promise<string> => {
     } catch (error) {
       if (!hasErrorCode(error, 'ENOENT')) throw error
 
-      const token = newWebToken()
+      const token = newToken()
       try {
         tokenFile = await open(
           tokenPath,
@@ -53,9 +54,9 @@ const loadOrCreateWebToken = async (configRoot: string): Promise<string> => {
       try {
         const writableIdentity = await writableTokenFile.stat()
         if (writableIdentity.dev !== identity.dev || writableIdentity.ino !== identity.ino) {
-          throw new Error('Web token file changed while it was being opened.')
+          throw new Error('Credential file changed while it was being opened.')
         }
-        const token = newWebToken()
+        const token = newToken()
         await writableTokenFile.chmod(0o600)
         await writableTokenFile.truncate(0)
         await writableTokenFile.write(`${token}\n`, 0, 'utf8')
@@ -68,6 +69,12 @@ const loadOrCreateWebToken = async (configRoot: string): Promise<string> => {
     }
   }
 }
+
+const loadOrCreateWebToken = (configRoot: string): Promise<string> =>
+  loadOrCreateToken(configRoot, TOKEN_FILE)
+
+const loadOrCreateTaskToken = (configRoot: string): Promise<string> =>
+  loadOrCreateToken(configRoot, TASK_TOKEN_FILE)
 
 const safeEqual = (left: string | undefined, right: string): boolean => {
   if (!left) return false
@@ -112,13 +119,17 @@ const isAllowedOrigin = (request: IncomingMessage): boolean => {
   }
 }
 
+const bearerToken = (request: IncomingMessage): string | undefined => {
+  const authorization = request.headers.authorization
+  return authorization?.startsWith('Bearer ') ? authorization.slice(7) : undefined
+}
+
 const authenticateRequest = (
   request: IncomingMessage,
   url: URL,
   token: string
-): { ok: boolean; queryToken: boolean; localBearer: boolean } => {
-  const authorization = request.headers.authorization
-  const bearer = authorization?.startsWith('Bearer ') ? authorization.slice(7) : undefined
+): { ok: boolean; queryToken: boolean; localBearer: boolean; browserCookie: boolean } => {
+  const bearer = bearerToken(request)
   const query = url.searchParams.get('token') ?? undefined
   const ok =
     isLoopbackHost(request.headers.host) &&
@@ -127,9 +138,24 @@ const authenticateRequest = (
   return {
     ok,
     queryToken: safeEqual(query, token),
-    localBearer: ok && bearer !== undefined && request.headers.origin === undefined
+    localBearer: ok && bearer !== undefined && request.headers.origin === undefined,
+    browserCookie: ok && bearer === undefined && query === undefined
   }
 }
+
+const authenticateTaskRequest = (
+  request: IncomingMessage,
+  url: URL,
+  token: string | undefined,
+  allowQuery = false
+): boolean =>
+  token !== undefined &&
+  isLoopbackHost(request.headers.host) &&
+  isAllowedOrigin(request) &&
+  safeEqual(
+    bearerToken(request) ?? (allowQuery ? (url.searchParams.get('token') ?? undefined) : undefined),
+    token
+  )
 
 const persistAuthCookie = (response: ServerResponse, token: string): void => {
   response.setHeader(
@@ -138,4 +164,12 @@ const persistAuthCookie = (response: ServerResponse, token: string): void => {
   )
 }
 
-export { authenticateRequest, loadOrCreateWebToken, persistAuthCookie, TOKEN_FILE }
+export {
+  authenticateRequest,
+  authenticateTaskRequest,
+  loadOrCreateTaskToken,
+  loadOrCreateWebToken,
+  persistAuthCookie,
+  TASK_TOKEN_FILE,
+  TOKEN_FILE
+}

@@ -8,6 +8,7 @@ export const DEV_CONFIG_DIR = '.open-science-project'
 export const PROD_CONFIG_DIR = '.open-science'
 export const STATE_FILE = 'web-service.json'
 export const TOKEN_FILE = 'web-token'
+export const TASK_TOKEN_FILE = 'task-token'
 
 const exists = async (path) => {
   try {
@@ -63,3 +64,6 @@ export const findServiceState = async (options = {}) => {
 
 export const readWebToken = async (configRoot) =>
   (await readFile(join(configRoot, TOKEN_FILE), 'utf8')).trim()
+
+export const readTaskToken = async (configRoot) =>
+  (await readFile(join(configRoot, TASK_TOKEN_FILE), 'utf8')).trim()
