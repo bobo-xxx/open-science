@@ -1,7 +1,16 @@
+import type { ComputeExecutionMode } from '@aipoch/compute'
 import type { ArtifactFile } from './artifacts'
-import type { PermissionProfileId } from './permission-profiles'
+import type { ConfiguredModelCatalogEntry } from './configured-model-catalog'
+import type { ReasoningEffort } from './model-preference-contract'
+import type { PermissionProfileId, SessionPermissionProfileState } from './permission-profiles'
 import type { CreateProjectRequest, Project, UpdateProjectRequest } from './projects'
-import type { ReviewLifecycle, ReviewOutcome, ReviewRunNotStartedReason } from './reviewer'
+import type {
+  CheckStatus,
+  FindingResolution,
+  ReviewLifecycle,
+  ReviewOutcome,
+  ReviewRunNotStartedReason
+} from './reviewer'
 import type {
   ProjectSessionDefaults,
   SessionAgentConfigurationPatch,
@@ -13,6 +22,10 @@ import type {
 import type { DelegationPolicy, PersistedSessionStatus } from './session-persistence'
 import type { ActivePlanProjection } from './session-plan/contract'
 import type {
+  PersistedMessageStatus,
+  PersistedToolActivityStatus
+} from './session-message-contract'
+import type {
   AgentFrameworkId,
   ProviderReadinessReason,
   ReadinessStatus,
@@ -20,12 +33,94 @@ import type {
   SubagentModelConfiguration
 } from './settings'
 
+export type TaskSessionHistoryAttachment = {
+  id: string
+  versionId?: string
+  name: string
+  mimeType?: string
+  size: number
+}
+
+export type TaskSessionHistoryMessage = {
+  id: string
+  role: 'user' | 'agent'
+  content: string
+  status: PersistedMessageStatus
+  createdAt: number
+  updatedAt: number
+  responseToMessageId?: string
+  artifactIds?: string[]
+  attachments?: TaskSessionHistoryAttachment[]
+}
+
+export type TaskSessionHistoryActivity = {
+  id: string
+  title: string
+  status: PersistedToolActivityStatus
+  createdAt: number
+  updatedAt: number
+  promptMessageId?: string
+}
+
+export type TaskSessionHistoryPage = {
+  projectId: string
+  sessionId: string
+  revision: number
+  messageBranchId?: string
+  messages: TaskSessionHistoryMessage[]
+  activities: TaskSessionHistoryActivity[]
+  hasMore: boolean
+  beforeCursor?: string
+}
+
 export type TaskAgentRuntime = Readonly<{
   framework: AgentFrameworkId
   status: ReadinessStatus
   version?: string
   source?: 'managed' | 'external'
 }>
+
+export type TaskConfigurationOptions = Readonly<{
+  defaults: Readonly<{
+    framework: AgentFrameworkId
+    providerId?: string
+    model?: string
+    reasoningEffort: ReasoningEffort
+    permissionProfile: PermissionProfileId
+  }>
+  models: ReadonlyArray<
+    Pick<
+      ConfiguredModelCatalogEntry,
+      | 'providerId'
+      | 'providerName'
+      | 'label'
+      | 'selectable'
+      | 'supportsImageInput'
+      | 'unavailableReason'
+    > & { model?: string; reasoningEfforts: readonly ReasoningEffort[] }
+  >
+  skills: ReadonlyArray<
+    Readonly<{
+      id: string
+      name: string
+      displayName: string
+      enabled: boolean
+      available: boolean
+      unavailableReason?: 'identity-conflict'
+    }>
+  >
+  specialists: ReadonlyArray<Readonly<{ id: string; name: string; displayName?: string }>>
+  computeHosts: ReadonlyArray<
+    Readonly<{ providerId: string; displayName: string; executionMode: ComputeExecutionMode }>
+  >
+}>
+
+export type TaskSessionRuntimePermission = Readonly<
+  Pick<
+    SessionPermissionProfileState,
+    'selectedProfile' | 'effectiveProfile' | 'autoReviewStrategy' | 'fullAccessAvailable'
+  >
+>
 
 export type TaskDoctorReport = Readonly<{
   ready: boolean
@@ -55,6 +150,8 @@ export type TaskSubmission = {
   error?: { code: string; message: string }
 }
 
+export type TaskRunAttachment = { id: string; name: string; size: number; expiresAt: number }
+
 export type TaskRunStatus = 'running' | 'completed' | 'failed' | 'cancelled'
 
 export type TaskRunFailureCode = 'process_restarted'
@@ -82,6 +179,7 @@ export type TaskRunProgressEvent = {
 export type TaskRunIdentity = Pick<TaskRunProgressEvent, 'runId' | 'sessionId' | 'projectId'>
 
 export type StartTaskRunRequest = {
+  attachmentIds?: string[]
   /** Project ID. The external field name remains `project`. */
   project: string
   prompt: string
@@ -113,6 +211,50 @@ export type TaskRunReview = {
   lifecycle?: ReviewLifecycle
   outcome?: ReviewOutcome | null
   errorMessage?: string
+}
+
+export type TaskSessionReviewQuery = {
+  projectId: string
+  turnMessageId?: string
+  messageBranchId?: string
+}
+
+export type TaskStartSessionReviewRequest = TaskSessionReviewQuery & {
+  turnMessageId: string
+  allowCorrections?: boolean
+}
+
+export type TaskRerunSessionReviewRequest = {
+  projectId: string
+  allowCorrections?: boolean
+}
+
+export type TaskSessionReviewStart =
+  { started: true; reviewId: string } | { started: false; reason: ReviewRunNotStartedReason }
+
+export type TaskSessionReview = {
+  id: string
+  projectId: string
+  sessionId: string
+  turnMessageId: string
+  scopeTurnMessageId: string
+  messageBranchId?: string
+  lifecycle: ReviewLifecycle
+  outcome: ReviewOutcome | null
+  errorMessage?: string
+  model: string
+  stale?: boolean
+  verificationUnavailable?: boolean
+  createdAt: number
+  updatedAt: number
+  checks: Array<{
+    id: string
+    status: CheckStatus
+    claim: string
+    evidence: string
+    artifactVersionId?: string
+    resolution: FindingResolution
+  }>
 }
 
 export type TaskPlanResponseRequest =
@@ -178,6 +320,8 @@ export type TaskSessionConfiguration = Readonly<{
   revision: number
   cwd: string
   specialistId?: string
+  /** Current enforcement strategy when the session has an attached runtime. */
+  runtimePermission?: TaskSessionRuntimePermission
   persisted: Readonly<{
     agentConfiguration?: SessionAgentConfigurationValue
     permissionProfile?: PermissionProfileId
@@ -266,6 +410,10 @@ export type AcquiredTaskArtifact = {
 }
 
 export type TaskApiErrorCode =
+  | 'attachment_staging_unavailable'
+  | 'attachment_not_found'
+  | 'configuration_options_unavailable'
+  | 'session_history_cursor_stale'
   | 'submission_conflict'
   | 'submission_unavailable'
   | 'submission_not_found'
@@ -280,5 +428,6 @@ export type TaskApiErrorCode =
   | 'session_archived'
   | 'project_archived'
   | 'run_not_found'
+  | 'review_not_found'
   | 'artifact_not_found'
   | 'specialist_not_found'

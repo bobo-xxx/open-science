@@ -24,6 +24,7 @@ import {
   type CorrectionResume
 } from './correction-resume'
 import { flagStaleReviews } from './stale-reviews'
+import { isReviewTurnStartingMessage, resolveReviewTurnProjection } from './scope'
 import { ReviewRepository } from './repository'
 import type { ReviewerAcpRuntime } from './acp-runtime'
 import type { SessionAuxiliaryTurnUsageRecord } from '../session-persistence/auxiliary-turn-usage'
@@ -446,6 +447,12 @@ const createReviewerCommandOwner = (options: ReviewerIpcOptions): ReviewerComman
     const inFlightKey = `${projectId}\0${sessionId}\0${turnMessageId}`
     const existingStart = inFlightReviewStarts.get(inFlightKey)
     if (existingStart) {
+      if (request.taskExplicit) {
+        // A concurrent request may target a different branch or have enabled corrections.
+        // The task transport coalesces exact retries before they reach this owner.
+        projectAdmission.release()
+        return { started: false, reason: 'already-in-flight' }
+      }
       log.info('review joined: already in flight for this turn', { sessionId, turnMessageId })
       return await existingStart.promise.then((result) => {
         projectAdmission.release()
@@ -536,9 +543,58 @@ const createReviewerCommandOwner = (options: ReviewerIpcOptions): ReviewerComman
       return finishBeforeBackground({ started: false, reason: 'run-failed' })
     }
 
-    let agentTarget
+    let resolvedScopeBranchId = scopeMessageBranchId
+    if (request.taskExplicit) {
+      const auditedTurnId = scopeTurnMessageId ?? turnMessageId
+      const projection = resolveReviewTurnProjection(session, auditedTurnId, scopeMessageBranchId)
+      const graph = session.conversationGraph
+      const activePromptMessageId = session.activeRun?.promptMessageId
+      const completedAnswer = (id: string): boolean => {
+        const index = projection.messages.findIndex((message) => message.id === id)
+        const answer = projection.messages[index]
+        if (answer?.role !== 'agent' || answer.status !== 'complete' || answer.interrupted) {
+          return false
+        }
+        const anchor = projection.messages.slice(0, index).findLast(isReviewTurnStartingMessage)
+        if (
+          !anchor ||
+          anchor.interrupted ||
+          (anchor.turnOutcome !== undefined && anchor.turnOutcome.kind !== 'completed') ||
+          activePromptMessageId === anchor.id
+        ) {
+          return false
+        }
+        for (const message of projection.messages.slice(index + 1)) {
+          if (isReviewTurnStartingMessage(message)) break
+          if (message.role === 'agent') return false
+        }
+        return true
+      }
+      if (
+        session.projectId !== projectId ||
+        session.archivedAt !== undefined ||
+        (scopeMessageBranchId !== undefined &&
+          projection.messageBranchId !== scopeMessageBranchId) ||
+        (graph && projection.agentFrameId !== graph.rootFrameId) ||
+        !completedAnswer(turnMessageId) ||
+        !completedAnswer(auditedTurnId) ||
+        (mainSessionId !== undefined &&
+          (mainSessionId !== session.id ||
+            (graph &&
+              projection.messageBranchId !==
+                graph.frames.find((frame) => frame.id === graph.rootFrameId)?.activeBranchId)))
+      ) {
+        return finishBeforeBackground({ started: false, reason: 'invalid-scope' })
+      }
+      resolvedScopeBranchId = projection.messageBranchId
+    }
+
+    let agentTarget: Awaited<ReturnType<SessionAgentTargetResolver>> | undefined
     try {
-      agentTarget = await options.resolveSessionAgentTarget?.(session)
+      if (!request.taskExplicit || mainSessionId !== undefined) {
+        // Assessment-only SDK requests do not change the Main Agent binding.
+        agentTarget = await options.resolveSessionAgentTarget?.(session)
+      }
       if (
         agentTarget &&
         options.saveSessionAgentConfiguration &&
@@ -654,20 +710,25 @@ const createReviewerCommandOwner = (options: ReviewerIpcOptions): ReviewerComman
       reviewSettlements.set(effectiveMainSessionKey, settlements)
       let releaseFixLoop: (() => void) | undefined
       let fixLoopBroadcastStarted = false
+      let admittedSession = request.taskExplicit ? session : undefined
 
       void runReview({
         correctionResume,
         sessionId,
         turnMessageId,
         scopeTurnMessageId,
-        scopeMessageBranchId,
+        scopeMessageBranchId: resolvedScopeBranchId,
         evidenceScope,
         projectId,
         mainSessionId,
         model: modelAdmission.model,
-        // Reload on every orchestrator request. In particular, the post-correction read must observe
-        // the newly persisted [Auditor] and agent messages instead of the review-start snapshot.
-        getSession: loadCurrentSession,
+        // The first assessment uses the snapshot whose exact branch and turn were admitted.
+        // Correction and legacy calls read the latest Session to observe changes after admission.
+        getSession: async () => {
+          const initial = admittedSession
+          admittedSession = undefined
+          return initial ?? loadCurrentSession()
+        },
         reviewRepository,
         runSessionMutation: options.withSessionMutation
           ? (mutation) => options.withSessionMutation!(projectId, sessionId, mutation)
@@ -696,7 +757,10 @@ const createReviewerCommandOwner = (options: ReviewerIpcOptions): ReviewerComman
             }
           : {}),
         reviewerMcpEntryPath: options.mcpEntryPath,
-        onStarted: () => inFlightStart.resolve({ started: true }),
+        onStarted: (reviewId) =>
+          inFlightStart.resolve(
+            request.taskExplicit ? { started: true, reviewId } : { started: true }
+          ),
         onReviewUpdate: (review: ReviewWithChecks) => {
           broadcastReviewUpdate({ review })
         },

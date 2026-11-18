@@ -40,7 +40,7 @@ const SESSION_REFRESH_POLL_MS = 50
 // Options for the Phase 3 fix loop.
 type ReviewerFixLoopOptions = {
   resumeCorrection?: { promptMessageId: string; turnMessageId: string; round: number }
-  onAssessmentStarted?: () => void
+  onAssessmentStarted?: (reviewId: string) => void
   sessionId: string
   // The original turn's message id (shared across all Review rows in this closure).
   originalTurnMessageId: string

@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { afterEach, expect, it, vi } from 'vitest'
 import { TaskSubmissions } from './task-submissions'
 import { writeDurableJsonFile } from '@aipoch/durable-files'
-import type { TaskRun } from '../../shared/task-api'
+import type { StartTaskRunRequest, TaskRun } from '../../shared/task-api'
 
 vi.mock('@aipoch/durable-files', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@aipoch/durable-files')>()
@@ -36,8 +36,10 @@ const run: TaskRun = {
 
 it('persists admission before slow preparation and deduplicates across retry and restart', async () => {
   const path = await root()
+  const attachedRequest = { ...request, sessionId: 'session', attachmentIds: ['staged-handle'] }
   let finish!: (run: TaskRun) => void
-  const startRun = vi.fn(async () => {
+  const startRun = vi.fn(async (prepared: StartTaskRunRequest) => {
+    expect(prepared).toEqual(attachedRequest)
     expect(
       JSON.parse(await readFile(join(path, 'task-submissions.json'), 'utf8')).submissions[0].status
     ).toBe('pending')
@@ -46,12 +48,17 @@ it('persists admission before slow preparation and deduplicates across retry and
     })
   })
   const owner = new TaskSubmissions(path, { loadRuns: async () => [], startRun })
-  expect(await owner.submit('request-1', request)).toMatchObject({ status: 'pending' })
-  expect(await owner.submit('request-1', { prompt: 'Research', project: 'project' })).toMatchObject(
-    { status: 'pending' }
-  )
+  expect(await owner.submit('request-1', attachedRequest)).toMatchObject({ status: 'pending' })
+  expect(
+    await owner.submit('request-1', {
+      attachmentIds: ['staged-handle'],
+      sessionId: 'session',
+      prompt: 'Research',
+      project: 'project'
+    })
+  ).toMatchObject({ status: 'pending' })
   await expect(
-    owner.submit('request-1', { ...request, prompt: 'Different' })
+    owner.submit('request-1', { ...attachedRequest, attachmentIds: ['different-handle'] })
   ).rejects.toMatchObject({ code: 'submission_conflict' })
   await vi.waitFor(() => expect(finish).toBeTypeOf('function'))
   finish(run)
@@ -60,12 +67,14 @@ it('persists admission before slow preparation and deduplicates across retry and
   )
   await owner.dispose()
   const restarted = new TaskSubmissions(path, { loadRuns: async () => [run], startRun })
-  expect(await restarted.submit('request-1', request)).toMatchObject({
+  expect(await restarted.submit('request-1', attachedRequest)).toMatchObject({
     status: 'accepted',
     runId: run.id
   })
   expect(startRun).toHaveBeenCalledTimes(1)
-  expect(await readFile(join(path, 'task-submissions.json'), 'utf8')).not.toContain('Research')
+  const journal = await readFile(join(path, 'task-submissions.json'), 'utf8')
+  expect(journal).not.toContain('Research')
+  expect(journal).not.toContain('staged-handle')
 })
 
 it.each([true, false])(

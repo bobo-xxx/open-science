@@ -52,6 +52,46 @@ afterEach(async () => {
 })
 
 describe('OpenScienceClient', () => {
+  it('exposes the runtime version and caller capabilities without its internal bootstrap data', async () => {
+    const fetch = vi.fn(async () =>
+      response(200, {
+        appVersion: '1.2.2',
+        platform: 'win32',
+        configRoot: '/private-profile',
+        taskCapabilities: ['permission-prompts-none', 'future-operation']
+      })
+    )
+    const client = new OpenScienceClient({ baseUrl: 'http://localhost', token: 'test', fetch })
+    await expect(client.getCapabilities()).resolves.toEqual({
+      appVersion: '1.2.2',
+      platform: 'win32',
+      taskCapabilities: ['permission-prompts-none', 'future-operation']
+    })
+    expect(fetch).toHaveBeenCalledOnce()
+  })
+
+  it('tolerates older runtimes that do not advertise task capabilities', async () => {
+    const client = new OpenScienceClient({
+      baseUrl: 'http://localhost',
+      token: 'test',
+      fetch: async () => response(200, { appVersion: '1.0.0' })
+    })
+    await expect(client.getCapabilities()).resolves.toEqual({
+      appVersion: '1.0.0',
+      platform: null,
+      taskCapabilities: []
+    })
+  })
+
+  it('rejects malformed capability metadata', async () => {
+    const client = new OpenScienceClient({
+      baseUrl: 'http://localhost',
+      token: 'test',
+      fetch: async () => response(200, { taskCapabilities: ['durable-submissions', 1] })
+    })
+    await expect(client.getCapabilities()).rejects.toMatchObject({ code: 'invalid_response' })
+  })
+
   it('retains the receipt identity when the deadline expires just after admission', async () => {
     const now = vi.spyOn(Date, 'now').mockReturnValue(0)
     try {
@@ -169,6 +209,70 @@ describe('OpenScienceClient', () => {
     }
   )
 
+  it('passes the project scope and opaque page cursor when reading session history', async () => {
+    const fetch = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ data: { messages: [], activities: [], hasMore: false } }), {
+          status: 200
+        })
+    )
+    const client = new OpenScienceClient({
+      baseUrl: 'http://127.0.0.1:44100',
+      token: 'test',
+      fetch
+    })
+    await expect(
+      client.getSessionHistory('project name', 'session id', {
+        beforeCursor: 'cursor+suffix',
+        limit: 3
+      })
+    ).resolves.toMatchObject({ hasMore: false })
+    expect(fetch).toHaveBeenCalledWith(
+      'http://127.0.0.1:44100/api/v1/projects/project%20name/sessions/session%20id/history?beforeCursor=cursor%2Bsuffix&limit=3',
+      expect.objectContaining({ method: 'GET' })
+    )
+  })
+
+  it('uploads bytes through the scoped endpoint and refuses to drop handles on older servers', async () => {
+    const fetch = vi.fn(
+      async (url: string) =>
+        new Response(
+          JSON.stringify(
+            url.endsWith('/api/bootstrap')
+              ? { taskCapabilities: ['durable-submissions'] }
+              : { data: { id: 'handle' } }
+          ),
+          { status: 200 }
+        )
+    )
+    const client = new OpenScienceClient({
+      baseUrl: 'http://127.0.0.1:44100',
+      token: 'test',
+      fetch
+    })
+    const upload = await client.stageRunAttachment('p', 's', {
+      name: 'input.txt',
+      bytes: new Uint8Array([65])
+    })
+    expect(fetch.mock.calls[0][0]).toBe(
+      'http://127.0.0.1:44100/api/v1/projects/p/sessions/s/run-attachments'
+    )
+    expect(fetch).toHaveBeenNthCalledWith(
+      1,
+      expect.any(String),
+      expect.objectContaining({ method: 'POST', body: '{"name":"input.txt","base64":"QQ=="}' })
+    )
+    const request = { project: 'p', sessionId: 's', prompt: 'Read it.', attachmentIds: [upload.id] }
+    await expect(client.startRun(request)).rejects.toMatchObject({ code: 'unsupported_capability' })
+    await expect(client.submitRun('request-1', request)).rejects.toMatchObject({
+      code: 'unsupported_capability'
+    })
+    expect(fetch.mock.calls.slice(1).map(([url]) => url)).toEqual([
+      'http://127.0.0.1:44100/api/bootstrap',
+      'http://127.0.0.1:44100/api/bootstrap'
+    ])
+  })
+
   it('pins the SDK method inventory including Connector management', () => {
     expect(Object.getOwnPropertyNames(OpenScienceClient.prototype).sort()).toEqual(
       [
@@ -177,6 +281,7 @@ describe('OpenScienceClient', () => {
         'bootstrap',
         'installCli',
         'health',
+        'getCapabilities',
         'listConnectors',
         'getConnector',
         'setConnectorEnabled',
@@ -189,12 +294,15 @@ describe('OpenScienceClient', () => {
         'updateCredential',
         'listProjects',
         'listRuntimes',
+        'listConfigurationOptions',
         'createProject',
         'updateProject',
         'getProjectSessionDefaults',
         'updateProjectSessionDefaults',
         'listSessions',
         'getSession',
+        'getSessionHistory',
+        'stageRunAttachment',
         'getSessionConfiguration',
         'updateSessionConfiguration',
         'callRpc',
@@ -204,6 +312,10 @@ describe('OpenScienceClient', () => {
         'updateAgentRouting',
         'getSessionPlan',
         'respondSessionPlan',
+        'listSessionReviews',
+        'getSessionReview',
+        'startSessionReview',
+        'rerunSessionReview',
         'submitRun',
         'getSubmission',
         'waitForSubmission',
@@ -243,6 +355,7 @@ describe('OpenScienceClient', () => {
 
     await client.doctor()
     await client.listRuntimes()
+    await client.listConfigurationOptions()
     await client.getProjectSessionDefaults('project/1')
     await client.updateProjectSessionDefaults('project/1', {
       expectedUpdatedAt: 2,
@@ -262,6 +375,7 @@ describe('OpenScienceClient', () => {
     expect(fetch.mock.calls.map(([url]) => url)).toEqual([
       'http://127.0.0.1:44100/api/v1/doctor',
       'http://127.0.0.1:44100/api/v1/runtimes',
+      'http://127.0.0.1:44100/api/v1/configuration/options',
       'http://127.0.0.1:44100/api/v1/projects/project%2F1/session-defaults',
       'http://127.0.0.1:44100/api/v1/projects/project%2F1/session-defaults',
       'http://127.0.0.1:44100/api/v1/sessions/session%2F1/config',
@@ -270,6 +384,7 @@ describe('OpenScienceClient', () => {
       'http://127.0.0.1:44100/api/v1/settings/agent-routing'
     ])
     expect(fetch.mock.calls.map(([, options]) => options?.method ?? 'GET')).toEqual([
+      'GET',
       'GET',
       'GET',
       'GET',

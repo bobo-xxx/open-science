@@ -334,11 +334,21 @@ export class SpecialistService {
     throw specialistError(`Runnable Specialist "${name}" not found.`)
   }
 
-  async resolveRunnableByReference(reference: string): Promise<SpecialistView> {
-    const profiles = [
+  private async listReferenceProfiles(): Promise<SpecialistView[]> {
+    return [
       ...(await this.listRunnableCustom()),
       ...(await this.builtinEntries()).map((entry) => this.toBuiltinView(entry))
     ]
+  }
+
+  async listRunnableProfiles(): Promise<SpecialistView[]> {
+    return (await this.listReferenceProfiles()).filter(
+      (profile) => profile.enabled && profile.setupPending !== true
+    )
+  }
+
+  async resolveRunnableByReference(reference: string): Promise<SpecialistView> {
+    const profiles = await this.listReferenceProfiles()
     const byId = profiles.find((profile) => profile.id === reference)
     if (byId) {
       if (!byId.enabled || byId.setupPending === true) {

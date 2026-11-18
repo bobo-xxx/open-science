@@ -213,11 +213,52 @@ export type CredentialView = DeviceCredentialView
 export type CredentialsSnapshot = DeviceCredentialsSnapshot
 
 export type PermissionProfile = 'ask' | 'auto' | 'full'
+export type SessionRuntimePermission = {
+  selectedProfile: PermissionProfile
+  effectiveProfile: PermissionProfile
+  autoReviewStrategy?: 'native' | 'conservative'
+  fullAccessAvailable: boolean
+}
 export type DelegationPolicy = 'allow' | 'deny'
 export type TurnIntent = 'plan-first'
 export type ReasoningEffort = 'default' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 export type AgentFramework =
   'open-science-agent' | 'claude-code' | 'opencode' | 'codex' | 'codebuddy' | 'pi'
+export type ConfigurationOptions = {
+  defaults: {
+    framework: AgentFramework
+    providerId?: string
+    model?: string
+    reasoningEffort: ReasoningEffort
+    permissionProfile: PermissionProfile
+  }
+  models: ReadonlyArray<{
+    providerId: string
+    providerName: string
+    /** Omitted when the provider runtime chooses its default model. */
+    model?: string
+    label: string
+    selectable: boolean
+    supportsImageInput: boolean
+    unavailableReason?: 'framework-incompatible' | 'model-bridge-unsupported'
+    reasoningEfforts: readonly ReasoningEffort[]
+  }>
+  skills: ReadonlyArray<{
+    id: string
+    name: string
+    displayName: string
+    enabled: boolean
+    available: boolean
+    unavailableReason?: 'identity-conflict'
+  }>
+  specialists: ReadonlyArray<{ id: string; name: string; displayName?: string }>
+  computeHosts: ReadonlyArray<{
+    providerId: string
+    displayName: string
+    executionMode:
+      'direct_ssh' | 'slurm' | 'kubernetes' | 'ray_jobs' | 'hugging_face_jobs' | 'modal_sandbox'
+  }>
+}
 export type ReadinessStatus = 'ready' | 'missing' | 'not_ready'
 export type ProviderReadinessReason =
   | 'credential_invalid'
@@ -376,6 +417,61 @@ export type SessionPlan = {
   }
 }
 
+export type SessionReviewScope = { projectId: string }
+
+export type SessionReviewQuery = SessionReviewScope & {
+  turnMessageId?: string
+  messageBranchId?: string
+}
+
+export type StartSessionReviewRequest = SessionReviewQuery & {
+  turnMessageId: string
+  allowCorrections?: boolean
+}
+
+export type RerunSessionReviewRequest = SessionReviewScope & {
+  allowCorrections?: boolean
+}
+
+export type SessionReviewStart =
+  | { started: true; reviewId: string }
+  | {
+      started: false
+      reason:
+        | 'already-in-flight'
+        | 'invalid-scope'
+        | 'not-found'
+        | 'load-failed'
+        | 'run-failed'
+        | 'already-reviewed'
+        | 'idempotency-check-failed'
+    }
+
+export type SessionReview = {
+  id: string
+  projectId: string
+  sessionId: string
+  turnMessageId: string
+  scopeTurnMessageId: string
+  messageBranchId?: string
+  lifecycle: 'running' | 'complete' | 'error'
+  outcome: 'pass' | 'flagged' | null
+  errorMessage?: string
+  model: string
+  stale?: boolean
+  verificationUnavailable?: boolean
+  createdAt: number
+  updatedAt: number
+  checks: Array<{
+    id: string
+    status: 'pass' | 'warn' | 'fail'
+    claim: string
+    evidence: string
+    artifactVersionId?: string
+    resolution: 'open' | 'resolved' | 'unaddressed'
+  }>
+}
+
 export type RunAttention = { kind: 'plan-approval'; plan: SessionPlan }
 
 export type PlanDecisionResponse = {
@@ -457,6 +553,8 @@ export type SessionConfiguration = {
   revision: number
   cwd: string
   specialistId?: string
+  /** Current enforcement strategy when the session has an attached runtime. */
+  runtimePermission?: SessionRuntimePermission
   persisted: {
     agentConfiguration?: AgentConfiguration
     permissionProfile?: PermissionProfile
@@ -551,6 +649,54 @@ export class OpenScienceApiError extends Error {
   correlationId?: string
 }
 
+/** Task protocol features advertised to the current caller by the connected runtime. */
+export type OpenScienceCapabilities = {
+  appVersion: string | null
+  platform: string | null
+  /** A missing ID means the runtime did not advertise that feature to this caller. */
+  taskCapabilities: string[]
+}
+
+export type SessionHistoryAttachment = {
+  id: string
+  versionId?: string
+  name: string
+  mimeType?: string
+  size: number
+}
+
+export type SessionHistoryMessage = {
+  id: string
+  role: 'user' | 'agent'
+  content: string
+  status: 'complete' | 'streaming' | 'error'
+  createdAt: number
+  updatedAt: number
+  responseToMessageId?: string
+  artifactIds?: string[]
+  attachments?: SessionHistoryAttachment[]
+}
+
+export type SessionHistoryActivity = {
+  id: string
+  title: string
+  status: 'pending' | 'in_progress' | 'completed' | 'failed'
+  createdAt: number
+  updatedAt: number
+  promptMessageId?: string
+}
+
+export type SessionHistoryPage = {
+  projectId: string
+  sessionId: string
+  revision: number
+  messageBranchId?: string
+  messages: SessionHistoryMessage[]
+  activities: SessionHistoryActivity[]
+  hasMore: boolean
+  beforeCursor?: string
+}
+
 export class OpenScienceClient {
   constructor(options: {
     baseUrl: string
@@ -560,12 +706,14 @@ export class OpenScienceClient {
     requestTimeoutMs?: number
   })
   health(options?: RequestOptions): Promise<unknown>
+  getCapabilities(options?: RequestOptions): Promise<OpenScienceCapabilities>
   bootstrap(request: BootstrapRequest, options?: RequestOptions): Promise<BootstrapResult>
   installCli(
     options?: RequestOptions
   ): Promise<{ installed: boolean; onPath: boolean; target: string; pathHint?: string }>
   doctor(options?: RequestOptions): Promise<DoctorReport>
   listRuntimes(options?: RequestOptions): Promise<AgentRuntime[]>
+  listConfigurationOptions(options?: RequestOptions): Promise<ConfigurationOptions>
   listConnectors(options?: RequestOptions): Promise<ConnectorsSnapshot>
   getConnector(
     id: string,
@@ -639,6 +787,18 @@ export class OpenScienceClient {
   ): ReturnType<OpenScienceClient['getProjectSessionDefaults']>
   listSessions(projectId?: string, options?: RequestOptions): Promise<Session[]>
   getSession(sessionId: string, options?: RequestOptions): Promise<Session>
+  getSessionHistory(
+    projectId: string,
+    sessionId: string,
+    query?: { beforeCursor?: string; limit?: number },
+    options?: RequestOptions
+  ): Promise<SessionHistoryPage>
+  stageRunAttachment(
+    projectId: string,
+    sessionId: string,
+    input: { name: string; mimeType?: string; bytes: Uint8Array },
+    options?: RequestOptions
+  ): Promise<{ id: string; name: string; size: number; expiresAt: number }>
   getSessionConfiguration(
     sessionId: string,
     options?: RequestOptions
@@ -665,6 +825,28 @@ export class OpenScienceClient {
     request: { framework?: AgentFramework; reviewer?: ModelRouting; subagent?: ModelRouting },
     options?: RequestOptions
   ): Promise<AgentRouting>
+  listSessionReviews(
+    sessionId: string,
+    query: SessionReviewQuery,
+    options?: RequestOptions
+  ): Promise<SessionReview[]>
+  getSessionReview(
+    sessionId: string,
+    reviewId: string,
+    scope: SessionReviewScope,
+    options?: RequestOptions
+  ): Promise<SessionReview>
+  startSessionReview(
+    sessionId: string,
+    request: StartSessionReviewRequest,
+    options?: RequestOptions
+  ): Promise<SessionReviewStart>
+  rerunSessionReview(
+    sessionId: string,
+    reviewId: string,
+    request: RerunSessionReviewRequest,
+    options?: RequestOptions
+  ): Promise<SessionReviewStart>
   getSessionPlan(sessionId: string, options?: RequestOptions): Promise<SessionPlan | null>
   respondSessionPlan(
     sessionId: string,
@@ -698,6 +880,8 @@ export class OpenScienceClient {
       prompt: string
       cwd?: string
       sessionId?: string
+      /** One-use handles staged against this existing session by stageRunAttachment. */
+      attachmentIds?: string[]
       permissionProfile?: PermissionProfile
       skillIds?: string[]
       turnIntent?: TurnIntent

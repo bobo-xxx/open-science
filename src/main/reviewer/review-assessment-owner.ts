@@ -64,14 +64,14 @@ type CommonAssessmentOptions = {
 
 type InitialAssessmentOptions = CommonAssessmentOptions & {
   mode: 'initial'
-  onStarted?: () => void
+  onStarted?: (reviewId: string) => void
   keepFlaggedReviewRunning?: boolean
 }
 
 type TrackedAssessmentOptions = CommonAssessmentOptions & {
   mode: 'tracked'
   resumedSourceFindingIds?: string[]
-  onStarted?: () => void
+  onStarted?: (reviewId: string) => void
   trackedChecks: readonly ReviewCheck[]
 }
 
@@ -281,7 +281,7 @@ export const runReviewAssessment = async (
 
   const runningReview: ReviewWithChecks = { ...review, checks: [], submittedChecks: [] }
   onReviewUpdate?.(runningReview)
-  options.onStarted?.()
+  options.onStarted?.(runningReview.id)
 
   log.info(options.mode === 'tracked' ? 'scoped re-review created' : 'review created', {
     reviewId: review.id,

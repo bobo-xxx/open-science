@@ -55,7 +55,7 @@ export type RunReviewOptions = {
   // Called once the running Review row has been created and pushed — i.e. the review is confirmed to
   // have started. A failure before this point (scope resolution, the DB insert) throws without calling
   // it, so the caller can report started:false and leave the turn retriable.
-  onStarted?: () => void
+  onStarted?: (reviewId: string) => void
   // The project this session belongs to.
   projectId: string
   // Used to resolve the session's persisted data for turn-scope resolution.

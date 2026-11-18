@@ -362,6 +362,8 @@ export type ReviewRunRequest = {
   // bypasses that check so the user can force a fresh review. Defaults to 'manual' when omitted.
   origin?: ReviewRunOrigin
   evidenceScope?: DelegatedReviewEvidenceScope
+  /** Enforces the Task API's explicit root-turn scope and returns the admitted Review id. */
+  taskExplicit?: true
 }
 
 // Distinguishes an automatic post-turn review from a user-initiated one — see ReviewRunRequest.origin.
@@ -399,6 +401,7 @@ export type ReviewSuppressionEvent = ReviewSessionRequest & { clear?: boolean }
 //     duplicate by proceeding on an unverified check.
 export type ReviewRunNotStartedReason =
   | 'already-in-flight'
+  | 'invalid-scope'
   | 'not-found'
   | 'load-failed'
   | 'run-failed'
@@ -412,6 +415,7 @@ export type ReviewRunNotStartedReason =
 export type ReviewRunResult = {
   started: boolean
   reason?: ReviewRunNotStartedReason
+  reviewId?: string
 }
 
 // Navigation intent emitted when the user clicks "Go to transcript" on a warn/fail check.

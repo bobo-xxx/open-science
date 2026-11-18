@@ -91,6 +91,12 @@ import type {
   TaskSessionSummary,
   UpdateTaskProjectRequest
 } from '../../shared/task-api'
+import {
+  MAX_COMPOSER_ATTACHMENTS,
+  toPersistedUploadedAttachment,
+  toRuntimeUploadedAttachment,
+  type UploadedAttachment
+} from '../../shared/uploads'
 import { ArchiveAvailabilityError, archiveAvailabilityMessage } from '../archive/availability-error'
 import { toErrorMessage } from '../error-message'
 import type { TaskRunJournal, TaskRunJournalEntry } from './task-run-journal'
@@ -188,6 +194,7 @@ type TaskAgentResumeSessionRequest = {
 }
 
 type TaskAgentPromptRequest = {
+  attachments?: UploadedAttachment[]
   permissionPrompts?: 'none'
   sessionId: string
   promptMessageId: string
@@ -243,7 +250,16 @@ type TaskReviewerPort = {
   ): Promise<TaskRunReview>
 }
 
+type TaskAttachmentReservation = {
+  finalize(): Promise<UploadedAttachment[]>
+  dispose(): Promise<void>
+}
+
 type TaskRunnerDependencies = {
+  reserveAttachments?: (
+    scope: { projectId: string; sessionId: string },
+    ids: readonly string[]
+  ) => TaskAttachmentReservation
   projects: TaskProjectPort
   sessions: TaskSessionPort
   previewResources: TaskPreviewResourcePort
@@ -1241,6 +1257,21 @@ class TaskRunner {
     if (request.sessionId !== undefined && typeof request.sessionId !== 'string') {
       throw new TaskRunnerError('invalid_request', 'Session id must be a string.')
     }
+    if (
+      request.attachmentIds !== undefined &&
+      (!Array.isArray(request.attachmentIds) ||
+        request.attachmentIds.length > MAX_COMPOSER_ATTACHMENTS ||
+        request.attachmentIds.some((id) => typeof id !== 'string' || id.length !== 36) ||
+        new Set(request.attachmentIds).size !== request.attachmentIds.length)
+    ) {
+      throw new TaskRunnerError(
+        'invalid_request',
+        'Run attachment handles must be unique and valid.'
+      )
+    }
+    if (request.attachmentIds?.length && !request.sessionId) {
+      throw new TaskRunnerError('invalid_request', 'Run attachments require an existing session.')
+    }
     if (request.cwd !== undefined && typeof request.cwd !== 'string') {
       throw new TaskRunnerError('invalid_request', 'Working directory must be a string.')
     }
@@ -1459,11 +1490,31 @@ class TaskRunner {
     if (existing) this.reserveSession(existing.id, runId)
     type PreparedSession = Awaited<ReturnType<TaskRunner['prepareSession']>>
     let accepted: { prepared: PreparedSession; session: PersistedChatSession; run: MutableTaskRun }
+    let attachmentReservation: TaskAttachmentReservation | undefined
     try {
+      if (existing && request.attachmentIds?.length) {
+        if (!this.dependencies.reserveAttachments) {
+          throw new TaskRunnerError(
+            'attachment_staging_unavailable',
+            'Run attachment staging is unavailable.'
+          )
+        }
+        attachmentReservation = this.dependencies.reserveAttachments(
+          { projectId: project.id, sessionId: existing.id },
+          request.attachmentIds
+        )
+      }
       const prepare = (
         requestForPreparation = normalizedRequest
       ): ReturnType<TaskRunner['prepareSession']> =>
-        this.prepareSession(project, existing, requestForPreparation, prompt, userMessageId)
+        this.prepareSession(
+          project,
+          existing,
+          requestForPreparation,
+          prompt,
+          userMessageId,
+          attachmentReservation
+        )
       const acceptPrepared = async (prepared: PreparedSession): Promise<typeof accepted> => {
         this.assertAcceptingRuns()
         let session = prepared.session
@@ -1557,6 +1608,8 @@ class TaskRunner {
         )
       }
       throw error
+    } finally {
+      await attachmentReservation?.dispose()
     }
     const { prepared, session, run } = accepted
     if (this.disposed) {
@@ -1760,7 +1813,8 @@ class TaskRunner {
     existing: PersistedChatSession | undefined,
     request: StartTaskRunRequest,
     prompt: string,
-    userMessageId: string
+    userMessageId: string,
+    attachmentReservation?: TaskAttachmentReservation
   ): Promise<{
     session: PersistedChatSession
     persistOnPromptAdmission: boolean
@@ -1901,6 +1955,10 @@ class TaskRunner {
     }
 
     const userMessage = createUserMessage(userMessageId, prompt, now, request.turnIntent)
+    if (attachmentReservation) {
+      const uploads = await attachmentReservation.finalize()
+      userMessage.uploads = uploads.map(toPersistedUploadedAttachment)
+    }
     const session: PersistedChatSession = existing
       ? {
           ...existing,
@@ -2032,6 +2090,9 @@ class TaskRunner {
     try {
       this.publishProgress(run, 'prompt-dispatched')
       const promptMessageId = session.activeRun!.promptMessageId
+      const attachments = session.messages
+        .find((message) => message.id === promptMessageId)
+        ?.uploads?.map((upload) => toRuntimeUploadedAttachment(upload, session.projectId))
       const provenanceContext = getActiveConversationContext(
         materializeSessionConversationGraph(session).conversationGraph,
         promptMessageId
@@ -2042,6 +2103,7 @@ class TaskRunner {
           promptMessageId,
           provenanceContext,
           text: prompt,
+          ...(attachments?.length ? { attachments } : {}),
           ...(request.permissionPrompts ? { permissionPrompts: request.permissionPrompts } : {}),
           ...(request.turnIntent ? { turnIntent: request.turnIntent } : {}),
           ...(request.skillIds?.length ? { skillIds: request.skillIds } : {}),
@@ -2961,7 +3023,7 @@ class TaskRunner {
   }
 }
 
-export { summarizeSession, TaskRunner, TaskRunnerError }
+export { summarizeSession, taskModelCatalog, TaskRunner, TaskRunnerError }
 export type {
   TaskAgentCreateSessionRequest,
   TaskAgentPort,
@@ -2970,6 +3032,7 @@ export type {
   TaskAgentResumeSessionRequest,
   TaskAgentSession,
   TaskArtifactPort,
+  TaskAttachmentReservation,
   TaskComputePreferencePort,
   TaskPreviewResourcePort,
   TaskProjectPort,

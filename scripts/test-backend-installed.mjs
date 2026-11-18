@@ -107,6 +107,18 @@ try {
   assert.equal(detected.credentialStore, 'os')
 
   const client = await connectToOpenScience({ configRoot: root })
+  const { appVersion, platform, taskCapabilities } = await client.getCapabilities()
+  assert.ok(appVersion)
+  assert.equal(platform, process.platform)
+  assert.ok(taskCapabilities.includes('configuration-options'))
+  assert.ok(taskCapabilities.includes('session-history'))
+  assert.ok(
+    (await client.listConfigurationOptions()).models.some(
+      ({ providerId, model, selectable }) =>
+        providerId === provider.id && model === 'e2e-model' && selectable
+    )
+  )
+  passed('SDK capability and configured model discovery through the installed backend')
   abortEvents = new AbortController()
   const events = client.events({ signal: abortEvents.signal })
   await events.ready
@@ -129,6 +141,10 @@ try {
   )
   assert.equal(task.status, 'completed')
   assert.match(task.output, /Background execution submitted/)
+  const historyPage = await client.getSessionHistory(projectId, task.sessionId)
+  assert.ok(historyPage.messages.some((message) => message.role === 'user'))
+  assert.ok(historyPage.messages.some((message) => message.role === 'agent'))
+  passed('SDK history projection for a task on the installed backend')
   const scope = { projectId, sessionId: task.sessionId, workspaceCwd: task.cwd }
   const first = await rpc('notebook:execute', {
     ...scope,

@@ -176,11 +176,20 @@ type WebServerOptions = {
         | 'submitRun'
         | 'getSubmission'
         | 'getSessionPlan'
+        | 'getSessionHistory'
+        | 'supportsRunAttachments'
+        | 'stageRunAttachment'
         | 'respondSessionPlan'
+        | 'listSessionReviews'
+        | 'getSessionReview'
+        | 'startSessionReview'
+        | 'rerunSessionReview'
         | 'resolveActiveRun'
         | 'getProjectSessionDefaults'
         | 'updateProjectSessionDefaults'
         | 'getSessionConfiguration'
+        | 'listConfigurationOptions'
+        | 'supportsConfigurationOptions'
         | 'updateSessionConfiguration'
         | 'listConnectors'
         | 'getConnector'
@@ -609,12 +618,15 @@ const readJsonBody = async (
 }
 
 const taskErrorStatus = (error: TaskApiError): number => {
-  if (error.code === 'submission_unavailable') return 503
+  if (error.code === 'attachment_staging_unavailable') return 503
+  if (error.code === 'submission_unavailable' || error.code === 'configuration_options_unavailable')
+    return 503
   if (error.code === 'submission_conflict' || error.code === 'session_read_only') return 409
   if (error.code === 'invalid_request') return 400
   if (error.code === 'invalid_configuration') return 400
   if (
     error.code === 'session_busy' ||
+    error.code === 'session_history_cursor_stale' ||
     error.code === 'session_revision_conflict' ||
     error.code === 'project_conflict' ||
     error.code === 'session_archived' ||
@@ -624,6 +636,9 @@ const taskErrorStatus = (error: TaskApiError): number => {
   }
   return 404
 }
+
+const isReviewScopeId = (value: unknown): value is string =>
+  typeof value === 'string' && value.length > 0 && value.length <= 512 && value.trim() === value
 
 const parseTaskPlanResponseRequest = (value: unknown): TaskPlanResponseRequest => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -1062,6 +1077,15 @@ const handleTaskApiRequest = async (
         reply(200, { data })
         return true
       }
+      if (
+        url.pathname === '/api/v1/configuration/options' &&
+        request.method === 'GET' &&
+        tasks.listConfigurationOptions
+      ) {
+        assertExternalAuthorizationCurrent(externalAuthorization)
+        reply(200, { data: await tasks.listConfigurationOptions() })
+        return true
+      }
       const connectorMatch = url.pathname.match(
         /^\/api\/v1\/connectors(?:\/([^/]+)(?:\/(enabled|test))?)?$/
       )
@@ -1300,6 +1324,120 @@ const handleTaskApiRequest = async (
         })
         return true
       }
+      const sessionReviewMatch = url.pathname.match(
+        /^\/api\/v1\/sessions\/([^/]+)\/reviews(?:\/([^/]+)(\/rerun)?)?$/
+      )
+      if (sessionReviewMatch) {
+        const [, encodedSessionId, encodedReviewId, rerun] = sessionReviewMatch
+        const sessionId = decodeURIComponent(encodedSessionId)
+        const reviewId = encodedReviewId ? decodeURIComponent(encodedReviewId) : undefined
+        if (!isReviewScopeId(sessionId) || (reviewId !== undefined && !isReviewScopeId(reviewId))) {
+          throw new TaskApiError('invalid_request', 'Session or Review id is invalid.')
+        }
+        if (
+          request.method === 'GET' &&
+          !rerun &&
+          tasks.listSessionReviews &&
+          tasks.getSessionReview
+        ) {
+          const projectId = url.searchParams.get('projectId')
+          const turnMessageId = url.searchParams.get('turnMessageId') ?? undefined
+          const messageBranchId = url.searchParams.get('messageBranchId') ?? undefined
+          if (
+            !isReviewScopeId(projectId) ||
+            (turnMessageId !== undefined && !isReviewScopeId(turnMessageId)) ||
+            (messageBranchId !== undefined && !isReviewScopeId(messageBranchId))
+          ) {
+            throw new TaskApiError(
+              'invalid_request',
+              'A Project id and valid Review filters are required.'
+            )
+          }
+          assertExternalAuthorizationCurrent(externalAuthorization)
+          const data = reviewId
+            ? await tasks.getSessionReview(sessionId, reviewId, projectId)
+            : await tasks.listSessionReviews(sessionId, {
+                projectId,
+                turnMessageId,
+                messageBranchId
+              })
+          reply(200, { data })
+          return true
+        }
+        if (
+          request.method === 'POST' &&
+          (!reviewId || rerun) &&
+          tasks.startSessionReview &&
+          tasks.rerunSessionReview
+        ) {
+          const body = await readJsonBody(
+            request,
+            response,
+            requestBodyBudgetRegistry,
+            requestBodyClientId
+          )
+          if (!body || typeof body !== 'object' || Array.isArray(body)) {
+            throw new TaskApiError('invalid_request', 'Review request must be a JSON object.')
+          }
+          const { projectId, turnMessageId, messageBranchId, allowCorrections } = body as Record<
+            string,
+            unknown
+          >
+          if (
+            !isReviewScopeId(projectId) ||
+            (allowCorrections !== undefined && typeof allowCorrections !== 'boolean')
+          ) {
+            throw new TaskApiError(
+              'invalid_request',
+              'A Project id and valid correction option are required.'
+            )
+          }
+          assertExternalAuthorizationCurrent(externalAuthorization)
+          type ReviewAdmission = ReturnType<HeadlessTaskApi['startSessionReview']>
+          const admit = (operation: () => ReviewAdmission): ReviewAdmission =>
+            runIdempotentTask(
+              idempotencyRegistry,
+              request,
+              url,
+              callerContext,
+              idempotencyOwnerScope,
+              body,
+              operation
+            )
+          if (reviewId) {
+            if (turnMessageId !== undefined || messageBranchId !== undefined) {
+              throw new TaskApiError(
+                'invalid_request',
+                'A Review rerun uses the original turn and branch.'
+              )
+            }
+            const data = await admit(() =>
+              tasks.rerunSessionReview!(sessionId, reviewId, { projectId, allowCorrections })
+            )
+            reply(data.started ? 202 : 200, { data })
+          } else {
+            if (
+              !isReviewScopeId(turnMessageId) ||
+              (messageBranchId !== undefined && !isReviewScopeId(messageBranchId))
+            ) {
+              throw new TaskApiError(
+                'invalid_request',
+                'A turn message id and valid branch id are required.'
+              )
+            }
+            const data = await admit(() =>
+              tasks.startSessionReview!(sessionId, {
+                projectId,
+                turnMessageId,
+                messageBranchId,
+                allowCorrections
+              })
+            )
+            reply(data.started ? 202 : 200, { data })
+          }
+          return true
+        }
+      }
       const sessionPlanMatch = url.pathname.match(/^\/api\/v1\/sessions\/([^/]+)\/plan$/)
       if (sessionPlanMatch && request.method === 'GET' && tasks.getSessionPlan) {
         assertExternalAuthorizationCurrent(externalAuthorization)
@@ -1353,6 +1491,48 @@ const handleTaskApiRequest = async (
             decodeURIComponent(sessionConfigMatch[1]),
             body
           )
+        })
+        return true
+      }
+      const stageRunAttachmentMatch = url.pathname.match(
+        /^\/api\/v1\/projects\/([^/]+)\/sessions\/([^/]+)\/run-attachments$/
+      )
+      if (stageRunAttachmentMatch && request.method === 'POST' && tasks.stageRunAttachment) {
+        if (callerContext.location !== 'local') {
+          reply(403, {
+            error: { code: 'forbidden', message: 'Run attachments require local access.' }
+          })
+          return true
+        }
+        const body = await readJsonBody(
+          request,
+          response,
+          requestBodyBudgetRegistry,
+          requestBodyClientId
+        )
+        reply(201, {
+          data: await tasks.stageRunAttachment(
+            decodeURIComponent(stageRunAttachmentMatch[1]),
+            decodeURIComponent(stageRunAttachmentMatch[2]),
+            body
+          )
+        })
+        return true
+      }
+      const sessionHistoryMatch = url.pathname.match(
+        /^\/api\/v1\/projects\/([^/]+)\/sessions\/([^/]+)\/history$/
+      )
+      if (sessionHistoryMatch && request.method === 'GET' && tasks.getSessionHistory) {
+        const beforeCursor = url.searchParams.get('beforeCursor')
+        const limit = url.searchParams.get('limit')
+        assertExternalAuthorizationCurrent(externalAuthorization)
+        reply(200, {
+          data: await tasks.getSessionHistory({
+            projectId: decodeURIComponent(sessionHistoryMatch[1]),
+            sessionId: decodeURIComponent(sessionHistoryMatch[2]),
+            ...(beforeCursor !== null ? { beforeCursor } : {}),
+            ...(limit !== null ? { limit: /^\d+$/u.test(limit) ? Number(limit) : NaN } : {})
+          })
         })
         return true
       }
@@ -1619,7 +1799,15 @@ const startWebHttpServer = async (options: WebServerOptions): Promise<RunningWeb
                 'permission-prompts-none',
                 ...(!externalAuthorization && options.tasks.supportsSubmissions?.()
                   ? ['durable-submissions']
-                  : [])
+                  : []),
+                ...(options.tasks.supportsConfigurationOptions?.()
+                  ? ['configuration-options']
+                  : []),
+                ...(options.tasks.getSessionHistory ? ['session-history'] : []),
+                ...(!externalAuthorization && options.tasks.supportsRunAttachments?.()
+                  ? ['session-run-attachments']
+                  : []),
+                ...(options.tasks.startSessionReview ? ['session-reviews'] : [])
               ]
             : [],
           rpcProtocolVersion: WEB_RPC_PROTOCOL_VERSION,

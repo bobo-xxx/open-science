@@ -4056,6 +4056,100 @@ describe('startWebHttpServer', () => {
     }
   )
 
+  it('uses the authenticated SDK review routes and admits an exact retry only once', async () => {
+    const review = {
+      id: 'review/1',
+      projectId: 'project/1',
+      sessionId: 'session/1',
+      turnMessageId: 'turn-1',
+      scopeTurnMessageId: 'turn-1',
+      messageBranchId: 'branch/1',
+      lifecycle: 'running' as const,
+      outcome: null,
+      model: 'reviewer',
+      createdAt: 1,
+      updatedAt: 1,
+      checks: []
+    }
+    const startSessionReview = vi.fn(async () => ({
+      started: true as const,
+      reviewId: review.id
+    }))
+    const rerunSessionReview = vi.fn(async () => ({
+      started: true as const,
+      reviewId: 'review-2'
+    }))
+    const listSessionReviews = vi.fn(async () => [review])
+    const getSessionReview = vi.fn(async () => review)
+    const server = await startTestWebHttpServer({
+      host: '127.0.0.1',
+      port: 0,
+      token: 'test-token',
+      staticRoot: '/unused',
+      rpc: { channels: () => [], invoke: vi.fn() },
+      tasks: {
+        runWithCallerContext,
+        subscribeProgress: vi.fn(() => vi.fn()),
+        listProjects: vi.fn(),
+        createProject: vi.fn(),
+        updateProject: vi.fn(),
+        listSessions: vi.fn(),
+        getSession: vi.fn(),
+        startRun: vi.fn(),
+        getRun: vi.fn(),
+        cancelRun: vi.fn(),
+        listArtifacts: vi.fn(),
+        acquireArtifact: vi.fn(),
+        listSessionReviews,
+        getSessionReview,
+        startSessionReview,
+        rerunSessionReview
+      },
+      bootstrap: {
+        appName: 'Open-Science',
+        appVersion: '0.0.0',
+        configRoot: '/fake/root',
+        platform: 'test',
+        versions: { electron: '1', chrome: '1', node: '1' }
+      }
+    })
+    servers.push(server)
+    const baseUrl = `http://127.0.0.1:${server.port}`
+    const client = new OpenScienceClient({ baseUrl, token: 'test-token' })
+    const scope = { projectId: review.projectId }
+    const request = {
+      ...scope,
+      turnMessageId: review.turnMessageId,
+      messageBranchId: review.messageBranchId
+    }
+    const options = { idempotencyKey: 'review-attempt-1' }
+    const denied = await fetch(`${baseUrl}/api/v1/sessions/session%2F1/reviews`)
+    expect(denied.status).toBe(401)
+    const [first, retry] = await Promise.all([
+      client.startSessionReview(review.sessionId, request, options),
+      client.startSessionReview(review.sessionId, request, options)
+    ])
+    expect(first).toEqual({ started: true, reviewId: review.id })
+    expect(retry).toEqual(first)
+    expect(startSessionReview).toHaveBeenCalledTimes(1)
+    await expect(
+      client.startSessionReview(review.sessionId, { ...request, allowCorrections: true }, options)
+    ).rejects.toMatchObject({ code: 'idempotency_conflict', status: 409 })
+    await expect(client.listSessionReviews(review.sessionId, request)).resolves.toEqual([review])
+    expect(listSessionReviews).toHaveBeenCalledWith(review.sessionId, request)
+    await expect(client.getSessionReview(review.sessionId, review.id, scope)).resolves.toEqual(
+      review
+    )
+    expect(getSessionReview).toHaveBeenCalledWith(review.sessionId, review.id, review.projectId)
+    await expect(
+      client.rerunSessionReview(review.sessionId, review.id, { ...scope, allowCorrections: true })
+    ).resolves.toEqual({ started: true, reviewId: 'review-2' })
+    expect(rerunSessionReview).toHaveBeenCalledWith(review.sessionId, review.id, {
+      ...scope,
+      allowCorrections: true
+    })
+  })
+
   it('keeps remote browser idempotency keys in separate authorized caller scopes', async () => {
     const createProject = vi
       .fn()
@@ -5265,7 +5359,7 @@ describe('Connector Task HTTP routes', () => {
 })
 
 describe('Agent runtime Task HTTP routes', () => {
-  it('serves the runtime list locally without exposing executable paths', async () => {
+  it('serves the runtime and configuration catalogs without exposing executable paths', async () => {
     const settings = {
       claude: { resolvedPath: '/private/claude', version: '2.1.0' },
       opencode: {},
@@ -5299,11 +5393,22 @@ describe('Agent runtime Task HTTP routes', () => {
         }
       }
       if (channel === 'settings:get-settings') return settings
+      if (channel === 'settings:list-skills') return []
       throw new Error(`Unexpected command: ${channel}`)
     })
     const tasks = new HeadlessTaskApi({
       commands: { commandNames: () => [], invoke },
-      agent: {} as never
+      agent: {} as never,
+      controls: {
+        specialists: { resolve: async (id) => ({ id }) },
+        configuration: {
+          listSpecialists: async () => [],
+          listComputeHosts: async () => [
+            { providerId: 'ssh:cluster', displayName: 'Test Cluster', executionMode: 'slurm' }
+          ],
+          runtimePermission: () => undefined
+        }
+      }
     })
     const serverOptions = {
       host: '127.0.0.1',
@@ -5333,6 +5438,15 @@ describe('Agent runtime Task HTTP routes', () => {
       { framework: 'codex', status: 'missing' },
       { framework: 'codebuddy', status: 'missing' }
     ])
+    await expect(client.getCapabilities()).resolves.toMatchObject({
+      taskCapabilities: expect.arrayContaining(['configuration-options'])
+    })
+    await expect(client.listConfigurationOptions()).resolves.toMatchObject({
+      defaults: { framework: 'claude-code', permissionProfile: 'ask' },
+      computeHosts: [
+        { providerId: 'ssh:cluster', displayName: 'Test Cluster', executionMode: 'slurm' }
+      ]
+    })
     await tasks.dispose()
   })
 })

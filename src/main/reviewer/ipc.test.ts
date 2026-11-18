@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ReviewRunRequest, ReviewRunResult, ReviewWithChecks } from '../../shared/reviewer'
 import { REVIEWER_IPC } from '../../shared/reviewer'
+import { createLinearConversationGraph } from '../../shared/conversation-graph'
 import type { PersistedChatSession } from '../../shared/session-persistence'
 import type { AcpRuntime } from '../acp/runtime'
 import { ReviewerProjectRuntimeOwner } from './project-runtime-owner'
@@ -481,6 +482,92 @@ describe('reviewer IPC handlers', () => {
     }
     expect(passed.turnMessageId).toBe('original')
     expect(passed.scopeTurnMessageId).toBe('correction')
+  })
+
+  it('admits an explicit task review only on a completed answer in the specified branch', async () => {
+    const request = { ...createRequest(), taskExplicit: true as const }
+    const messages = [
+      {
+        id: 'completed-prompt',
+        role: 'user' as const,
+        status: 'complete' as const,
+        content: 'Review an earlier result',
+        eventIds: [],
+        createdAt: 1,
+        updatedAt: 1
+      },
+      {
+        id: request.turnMessageId,
+        role: 'agent' as const,
+        status: 'complete' as const,
+        content: 'Completed response',
+        eventIds: [],
+        createdAt: 2,
+        updatedAt: 2
+      },
+      {
+        id: 'unfinished-prompt',
+        role: 'user' as const,
+        status: 'complete' as const,
+        content: 'Start a different analysis',
+        eventIds: [],
+        createdAt: 3,
+        updatedAt: 3
+      },
+      {
+        id: 'unfinished',
+        role: 'agent' as const,
+        status: 'streaming' as const,
+        content: 'Incomplete response',
+        eventIds: [],
+        createdAt: 4,
+        updatedAt: 4
+      }
+    ]
+    const graph = createLinearConversationGraph({
+      sessionId: request.sessionId,
+      messages,
+      createdAt: 1,
+      updatedAt: 4
+    })
+    sessionLoadOne.mockResolvedValue({
+      id: request.sessionId,
+      projectId: request.projectId,
+      messages,
+      conversationGraph: graph
+    })
+    let finishRun!: () => void
+    runReview.mockImplementation((options: { onStarted?: (reviewId: string) => void }) => {
+      options.onStarted?.('review-123')
+      return new Promise<void>((resolve) => {
+        finishRun = resolve
+      })
+    })
+    const resolveSessionAgentTarget = vi.fn()
+    const owner = createReviewerCommandOwner({ acpRuntime, resolveSessionAgentTarget })
+    const branchId = graph.frames[0].activeBranchId
+    await expect(owner.run({ ...request, scopeMessageBranchId: 'other-branch' })).resolves.toEqual({
+      started: false,
+      reason: 'invalid-scope'
+    })
+    await expect(owner.run({ ...request, turnMessageId: 'unfinished' })).resolves.toEqual({
+      started: false,
+      reason: 'invalid-scope'
+    })
+    expect(runReview).not.toHaveBeenCalled()
+    await expect(owner.run(request)).resolves.toEqual({ started: true, reviewId: 'review-123' })
+    try {
+      expect(runReview).toHaveBeenCalledWith(
+        expect.objectContaining({ scopeMessageBranchId: branchId, mainSessionId: undefined })
+      )
+      expect(resolveSessionAgentTarget).not.toHaveBeenCalled()
+      await expect(owner.run({ ...request, mainSessionId: request.sessionId })).resolves.toEqual({
+        started: false,
+        reason: 'already-in-flight'
+      })
+    } finally {
+      finishRun?.()
+    }
   })
 
   it('preserves the historical scope branch when starting a manual rerun', async () => {
@@ -1555,7 +1642,7 @@ describe('Main correction completion ownership', () => {
     let releaseNew!: () => void
     runReview
       .mockImplementationOnce(async (options: Run) => {
-        options.onStarted?.()
+        options.onStarted?.(review.id)
         await options.onFixLoopStart?.()
         await new Promise<void>((resolve) => {
           releaseOld = resolve
@@ -1564,7 +1651,7 @@ describe('Main correction completion ownership', () => {
       })
       .mockImplementationOnce(async (options: Run) => {
         await options.onFixLoopStart?.()
-        options.onStarted?.()
+        options.onStarted?.('assessment')
         await new Promise<void>((resolve) => {
           releaseNew = resolve
         })

@@ -114,6 +114,11 @@ Install the package in your Node.js project (a global CLI install does not make 
 npm install @aipoch/open-science
 ```
 
+Call `client.getCapabilities()` to get the connected application's version, platform, and
+advertised Task capability IDs. Use the IDs to select optional operations, for example
+`taskCapabilities.includes('durable-submissions')`. Older runtimes may return an empty list.
+An advertised feature still depends on the operation's permissions and runtime requirements.
+
 Start and configure the local service as above. Save the example in an `.mjs` file and run it
 with Node.js. It creates a Project and uses its ID for subsequent requests:
 
@@ -156,6 +161,50 @@ await client.updateAgentRouting({
 
 const runtimes = await client.listRuntimes()
 ```
+
+When the server advertises `session-history`, read a Session's visible conversation with
+`getSessionHistory(projectId, sessionId, { limit: 80 })`. The first page starts at the newest end;
+pass its `beforeCursor` for earlier pages. Each page lists messages and activity summaries in
+chronological order. Deduplicate by ID when assembling pages, as a page can include an earlier
+prompt for context. If the server reports `session_history_cursor_stale`, reload the newest page.
+
+The `session-run-attachments` capability adds files to a new turn in an existing Session. Get its
+ID from `listSessions(project.id)` or from `startRun` after creating a Session without attachments.
+The local SDK stages up to 8 MiB per file. A handle is bound to the Project and Session, expires
+after 30 minutes or a service restart, and is consumed by a single admission attempt. Retrying the
+same durable submission request ID returns its existing receipt. For a new attempt after the
+handle was consumed, stage the file again.
+
+```js
+import { readFile } from 'node:fs/promises'
+
+const input = await client.stageRunAttachment(project.id, run.sessionId, {
+  name: 'observations.csv',
+  mimeType: 'text/csv',
+  bytes: await readFile('observations.csv')
+})
+const followUp = await client.startRun({
+  project: project.id,
+  sessionId: run.sessionId,
+  prompt: 'Summarize the observations in this file.',
+  attachmentIds: [input.id]
+})
+console.log(await client.waitForRun(followUp.id))
+```
+
+When the server advertises `configuration-options`, use `client.listConfigurationOptions()` to
+discover selectable models, installed Skills, runnable Specialists, and configured Compute Hosts.
+Use the returned `providerId`, `model`, Skill `id`, Specialist `id`, and Compute Host `providerId`
+in Session, Project-default, or run options where applicable. A model entry without `model` uses the
+provider's own default. Selectability reflects the active framework and configured catalog. It does
+not check live provider credentials or Compute connectivity. The call reports
+`configuration_options_unavailable` when the catalog is unavailable on the connected server.
+
+On an attached Session, `configuration.runtimePermission` shows the current enforcement profile,
+strategy, and full-access availability. `configuration.persisted.permissionProfile` is the saved
+choice and `configuration.effective.permissionProfile` is the configuration selected for execution.
+They can differ from the live runtime state. Without an attached runtime, `runtimePermission` is
+omitted.
 
 Session updates use `revision`; Project-default updates use `updatedAt`. Both reject stale writes.
 Project defaults are copied only when a Session is created, with precedence `startRun` request,
@@ -262,6 +311,33 @@ without returnOnAttention keeps the original terminal-only behavior.
 
 Automatic review and Specialist binding reuse existing Session JSON fields. Delegation adds
 delegationPolicy with values allow or deny; an omitted historical value restores as allow.
+
+When the server advertises `session-reviews`, request an explicit assessment of the final Agent
+message in a completed turn:
+
+```js
+const review = await client.startSessionReview(
+  sessionId,
+  {
+    projectId,
+    turnMessageId: finalAgentMessageId,
+    messageBranchId
+  },
+  { idempotencyKey: 'review-request-1' }
+)
+if (review.started) {
+  const report = await client.getSessionReview(sessionId, review.reviewId, { projectId })
+  console.log(report.lifecycle, report.checks)
+}
+```
+
+`listSessionReviews` filters by grouping turn and branch. `rerunSessionReview` takes an existing
+Review ID and keeps its original grouping turn, audited turn, and branch. A new explicit review
+and a rerun default to assessment only. Pass `allowCorrections: true` to allow the existing
+Reviewer fix loop on the active root branch. Starting a review returns as soon as the Review row
+is admitted. Read by its ID until its lifecycle reaches `complete` or `error`. `already-in-flight`
+means another review already owns the turn. An idempotency key deduplicates exact retries within a
+running server. Read the existing reports before retrying across a server restart.
 
 To stop a still-running task instead of waiting for it, cancel it explicitly. Cancellation waits for
 provider work and application finalization to drain before returning the terminal Run:

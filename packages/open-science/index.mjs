@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/explicit-function-return-type */
 
+import { Buffer } from 'node:buffer'
 import { findServiceState, readWebToken } from './config-root.mjs'
 
 const defaultSleep = (milliseconds) =>
@@ -10,6 +11,7 @@ const PACKAGE_REQUEST_TIMEOUT_MS = 60 * 60 * 1_000
 const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 30_000
 const EVENT_RECONNECT_DELAY_MS = 100
 const MAX_BUFFERED_EVENTS = 1_024
+const MAX_RUN_ATTACHMENT_BYTES = 8 * 1024 * 1024
 const TASK_EVENT_STREAM_PROTOCOL_VERSION = 1
 const NORMAL_EVENT_STREAM_CLOSE_CODES = new Set([1000])
 const FAILED_EVENT_STREAM_CLOSE_CODES = new Set([1002, 1003, 1007, 1008, 1009])
@@ -227,6 +229,30 @@ export class OpenScienceClient {
     )
   }
 
+  async getCapabilities(options) {
+    const bootstrap = await this.health(options)
+    if (!bootstrap || typeof bootstrap !== 'object' || Array.isArray(bootstrap)) {
+      throw new OpenScienceApiError('Invalid Open-Science capability response.', {
+        code: 'invalid_response'
+      })
+    }
+    const advertised = bootstrap.taskCapabilities
+    if (
+      advertised !== undefined &&
+      (!Array.isArray(advertised) ||
+        advertised.some((capability) => typeof capability !== 'string'))
+    ) {
+      throw new OpenScienceApiError('Invalid Open-Science task capabilities.', {
+        code: 'invalid_response'
+      })
+    }
+    return {
+      appVersion: typeof bootstrap.appVersion === 'string' ? bootstrap.appVersion : null,
+      platform: typeof bootstrap.platform === 'string' ? bootstrap.platform : null,
+      taskCapabilities: advertised ?? []
+    }
+  }
+
   bootstrap(request, options) {
     return this.request('/api/v1/bootstrap', { ...options, method: 'POST', body: request })
   }
@@ -241,6 +267,10 @@ export class OpenScienceClient {
 
   listRuntimes(options) {
     return this.request('/api/v1/runtimes', { ...options, method: 'GET' })
+  }
+
+  listConfigurationOptions(options) {
+    return this.request('/api/v1/configuration/options', { ...options, method: 'GET' })
   }
 
   listConnectors(options) {
@@ -352,6 +382,35 @@ export class OpenScienceClient {
     return this.request(`/api/v1/sessions/${encodeURIComponent(sessionId)}`, options)
   }
 
+  getSessionHistory(projectId, sessionId, query = {}, options) {
+    const params = new URLSearchParams()
+    if (query.beforeCursor !== undefined) params.set('beforeCursor', query.beforeCursor)
+    if (query.limit !== undefined) params.set('limit', String(query.limit))
+    const suffix = params.size > 0 ? `?${params}` : ''
+    return this.request(
+      `/api/v1/projects/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(sessionId)}/history${suffix}`,
+      options
+    )
+  }
+
+  stageRunAttachment(projectId, sessionId, { name, mimeType, bytes }, options) {
+    if (
+      !(bytes instanceof Uint8Array) ||
+      !bytes.byteLength ||
+      bytes.byteLength > MAX_RUN_ATTACHMENT_BYTES
+    ) {
+      throw new TypeError('Run attachment bytes must be a non-empty Uint8Array of at most 8 MiB.')
+    }
+    return this.request(
+      `/api/v1/projects/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(sessionId)}/run-attachments`,
+      {
+        ...options,
+        method: 'POST',
+        body: { name, mimeType, base64: Buffer.from(bytes).toString('base64') }
+      }
+    )
+  }
+
   getSessionConfiguration(sessionId, options) {
     return this.request(`/api/v1/sessions/${encodeURIComponent(sessionId)}/config`, options)
   }
@@ -435,6 +494,39 @@ export class OpenScienceClient {
     })
   }
 
+  listSessionReviews(sessionId, query, options) {
+    const params = new URLSearchParams({ projectId: query.projectId })
+    if (query.turnMessageId !== undefined) params.set('turnMessageId', query.turnMessageId)
+    if (query.messageBranchId !== undefined) params.set('messageBranchId', query.messageBranchId)
+    return this.request(`/api/v1/sessions/${encodeURIComponent(sessionId)}/reviews?${params}`, {
+      ...options,
+      method: 'GET'
+    })
+  }
+
+  getSessionReview(sessionId, reviewId, scope, options) {
+    const params = new URLSearchParams({ projectId: scope.projectId })
+    return this.request(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/reviews/${encodeURIComponent(reviewId)}?${params}`,
+      { ...options, method: 'GET' }
+    )
+  }
+
+  startSessionReview(sessionId, request, options) {
+    return this.request(`/api/v1/sessions/${encodeURIComponent(sessionId)}/reviews`, {
+      ...options,
+      method: 'POST',
+      body: request
+    })
+  }
+
+  rerunSessionReview(sessionId, reviewId, request, options) {
+    return this.request(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/reviews/${encodeURIComponent(reviewId)}/rerun`,
+      { ...options, method: 'POST', body: request }
+    )
+  }
+
   getSessionPlan(sessionId, options) {
     return this.request(`/api/v1/sessions/${encodeURIComponent(sessionId)}/plan`, options)
   }
@@ -455,6 +547,14 @@ export class OpenScienceClient {
         'This server does not support durable submission receipts. Update the server before submitting.',
         { code: 'unsupported_capability' }
       )
+    }
+    if (
+      request.attachmentIds !== undefined &&
+      !bootstrap.taskCapabilities?.includes('session-run-attachments')
+    ) {
+      throw new OpenScienceApiError('This server does not support staged Run attachments.', {
+        code: 'unsupported_capability'
+      })
     }
     try {
       return await this.request(`/api/v1/run-submissions/${encodeURIComponent(requestId)}`, {
@@ -511,13 +611,27 @@ export class OpenScienceClient {
 
   async startRun(request, options) {
     const deadline = Date.now() + resolveRequestTimeout(this.requestTimeoutMs, options?.timeoutMs)
-    if (request.permissionPrompts === 'none') {
+    if (
+      request.permissionPrompts === 'none' ||
+      (!options?.requestId && request.attachmentIds !== undefined)
+    ) {
       const bootstrap = await this.health(beforeDeadline(options, deadline))
-      if (!bootstrap.taskCapabilities?.includes('permission-prompts-none')) {
+      if (
+        request.permissionPrompts === 'none' &&
+        !bootstrap.taskCapabilities?.includes('permission-prompts-none')
+      ) {
         throw new OpenScienceApiError(
           'This Open-Science server does not support unattended permission handling. Update the server before starting this run.',
           { code: 'unsupported_capability' }
         )
+      }
+      if (
+        request.attachmentIds !== undefined &&
+        !bootstrap.taskCapabilities?.includes('session-run-attachments')
+      ) {
+        throw new OpenScienceApiError('This server does not support staged Run attachments.', {
+          code: 'unsupported_capability'
+        })
       }
     }
     if (options?.requestId) {

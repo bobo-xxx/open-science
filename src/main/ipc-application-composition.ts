@@ -15,6 +15,7 @@ import { createLocalModelApi } from './local-models/owner'
 import { registerLocalModelIpcHandlers } from './desktop-surface-declarations'
 import { type DiagnosticOperation } from '@aipoch/diagnostics/node'
 import type { ArtifactReproducibilityCheckState } from '../shared/artifact-reproducibility'
+import { externalComputeMode } from '../shared/compute'
 import type { SessionSummary } from '../shared/session-persistence'
 import { type AppIconPreview, type AppIconVariant } from '../shared/settings'
 import type { UploadTransferProgress } from '../shared/uploads'
@@ -1008,6 +1009,33 @@ export const createApplicationModules = async (
       specialists: {
         resolve: (reference) =>
           specialistCatalog.specialistService.resolveRunnableByReference(reference)
+      },
+      configuration: {
+        listSpecialists: async () =>
+          (await specialistCatalog.specialistService.listRunnableProfiles()).map(
+            ({ id, name, displayName }) => ({ id, name, displayName })
+          ),
+        listComputeHosts: async () =>
+          (await computeAdmission.hostRepository.listComputeTargets()).map((host) => ({
+            providerId: host.providerId,
+            displayName: host.displayName,
+            executionMode:
+              externalComputeMode(host.providerId) ??
+              ('executionMode' in host ? host.executionMode : undefined) ??
+              'direct_ssh'
+          })),
+        runtimePermission: (sessionId) => {
+          const snapshot = agentRuntime.runtime.getSnapshot()
+          if (!snapshot.sessionIds.includes(sessionId)) return undefined
+          const permission = snapshot.permissionProfiles[sessionId]
+          if (!permission) return undefined
+          return {
+            selectedProfile: permission.selectedProfile,
+            effectiveProfile: permission.effectiveProfile,
+            autoReviewStrategy: permission.autoReviewStrategy,
+            fullAccessAvailable: permission.fullAccessAvailable
+          }
+        }
       }
     },
     computePreferences: computeAdmission.sessionEnabledComputeHostsOwner,

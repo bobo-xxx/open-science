@@ -6,6 +6,7 @@ import { describe, expect, it, vi, type MockedFunction } from 'vitest'
 
 import type { AcpRuntimeEvent } from '../../shared/acp'
 import type { PersistedChatSession } from '../../shared/session-persistence'
+import type { ProviderView } from '../../shared/settings'
 import type { ApplicationCommandByNameDispatcher } from '../application-command-composition'
 import { createTaskCallerContext, type CallerContext } from '../caller-context'
 import {
@@ -48,7 +49,7 @@ const taskSettings = {
   opencodeManaged: false,
   codebuddyManaged: false,
   codexManaged: false,
-  providers: [],
+  providers: [] as ProviderView[],
   agentFrameworkId: 'claude-code',
   agentFrameworks: [] as { id: string; displayName: string }[],
   reasoningEffort: 'default',
@@ -271,6 +272,287 @@ const createComputePreferenceHarness = (
 }
 
 describe('HeadlessTaskApi adapter', () => {
+  it('pages complete history by scope without returning hidden or storage records', async () => {
+    const message = (id: string, createdAt: number): PersistedChatSession['messages'][number] => ({
+      id,
+      role: 'user' as const,
+      status: 'complete' as const,
+      content: id,
+      eventIds: [],
+      createdAt,
+      updatedAt: createdAt
+    })
+    const session: PersistedChatSession = {
+      id: 'history-session',
+      projectId: project.id,
+      title: 'History',
+      cwd: '/private/project',
+      status: 'idle',
+      createdAt: 1,
+      updatedAt: 3,
+      messages: [
+        message('oldest', 1),
+        { ...message('control', 2), turnIntent: 'save-as-skill' },
+        {
+          ...message('newest', 3),
+          role: 'agent',
+          content: '<think>private reasoning</think>Visible answer',
+          uploads: [
+            {
+              id: 'file-1',
+              sessionId: 'history-session',
+              path: '/private/staging/file.txt',
+              name: 'file.txt',
+              originalName: 'file.txt',
+              size: 8
+            }
+          ]
+        }
+      ]
+    }
+    let revision = 4
+    const api = new HeadlessTaskApi({
+      agent: createAgent(),
+      commands: commandsFrom(async (channel, caller, args) => {
+        expect(channel).toBe('sessions:load-history-page')
+        expect(caller).toEqual(taskCallerContext())
+        expect(args[0]).toMatchObject({ projectId: project.id, sessionId: session.id, limit: 1 })
+        return {
+          projectId: project.id,
+          sessionId: session.id,
+          revision,
+          complete: true,
+          session,
+          hasMore: false,
+          totalItems: session.messages.length
+        }
+      })
+    })
+    const scope = { projectId: project.id, sessionId: session.id, limit: 1 }
+    const newest = await api.getSessionHistory(scope)
+    expect(newest).toMatchObject({
+      revision: 4,
+      hasMore: true,
+      messages: [
+        { id: 'newest', content: 'Visible answer', attachments: [{ id: 'file-1', size: 8 }] }
+      ]
+    })
+    expect(JSON.stringify(newest)).not.toContain('/private/')
+    expect(newest.beforeCursor).toEqual(expect.any(String))
+    const older = await api.getSessionHistory({ ...scope, beforeCursor: newest.beforeCursor })
+    expect(older).toMatchObject({ hasMore: false, messages: [{ id: 'oldest' }] })
+    revision += 1
+    await expect(
+      api.getSessionHistory({ ...scope, beforeCursor: newest.beforeCursor })
+    ).rejects.toMatchObject({ code: 'session_history_cursor_stale' })
+  })
+
+  it('takes Run attachments only in their scoped Session and forwards immutable Versions', async () => {
+    const session: PersistedChatSession = {
+      id: 'attachment-session',
+      projectId: project.id,
+      title: 'Attachment session',
+      cwd: '/workspace/project',
+      status: 'idle',
+      messages: [],
+      createdAt: 1,
+      updatedAt: 1
+    }
+    const pending = {
+      id: 'file-1',
+      sessionId: '__pending__',
+      name: 'input.txt',
+      originalName: 'input.txt',
+      mimeType: 'text/plain',
+      path: '/private/staging/input.txt',
+      size: 4
+    }
+    const finalized = {
+      ...pending,
+      sessionId: session.id,
+      path: 'upload-version:version-1',
+      versionId: 'version-1',
+      versionNumber: 1
+    }
+    const invoke = vi.fn(async (channel: string, _caller: CallerContext, args: unknown[]) => {
+      if (channel === 'projects:list') return [project]
+      if (channel === 'sessions:load-all') {
+        return {
+          sessions: [session, { ...session, id: 'other-session' }],
+          manifest: { version: 1 }
+        }
+      }
+      if (channel === 'uploads:begin-transfer' || channel === 'uploads:delete') return true
+      if (channel === 'uploads:append-transfer') {
+        expect(args[0]).toMatchObject({ offset: 0, chunk: Buffer.from('data') })
+        return true
+      }
+      if (channel === 'uploads:finish-transfer') return pending
+      if (channel === 'uploads:finalize-session') {
+        expect(args).toEqual([
+          { projectId: project.id, sessionId: session.id, attachments: [pending] }
+        ])
+        return [finalized]
+      }
+      if (channel === 'sessions:save-session') {
+        return args[0]
+      }
+      if (channel === 'artifacts:finalize-run') return { ok: true, artifacts: [] }
+      throw new Error(`Unexpected Task command: ${channel}`)
+    })
+    const agent = createAgent({
+      prompt: vi.fn(async (_request, observer) => {
+        await observer?.onPromptAdmitted?.()
+        observer?.onProviderPromptAccepted?.()
+      })
+    })
+    const api = new HeadlessTaskApi({
+      agent,
+      commands: {
+        ...commandsFrom(invoke),
+        commandNames: () => [
+          'uploads:begin-transfer',
+          'uploads:append-transfer',
+          'uploads:finish-transfer',
+          'uploads:abort-transfer',
+          'uploads:finalize-session',
+          'uploads:delete'
+        ]
+      }
+    })
+    try {
+      const attachment = await api.stageRunAttachment(project.id, session.id, {
+        name: 'input.txt',
+        mimeType: 'text/plain',
+        base64: 'ZGF0YQ=='
+      })
+      expect(attachment).toEqual({
+        id: expect.any(String),
+        name: 'input.txt',
+        size: 4,
+        expiresAt: expect.any(Number)
+      })
+      const request = { project: project.id, prompt: 'Read it.', attachmentIds: [attachment.id] }
+      await expect(api.startRun({ ...request, sessionId: 'other-session' })).rejects.toMatchObject({
+        code: 'attachment_not_found'
+      })
+      expect(agent.prompt).not.toHaveBeenCalled()
+      const run = await api.startRun({ ...request, sessionId: session.id })
+      await api.waitForRun(run.id)
+      expect(agent.prompt).toHaveBeenCalledWith(
+        expect.objectContaining({
+          attachments: [
+            expect.objectContaining({
+              versionId: 'version-1',
+              path: `upload-version:${project.id}/${session.id}/file-1/version-1`
+            })
+          ]
+        }),
+        expect.anything()
+      )
+      await expect(api.startRun({ ...request, sessionId: session.id })).rejects.toMatchObject({
+        code: 'attachment_not_found'
+      })
+    } finally {
+      await api.dispose()
+    }
+  })
+
+  it('projects scoped Reviewer findings and runs corrections only on explicit request', async () => {
+    const session: PersistedChatSession = {
+      id: 'reviewed-session',
+      projectId: project.id,
+      title: 'Reviewed session',
+      cwd: '/workspace',
+      status: 'idle',
+      createdAt: 1,
+      updatedAt: 2,
+      messages: []
+    }
+    const review = {
+      id: 'review-1',
+      projectId: project.id,
+      sessionId: session.id,
+      turnMessageId: 'original-answer',
+      scope: { turnMessageId: 'correction-answer', messageBranchId: 'reviewed-branch' },
+      lifecycle: 'complete',
+      outcome: 'flagged',
+      model: 'reviewer-model',
+      createdAt: 1,
+      updatedAt: 3,
+      reviewerLog: [{ kind: 'thought', text: 'Private review trace' }],
+      checks: [
+        {
+          id: 'finding-1',
+          status: 'warn',
+          claim: 'No uncertainty interval',
+          evidence: 'The analysis only reports a point estimate.',
+          resolution: 'open'
+        }
+      ]
+    }
+    const invoke = vi.fn(async (channel: string) => {
+      if (channel === 'sessions:load-all') return { sessions: [session] }
+      if (channel === 'reviewer:get-for-session') return [review]
+      if (channel === 'reviewer:run') return { started: true, reviewId: 'review-2' }
+      throw new Error(`Unexpected command: ${channel}`)
+    })
+    const api = new HeadlessTaskApi({ commands: commandsFrom(invoke), agent: createAgent() })
+
+    const report = await api.getSessionReview(session.id, review.id, project.id)
+    expect(report).toMatchObject({
+      scopeTurnMessageId: 'correction-answer',
+      messageBranchId: 'reviewed-branch',
+      checks: [{ id: 'finding-1', status: 'warn', resolution: 'open' }]
+    })
+    expect(report).not.toHaveProperty('reviewerLog')
+    await expect(
+      api.listSessionReviews(session.id, { projectId: project.id, messageBranchId: 'other-branch' })
+    ).resolves.toEqual([])
+    await expect(
+      api.getSessionReview(session.id, review.id, 'other-project')
+    ).rejects.toMatchObject({
+      code: 'session_not_found'
+    })
+    await expect(
+      api.rerunSessionReview(session.id, 'unknown-review', { projectId: project.id })
+    ).rejects.toMatchObject({ code: 'review_not_found' })
+
+    await expect(
+      api.startSessionReview(session.id, {
+        projectId: project.id,
+        turnMessageId: 'answer',
+        messageBranchId: 'current-branch'
+      })
+    ).resolves.toEqual({ started: true, reviewId: 'review-2' })
+    expect(invoke).toHaveBeenLastCalledWith('reviewer:run', taskCallerContext(), [
+      {
+        sessionId: session.id,
+        projectId: project.id,
+        turnMessageId: 'answer',
+        scopeMessageBranchId: 'current-branch',
+        origin: 'manual',
+        taskExplicit: true
+      }
+    ])
+    await api.rerunSessionReview(session.id, review.id, {
+      projectId: project.id,
+      allowCorrections: true
+    })
+    expect(invoke).toHaveBeenLastCalledWith('reviewer:run', taskCallerContext(), [
+      {
+        sessionId: session.id,
+        projectId: project.id,
+        turnMessageId: 'original-answer',
+        scopeTurnMessageId: 'correction-answer',
+        scopeMessageBranchId: 'reviewed-branch',
+        mainSessionId: session.id,
+        origin: 'manual',
+        taskExplicit: true
+      }
+    ])
+  })
+
   it('projects the registered Agent runtimes without exposing executable paths', async () => {
     const settings = {
       ...taskSettings,
@@ -315,6 +597,132 @@ describe('HeadlessTaskApi adapter', () => {
       { framework: 'codebuddy', status: 'missing' }
     ])
     expect(JSON.stringify(await api.listRuntimes())).not.toContain('/private/')
+  })
+
+  it('lists selection options without returning provider credentials or private catalog fields', async () => {
+    const settings = {
+      ...taskSettings,
+      activeProviderId: 'provider-1',
+      activeModel: 'example-model',
+      defaultPermissionProfile: 'auto',
+      providers: [
+        {
+          id: 'provider-1',
+          type: 'custom' as const,
+          name: 'Example Provider',
+          models: ['example-model'],
+          supportsImageInput: true,
+          hasKey: true,
+          needsKey: false,
+          maskedKey: 'private-key-hint',
+          baseUrl: 'https://private-gateway.test'
+        }
+      ]
+    }
+    const invoke = vi.fn(async (channel: string) => {
+      if (channel === 'settings:list-skills') {
+        return [
+          { id: 'installed', name: 'installed', displayName: 'Installed', enabled: true },
+          {
+            id: 'duplicate',
+            name: 'duplicate',
+            displayName: 'Duplicate',
+            enabled: false,
+            available: false,
+            availability: 'identity-conflict',
+            directoryName: 'private-directory'
+          }
+        ]
+      }
+      throw new Error(`Unexpected Task command: ${channel}`)
+    })
+    const api = new HeadlessTaskApi({
+      commands: commandsFrom(invoke, settings),
+      agent: createAgent(),
+      controls: {
+        specialists: { resolve: async (id) => ({ id }) },
+        configuration: {
+          listSpecialists: async () => [{ id: 'specialist', name: 'SPECIALIST' }],
+          listComputeHosts: async () => [
+            { providerId: 'ssh:cluster', displayName: 'Cluster', executionMode: 'slurm' }
+          ],
+          runtimePermission: () => undefined
+        }
+      }
+    })
+
+    const options = await api.listConfigurationOptions()
+
+    expect(options).toMatchObject({
+      defaults: { framework: 'claude-code', providerId: 'provider-1', permissionProfile: 'auto' },
+      models: [
+        {
+          providerId: 'provider-1',
+          model: 'example-model',
+          selectable: true,
+          supportsImageInput: true,
+          reasoningEfforts: ['default', 'low', 'medium', 'high', 'xhigh', 'max']
+        }
+      ],
+      skills: [
+        { id: 'installed', enabled: true, available: true },
+        {
+          id: 'duplicate',
+          enabled: false,
+          available: false,
+          unavailableReason: 'identity-conflict'
+        }
+      ],
+      specialists: [{ id: 'specialist', name: 'SPECIALIST' }],
+      computeHosts: [{ providerId: 'ssh:cluster', displayName: 'Cluster', executionMode: 'slurm' }]
+    })
+    expect(JSON.stringify(options)).not.toContain('private-')
+  })
+
+  it('distinguishes stored session permission from attached runtime enforcement', async () => {
+    const session: PersistedChatSession = {
+      id: 'session-config',
+      projectId: project.id,
+      title: 'Configurable Session',
+      cwd: '/workspace',
+      status: 'idle',
+      messages: [],
+      createdAt: 1,
+      updatedAt: 1,
+      permissionProfile: 'full'
+    }
+    const invoke = vi.fn(async (channel: string) => {
+      if (channel === 'sessions:load-all') return { sessions: [session] }
+      throw new Error(`Unexpected Task command: ${channel}`)
+    })
+    let attached = true
+    const api = new HeadlessTaskApi({
+      commands: commandsFrom(invoke),
+      agent: createAgent(),
+      controls: {
+        specialists: { resolve: async (id) => ({ id }) },
+        configuration: {
+          listSpecialists: async () => [],
+          listComputeHosts: async () => [],
+          runtimePermission: (sessionId) =>
+            attached && sessionId === session.id
+              ? { selectedProfile: 'auto', effectiveProfile: 'ask', fullAccessAvailable: false }
+              : undefined
+        }
+      }
+    })
+
+    await expect(api.getSessionConfiguration(session.id)).resolves.toMatchObject({
+      persisted: { permissionProfile: 'full' },
+      effective: { permissionProfile: 'full' },
+      runtimePermission: {
+        selectedProfile: 'auto',
+        effectiveProfile: 'ask',
+        fullAccessAvailable: false
+      }
+    })
+    attached = false
+    expect(await api.getSessionConfiguration(session.id)).not.toHaveProperty('runtimePermission')
   })
 
   it('projects read-only readiness checks and stable next-action codes', async () => {

@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { randomUUID } from 'node:crypto'
 import type { BootstrapRequest, BootstrapResult } from '../../shared/bootstrap'
 import type { CliLauncherStatus } from '../../shared/cli'
+import { ApplicationCommandError } from '../../shared/application-command-contract'
 
 import type { AcpRuntimeEvent } from '../../shared/acp'
 import type { ArtifactVersionDescriptor } from '../../shared/artifact-provenance'
@@ -13,14 +14,24 @@ import type {
   ManagedFileVersionInspectResult,
   ManagedFileVersionIpcResult
 } from '../../shared/managed-file-versions'
+import { getDefaultPermissionProfile } from '../../shared/permission-profiles'
 import type { Project } from '../../shared/projects'
-import type { ReviewRunResult, ReviewWithChecks } from '../../shared/reviewer'
+import { resolveProviderReasoningEffortProfile } from '../../shared/provider-reasoning-effort'
+import { resolveReasoningEffortControl } from '../../shared/reasoning-effort'
+import type { ReviewRunRequest, ReviewRunResult, ReviewWithChecks } from '../../shared/reviewer'
 import type {
   UpdateProjectSessionDefaultsRequest,
   UpdateSessionConfigurationRequest
 } from '../../shared/session-configuration'
 import type { PersistedArtifact } from '../../shared/session-message-contract'
 import type { PersistedChatSession } from '../../shared/session-persistence'
+import {
+  loadSessionHistoryPageRequestSchema,
+  SESSION_HISTORY_CURSOR_STALE,
+  SessionHistoryCursorStaleError,
+  type LoadSessionHistoryPageRequest,
+  type SessionHistoryPage
+} from '../../shared/session-history'
 import type { ActivePlanProjection, PlanResponseCommand } from '../../shared/session-plan/contract'
 import type {
   AddCustomServerRequest,
@@ -41,14 +52,22 @@ import type {
   StartTaskRunRequest,
   TaskAgentRouting,
   TaskAgentRuntime,
+  TaskConfigurationOptions,
   TaskDoctorReport,
   TaskPlanResponseRequest,
   TaskProject,
   TaskProjectSessionDefaults,
   TaskRun,
+  TaskRunAttachment,
   TaskRunProgressEvent,
   TaskRunReview,
+  TaskRerunSessionReviewRequest,
+  TaskSessionReview,
+  TaskSessionReviewQuery,
+  TaskSessionReviewStart,
+  TaskStartSessionReviewRequest,
   TaskSessionConfiguration,
+  TaskSessionHistoryPage,
   TaskSessionSummary,
   UpdateTaskAgentRoutingRequest,
   UpdateTaskProjectRequest
@@ -64,10 +83,13 @@ import {
   TaskRunner,
   TaskRunnerError,
   summarizeSession,
+  taskModelCatalog,
   type TaskAgentPort,
   type TaskComputePreferencePort,
   type TaskRunnerDependencies
 } from '../tasks/task-runner'
+import { projectTaskSessionHistory } from './task-session-history'
+import { TaskAttachmentStaging } from './task-attachment-staging'
 
 const TASK_CALLER_CONTEXT = createTaskCallerContext()
 
@@ -92,20 +114,72 @@ type ArtifactBrowserSelection = {
   versionNumber?: number
 }
 
+const projectSessionReview = (review: ReviewWithChecks): TaskSessionReview => ({
+  id: review.id,
+  projectId: review.projectId,
+  sessionId: review.sessionId,
+  turnMessageId: review.turnMessageId,
+  scopeTurnMessageId: review.scope.turnMessageId,
+  messageBranchId: review.scope.messageBranchId,
+  lifecycle: review.lifecycle,
+  outcome: review.outcome,
+  errorMessage: review.errorMessage,
+  model: review.model,
+  stale: review.stale,
+  verificationUnavailable: review.verificationUnavailable,
+  createdAt: review.createdAt,
+  updatedAt: review.updatedAt,
+  checks: review.checks.map(({ id, status, claim, evidence, artifactVersionId, resolution }) => ({
+    id,
+    status,
+    claim,
+    evidence,
+    artifactVersionId,
+    resolution
+  }))
+})
+
 class HeadlessTaskApi {
   private readonly callerContexts = new AsyncLocalStorage<CallerContext>()
   private readonly commandClient = createApplicationCommandClient()
   private readonly runner: TaskRunner
   private readonly submissions?: TaskSubmissions
+  private readonly attachments?: TaskAttachmentStaging
 
   constructor(
     private readonly ports: TaskApiPorts,
     dependencies: Partial<TaskApiDependencies> = {}
   ) {
     const subscribeEvents = dependencies.subscribeEvents ?? (() => () => undefined)
+    const commands = new Set(ports.commands.commandNames())
+    if (
+      [
+        'uploads:begin-transfer',
+        'uploads:append-transfer',
+        'uploads:finish-transfer',
+        'uploads:abort-transfer',
+        'uploads:finalize-session',
+        'uploads:delete'
+      ].every((channel) => commands.has(channel))
+    ) {
+      this.attachments = new TaskAttachmentStaging((channel, body) => this.invoke(channel, body))
+    }
     // Non-Agent compatibility channels remain temporary façade adapters. Agent execution crosses a
     // direct, narrow port so Task never impersonates an Electron caller for runtime operations.
     this.runner = new TaskRunner({
+      ...(this.attachments
+        ? {
+            reserveAttachments: (scope, ids) => {
+              if (this.currentCallerContext().location !== 'local') {
+                throw new TaskRunnerError(
+                  'invalid_request',
+                  'Run attachments require local SDK access.'
+                )
+              }
+              return this.attachments!.reserve(scope, ids)
+            }
+          }
+        : {}),
       projects: {
         list: () => this.invoke('projects:list') as Promise<Project[]>,
         create: (request) => this.invoke('projects:create', request) as Promise<Project>,
@@ -241,6 +315,7 @@ class HeadlessTaskApi {
     try {
       await Promise.all([this.submissions?.dispose(), this.runner.dispose()])
     } finally {
+      await this.attachments?.dispose()
       this.commandClient.dispose()
     }
   }
@@ -328,6 +403,64 @@ class HeadlessTaskApi {
     })
   }
 
+  supportsConfigurationOptions(): boolean {
+    return this.ports.controls?.configuration !== undefined
+  }
+
+  async listConfigurationOptions(): Promise<TaskConfigurationOptions> {
+    const configuration = this.ports.controls?.configuration
+    if (!configuration) {
+      throw new TaskRunnerError(
+        'configuration_options_unavailable',
+        'This server does not have a Task configuration catalog.'
+      )
+    }
+    const [settings, skills, specialists, computeHosts] = await Promise.all([
+      this.invoke('settings:get-settings') as Promise<SettingsSnapshot>,
+      this.invoke('settings:list-skills') as Promise<SkillView[]>,
+      configuration.listSpecialists(),
+      configuration.listComputeHosts()
+    ])
+    const providers = new Map(settings.providers.map((provider) => [provider.id, provider]))
+    return {
+      defaults: {
+        framework: settings.agentFrameworkId,
+        providerId: settings.activeProviderId,
+        model: settings.activeModel,
+        reasoningEffort: settings.reasoningEffort,
+        permissionProfile: getDefaultPermissionProfile(settings)
+      },
+      models: taskModelCatalog(settings).map((entry) => {
+        const model = entry.model || undefined
+        const profile = resolveProviderReasoningEffortProfile(
+          providers.get(entry.providerId),
+          model
+        )
+        const { options } = resolveReasoningEffortControl('default', profile)
+        return {
+          providerId: entry.providerId,
+          providerName: entry.providerName,
+          model,
+          label: entry.label,
+          selectable: entry.selectable,
+          unavailableReason: entry.unavailableReason,
+          supportsImageInput: entry.supportsImageInput,
+          reasoningEfforts: ['default', ...options.map((option) => option.intent)]
+        }
+      }),
+      skills: skills.map((skill) => ({
+        id: skill.id,
+        name: skill.name,
+        displayName: skill.displayName,
+        enabled: skill.enabled,
+        available: skill.available !== false,
+        unavailableReason: skill.availability
+      })),
+      specialists,
+      computeHosts
+    }
+  }
+
   async doctor(): Promise<TaskDoctorReport> {
     const [preflight, skills, bootstrap] = await Promise.all([
       this.invoke('settings:get-preflight') as Promise<ReadinessPreflight>,
@@ -385,15 +518,73 @@ class HeadlessTaskApi {
     return this.runner.getSession(sessionId)
   }
 
-  getSessionConfiguration(sessionId: string): Promise<TaskSessionConfiguration> {
-    return this.runner.getSessionConfiguration(sessionId)
+  supportsRunAttachments(): boolean {
+    return this.attachments !== undefined
   }
 
-  updateSessionConfiguration(
+  async stageRunAttachment(
+    projectId: string,
+    sessionId: string,
+    body: unknown
+  ): Promise<TaskRunAttachment> {
+    if (this.currentCallerContext().location !== 'local' || !this.attachments) {
+      throw new TaskRunnerError(
+        'attachment_staging_unavailable',
+        'Run attachment staging is unavailable.'
+      )
+    }
+    const session = await this.runner.getSession(sessionId)
+    if (session.projectId !== projectId) {
+      throw new TaskRunnerError('session_not_found', 'Session not found in this project.')
+    }
+    return this.attachments.stage({ projectId, sessionId }, body)
+  }
+
+  async getSessionHistory(input: LoadSessionHistoryPageRequest): Promise<TaskSessionHistoryPage> {
+    const parsed = loadSessionHistoryPageRequestSchema.safeParse(input)
+    if (
+      !parsed.success ||
+      [parsed.data.projectId, parsed.data.sessionId].some(
+        (id) => id === '.' || id === '..' || /[/\\]/u.test(id) || id.includes('\0')
+      )
+    ) {
+      throw new TaskRunnerError('invalid_request', 'Invalid session history request.')
+    }
+    try {
+      const page = (await this.invoke('sessions:load-history-page', parsed.data)) as
+        SessionHistoryPage | undefined
+      if (!page)
+        throw new TaskRunnerError('session_not_found', 'Session not found in this project.')
+      return projectTaskSessionHistory(page, parsed.data)
+    } catch (error) {
+      if (
+        error instanceof SessionHistoryCursorStaleError ||
+        (error instanceof ApplicationCommandError && error.code === SESSION_HISTORY_CURSOR_STALE)
+      ) {
+        throw new TaskRunnerError('session_history_cursor_stale', error.message)
+      }
+      throw error
+    }
+  }
+
+  async getSessionConfiguration(sessionId: string): Promise<TaskSessionConfiguration> {
+    return this.withRuntimePermission(await this.runner.getSessionConfiguration(sessionId))
+  }
+
+  async updateSessionConfiguration(
     sessionId: string,
     request: UpdateSessionConfigurationRequest
   ): Promise<TaskSessionConfiguration> {
-    return this.runner.updateSessionConfiguration(sessionId, request)
+    return this.withRuntimePermission(
+      await this.runner.updateSessionConfiguration(sessionId, request)
+    )
+  }
+
+  private withRuntimePermission(configuration: TaskSessionConfiguration): TaskSessionConfiguration {
+    const runtimePermission = this.ports.controls?.configuration?.runtimePermission(
+      configuration.sessionId
+    )
+    return runtimePermission ? { ...configuration, runtimePermission } : configuration
   }
 
   getProjectSessionDefaults(projectId: string): Promise<TaskProjectSessionDefaults> {
@@ -527,6 +718,99 @@ class HeadlessTaskApi {
       session.projectId,
       session.id
     ) as Promise<ActivePlanProjection | null>
+  }
+
+  async listSessionReviews(
+    sessionId: string,
+    query: TaskSessionReviewQuery
+  ): Promise<TaskSessionReview[]> {
+    const reviews = await this.readSessionReviews(sessionId, query.projectId)
+    return reviews
+      .filter(
+        (review) =>
+          (query.turnMessageId === undefined || review.turnMessageId === query.turnMessageId) &&
+          (query.messageBranchId === undefined ||
+            review.scope.messageBranchId === query.messageBranchId)
+      )
+      .map(projectSessionReview)
+  }
+
+  async getSessionReview(
+    sessionId: string,
+    reviewId: string,
+    projectId: string
+  ): Promise<TaskSessionReview> {
+    return projectSessionReview(await this.findSessionReview(sessionId, reviewId, projectId))
+  }
+
+  async startSessionReview(
+    sessionId: string,
+    request: TaskStartSessionReviewRequest
+  ): Promise<TaskSessionReviewStart> {
+    await this.requireSessionReviewScope(sessionId, request.projectId)
+    return this.admitSessionReview({
+      projectId: request.projectId,
+      sessionId,
+      turnMessageId: request.turnMessageId,
+      scopeMessageBranchId: request.messageBranchId,
+      ...(request.allowCorrections === true ? { mainSessionId: sessionId } : {})
+    })
+  }
+
+  async rerunSessionReview(
+    sessionId: string,
+    reviewId: string,
+    request: TaskRerunSessionReviewRequest
+  ): Promise<TaskSessionReviewStart> {
+    const review = await this.findSessionReview(sessionId, reviewId, request.projectId)
+    return this.admitSessionReview({
+      projectId: review.projectId,
+      sessionId: review.sessionId,
+      turnMessageId: review.turnMessageId,
+      scopeTurnMessageId: review.scope.turnMessageId,
+      scopeMessageBranchId: review.scope.messageBranchId,
+      ...(request.allowCorrections === true ? { mainSessionId: sessionId } : {})
+    })
+  }
+
+  private async requireSessionReviewScope(sessionId: string, projectId: string): Promise<void> {
+    const session = await this.runner.getSession(sessionId)
+    if (session.projectId !== projectId) {
+      throw new TaskRunnerError('session_not_found', 'Session not found in this project.')
+    }
+  }
+
+  private async readSessionReviews(
+    sessionId: string,
+    projectId: string
+  ): Promise<ReviewWithChecks[]> {
+    await this.requireSessionReviewScope(sessionId, projectId)
+    return this.invoke('reviewer:get-for-session', {
+      projectId,
+      appSessionId: sessionId
+    }) as Promise<ReviewWithChecks[]>
+  }
+
+  private async findSessionReview(
+    sessionId: string,
+    reviewId: string,
+    projectId: string
+  ): Promise<ReviewWithChecks> {
+    const reviews = await this.readSessionReviews(sessionId, projectId)
+    const review = reviews.find((candidate) => candidate.id === reviewId)
+    if (!review) throw new TaskRunnerError('review_not_found', 'Review not found in this session.')
+    return review
+  }
+
+  private async admitSessionReview(request: ReviewRunRequest): Promise<TaskSessionReviewStart> {
+    const result = (await this.invoke('reviewer:run', {
+      ...request,
+      origin: 'manual',
+      taskExplicit: true
+    })) as ReviewRunResult
+    if (!result.started) return { started: false, reason: result.reason ?? 'run-failed' }
+    if (!result.reviewId) throw new Error('Reviewer admission did not return a Review id.')
+    return { started: true, reviewId: result.reviewId }
   }
 
   async respondSessionPlan(
