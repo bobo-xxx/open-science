@@ -193,11 +193,12 @@ export const rearmUnacceptedElicitationContinuations = (
   }
 }
 
-// Run only after graph and flat activities have passed the same persisted-field sanitizers.
-// A durable question can outlive its provider before a stop event has classified the Session wait.
-export const restorePendingElicitationWait = (
+// Use after graph and flat activities have passed the same persisted-field sanitizers.
+const resolveRestorableElicitationWait = (
   session: PersistedChatSession
-): PersistedChatSession => {
+):
+  | { promptMessageId: string; requests: { requestId: string; fieldCount: number }[] }
+  | undefined => {
   const graph = session.conversationGraph
   if (
     !graph ||
@@ -205,7 +206,7 @@ export const restorePendingElicitationWait = (
     session.runtimeContext?.permission ||
     session.runtimeContext?.plan?.approval === 'pending'
   ) {
-    return session
+    return undefined
   }
   const frame = graph.frames.find(({ id }) => id === graph.activeFrameId)
   const messages = resolveActiveConversationMessages(graph)
@@ -220,16 +221,16 @@ export const restorePendingElicitationWait = (
     (session.resumeRecovery?.promptMessageId !== undefined &&
       session.resumeRecovery.promptMessageId !== prompt.id)
   )
-    return session
+    return undefined
   const pending = resolveActiveConversationActivities(graph).activities.filter(
     ({ elicitation }) =>
       elicitation?.state === 'pending' && elicitation.durable?.kind === 'agent-user-choice'
   )
-  const restorable = pending.some((activity) => {
+  const requests = pending.flatMap((activity) => {
     const authority = graph.activities.find(({ id }) => id === activity.id)!
     const durable = activity.elicitation!.durable!
     const flat = (session.activities ?? []).filter(({ id }) => id === activity.id)
-    return (
+    const restorable =
       authority.agentFrameId === frame.id &&
       authority.messageBranchId === frame.activeBranchId &&
       authority.promptMessageId === prompt.id &&
@@ -243,11 +244,44 @@ export const restorePendingElicitationWait = (
       flat[0].sortIndex === activity.sortIndex &&
       // Sanitization fixes property order, so JSON equality checks the complete durable payload.
       JSON.stringify(flat[0].elicitation) === JSON.stringify(activity.elicitation)
-    )
+    return restorable
+      ? [{ requestId: durable.requestId, fieldCount: activity.elicitation!.fields.length }]
+      : []
   })
-  if (!restorable) return session
+  return requests.length > 0 ? { promptMessageId: prompt.id, requests } : undefined
+}
+
+export const projectPersistedSessionWaits = (
+  session: PersistedChatSession
+): {
+  permission?: { requestId: string; delegated: boolean }
+  questions: readonly { requestId: string; fieldCount: number }[]
+} => {
+  const authority =
+    session.status === 'waiting-permission' &&
+    session.runtimeContext?.permission?.state === 'pending'
+      ? resolveRestorablePermissionToolAuthority(session)
+      : undefined
+  const request = authority?.permission.request
+  const elicitation =
+    session.status === 'waiting-for-user' ? resolveRestorableElicitationWait(session) : undefined
+  return {
+    ...(request
+      ? { permission: { requestId: request.requestId, delegated: request.delegated !== undefined } }
+      : {}),
+    questions: elicitation?.requests ?? []
+  }
+}
+
+// A durable question can outlive its provider before a stop event has classified the Session wait.
+export const restorePendingElicitationWait = (
+  session: PersistedChatSession
+): PersistedChatSession => {
+  const graph = session.conversationGraph
+  const authority = resolveRestorableElicitationWait(session)
+  if (!graph || !authority) return session
   const clearInterrupted = <T extends PersistedChatMessage>(message: T): T =>
-    message.id === prompt.id ? { ...message, interrupted: undefined } : message
+    message.id === authority.promptMessageId ? { ...message, interrupted: undefined } : message
   return {
     ...session,
     status: 'waiting-for-user',

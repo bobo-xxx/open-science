@@ -168,13 +168,15 @@ await client.updateAgentRouting({
 const runtimes = await client.listRuntimes()
 ```
 
-Use `listPendingSessionInteractions(projectId, sessionId)` to see which live interactions need a
+Use `listPendingSessionInteractions(projectId, sessionId)` to see which interactions need a
 user decision. The `session-pending-interactions` capability covers permission requests,
 provider or application structured questions in the current runtime, and Compute approvals
-for that exact Project and Session. The method returns opaque IDs for polling, kind and safe
-metadata, such as a question's field count or the Compute operation. Requests disappear from
-the list when the owner settles them. An older server returns `unsupported_capability`.
-Complete the interaction in Desktop or Web. Plan First still uses the Plan API.
+for that exact Project and Session. Current servers also report durable MCP permission waits,
+agent questions and delegated questions that still match the saved Session and active Branch.
+The method returns opaque IDs for polling, kind and metadata such as a question's field count
+or the Compute operation. Requests disappear when their owner settles them. Servers without the
+capability return `unsupported_capability`. Complete the interaction in Desktop or Web. Plan First
+still uses the Plan API.
 
 Use `watchPendingSessionInteractions(projectId, sessionId, { signal })` for a stream of
 snapshots. It yields the initial list, then yields again when the list changes, including an
@@ -182,10 +184,6 @@ empty list when all waits clear. The SDK polls the scoped endpoint every second 
 Use `pollIntervalMs` to set the interval and `timeoutMs` to set the request deadline. Breaking
 the loop or aborting the signal stops observation. A failed read ends the stream, and a new
 watch starts from the current snapshot. Changes between polls can be coalesced.
-
-This list reflects live application owners. Detached waits after a restart and delegated
-structured questions stored only in the Session are outside the current projection. Review
-the Session in Desktop or Web for those interactions.
 
 When the server advertises `session-history`, read a Session's visible conversation with
 `getSessionHistory(projectId, sessionId, { limit: 80 })`. The first page starts at the newest end;

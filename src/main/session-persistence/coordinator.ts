@@ -624,12 +624,15 @@ class SessionPersistenceCoordinator implements DelegatedWorkRecordCommands {
   // `readSessionFile` quarantines unless `quarantineInvalidFiles === false`, so a plain read would
   // let a non-owner rename a corrupt live session file outside this coordinator's write lane.
   // Returns undefined for missing/unreadable instead of throwing, so callers can degrade.
+  // Pending interaction observers can require the saved runtime state before restart repair.
   readSessionSnapshot(
     projectId: string,
-    sessionId: string
+    sessionId: string,
+    options?: { preserveRuntimeState: true }
   ): Promise<PersistedChatSession | undefined> {
     return this.operationScheduler.runSession(projectId, sessionId, async () => {
       const loaded = await this.repository.loadSessionWithDiagnostics(projectId, sessionId, {
+        ...options,
         mode: 'read-only'
       })
       return loaded.status === 'found' ? structuredClone(loaded.session) : undefined

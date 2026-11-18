@@ -1010,13 +1010,18 @@ export const createApplicationModules = async (
     taskAgent: agentWorkflows.taskAgent,
     taskControls: {
       listPendingSessionInteractions: async (scope) => {
-        const ownerProjectId =
-          await sessionAuthority.sessionPersistenceCoordinator.sessionProjectId(scope.sessionId)
+        const sessions = sessionAuthority.sessionPersistenceCoordinator
+        const ownerProjectId = await sessions.sessionProjectId(scope.sessionId)
         if (ownerProjectId !== scope.projectId) return undefined
+        // Observe durable waits without applying app-restart recovery to a decision in flight.
+        const session = await sessions.readSessionSnapshot(scope.projectId, scope.sessionId, {
+          preserveRuntimeState: true
+        })
         return projectTaskPendingSessionInteractions(
           scope,
           agentRuntime.runtime.getPendingSessionRequests(scope.projectId, scope.sessionId),
-          computeServices.computeIpcModule.handlers.listPendingSessionApprovals(scope)
+          computeServices.computeIpcModule.handlers.listPendingSessionApprovals(scope),
+          session
         )
       },
       specialists: {

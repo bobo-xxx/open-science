@@ -136,6 +136,7 @@ export {
   INTERRUPTED_SESSION_ERROR,
   INTERRUPTED_TURN_ERROR,
   normalizeSessionAfterRestore,
+  projectPersistedSessionWaits,
   rearmUnacceptedElicitationContinuations
 } from './session-persistence/restore'
 export {

@@ -1,5 +1,10 @@
 import { resolveMessageBranchPath, type PersistedAgentFrame } from './conversation-graph'
-import type { PersistedChatSession } from './session-persistence'
+import type { DelegatedQuestionRequest, PersistedChatSession } from './session-persistence'
+
+type DelegatedQuestionSession = Pick<
+  PersistedChatSession,
+  'conversationGraph' | 'runtimeContext' | 'packageOrigin'
+>
 
 // Resource-safety checks (quit, migration, archive) must consider every delegated record in the
 // writable Session, including work attached to an inactive conversation branch. An Attempt is "current" only
@@ -25,20 +30,19 @@ const earliestCurrentDelegatedAttemptStartedAt = (
   return startedAt.length > 0 ? Math.min(...startedAt) : undefined
 }
 
-const hasAnswerableDelegatedQuestion = (
-  session:
-    Pick<PersistedChatSession, 'conversationGraph' | 'runtimeContext' | 'packageOrigin'> | undefined
-): boolean => {
-  if (session?.packageOrigin) return false
+const projectAnswerableDelegatedQuestions = (
+  session: DelegatedQuestionSession | undefined
+): readonly DelegatedQuestionRequest[] => {
+  if (session?.packageOrigin) return []
   const graph = session?.conversationGraph
   const owner = session?.runtimeContext?.delegatedWork
   if (!graph || !owner?.questionRequests || owner.questionRequestsQuarantine !== undefined) {
-    return false
+    return []
   }
   const root = graph.frames.find((frame) => frame.id === graph.rootFrameId && frame.kind === 'root')
   const activeRootMessageIds = resolveActiveRootMessageIds(graph)
-  if (!root || !activeRootMessageIds) return false
-  return owner.questionRequests.some((request) => {
+  if (!root || !activeRootMessageIds) return []
+  return owner.questionRequests.filter((request) => {
     if (
       request.status !== 'pending' ||
       request.rootBranchId !== root.activeBranchId ||
@@ -58,6 +62,9 @@ const hasAnswerableDelegatedQuestion = (
     )
   })
 }
+
+const hasAnswerableDelegatedQuestion = (session: DelegatedQuestionSession | undefined): boolean =>
+  projectAnswerableDelegatedQuestions(session).length > 0
 
 const resolveActiveRootMessageIds = (
   graph: NonNullable<PersistedChatSession['conversationGraph']>
@@ -94,5 +101,6 @@ export {
   hasAnswerableDelegatedQuestion,
   hasCurrentRunningDelegatedAttempt,
   projectActiveRootDelegatedFrames,
+  projectAnswerableDelegatedQuestions,
   resolveActiveRootMessageIds
 }

@@ -1,6 +1,11 @@
 import { createHash } from 'node:crypto'
 import type { AcpStateSnapshot } from '../../shared/acp'
 import type { ComputeApprovalRequest } from '../../shared/compute'
+import { projectAnswerableDelegatedQuestions } from '../../shared/delegated-work-projection'
+import {
+  projectPersistedSessionWaits,
+  type PersistedChatSession
+} from '../../shared/session-persistence'
 import type {
   TaskConfigurationOptions,
   TaskPendingSessionInteraction,
@@ -8,6 +13,7 @@ import type {
 } from '../../shared/task-api'
 
 type TaskInteractionScope = Pick<TaskPendingSessionInteraction, 'projectId' | 'sessionId'>
+type TaskPendingQuestion = { requestId: string; fieldCount: number }
 
 type TaskControlPorts = {
   specialists: {
@@ -23,12 +29,30 @@ type TaskControlPorts = {
   ): Promise<readonly TaskPendingSessionInteraction[] | undefined>
 }
 
+const projectDelegatedTaskQuestions = (session: PersistedChatSession): TaskPendingQuestion[] => {
+  const work = session.runtimeContext?.delegatedWork
+  return projectAnswerableDelegatedQuestions(session).flatMap((request) => {
+    const record = work?.records.find(({ agentFrameId }) => agentFrameId === request.sourceFrameId)
+    const attempt = record?.attempts.at(-1)
+    const hasSourcePrompt = session.conversationGraph?.messages.some(
+      ({ agentFrameId, role }) => agentFrameId === request.sourceFrameId && role === 'user'
+    )
+    return attempt?.id === request.sourceAttemptId &&
+      attempt.runtimeSegmentIds.includes(request.sourceRuntimeSegmentId) &&
+      (attempt.executionModel ?? record?.attempts[0]?.executionModel) &&
+      hasSourcePrompt
+      ? [{ requestId: request.requestId, fieldCount: request.questions.length }]
+      : []
+  })
+}
+
 // Owner IDs are used only to correlate polls while an interaction remains pending. The public
 // projection excludes the inputs, option labels, commands, provider data and answer fields.
 const projectTaskPendingSessionInteractions = (
   { projectId, sessionId }: TaskInteractionScope,
   state: Pick<AcpStateSnapshot, 'pendingPermissions' | 'pendingElicitations'>,
-  computeApprovals: ReadonlyArray<Pick<ComputeApprovalRequest, 'id' | 'operation'>>
+  computeApprovals: ReadonlyArray<Pick<ComputeApprovalRequest, 'id' | 'operation'>>,
+  session?: PersistedChatSession
 ): TaskPendingSessionInteraction[] => {
   const identifier = (
     kind: TaskPendingSessionInteraction['kind'],
@@ -63,7 +87,36 @@ const projectTaskPendingSessionInteractions = (
       operation
     }))
   ]
-  return [...new Map(entries.map((entry) => [entry.id, entry])).values()]
+  const pending = new Map(entries.map((entry) => [entry.id, entry]))
+  if (
+    !session ||
+    session.projectId !== projectId ||
+    session.id !== sessionId ||
+    session.packageOrigin ||
+    session.archivedAt !== undefined
+  ) {
+    return [...pending.values()]
+  }
+
+  const addDurable = (entry: TaskPendingSessionInteraction): void => {
+    if (!pending.has(entry.id)) pending.set(entry.id, entry)
+  }
+  const { permission, questions } = projectPersistedSessionWaits(session)
+  if (permission) {
+    addDurable({
+      ...identifier('permission', permission.requestId),
+      kind: 'permission',
+      isMcp: true,
+      delegated: permission.delegated
+    })
+  }
+  for (const { requestId, fieldCount } of [
+    ...questions,
+    ...projectDelegatedTaskQuestions(session)
+  ]) {
+    addDurable({ ...identifier('question', requestId), kind: 'question', fieldCount })
+  }
+  return [...pending.values()]
 }
 
 export { projectTaskPendingSessionInteractions }

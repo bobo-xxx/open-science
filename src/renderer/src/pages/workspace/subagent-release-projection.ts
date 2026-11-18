@@ -7,6 +7,7 @@ import {
 import {
   hasAnswerableDelegatedQuestion,
   projectActiveRootDelegatedFrames,
+  projectAnswerableDelegatedQuestions,
   resolveActiveRootMessageIds
 } from '../../../../shared/delegated-work-projection'
 import type {
@@ -115,41 +116,12 @@ const projectSessionSubagents = (
   }
 }
 
-const projectAnswerableDelegatedQuestions = (
+const projectDelegatedQuestionQueue = (
   session: PersistedChatSession | undefined
 ): readonly DelegatedQuestionRequest[] => {
   const graph = session?.conversationGraph
-  const owner = session?.runtimeContext?.delegatedWork
-  if (
-    session?.packageOrigin ||
-    !graph ||
-    !owner?.questionRequests ||
-    owner.questionRequestsQuarantine !== undefined
-  ) {
-    return []
-  }
-  const root = graph.frames.find((frame) => frame.id === graph.rootFrameId && frame.kind === 'root')
-  const activeRootMessageIds = resolveActiveRootMessageIds(graph)
-  if (!root || !activeRootMessageIds) return []
-  const eligible = owner.questionRequests.filter((request) => {
-    if (
-      request.status !== 'pending' ||
-      request.rootBranchId !== root.activeBranchId ||
-      !activeRootMessageIds.has(request.rootOriginMessageId)
-    ) {
-      return false
-    }
-    const source = graph.frames.find((frame) => frame.id === request.sourceFrameId)
-    return Boolean(
-      source &&
-      source.kind === 'delegate' &&
-      source.parentFrameId === root.id &&
-      source.originBindingState === 'validated' &&
-      source.originMessageId === request.rootOriginMessageId &&
-      source.activeBranchId === request.sourceMessageBranchId &&
-      (source.delegateName?.trim() || source.agentName?.trim()) === request.sourceName
-    )
-  })
+  if (!graph || graph.activeFrameId !== graph.rootFrameId) return []
+  const eligible = projectAnswerableDelegatedQuestions(session)
   const useFallbackOrder = eligible.some((request) => request.sequence === undefined)
   return eligible.toSorted((left, right) => {
     const sequenceOrder = useFallbackOrder ? 0 : left.sequence! - right.sequence!
@@ -157,14 +129,6 @@ const projectAnswerableDelegatedQuestions = (
       sequenceOrder || left.askedAt - right.askedAt || left.requestId.localeCompare(right.requestId)
     )
   })
-}
-
-const projectDelegatedQuestionQueue = (
-  session: PersistedChatSession | undefined
-): readonly DelegatedQuestionRequest[] => {
-  const graph = session?.conversationGraph
-  if (!graph || graph.activeFrameId !== graph.rootFrameId) return []
-  return projectAnswerableDelegatedQuestions(session)
 }
 
 const projectInlineParentMessages = (

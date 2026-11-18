@@ -17,10 +17,14 @@ the scope where the operation will execute.
 | Read visible messages and activities      | `getSessionHistory`                                                                     | Project and Session, active conversation branch                                                     | History scope and cursor tests                                   |
 | Stage input files for a turn              | `stageRunAttachment`, `startRun`/`submitRun` with `attachmentIds`                       | Local caller and existing Session; one-use staged handles                                           | Attachment admission and SDK contract tests                      |
 | Read and download task outputs            | `listArtifacts`, `downloadArtifact`                                                     | Managed Session artifacts                                                                           | Existing artifact integration tests                              |
-| Observe live pending interactions         | `listPendingSessionInteractions`, `watchPendingSessionInteractions`                     | Exact Project and Session; snapshots of pending permission, question, and Compute approval metadata | Task API, authenticated HTTP, SDK watcher and Desktop tests      |
+| Observe pending interactions              | `listPendingSessionInteractions`, `watchPendingSessionInteractions`                     | Exact Project and Session, with live and validated durable interaction metadata                     | Task projection, Task API, HTTP, SDK watcher and Desktop tests    |
 | Resolve protected interactions            | Desktop and Web                                                                         | Current human caller; preserve the existing operation-specific scopes                               | External host proof is a later SDK milestone                     |
 | Submit and manage Compute Jobs            | Internal agent workflow                                                                 | Configured Host and project/session; use existing approval rules                                    | Direct SDK job lifecycle is a later milestone                    |
 | Manage research resources                 | Partial Project, Connector, Credential, Literature methods                              | Each resource's application owner                                                                   | Expand by operation and record evidence before claiming coverage |
+
+Pending interaction snapshots include live permission, question and Compute approval metadata.
+The same methods report durable MCP permission waits, agent questions and delegated questions when
+their saved Session and Branch still support a response.
 
 First-release acceptance uses Desktop and standalone artifacts at the same revision on Windows
 x64, macOS ARM64 and x64, and Linux ARM64 and x64. Real Slurm acceptance is a separate run
