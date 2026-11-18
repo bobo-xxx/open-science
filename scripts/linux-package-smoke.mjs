@@ -15,6 +15,7 @@ import {
 } from './database-migration-ledger-smoke.mjs'
 import { authenticatePackagedAppEndpoint } from './packaged-web-service-auth.mjs'
 import { collectSmokeDiagnostics } from './package-smoke-diagnostics.mjs'
+import { verifyPackagedSdk } from './sdk-package-smoke.mjs'
 
 const APPIMAGE_PATTERN = /^aipoch-open-science-(.+)-linux-(?:x64|x86_64|arm64)\.AppImage$/
 const SMOKE_ROOT_PREFIX = 'open-science-linux-package-smoke-'
@@ -211,6 +212,7 @@ const launchAndProbe = async ({ resourceRoot, expectedVersion, env }) => {
     ) {
       throw new Error(`Unexpected packaged Linux bootstrap: ${JSON.stringify(bootstrap)}`)
     }
+    await verifyPackagedSdk({ resourceRoot, ...service, expectedVersion })
     const shutdown = await fetch(`${service.endpoint}/api/shutdown?${service.auth}`, {
       method: 'POST',
       signal: AbortSignal.timeout(15_000)

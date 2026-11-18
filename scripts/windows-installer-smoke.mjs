@@ -30,6 +30,7 @@ import {
   writeDatabaseMigrationCertification
 } from './database-migration-ledger-smoke.mjs'
 import { authenticatePackagedAppEndpoint } from './packaged-web-service-auth.mjs'
+import { verifyPackagedSdk } from './sdk-package-smoke.mjs'
 
 const APP_EXECUTABLE = 'open-science.exe'
 const ARTIFACT_MCP_SERVER_ARG = '--open-science-artifact-mcp'
@@ -1064,6 +1065,12 @@ const launchAndProbe = async ({
       legacyConfigRoots
     })
 
+    await verifyPackagedSdk({
+      resourceRoot: join(installDirectory, 'resources'),
+      endpoint,
+      auth,
+      expectedVersion
+    })
     if (exerciseNotebookRuntime) await runPackagedNotebookEnvironmentSmoke(endpoint, auth)
     await requestPackagedAppShutdown(endpoint, auth)
     const exitCode = await waitForShutdownExit(exit, child, output)

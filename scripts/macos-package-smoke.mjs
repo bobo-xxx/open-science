@@ -15,6 +15,7 @@ import {
 } from './database-migration-ledger-smoke.mjs'
 import { authenticatePackagedAppEndpoint } from './packaged-web-service-auth.mjs'
 import { collectSmokeDiagnostics } from './package-smoke-diagnostics.mjs'
+import { verifyPackagedSdk } from './sdk-package-smoke.mjs'
 
 const ARTIFACT_PATTERN = /^aipoch-open-science-(.+)-mac-(?:arm64|x64)\.(dmg|zip)$/
 const SMOKE_ROOT_PREFIX = 'open-science-macos-package-smoke-'
@@ -218,6 +219,11 @@ const launchAndProbe = async ({ executable, expectedVersion, env, userDataRoot }
     ) {
       throw new Error(`Unexpected packaged macOS bootstrap: ${JSON.stringify(bootstrap)}`)
     }
+    await verifyPackagedSdk({
+      resourceRoot: join(executable, '..', '..', 'Resources'),
+      ...service,
+      expectedVersion
+    })
     const shellCertification = JSON.parse(
       await readFile(
         join(env.OPEN_SCIENCE_E2E_STORAGE_ROOT, 'native-shell-certification.json'),

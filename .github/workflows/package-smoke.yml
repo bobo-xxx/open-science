@@ -96,6 +96,8 @@ jobs:
     needs: setup
     if: ${{ needs.setup.result == 'success' && !inputs.setup_only }}
     runs-on: ${{ matrix.os }}
+    env:
+      OPEN_SCIENCE_VERIFY_PACKAGED_SDK: ${{ !inputs.artifact_run_id && '1' || '0' }}
     environment: ${{ inputs.require_windows_signing && matrix.platform == 'win' && 'windows-signing' || '' }}
     # Windows certification can use a 30-minute hosted-runner ACL budget after dependency setup,
     # artifact download, installer smoke, and post-job evidence collection.
