@@ -525,6 +525,7 @@
         "e2e/session-residency-capacity.spec.ts",
         "e2e/compute-execution-mode.spec.ts",
         "e2e/compute-process-monitor.spec.ts",
+        "e2e/sdk-task-basics.spec.ts",
         "e2e/find-overlay.spec.ts",
         "e2e/literature-client-sync.spec.ts",
         "e2e/journal-attributes.spec.ts",
