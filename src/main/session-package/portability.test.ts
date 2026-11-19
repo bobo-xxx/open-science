@@ -10,6 +10,7 @@ import { SessionPackageService } from './service'
 import { createProvenanceTestFixture } from '../artifacts/provenance-test-fixtures'
 import { NotebookRunRepository } from '../notebook/repository'
 import { SessionRepository } from '../session-persistence/repository'
+import { PACKAGE_INSTRUCTION_PATH } from '../../shared/session-package'
 
 vi.mock('electron', () => ({
   app: { getPath: () => '/home/user', isPackaged: true },
@@ -260,6 +261,7 @@ it.each([
           requiredFeatures: ['ro-crate'],
           inventory: [
             ...origin.sourceManifest.inventory,
+            expect.objectContaining({ path: PACKAGE_INSTRUCTION_PATH, kind: 'readme' }),
             expect.objectContaining({ path: 'ro-crate-metadata.json', kind: 'metadata' })
           ]
         })

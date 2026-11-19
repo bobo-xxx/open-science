@@ -71,6 +71,7 @@ import type {
   PackageSelectionSummary
 } from '../../shared/session-package'
 import {
+  PACKAGE_INSTRUCTION_PATH,
   PACKAGE_MAX_BYTES,
   PACKAGE_MAX_FILE_BYTES,
   PACKAGE_RO_CRATE_METADATA,
@@ -115,6 +116,7 @@ import {
   writePackageArchive
 } from './archive'
 import { assertPackageCapacity } from './capacity'
+import { PACKAGE_INSTRUCTION } from './opening-guide'
 import { createPackageContentVerifier } from './materialize'
 import { PackageCleanupPendingError, withPackageCleanup } from './cleanup'
 import { SessionPackageDeletion } from './deletion'
@@ -226,6 +228,13 @@ export class PackageImportRecoveryRequiredError extends Error {
 
 const PACKAGE_README =
   '# Open-Science Session package\n\nOpen-Science can inspect and import this archive as read-only research history. Import does not execute code or restore account credentials. Checksums verify bytes, not scientific claims or the identity of the sender.\n'
+
+const openingGuideEntry: SessionPackageManifest['inventory'][number] = {
+  path: PACKAGE_INSTRUCTION_PATH,
+  kind: 'readme',
+  sizeBytes: Buffer.byteLength(PACKAGE_INSTRUCTION),
+  checksum: sha256(PACKAGE_INSTRUCTION)
+}
 
 type PackageOptions = {
   literatureSource?: PackageLiteratureSource
@@ -820,12 +829,19 @@ export class SessionPackageService {
       const optionalKeys = new Set(
         [...selectable, ...inheritedExclusions].map((file) => file.storageKey)
       )
+      const exportInventory = options.consumeSnapshot
+        ? manifest.inventory
+        : manifest.inventory.map((entry) =>
+            entry.path === PACKAGE_INSTRUCTION_PATH ? openingGuideEntry : entry
+          )
+      if (!options.consumeSnapshot && !exportInventory.includes(openingGuideEntry))
+        exportInventory.push(openingGuideEntry)
       const selection = await this.chooseFiles(
         options,
         markRequiredPackageFiles(
           records,
           selectable,
-          manifest.inventory.filter(
+          exportInventory.filter(
             (entry) =>
               (!entry.storageKey || !optionalKeys.has(entry.storageKey)) &&
               !previousFilmKeys.has(entry.storageKey ?? '')
@@ -834,7 +850,7 @@ export class SessionPackageService {
         {
           researchFilms: filmSummary,
           pdfNotesAvailable: !!records.pdfNotes?.length,
-          metadataBytes: manifest.inventory
+          metadataBytes: exportInventory
             .filter((entry) => !entry.storageKey)
             .reduce((sum, entry) => sum + entry.sizeBytes, 0),
           retainedFiles: manifest.inventory
@@ -874,7 +890,7 @@ export class SessionPackageService {
         requiredFeatures: manifest.requiredFeatures?.filter(
           (feature) => feature !== 'research-film'
         ),
-        inventory: manifest.inventory
+        inventory: exportInventory
           .filter(
             (entry) =>
               entry.path !== PACKAGE_RO_CRATE_METADATA &&
@@ -919,6 +935,12 @@ export class SessionPackageService {
             this.signal.throwIfAborted()
             if (copiedPaths.has(entry.path)) continue
             copiedPaths.add(entry.path)
+            if (entry.path === PACKAGE_INSTRUCTION_PATH && !options.consumeSnapshot) {
+              await writeFile(join(staging, entry.path), PACKAGE_INSTRUCTION, {
+                signal: this.signal
+              })
+              continue
+            }
             if (entry.path === 'records.json') {
               await writeFile(join(staging, entry.path), forwardedRecordsJson)
               continue
@@ -1160,10 +1182,11 @@ export class SessionPackageService {
     }
     const sessionJson = JSON.stringify({ version: 2, session: sharedSession })
     let recordsJson = JSON.stringify(records)
+    const readmeBytes =
+      Buffer.byteLength(PACKAGE_README) +
+      (options.consumeSnapshot ? 0 : openingGuideEntry.sizeBytes)
     let metadataBytes =
-      Buffer.byteLength(sessionJson) +
-      Buffer.byteLength(recordsJson) +
-      Buffer.byteLength(PACKAGE_README)
+      Buffer.byteLength(sessionJson) + Buffer.byteLength(recordsJson) + readmeBytes
     diagnostic.phase('select-files')
     const selection = await this.chooseFiles(
       options,
@@ -1172,7 +1195,8 @@ export class SessionPackageService {
         ...[sessionJson, recordsJson, PACKAGE_README].map((content) => ({
           sizeBytes: Buffer.byteLength(content),
           checksum: sha256(content)
-        }))
+        })),
+        ...(options.consumeSnapshot ? [] : [openingGuideEntry])
       ]),
       {
         retainedFiles,
@@ -1191,10 +1215,7 @@ export class SessionPackageService {
       records.pdfNotes = await capturePackagePdfNotes(client, records, excludedKeys)
       retainInheritedPdfNotes(records, inheritedPdfNotes, excludedKeys)
       recordsJson = JSON.stringify(records)
-      metadataBytes =
-        Buffer.byteLength(sessionJson) +
-        Buffer.byteLength(recordsJson) +
-        Buffer.byteLength(PACKAGE_README)
+      metadataBytes = Buffer.byteLength(sessionJson) + Buffer.byteLength(recordsJson) + readmeBytes
     }
     const excludedFiles = [
       ...new Map(
@@ -1303,6 +1324,12 @@ export class SessionPackageService {
           packageEntry(directory, 'records.json', 'records'),
           packageEntry(directory, 'README.md', 'readme')
         ])
+        if (!options.consumeSnapshot) {
+          await writeFile(join(directory, PACKAGE_INSTRUCTION_PATH), PACKAGE_INSTRUCTION, {
+            signal: this.signal
+          })
+          inventory.push(openingGuideEntry)
+        }
         await mkdir(join(directory, 'objects'))
         let completedBytes = 0
         let completedFiles = 0
