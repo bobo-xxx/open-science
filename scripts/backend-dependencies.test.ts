@@ -961,6 +961,12 @@ describe('standalone dependency boundary', () => {
   ])('forbids %s in the package closure', (name) => {
     expect(isElectronPackage(name)).toBe(true)
   })
+  it.each(['electron-to-chromium', 'electron-to-chromium/versions'])(
+    'allows Babel’s browser version data dependency %s',
+    (name) => {
+      expect(isElectronPackage(name)).toBe(false)
+    }
+  )
   it('rejects an Electron import in any reachable worker or transitive source', () => {
     expect(() =>
       assertBackendImports(

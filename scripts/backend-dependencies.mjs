@@ -53,6 +53,7 @@ export async function inlineDesktopDependencyMaps(manifest, directory) {
 }
 
 export const isElectronPackage = (name) =>
+  !/^electron-to-chromium(?:$|\/)/.test(name) &&
   /^(?:electron(?:$|\/|-)|@electron(?:-toolkit)?\/)/.test(name)
 
 // Claude always uses the detected executable; Prisma's optional peers generate clients at build time.
